@@ -14,6 +14,7 @@
 #include <mcp/elicit.hpp>
 #include <mcp/methods.hpp>
 #include <mcp/rpc.hpp>
+#include <mcp/protocol.hpp>
 #include <mcp/stdio.hpp>
 #include <mcp/client.hpp>
 #include <mcp/server.hpp>
