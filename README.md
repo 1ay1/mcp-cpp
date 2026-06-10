@@ -55,7 +55,9 @@ The architecture is borrowed from
 
 ## Coverage (2025-11-25)
 
-Everything in the spec revision is modelled and round-trips:
+Every `export interface` / `export type` in the authoritative
+[`schema.ts`](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/schema/2025-11-25/schema.ts)
+is represented and round-trips. Concretely:
 
 - **Base protocol** — JSON-RPC 2.0 envelopes, `initialize` handshake +
   capability negotiation, `ping`, cancellation, progress, pagination, `_meta`.
@@ -71,6 +73,22 @@ Everything in the spec revision is modelled and round-trips:
 - **Tasks** (durable requests, SEP-1686) — `tasks/get`, `tasks/result`,
   `tasks/cancel`, `tasks/list`, status notifications, task-augmented params.
 
+The schema's seven closing discriminated unions (`JSONRPCMessage`,
+`ClientRequest`, `ServerRequest`, `ClientNotification`, `ServerNotification`,
+`ClientResult`, `ServerResult`) are modelled as real `Sum` types. On top of
+them sits a **compile-time method dictionary**: each `dict::X` descriptor bakes
+its wire-method literal (as an NTTP), its `Params`, and its `Result` into one
+indivisible token, so
+
+```cpp
+auto fut = mcp::call<dict::CallTool>(engine, params);   // future<CallToolResult>
+mcp::handle<dict::CallTool>(engine, [](const CallToolParams& p){ … });
+mcp::send<dict::Progress>(engine, progressParams);
+```
+
+resolve the method string *and* the result type from a single name — a
+mismatched (method, params, result) triple is unrepresentable.
+
 ## Layout
 
 | Header               | Role                                                      |
@@ -82,6 +100,7 @@ Everything in the spec revision is modelled and round-trips:
 | `mcp/types.hpp`      | implementation, capabilities, tool, resource, prompt, task|
 | `mcp/elicit.hpp`     | elicitation primitive/enum schemas                        |
 | `mcp/methods.hpp`    | every request/result param record + `mcp::method::*`      |
+| `mcp/protocol.hpp`   | JSON-RPC envelope algebra, message-level sums, method dict |
 | `mcp/rpc.hpp`        | bidirectional JSON-RPC engine (sync + async + timeouts)   |
 | `mcp/stdio.hpp`      | line-delimited stdio transport                            |
 | `mcp/coro.hpp`       | optional `mcp::co::Task<T>` coroutine surface             |
