@@ -286,11 +286,47 @@ template <> struct CodecOf<TitledMultiSelectEnum> {
     }
 };
 
+//  LegacyTitledEnumSchema — the deprecated single-select form that carries an
+//  `enumNames` parallel array (schema.ts LegacyTitledEnumSchema). Kept for
+//  backward compatibility with pre-SEP-1330 clients.
+struct LegacyTitledEnum {
+    List<std::string>        values;
+    Maybe<List<std::string>> enumNames;
+    Maybe<std::string>       title;
+    Maybe<std::string>       description;
+    Maybe<std::string>       defaultValue;
+};
+template <> struct CodecOf<LegacyTitledEnum> {
+    static Codec<LegacyTitledEnum> get() {
+        return {
+            [](const LegacyTitledEnum& s) -> Json {
+                Json j = {{"type", "string"}, {"enum", s.values}};
+                if (s.enumNames)    j["enumNames"]   = *s.enumNames;
+                if (s.title)        j["title"]       = *s.title;
+                if (s.description)  j["description"] = *s.description;
+                if (s.defaultValue) j["default"]     = *s.defaultValue;
+                return j;
+            },
+            [](const Json& j) -> LegacyTitledEnum {
+                if (j.value("type", "") != "string" || !j.contains("enum") ||
+                    !j.contains("enumNames"))
+                    throw CodecError("not a LegacyTitledEnum");
+                LegacyTitledEnum s;
+                s.values    = j.at("enum").get<List<std::string>>();
+                s.enumNames = j.at("enumNames").get<List<std::string>>();
+                if (auto it = j.find("title");       it != j.end()) s.title = it->get<std::string>();
+                if (auto it = j.find("description"); it != j.end()) s.description = it->get<std::string>();
+                if (auto it = j.find("default");     it != j.end()) s.defaultValue = it->get<std::string>();
+                return s;
+            }};
+    }
+};
+
 //  PrimitiveSchemaDefinition — the union. Decode order matters: try the more
 //  specific (enum) shapes before the plain String schema.
 using PrimitiveSchema = Sum<
     UntitledSingleSelectEnum, TitledSingleSelectEnum,
-    UntitledMultiSelectEnum,  TitledMultiSelectEnum,
+    UntitledMultiSelectEnum,  TitledMultiSelectEnum, LegacyTitledEnum,
     NumberSchema, BooleanSchema, StringSchema>;
 
 template <> struct CodecOf<PrimitiveSchema> {
@@ -300,6 +336,7 @@ template <> struct CodecOf<PrimitiveSchema> {
             codec<TitledSingleSelectEnum>(),
             codec<UntitledMultiSelectEnum>(),
             codec<TitledMultiSelectEnum>(),
+            codec<LegacyTitledEnum>(),
             codec<NumberSchema>(),
             codec<BooleanSchema>(),
             codec<StringSchema>());

@@ -38,6 +38,30 @@ template <> struct CodecOf<Icon> {
 };
 
 //==============================================================================
+//  BaseMetadata & Icons — the spec's mixin interfaces (schema.ts BaseMetadata,
+//  Icons). Their fields are inlined into Implementation/Tool/Resource/Prompt
+//  (a record cannot inherit a codec), but the named types are provided for
+//  vocabulary completeness and for callers that want them standalone.
+//==============================================================================
+struct BaseMetadata {
+    std::string        name;
+    Maybe<std::string> title;
+};
+template <> struct CodecOf<BaseMetadata> {
+    static Codec<BaseMetadata> get() {
+        return record<BaseMetadata>(
+            required("name",  &BaseMetadata::name),
+            optional("title", &BaseMetadata::title));
+    }
+};
+struct Icons { Maybe<List<Icon>> icons; };
+template <> struct CodecOf<Icons> {
+    static Codec<Icons> get() {
+        return record<Icons>(optional("icons", &Icons::icons));
+    }
+};
+
+//==============================================================================
 //  Implementation — peer identity exchanged at initialize.
 //==============================================================================
 struct Implementation {
@@ -443,6 +467,15 @@ struct TaskMetadata { Maybe<double> ttl; };
 template <> struct CodecOf<TaskMetadata> {
     static Codec<TaskMetadata> get() {
         return record<TaskMetadata>(optional("ttl", &TaskMetadata::ttl));
+    }
+};
+
+//  RelatedTaskMetadata — references a task this message relates to (schema.ts
+//  RelatedTaskMetadata). Carried in `_meta` under the spec's task key.
+struct RelatedTaskMetadata { std::string taskId; };
+template <> struct CodecOf<RelatedTaskMetadata> {
+    static Codec<RelatedTaskMetadata> get() {
+        return record<RelatedTaskMetadata>(required("taskId", &RelatedTaskMetadata::taskId));
     }
 };
 
