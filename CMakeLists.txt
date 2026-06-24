@@ -36,6 +36,26 @@ target_include_directories(mcp INTERFACE
 target_link_libraries(mcp INTERFACE nlohmann_json::nlohmann_json)
 target_compile_features(mcp INTERFACE cxx_std_23)
 
+# ── The batteries-included toolset: a COMPILED add-on (libmcp_tools) ────────
+# The core protocol library above is header-only. The built-in agent toolset
+# (filesystem / shell / search / git / web + host-injected memory / todo /
+# skill / docs / subagent SHELLS) is substantial implementation code, so it
+# lives in a compiled static lib a host links only if it wants the tools.
+# Heavy template cost stays out of the header-only core.
+option(MCP_BUILD_TOOLS "Build the batteries-included mcp::tools toolset" ON)
+if(MCP_BUILD_TOOLS)
+    file(GLOB MCP_TOOLS_SOURCES CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/*.cpp)
+    add_library(mcp_tools STATIC ${MCP_TOOLS_SOURCES})
+    add_library(mcp::tools ALIAS mcp_tools)
+    target_include_directories(mcp_tools
+        PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                $<INSTALL_INTERFACE:include>
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/tools)
+    target_link_libraries(mcp_tools PUBLIC mcp::mcp)
+    target_compile_features(mcp_tools PUBLIC cxx_std_23)
+endif()
+
 if(MCP_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
