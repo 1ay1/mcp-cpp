@@ -18,3 +18,8 @@
 #include <mcp/stdio.hpp>
 #include <mcp/client.hpp>
 #include <mcp/server.hpp>
+
+// The capability layer (a uniform CapabilityProvider abstraction over local
+// closures, spawned MCP servers, and future transports). Sits above the wire
+// protocol; opt-in via <mcp/cap/cap.hpp> too.
+#include <mcp/cap/cap.hpp>
