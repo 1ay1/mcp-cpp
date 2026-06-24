@@ -11,19 +11,36 @@ namespace mcp::tools::util {
 using nlohmann::json;
 
 namespace {
-constexpr std::string_view kAliasesPath[]       = {"file_path", "filepath", "filename"};
-constexpr std::string_view kAliasesFilePath[]   = {"path",      "filepath", "filename"};
-constexpr std::string_view kAliasesOldString[]  = {"old_str",   "oldStr"};
-constexpr std::string_view kAliasesNewString[]  = {"new_str",   "newStr"};
+// Alias tables. These are the canonical-key -> {wrong keys a model emits}
+// mappings. raw() consults them so a tool reading the canonical key still
+// finds a value the model parked under a synonym. This is the SINGLE robust
+// layer every tool path flows through (native tool_calls, salvaged leaked
+// calls, JSON-protocol, MCP-server tools, the stdio MCP server) — so the weak-
+// model vocabulary lives here rather than being re-patched at each call site.
+constexpr std::string_view kAliasesPath[]       = {"file_path", "filepath", "filename",
+                                                    "file",      "dir",      "directory",
+                                                    "target",    "pathname"};
+constexpr std::string_view kAliasesFilePath[]   = {"path",      "filepath", "filename",
+                                                    "file",      "target",   "pathname"};
+constexpr std::string_view kAliasesOldString[]  = {"old_text",  "old_str",  "oldStr",
+                                                    "old",       "search",   "find", "from"};
+constexpr std::string_view kAliasesNewString[]  = {"new_text",  "new_str",  "newStr",
+                                                    "new",       "replace",  "replacement", "to"};
 constexpr std::string_view kAliasesContent[]    = {"file_text", "text",
                                                     "file_content", "contents",
-                                                    "body", "data"};
+                                                    "body", "data", "code"};
 constexpr std::string_view kAliasesOffset[]     = {"start_line", "start", "from_line"};
 constexpr std::string_view kAliasesLimit[]      = {"end_line",   "num_lines", "max_lines",
                                                     "count",      "line_count"};
 constexpr std::string_view kAliasesCd[]         = {"cwd", "workdir", "working_directory",
                                                     "directory"};
-constexpr std::string_view kAliasesCommand[]    = {"cmd", "shell_command"};
+constexpr std::string_view kAliasesCommand[]    = {"cmd", "shell_command", "shell",
+                                                    "script", "run", "cmdline"};
+constexpr std::string_view kAliasesPattern[]    = {"query", "q", "regex", "search",
+                                                    "term", "glob", "match", "pat"};
+constexpr std::string_view kAliasesQuery[]      = {"q", "search", "term", "text",
+                                                    "prompt", "question"};
+constexpr std::string_view kAliasesUrl[]        = {"uri", "link", "address", "href"};
 
 std::span<const std::string_view> aliases_for(std::string_view key) noexcept {
     if (key == "path")       return {kAliasesPath};
@@ -35,6 +52,9 @@ std::span<const std::string_view> aliases_for(std::string_view key) noexcept {
     if (key == "limit")      return {kAliasesLimit};
     if (key == "cd")         return {kAliasesCd};
     if (key == "command")    return {kAliasesCommand};
+    if (key == "pattern")    return {kAliasesPattern};
+    if (key == "query")      return {kAliasesQuery};
+    if (key == "url")        return {kAliasesUrl};
     return {};
 }
 } // namespace
