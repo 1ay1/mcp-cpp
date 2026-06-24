@@ -50,6 +50,36 @@
 
 namespace mcp::cap {
 
+// Move-only owner of a single Windows pipe HANDLE. Closes on scope exit unless
+// release()'d — the CreatePipe/CreateProcess prologue's leak-ladder becomes
+// automatic: every pipe end is parked in a HandleGuard the instant CreatePipe
+// hands it back, any throw before the commit point unwinds them all, and at the
+// commit point the surviving ends are release()'d into the streambufs (which
+// own them thereafter). Zero runtime cost: one HANDLE, no vtable, no heap.
+class HandleGuard {
+public:
+    HandleGuard() noexcept = default;
+    explicit HandleGuard(HANDLE h) noexcept : h_(h) {}
+    HandleGuard(HandleGuard&& o) noexcept : h_(o.h_) { o.h_ = nullptr; }
+    HandleGuard& operator=(HandleGuard&& o) noexcept {
+        if (this != &o) { reset(); h_ = o.h_; o.h_ = nullptr; }
+        return *this;
+    }
+    HandleGuard(const HandleGuard&)            = delete;
+    HandleGuard& operator=(const HandleGuard&) = delete;
+    ~HandleGuard() { reset(); }
+
+    [[nodiscard]] HANDLE get() const noexcept { return h_; }
+    [[nodiscard]] HANDLE release() noexcept { HANDLE h = h_; h_ = nullptr; return h; }
+    void reset() noexcept {
+        if (h_ && h_ != INVALID_HANDLE_VALUE) { ::CloseHandle(h_); }
+        h_ = nullptr;
+    }
+
+private:
+    HANDLE h_ = nullptr;
+};
+
 // A std::streambuf backed by a Windows pipe HANDLE. Replaces libstdc++'s
 // __gnu_cxx::stdio_filebuf (which is unavailable on MSVC) so ChildProcess can
 // expose std::istream/std::ostream over the child's stdio pipes. Blocking
@@ -141,24 +171,28 @@ public:
         sa.nLength        = sizeof(sa);
         sa.bInheritHandle = TRUE;          // pipe ends are inheritable
 
-        HANDLE child_stdin_rd = nullptr, child_stdin_wr = nullptr;
-        HANDLE child_stdout_rd = nullptr, child_stdout_wr = nullptr;
-        if (!::CreatePipe(&child_stdin_rd, &child_stdin_wr, &sa, 0))
+        // Each pipe end is owned by a HandleGuard the moment CreatePipe yields
+        // it, so any throw before the commit point closes every open handle
+        // automatically — no hand-rolled CloseHandle ladder to drift out of
+        // sync with the open set.
+        HANDLE rd = nullptr, wr = nullptr;
+        if (!::CreatePipe(&rd, &wr, &sa, 0))
             throw std::runtime_error("mcp::cap: CreatePipe(stdin) failed");
-        if (!::CreatePipe(&child_stdout_rd, &child_stdout_wr, &sa, 0)) {
-            ::CloseHandle(child_stdin_rd); ::CloseHandle(child_stdin_wr);
+        HandleGuard child_stdin_rd{rd}, child_stdin_wr{wr};
+        if (!::CreatePipe(&rd, &wr, &sa, 0))
             throw std::runtime_error("mcp::cap: CreatePipe(stdout) failed");
-        }
+        HandleGuard child_stdout_rd{rd}, child_stdout_wr{wr};
+
         // The PARENT ends must NOT be inherited by the child, else they never
         // close and we'd never see EOF.
-        ::SetHandleInformation(child_stdin_wr,  HANDLE_FLAG_INHERIT, 0);
-        ::SetHandleInformation(child_stdout_rd, HANDLE_FLAG_INHERIT, 0);
+        ::SetHandleInformation(child_stdin_wr.get(),  HANDLE_FLAG_INHERIT, 0);
+        ::SetHandleInformation(child_stdout_rd.get(), HANDLE_FLAG_INHERIT, 0);
 
         STARTUPINFOA si{};
         si.cb         = sizeof(si);
         si.dwFlags    = STARTF_USESTDHANDLES;
-        si.hStdInput  = child_stdin_rd;
-        si.hStdOutput = child_stdout_wr;
+        si.hStdInput  = child_stdin_rd.get();
+        si.hStdOutput = child_stdout_wr.get();
         si.hStdError  = ::GetStdHandle(STD_ERROR_HANDLE);   // inherit parent stderr
 
         std::string cmdline = build_command_line_(s);
@@ -176,22 +210,22 @@ public:
             /*lpCurrentDirectory=*/nullptr,
             &si, &pi);
 
-        // The child owns its ends now; close ours regardless of success.
-        ::CloseHandle(child_stdin_rd);
-        ::CloseHandle(child_stdout_wr);
-        if (!ok) {
-            ::CloseHandle(child_stdin_wr);
-            ::CloseHandle(child_stdout_rd);
+        // The child owns its ends now; drop ours regardless of success.
+        child_stdin_rd.reset();
+        child_stdout_wr.reset();
+        if (!ok)
+            // child_stdin_wr / child_stdout_rd close here via guard unwind.
             throw std::runtime_error("mcp::cap: CreateProcess('" + s.command +
                                      "') failed (err " +
                                      std::to_string(::GetLastError()) + ")");
-        }
         ::CloseHandle(pi.hThread);
         proc_   = pi.hProcess;
         pid_    = static_cast<int>(pi.dwProcessId);
 
-        in_buf_  = std::make_unique<handle_streambuf>(child_stdout_rd);  // child stdout
-        out_buf_ = std::make_unique<handle_streambuf>(child_stdin_wr);   // child stdin
+        // Commit point: release the surviving parent ends into the streambufs,
+        // which own the handles thereafter and close them via shutdown().
+        in_buf_  = std::make_unique<handle_streambuf>(child_stdout_rd.release());  // child stdout
+        out_buf_ = std::make_unique<handle_streambuf>(child_stdin_wr.release());   // child stdin
         in_stream_  = std::make_unique<std::istream>(in_buf_.get());
         out_stream_ = std::make_unique<std::ostream>(out_buf_.get());
     }
@@ -344,6 +378,34 @@ private:
 
 namespace mcp::cap {
 
+// Move-only owner of a single pipe-end FD. Closes on scope exit unless
+// release()'d, so the spawn prologue's leak-ladder (close every FD opened so
+// far on any early throw) becomes automatic and impossible to get wrong: each
+// ::pipe() end is parked in an FdGuard the instant it exists, a throw between
+// here and the commit point unwinds them in reverse, and at the commit point
+// the surviving ends are release()'d — into the child (via dup2) or into the
+// parent's streambufs. Zero runtime cost: one int, no vtable, no heap.
+class FdGuard {
+public:
+    FdGuard() noexcept = default;
+    explicit FdGuard(int fd) noexcept : fd_(fd) {}
+    FdGuard(FdGuard&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
+    FdGuard& operator=(FdGuard&& o) noexcept {
+        if (this != &o) { reset(); fd_ = o.fd_; o.fd_ = -1; }
+        return *this;
+    }
+    FdGuard(const FdGuard&)            = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+    ~FdGuard() { reset(); }
+
+    [[nodiscard]] int get() const noexcept { return fd_; }
+    [[nodiscard]] int release() noexcept { int f = fd_; fd_ = -1; return f; }
+    void reset() noexcept { if (fd_ >= 0) { ::close(fd_); fd_ = -1; } }
+
+private:
+    int fd_ = -1;
+};
+
 // A spawned child process whose stdin/stdout are wired to iostreams. stderr is
 // left attached to the parent's (MCP servers log there; the spec keeps stderr
 // free for logging). Construction throws std::runtime_error on spawn failure.
@@ -356,24 +418,28 @@ public:
     };
 
     explicit ChildProcess(const Spawn& s) {
-        int in_pipe[2]  = {-1, -1};   // parent[1] → child stdin[0]
-        int out_pipe[2] = {-1, -1};   // child stdout[1] → parent[0]
+        // parent[1] → child stdin[0]; child stdout[1] → parent[0]. Each end is
+        // owned by an FdGuard the moment ::pipe() hands it back, so any throw
+        // before the commit point unwinds every open FD automatically — no
+        // hand-rolled close-ladder to drift out of sync with the open set.
+        int in_pipe[2]  = {-1, -1};
+        int out_pipe[2] = {-1, -1};
         if (::pipe(in_pipe) != 0)
             throw std::runtime_error("mcp::cap: pipe() failed (stdin)");
-        if (::pipe(out_pipe) != 0) {
-            ::close(in_pipe[0]); ::close(in_pipe[1]);
+        FdGuard in_rd{in_pipe[0]}, in_wr{in_pipe[1]};
+        if (::pipe(out_pipe) != 0)
             throw std::runtime_error("mcp::cap: pipe() failed (stdout)");
-        }
+        FdGuard out_rd{out_pipe[0]}, out_wr{out_pipe[1]};
 
         pid_ = ::fork();
-        if (pid_ < 0) {
-            ::close(in_pipe[0]);  ::close(in_pipe[1]);
-            ::close(out_pipe[0]); ::close(out_pipe[1]);
+        if (pid_ < 0)
             throw std::runtime_error("mcp::cap: fork() failed");
-        }
+            // in_rd/in_wr/out_rd/out_wr all close here via guard unwind.
 
         if (pid_ == 0) {
             // ── child ────────────────────────────────────────────────────
+            // Raw FDs: this is the forked child; the parent's guards are
+            // copies in a separate address space and irrelevant here.
             ::dup2(in_pipe[0],  STDIN_FILENO);
             ::dup2(out_pipe[1], STDOUT_FILENO);
             ::close(in_pipe[0]);  ::close(in_pipe[1]);
@@ -397,10 +463,14 @@ public:
         }
 
         // ── parent ──────────────────────────────────────────────────────
-        ::close(in_pipe[0]);
-        ::close(out_pipe[1]);
-        in_buf_  = std::make_unique<__gnu_cxx::stdio_filebuf<char>>(out_pipe[0], std::ios::in);
-        out_buf_ = std::make_unique<__gnu_cxx::stdio_filebuf<char>>(in_pipe[1],  std::ios::out);
+        // Drop the child-side ends (guards close them on destruction); the
+        // parent-side ends are release()'d into the stdio_filebufs, which now
+        // own the FDs and close them via shutdown(). Commit point: from here
+        // on the streams hold the only references.
+        in_rd.reset();    // child's stdin read end — parent doesn't use it
+        out_wr.reset();   // child's stdout write end — parent doesn't use it
+        in_buf_  = std::make_unique<__gnu_cxx::stdio_filebuf<char>>(out_rd.release(), std::ios::in);
+        out_buf_ = std::make_unique<__gnu_cxx::stdio_filebuf<char>>(in_wr.release(),  std::ios::out);
         in_stream_  = std::make_unique<std::istream>(in_buf_.get());
         out_stream_ = std::make_unique<std::ostream>(out_buf_.get());
     }
