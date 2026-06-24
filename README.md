@@ -89,6 +89,83 @@ mcp::send<dict::Progress>(engine, progressParams);
 resolve the method string *and* the result type from a single name — a
 mismatched (method, params, result) triple is unrepresentable.
 
+## The capability layer
+
+The wire protocol (`client.hpp` / `server.hpp`) answers *how two peers talk
+JSON-RPC*. Above it sits `mcp/cap/` — one uniform abstraction for the question
+an agent actually has:
+
+```
+What can I do?   →  Registry::tools()
+Do this thing.   →  Registry::dispatch(Request{tool, args})
+```
+
+A `CapabilityProvider` is the single seam. Today's implementations:
+
+| Provider              | Backs                                                    |
+|-----------------------|----------------------------------------------------------|
+| `LocalProvider`       | in-process C++ closures (the host's own tools)           |
+| `StdioServerProvider` | an external MCP server spawned over stdio (`ChildProcess`) |
+
+The `ClientProvider` base + `ChildProcess` bridge make new transports (HTTP/SSE
+MCP, an RPC service, a database) a matter of subclassing one interface — the
+agent **cannot tell them apart**, which is the point.
+
+A `Registry` fans N providers into one surface: it presents the union of their
+tools, namespaces collisions as `<origin>__<name>`, routes `dispatch()` to the
+owning provider, and fans in resources + prompts the same way. It also forwards
+each provider's `*_list_changed` notification so a host can invalidate a tool
+index it built. MCP is just *one kind of provider* — remove it and the
+abstraction is intact.
+
+```cpp
+#include <mcp/cap/cap.hpp>
+using namespace mcp::cap;
+
+Registry reg;
+reg.add(std::make_shared<LocalProvider>("local"));         // your closures
+reg.add(std::make_shared<StdioServerProvider>(/*spawn cfg*/)); // a real MCP server
+
+for (const Tool& t : reg.tools()) advertise(t);            // union, namespaced
+Result r = reg.dispatch("local__read", Json{{"path","a.c"}});
+```
+
+## Batteries-included toolset
+
+`mcp/tools/` is a COMPILED add-on (`libmcp_tools` / `mcp::tools`, built when
+`MCP_BUILD_TOOLS=ON`) — separate from the header-only core, linked only if you
+want a production agent toolset out of the box:
+
+- **Tier-1, self-contained** — `read` / `write` / `edit` / `list_dir`,
+  `bash`, `grep` / `glob` / `find_definition`, `diagnostics`,
+  `git_status` / `git_diff` / `git_log` / `git_commit`, `web_fetch` /
+  `web_search`. Fully defined by the library (the web tools need an injected
+  HTTP backend).
+- **Host-coupled SHELLS** — `remember` / `forget` / `wipe_memory`, `todo`,
+  `skill`, `search_docs`, `task`. mcp-cpp owns each tool's *shell* (name,
+  schema, arg parsing, output formatting, protocol surface); the **host**
+  injects the one operation it performs via a small `std::function`-based
+  interface. Inversion of control: a tool is registered only if its backend is
+  installed, so the library never drags in your database / RAG stack / agent
+  loop.
+
+```cpp
+#include <mcp/tools/toolset.hpp>
+
+mcp::tools::HostServices svc;
+svc.memory    = std::make_shared<MyMemoryStore>();   // enables remember/forget/wipe
+svc.retriever = std::make_shared<MyDocRetriever>();  // enables search_docs
+svc.http      = std::make_shared<MyHttpClient>();    // enables web_fetch/web_search
+// leave svc.subagent null → no `task` tool is offered
+auto provider = mcp::tools::make_provider(svc);      // a CapabilityProvider
+```
+
+Two pieces of metadata the bare wire has no field for ride in the result's
+structured payload under a reserved key (`meta.hpp`): an **`EffectSet`**
+(Read / Write / Net / Exec — drives permission prompts + the scheduler below)
+and, for write/edit, a **`FileChange`** (before/after for a diff-review UI). A
+host that cares decodes them; one that doesn't just sees the text.
+
 ## Effect-aware parallel tool scheduling
 
 A differentiator no other MCP client ships. When a model emits a **batch** of
@@ -144,9 +221,11 @@ exactly where it must.
 | `mcp/coro.hpp`       | optional `mcp::co::Task<T>` coroutine surface             |
 | `mcp/client.hpp`     | typed host-side `Client`                                  |
 | `mcp/server.hpp`     | typed `Server` with a tool/resource/prompt registry       |
-| `mcp/cap/*.hpp`      | capability layer: `Registry` fan-in, providers, scheduler |
+| `mcp/cap/cap.hpp`    | capability layer umbrella (`Registry`, `LocalProvider`, …) |
 | `mcp/cap/scheduler.hpp` | effect-aware parallel tool scheduling (see above)      |
-| `mcp/mcp.hpp`        | umbrella include                                          |
+| `mcp/tools/toolset.hpp` | compiled batteries-included toolset (`MCP_BUILD_TOOLS`) |
+| `mcp/tools/host.hpp` | `HostServices` IoC seam for host-coupled tool shells      |
+| `mcp/mcp.hpp`        | umbrella include (core protocol)                          |
 
 ## Quick start — a server in ~10 lines
 
@@ -202,6 +281,12 @@ ctest --test-dir build --output-on-failure
 ./build/examples/mcp_client_example ./build/examples/mcp_server_example
 ```
 
+The core protocol + capability layer are **header-only**. The batteries-included
+toolset is a separate compiled library (`libmcp_tools`, target `mcp::tools`),
+built by default; turn it off with `-DMCP_BUILD_TOOLS=OFF` if you only want the
+protocol + capability headers. Tests (`MCP_BUILD_TESTS`) and examples
+(`MCP_BUILD_EXAMPLES`) are also on by default.
+
 Requires a C++23 compiler (GCC 14+/Clang 17+). nlohmann/json v3.11.3 is fetched
 automatically by CMake.
 
@@ -217,6 +302,10 @@ automatically by CMake.
   slow tool call or sampling request never blocks the single reader thread.
 - The coroutine `Task<T>` lives in `mcp::co` to avoid colliding with the
   protocol's `mcp::Task` (a durable-request record).
+- **MCP is one provider, not the center.** The capability layer (`cap/`) treats
+  the wire protocol as a single `CapabilityProvider` implementation; a host
+  programs against `Registry`, not against MCP. Swapping MCP for a local
+  closure set or an HTTP service touches zero host code.
 
 ## License
 
