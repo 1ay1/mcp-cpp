@@ -116,6 +116,16 @@ public:
         return ::waitpid(pid_, &status, WNOHANG) == 0;
     }
 
+    // Close ONLY the child's stdin (our write end). A well-behaved server sees
+    // EOF and begins exiting, which in turn closes its stdout — unblocking a
+    // reader thread parked in getline on our read end. Does NOT reap or touch
+    // the read stream, so a reader can drain remaining output + the EOF
+    // cleanly. Safe to call before joining the reader, then shutdown() after.
+    void close_stdin() noexcept {
+        out_stream_.reset();
+        out_buf_.reset();   // closes child's stdin FD
+    }
+
     // Close child stdin (EOF → graceful exit), poll briefly, then SIGTERM.
     // Idempotent; also called by the destructor.
     void shutdown() noexcept {
