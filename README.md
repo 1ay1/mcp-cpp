@@ -89,6 +89,44 @@ mcp::send<dict::Progress>(engine, progressParams);
 resolve the method string *and* the result type from a single name — a
 mismatched (method, params, result) triple is unrepresentable.
 
+## Effect-aware parallel tool scheduling
+
+A differentiator no other MCP client ships. When a model emits a **batch** of
+tool calls in one turn — and frontier models do this constantly (three `read`s,
+a `grep`, a `glob`, then an `edit`) — almost every agent runtime runs them
+**strictly sequentially**, because the bare wire gives no machine-readable
+interference model. mcp-cpp has one: every tool declares an `EffectSet`
+(Read / Write / Net / Exec) and most fs tools name their target **paths** right
+in the args. From those two facts the scheduler derives a provably-safe
+concurrent execution plan with **zero host annotation**:
+
+```cpp
+#include <mcp/cap/scheduler.hpp>
+
+std::vector<cap::Request> batch = model_tool_calls();      // what the model asked for
+auto results = cap::run(registry, batch,                  // 1:1 with batch, original order
+                        mcp::tools::make_effect_fn());     // rich built-in effects
+```
+
+- A **wave** of pairwise non-conflicting calls runs concurrently; waves run in
+  submission order, so a write is never reordered before a read the model
+  intended first. The result vector comes back **1:1 with the input** — the
+  agent loop is none the wiser anything ran in parallel.
+- Conflict model: any `Exec` serialises against everything (a shell command's
+  blast radius is unbounded); two pure reads **never** conflict; a write
+  serialises only against calls whose paths **overlap** (prefix-aware, so
+  writing `src/` orders against reading `src/a.c`); a write with no extractable
+  path serialises against all fs peers.
+- `plan_waves()` is a **pure** planner (no I/O, unit-tested in isolation);
+  `run()` is a thin `std::async` executor behind the same one-call surface the
+  host already uses. Works over **any** provider mix — a default `EffectFn`
+  reads the standard MCP `readOnlyHint` / `openWorldHint` annotations so it does
+  something safe even for a third-party server that never heard of `EffectSet`.
+
+Four independent reads that each block 8 ms collapse from 32 ms serial to 8 ms
+concurrent — and a write that touches one of those paths still serialises
+exactly where it must.
+
 ## Layout
 
 | Header               | Role                                                      |
@@ -106,6 +144,8 @@ mismatched (method, params, result) triple is unrepresentable.
 | `mcp/coro.hpp`       | optional `mcp::co::Task<T>` coroutine surface             |
 | `mcp/client.hpp`     | typed host-side `Client`                                  |
 | `mcp/server.hpp`     | typed `Server` with a tool/resource/prompt registry       |
+| `mcp/cap/*.hpp`      | capability layer: `Registry` fan-in, providers, scheduler |
+| `mcp/cap/scheduler.hpp` | effect-aware parallel tool scheduling (see above)      |
 | `mcp/mcp.hpp`        | umbrella include                                          |
 
 ## Quick start — a server in ~10 lines

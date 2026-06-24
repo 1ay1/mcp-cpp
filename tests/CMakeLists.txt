@@ -14,6 +14,11 @@ add_executable(mcp_cap_test cap_test.cpp)
 target_link_libraries(mcp_cap_test PRIVATE mcp::mcp)
 add_test(NAME mcp_cap_test COMMAND mcp_cap_test)
 
+add_executable(mcp_scheduler_test scheduler_test.cpp)
+find_package(Threads REQUIRED)
+target_link_libraries(mcp_scheduler_test PRIVATE mcp::mcp Threads::Threads)
+add_test(NAME mcp_scheduler_test COMMAND mcp_scheduler_test)
+
 if(MCP_BUILD_TOOLS)
     add_executable(mcp_toolset_test toolset_test.cpp)
     target_link_libraries(mcp_toolset_test PRIVATE mcp::tools)

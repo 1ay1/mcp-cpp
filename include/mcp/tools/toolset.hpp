@@ -25,9 +25,11 @@
 #pragma once
 
 #include <mcp/cap/capability.hpp>
+#include <mcp/cap/scheduler.hpp>
 #include <mcp/tools/host.hpp>
 
 #include <cstdint>
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -98,5 +100,54 @@ struct ToolsetConfig {
 make_provider(HostServices svc,
               ToolsetConfig cfg = {},
               std::string   origin = "local");
+
+// ── Scheduler glue ──────────────────────────────────────────────────────────
+// The effect declaration for a built-in tool, by name. DEFINED in the compiled
+// toolset (effects.cpp); also declared in meta.hpp. Forward-declared here
+// (rather than #include <mcp/tools/meta.hpp>) to avoid a circular include:
+// meta.hpp needs EffectSet/FileChange from THIS header.
+[[nodiscard]] EffectSet effects_for_builtin(const std::string& name);
+
+// A cap::EffectFn keyed off the RICH built-in effect table (effects_for_builtin)
+// + the built-in path-extraction, so the effect-aware parallel scheduler
+// (mcp/cap/scheduler.hpp) reasons about the batteries-included tools precisely
+// instead of falling back to the coarse standard-annotation reader. A host with
+// this toolset wires the scheduler in one line:
+//
+//     auto fn = mcp::tools::make_effect_fn();
+//     auto results = mcp::cap::run(registry, batch, fn);
+//
+// Tools NOT in the built-in table (third-party MCP servers in the same
+// registry) get a conservative writer classification so they always serialise
+// — the planner never parallelises a tool it can't reason about.
+[[nodiscard]] inline mcp::cap::EffectFn make_effect_fn() {
+    // The host-coupled shells are pure from the scheduler's standpoint (their
+    // side effects are the host's responsibility) and carry an EffectSet{} in
+    // the table — indistinguishable by bits from an UNKNOWN tool. Enumerate
+    // the known-pure names so we don't mis-serialise them, and treat any other
+    // zero-effect lookup as an unknown third-party tool to serialise.
+    static const std::vector<std::string> kKnownPure = {
+        "remember", "forget", "wipe_memory", "todo", "skill"};
+    return [](const mcp::cap::Request& r) -> mcp::cap::CallFacts {
+        mcp::cap::CallFacts f;
+        // The registry may namespace the bare name ("local__read"); the effect
+        // table is keyed on the bare name, so strip any "<origin>__" prefix.
+        std::string name = r.tool;
+        if (auto pos = name.rfind("__"); pos != std::string::npos)
+            name = name.substr(pos + 2);
+        EffectSet fx = effects_for_builtin(name);
+        const bool known_pure =
+            std::find(kKnownPure.begin(), kKnownPure.end(), name) != kKnownPure.end();
+        if (fx.bits() == 0 && !known_pure) {
+            // Unknown tool (not in the built-in table, not a known-pure shell):
+            // conservative writer so the planner always serialises it.
+            f.effects = mcp::cap::Effects{mcp::cap::Eff::WriteFs};
+            return f;
+        }
+        f.effects = mcp::cap::Effects{fx.bits()};   // bit layout is identical
+        f.paths   = mcp::cap::extract_paths(name, r.args);
+        return f;
+    };
+}
 
 } // namespace mcp::tools
