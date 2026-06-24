@@ -18,4 +18,8 @@ if(MCP_BUILD_TOOLS)
     add_executable(mcp_toolset_test toolset_test.cpp)
     target_link_libraries(mcp_toolset_test PRIVATE mcp::tools)
     add_test(NAME mcp_toolset_test COMMAND mcp_toolset_test)
+
+    add_executable(mcp_fs_tools_test fs_tools_test.cpp)
+    target_link_libraries(mcp_fs_tools_test PRIVATE mcp::tools)
+    add_test(NAME mcp_fs_tools_test COMMAND mcp_fs_tools_test)
 endif()
