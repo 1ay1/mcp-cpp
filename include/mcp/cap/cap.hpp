@@ -19,4 +19,5 @@
 #include <mcp/cap/local.hpp>
 #include <mcp/cap/registry.hpp>
 #include <mcp/cap/process.hpp>
+#include <mcp/cap/client_provider.hpp>
 #include <mcp/cap/stdio_server.hpp>

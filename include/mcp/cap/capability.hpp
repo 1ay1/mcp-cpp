@@ -20,13 +20,15 @@
 //
 #pragma once
 
-#include <mcp/types.hpp>     // Tool, JsonSchema
-#include <mcp/content.hpp>   // ContentBlock, TextContent
-#include <mcp/methods.hpp>   // CallToolResult
+#include <mcp/types.hpp>     // Tool, JsonSchema, Resource, Prompt
+#include <mcp/content.hpp>   // ContentBlock, TextContent, ResourceContents
+#include <mcp/methods.hpp>   // CallToolResult, GetPromptResult
 #include <mcp/codec.hpp>     // to_json
 
+#include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace mcp::cap {
@@ -73,6 +75,43 @@ public:
     // Perform one capability. MUST NOT throw — map any failure to
     // Result::error so the agent can react instead of crashing.
     [[nodiscard]] virtual Result execute(const Request& req) = 0;
+
+    // ── Resources (MCP resources/*) ──────────────────────────────────────
+    // A provider that exposes no resources returns {} (the default). MUST NOT
+    // throw — map failures into the returned value / a logged warning.
+    [[nodiscard]] virtual std::vector<Resource> resources() const { return {}; }
+    [[nodiscard]] virtual std::vector<ResourceTemplate> resource_templates() const { return {}; }
+    // Read a resource by URI. `out` receives the decoded contents; returns
+    // false (and leaves a human message in `err`) on any failure.
+    [[nodiscard]] virtual bool read_resource(const std::string& /*uri*/,
+                                             std::vector<ResourceContents>& /*out*/,
+                                             std::string& err) {
+        err = "provider has no resources";
+        return false;
+    }
+
+    // ── Prompts (MCP prompts/*) ──────────────────────────────────────────
+    [[nodiscard]] virtual std::vector<Prompt> prompts() const { return {}; }
+    // Render a prompt with the given string arguments. `out` receives the
+    // message list; returns false (+ `err`) on failure.
+    [[nodiscard]] virtual bool get_prompt(const std::string& /*name*/,
+                                          const std::vector<std::pair<std::string, std::string>>& /*args*/,
+                                          GetPromptResult& /*out*/,
+                                          std::string& err) {
+        err = "provider has no prompts";
+        return false;
+    }
+
+    // ── Dynamic list-changed (tools/resources/prompts list_changed) ──────
+    // The provider invokes this callback (from its transport reader thread)
+    // whenever the server sends a *_list_changed notification, after it has
+    // refreshed its own cached list(). A host wires this to invalidate any
+    // tool index it built from this provider. Default: store + ignore.
+    using ListChangedFn = std::function<void()>;
+    virtual void set_on_list_changed(ListChangedFn fn) { on_list_changed_ = std::move(fn); }
+
+protected:
+    ListChangedFn on_list_changed_;
 };
 
 // ── content helpers (shared by every MCP-backed provider) ──────────────────
