@@ -12,13 +12,317 @@
 //
 #pragma once
 
-#if defined(__unix__) || defined(__APPLE__)
+// A long-lived child process with bidirectional stdio is available on every
+// platform agentty targets: POSIX (fork/exec/pipe) and Windows
+// (CreateProcess/CreatePipe). Both expose the SAME ChildProcess interface so
+// StdioServerProvider — and any client that spawns its own MCP servers —
+// works identically everywhere.
+#if defined(__unix__) || defined(__APPLE__) || defined(_WIN32)
 #  define MCP_CAP_HAVE_PROCESS 1
 #else
 #  define MCP_CAP_HAVE_PROCESS 0
 #endif
 
 #if MCP_CAP_HAVE_PROCESS
+
+#if defined(_WIN32)
+//
+// ── Windows backend (CreateProcess + CreatePipe) ────────────────────────────
+//
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <chrono>
+#include <cstdio>
+#include <istream>
+#include <memory>
+#include <ostream>
+#include <stdexcept>
+#include <streambuf>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace mcp::cap {
+
+// A std::streambuf backed by a Windows pipe HANDLE. Replaces libstdc++'s
+// __gnu_cxx::stdio_filebuf (which is unavailable on MSVC) so ChildProcess can
+// expose std::istream/std::ostream over the child's stdio pipes. Blocking
+// ReadFile/WriteFile, single-byte put-back area — the StdioTransport reads
+// line-buffered JSON-RPC frames, so a small buffer is fine.
+class handle_streambuf final : public std::streambuf {
+public:
+    explicit handle_streambuf(HANDLE h) : h_(h) {
+        setg(in_, in_ + 1, in_ + 1);   // empty get area (force underflow)
+        setp(out_, out_ + sizeof(out_));
+    }
+    ~handle_streambuf() override { sync(); close(); }
+
+    handle_streambuf(const handle_streambuf&)            = delete;
+    handle_streambuf& operator=(const handle_streambuf&) = delete;
+
+    void close() noexcept {
+        if (h_ != INVALID_HANDLE_VALUE && h_ != nullptr) {
+            ::CloseHandle(h_);
+            h_ = INVALID_HANDLE_VALUE;
+        }
+    }
+    [[nodiscard]] bool valid() const noexcept {
+        return h_ != INVALID_HANDLE_VALUE && h_ != nullptr;
+    }
+
+protected:
+    // ── reading: fill the 1-byte get area from the pipe ──────────────────
+    int_type underflow() override {
+        if (!valid()) return traits_type::eof();
+        DWORD got = 0;
+        // ReadFile blocks until ≥1 byte or the write end closes (→ got==0 /
+        // ERROR_BROKEN_PIPE), which we surface as EOF — mirroring POSIX read().
+        if (!::ReadFile(h_, in_, 1, &got, nullptr) || got == 0)
+            return traits_type::eof();
+        setg(in_, in_, in_ + 1);
+        return traits_type::to_int_type(in_[0]);
+    }
+
+    // ── writing: flush the put area to the pipe ──────────────────────────
+    int_type overflow(int_type ch) override {
+        if (sync() != 0) return traits_type::eof();
+        if (!traits_type::eq_int_type(ch, traits_type::eof())) {
+            char c = traits_type::to_char_type(ch);
+            *pptr() = c;
+            pbump(1);
+        }
+        return traits_type::not_eof(ch);
+    }
+
+    int sync() override {
+        std::ptrdiff_t n = pptr() - pbase();
+        if (n <= 0) return 0;
+        if (!valid()) return -1;
+        const char* p = pbase();
+        std::ptrdiff_t left = n;
+        while (left > 0) {
+            DWORD wrote = 0;
+            if (!::WriteFile(h_, p, static_cast<DWORD>(left), &wrote, nullptr) ||
+                wrote == 0)
+                return -1;
+            p    += wrote;
+            left -= wrote;
+        }
+        setp(out_, out_ + sizeof(out_));
+        return 0;
+    }
+
+private:
+    HANDLE h_;
+    char   in_[1]{};
+    char   out_[4096]{};
+};
+
+// A spawned child process whose stdin/stdout are wired to iostreams. stderr is
+// inherited from the parent (MCP servers log there). Construction throws
+// std::runtime_error on spawn failure. Windows CreateProcess backend; same
+// interface as the POSIX version below.
+class ChildProcess {
+public:
+    struct Spawn {
+        std::string              command;   // executable (PATH-resolved)
+        std::vector<std::string> args;      // NOT including argv[0]
+        std::vector<std::string> env_kv;    // extra "KEY=VALUE" entries
+    };
+
+    explicit ChildProcess(const Spawn& s) {
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength        = sizeof(sa);
+        sa.bInheritHandle = TRUE;          // pipe ends are inheritable
+
+        HANDLE child_stdin_rd = nullptr, child_stdin_wr = nullptr;
+        HANDLE child_stdout_rd = nullptr, child_stdout_wr = nullptr;
+        if (!::CreatePipe(&child_stdin_rd, &child_stdin_wr, &sa, 0))
+            throw std::runtime_error("mcp::cap: CreatePipe(stdin) failed");
+        if (!::CreatePipe(&child_stdout_rd, &child_stdout_wr, &sa, 0)) {
+            ::CloseHandle(child_stdin_rd); ::CloseHandle(child_stdin_wr);
+            throw std::runtime_error("mcp::cap: CreatePipe(stdout) failed");
+        }
+        // The PARENT ends must NOT be inherited by the child, else they never
+        // close and we'd never see EOF.
+        ::SetHandleInformation(child_stdin_wr,  HANDLE_FLAG_INHERIT, 0);
+        ::SetHandleInformation(child_stdout_rd, HANDLE_FLAG_INHERIT, 0);
+
+        STARTUPINFOA si{};
+        si.cb         = sizeof(si);
+        si.dwFlags    = STARTF_USESTDHANDLES;
+        si.hStdInput  = child_stdin_rd;
+        si.hStdOutput = child_stdout_wr;
+        si.hStdError  = ::GetStdHandle(STD_ERROR_HANDLE);   // inherit parent stderr
+
+        std::string cmdline = build_command_line_(s);
+        std::string env_block;
+        const bool have_env = build_env_block_(s, env_block);
+
+        PROCESS_INFORMATION pi{};
+        BOOL ok = ::CreateProcessA(
+            /*lpApplicationName=*/nullptr,
+            /*lpCommandLine=*/cmdline.data(),
+            /*procAttrs=*/nullptr, /*threadAttrs=*/nullptr,
+            /*bInheritHandles=*/TRUE,
+            /*creationFlags=*/0,
+            /*lpEnvironment=*/have_env ? env_block.data() : nullptr,
+            /*lpCurrentDirectory=*/nullptr,
+            &si, &pi);
+
+        // The child owns its ends now; close ours regardless of success.
+        ::CloseHandle(child_stdin_rd);
+        ::CloseHandle(child_stdout_wr);
+        if (!ok) {
+            ::CloseHandle(child_stdin_wr);
+            ::CloseHandle(child_stdout_rd);
+            throw std::runtime_error("mcp::cap: CreateProcess('" + s.command +
+                                     "') failed (err " +
+                                     std::to_string(::GetLastError()) + ")");
+        }
+        ::CloseHandle(pi.hThread);
+        proc_   = pi.hProcess;
+        pid_    = static_cast<int>(pi.dwProcessId);
+
+        in_buf_  = std::make_unique<handle_streambuf>(child_stdout_rd);  // child stdout
+        out_buf_ = std::make_unique<handle_streambuf>(child_stdin_wr);   // child stdin
+        in_stream_  = std::make_unique<std::istream>(in_buf_.get());
+        out_stream_ = std::make_unique<std::ostream>(out_buf_.get());
+    }
+
+    ~ChildProcess() { shutdown(); }
+
+    ChildProcess(const ChildProcess&)            = delete;
+    ChildProcess& operator=(const ChildProcess&) = delete;
+
+    [[nodiscard]] std::istream& out() noexcept { return *in_stream_; }   // child stdout
+    [[nodiscard]] std::ostream& in()  noexcept { return *out_stream_; }  // child stdin
+    [[nodiscard]] int pid() const noexcept { return pid_; }
+
+    [[nodiscard]] bool alive() const noexcept {
+        if (!proc_) return false;
+        return ::WaitForSingleObject(proc_, 0) == WAIT_TIMEOUT;
+    }
+
+    // Close ONLY the child's stdin (our write end) → the server sees EOF and
+    // begins exiting, which closes its stdout and unblocks a reader parked in
+    // ReadFile. Does NOT touch the read stream or reap the process.
+    void close_stdin() noexcept {
+        if (out_stream_) out_stream_->flush();
+        out_stream_.reset();
+        out_buf_.reset();   // closes child's stdin HANDLE
+    }
+
+    // Close child stdin (EOF → graceful exit), wait briefly, then terminate.
+    // Idempotent; also called by the destructor.
+    void shutdown() noexcept {
+        if (out_stream_) out_stream_->flush();
+        out_stream_.reset();
+        out_buf_.reset();             // EOF to the child
+        if (proc_) {
+            if (::WaitForSingleObject(proc_, 500) == WAIT_TIMEOUT)
+                ::TerminateProcess(proc_, 1);
+            ::WaitForSingleObject(proc_, 2000);
+            ::CloseHandle(proc_);
+            proc_ = nullptr;
+            pid_  = -1;
+        }
+        in_stream_.reset();
+        in_buf_.reset();
+    }
+
+private:
+    // Quote one argv token per the CommandLineToArgvW rules MSVCRT uses, so a
+    // child parsing its command line recovers the exact arguments.
+    static std::string quote_arg_(const std::string& a) {
+        if (!a.empty() &&
+            a.find_first_of(" \t\n\v\"") == std::string::npos)
+            return a;                         // no quoting needed
+        std::string out = "\"";
+        for (auto it = a.begin();; ++it) {
+            std::size_t backslashes = 0;
+            while (it != a.end() && *it == '\\') { ++it; ++backslashes; }
+            if (it == a.end()) {
+                out.append(backslashes * 2, '\\');   // escape trailing run
+                break;
+            } else if (*it == '"') {
+                out.append(backslashes * 2 + 1, '\\');
+                out.push_back('"');
+            } else {
+                out.append(backslashes, '\\');
+                out.push_back(*it);
+            }
+        }
+        out.push_back('"');
+        return out;
+    }
+
+    static std::string build_command_line_(const Spawn& s) {
+        std::string cl = quote_arg_(s.command);
+        for (const auto& a : s.args) { cl.push_back(' '); cl += quote_arg_(a); }
+        return cl;
+    }
+
+    // Build a merged environment block (parent env + s.env_kv overrides) in the
+    // double-NUL-terminated form CreateProcess wants. Returns false (and leaves
+    // `out` empty) when there are no overrides, so the caller passes nullptr to
+    // simply inherit the parent environment.
+    static bool build_env_block_(const Spawn& s, std::string& out) {
+        if (s.env_kv.empty()) return false;
+        // Start from the parent environment.
+        std::vector<std::string> entries;
+        if (LPCH env = ::GetEnvironmentStringsA()) {
+            for (const char* p = env; *p; ) {
+                std::string e = p;
+                p += e.size() + 1;
+                if (!e.empty() && e[0] != '=') entries.push_back(std::move(e));
+            }
+            ::FreeEnvironmentStringsA(env);
+        }
+        auto key_of = [](const std::string& kv) {
+            auto eq = kv.find('=');
+            return eq == std::string::npos ? kv : kv.substr(0, eq);
+        };
+        auto ci_eq = [](const std::string& a, const std::string& b) {
+            if (a.size() != b.size()) return false;
+            for (std::size_t i = 0; i < a.size(); ++i)
+                if (std::toupper((unsigned char)a[i]) !=
+                    std::toupper((unsigned char)b[i])) return false;
+            return true;
+        };
+        for (const auto& kv : s.env_kv) {
+            if (kv.find('=') == std::string::npos) continue;
+            std::string k = key_of(kv);
+            for (auto& e : entries)
+                if (ci_eq(key_of(e), k)) { e.clear(); break; }  // drop old
+            entries.push_back(kv);
+        }
+        for (const auto& e : entries) {
+            if (e.empty()) continue;
+            out += e;
+            out.push_back('\0');
+        }
+        out.push_back('\0');   // final terminator
+        return true;
+    }
+
+    HANDLE proc_ = nullptr;
+    int    pid_  = -1;
+    std::unique_ptr<handle_streambuf> in_buf_;
+    std::unique_ptr<handle_streambuf> out_buf_;
+    std::unique_ptr<std::istream>     in_stream_;
+    std::unique_ptr<std::ostream>     out_stream_;
+};
+
+} // namespace mcp::cap
+
+#else  // !_WIN32 — POSIX backend (fork/exec/pipe)
 
 #include <ext/stdio_filebuf.h>   // __gnu_cxx::stdio_filebuf (libstdc++)
 
@@ -157,5 +461,7 @@ private:
 };
 
 } // namespace mcp::cap
+
+#endif // _WIN32 vs POSIX backend
 
 #endif // MCP_CAP_HAVE_PROCESS
