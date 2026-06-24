@@ -60,9 +60,9 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
     // Self-contained Tier-1 tools land here, gated on cfg.* toggles, once the
     // bodies are ported:
     if (cfg.filesystem)  detail::register_fs_tools(shells);
-    //   if (cfg.shell)       detail::register_shell_tools(shells);
-    //   if (cfg.search)      detail::register_search_tools(shells);
-    //   if (cfg.diagnostics) detail::register_diagnostics_tool(shells);
+    if (cfg.shell)       detail::register_shell_tools(shells);
+    if (cfg.search)      detail::register_search_tools(shells);
+    if (cfg.diagnostics) detail::register_diagnostics_tool(shells);
     //   if (cfg.git)         detail::register_git_tools(shells);
     //   if (cfg.web)         detail::register_web_tools(shells, svc.http);
 
