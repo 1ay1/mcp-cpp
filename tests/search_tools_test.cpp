@@ -37,6 +37,10 @@ int main() {
     auto root = fs::temp_directory_path() / ("mcp_search_test_" + std::to_string(::getpid()));
     fs::create_directories(root);
     util::set_workspace_root(root);
+    // git_status/log/commit invoke `git` in the process cwd; agentty runs
+    // with cwd == workspace, so mirror that here for a faithful test.
+    auto prev_cwd = fs::current_path();
+    fs::current_path(root);
 
     // Seed a small tree.
     write_file(root / "alpha.cpp",
@@ -162,6 +166,45 @@ int main() {
         std::puts("diagnostics: explicit command ok");
     }
 
+    // ── git tools against a fresh repo ───────────────────────────────────
+    {
+        // init a repo inside the workspace + configure identity
+        auto g = obj(); g["command"] =
+            "git init -q && git config user.email t@t.t && git config user.name T";
+        auto gi = call(*provider, "bash", g);
+        assert(!gi.is_error);
+
+        // git_status on a clean-ish repo (untracked files present)
+        auto sargs = obj(); sargs["path"] = root.string();
+        auto st = call(*provider, "git_status", sargs);
+        assert(!st.is_error);
+        assert(read_effects(st).has(Effect::ReadFs));
+        std::puts("git_status: ok");
+
+        // git_commit stages everything and commits
+        auto cargs = obj();
+        cargs["message"]   = "seed commit";
+        cargs["stage_all"] = true;
+        auto ci = call(*provider, "git_commit", cargs);
+        assert(!ci.is_error);
+        assert(read_effects(ci).has(Effect::WriteFs));
+        std::puts("git_commit: ok");
+
+        // git_log shows the commit
+        auto largs = obj(); largs["oneline"] = true;
+        auto lg = call(*provider, "git_log", largs);
+        assert(!lg.is_error);
+        assert(lg.text.find("seed commit") != std::string::npos);
+        std::puts("git_log: ok");
+
+        // git_commit with empty message rejected
+        auto bad = obj(); bad["message"] = "   ";
+        auto br = call(*provider, "git_commit", bad);
+        assert(br.is_error);
+        std::puts("git_commit: empty message refused");
+    }
+
+    fs::current_path(prev_cwd);
     fs::remove_all(root);
     std::puts("ALL SEARCH/SHELL/DIAGNOSTICS TOOL TESTS PASSED");
     return 0;
