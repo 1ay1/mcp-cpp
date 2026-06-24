@@ -1,0 +1,554 @@
+#include <mcp/tools/util/fs_helpers.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <system_error>
+#include <unordered_map>
+#include <vector>
+
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <io.h>
+#  include <fcntl.h>
+#  include <share.h>
+#  include <process.h>
+#  include <sys/stat.h>
+#else
+#  include <fcntl.h>
+#  include <unistd.h>
+#  include <sys/stat.h>
+#endif
+
+namespace mcp::tools::util {
+
+namespace {
+// Translate the most common filesystem errno values to a sentence the
+// model can act on. Raw `strerror` reads as "Permission denied" /
+// "No such file or directory" — fine for humans, but the LLM responds
+// better to the longer form ("you don't have write permission to X")
+// when it's deciding whether to retry as a different path or surface a
+// human ask. The caller appends the path/operation context.
+std::string explain_errno(int e) {
+    switch (e) {
+        case EACCES:        return "permission denied";
+        case EPERM:         return "operation not permitted (privileged op)";
+        case ENOENT:        return "path not found";
+        case ENOTDIR:       return "expected a directory but found a file";
+        case EISDIR:        return "expected a file but found a directory";
+        case ENOSPC:        return "out of disk space";
+        case EROFS:         return "filesystem is read-only";
+        case EMFILE:
+        case ENFILE:        return "too many open files (process FD limit hit)";
+        case ELOOP:         return "symlink loop";
+        case ENAMETOOLONG:  return "path is too long";
+        case EBUSY:         return "file is busy / locked by another process";
+#ifdef EDQUOT
+        case EDQUOT:        return "disk quota exceeded";
+#endif
+        default:            return std::strerror(e);
+    }
+}
+} // namespace
+
+std::string read_file(const fs::path& p) {
+    // Size-then-read: avoid the ifstream→ostringstream→.str() chain, which
+    // double-allocates and copies through the streambuf. One stat, one
+    // malloc, one read. Fallback to streambuf drain if the size isn't known
+    // (e.g. /proc, pipes) — those produce file_size==0 or throw.
+    std::error_code ec;
+    auto sz = fs::file_size(p, ec);
+#ifdef _WIN32
+    // Native Win32 path: CreateFileW with FILE_FLAG_SEQUENTIAL_SCAN tells
+    // the cache manager to read ahead aggressively (larger prefetch window,
+    // pages discarded after use). For the read / grep / edit hot path —
+    // one linear pass, no seeks — this is materially faster than the CRT
+    // ReadFile that std::ifstream lowers to. Also avoids the CRT's
+    // per-char buffer translation overhead on large files.
+    if (!ec && sz > 0) {
+        HANDLE h = ::CreateFileW(p.wstring().c_str(),
+                                 GENERIC_READ,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                 nullptr,
+                                 OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                                 nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            std::string out;
+            out.resize(sz);
+            char*  buf   = out.data();
+            size_t total = 0;
+            const size_t want = static_cast<size_t>(sz);
+            while (total < want) {
+                DWORD chunk = static_cast<DWORD>(
+                    std::min<size_t>(want - total, 1u << 20));   // 1 MiB reads
+                DWORD got = 0;
+                if (!::ReadFile(h, buf + total, chunk, &got, nullptr) || got == 0)
+                    break;
+                total += got;
+            }
+            ::CloseHandle(h);
+            if (total != want) out.resize(total);
+            return out;
+        }
+        // Fall through to ifstream on CreateFileW failure (rare: locked /
+        // permission-denied files where the CRT might still retry through
+        // a different path). Better to degrade gracefully than refuse.
+    }
+#endif
+    std::ifstream ifs(p, std::ios::binary);
+    if (!ifs) return {};
+    if (!ec && sz > 0) {
+        std::string out;
+        out.resize(sz);
+        ifs.read(out.data(), static_cast<std::streamsize>(sz));
+        if (auto got = ifs.gcount(); static_cast<uintmax_t>(got) != sz)
+            out.resize(static_cast<size_t>(got));
+        return out;
+    }
+    std::ostringstream oss; oss << ifs.rdbuf();
+    return oss.str();
+}
+
+std::string write_file(const fs::path& p, std::string_view content) {
+    auto parent = p.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        fs::create_directories(parent, ec);
+        if (ec) return "failed to create directory '" + parent.string() + "': " + ec.message();
+    }
+
+    // Atomic write: write to a sibling temp file, fsync, rename over target.
+    // Crash or power-loss mid-write leaves the original file intact; only
+    // the fully-written, fsync'd copy ever becomes visible at the target
+    // path. The temp must live in the same directory so the rename is a
+    // single filesystem operation — cross-device rename falls back to a
+    // non-atomic copy.
+    static std::atomic<uint64_t> seq{0};
+    const uint64_t n = seq.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+    const unsigned long pid = static_cast<unsigned long>(::GetCurrentProcessId());
+#else
+    const unsigned long pid = static_cast<unsigned long>(::getpid());
+#endif
+    fs::path tmp = p;
+    tmp += fs::path(".agentty-tmp-" + std::to_string(pid) + "-" + std::to_string(n));
+
+    // Preserve existing mode on POSIX so the rename doesn't regress perms.
+#ifndef _WIN32
+    mode_t target_mode = 0644;
+    bool   had_mode    = false;
+    {
+        struct stat st{};
+        if (::stat(p.c_str(), &st) == 0) {
+            target_mode = st.st_mode & 07777;
+            had_mode    = true;
+        }
+    }
+#endif
+
+    // Drop down to the POSIX/Win32 fd so we can fsync before the rename.
+    // ofstream::flush only empties the libstdc++ streambuf into the OS —
+    // power-loss / crash can still lose the bytes, and on some FUSE and
+    // network filesystems the data isn't readable by the next open until
+    // fsync completes.
+#ifdef _WIN32
+    // Use the wide-char variant so Unicode paths (e.g. under a non-ASCII
+    // %USERPROFILE%) round-trip correctly. `_sopen_s` takes an ANSI/MBCS
+    // path which silently corrupts multi-byte sequences on some MinGW
+    // ucrt configurations.
+    int fd = -1;
+    auto ws = tmp.wstring();
+    if (::_wsopen_s(&fd, ws.c_str(),
+                    _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY,
+                    _SH_DENYNO, _S_IREAD | _S_IWRITE) != 0 || fd < 0)
+        return "cannot open '" + p.string() + "' for writing";
+#else
+    int fd = ::open(tmp.c_str(),
+                    O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return std::string("cannot open '") + p.string() + "' for writing: "
+             + explain_errno(errno);
+#endif
+
+    auto cleanup_tmp = [&] {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+    };
+
+    const char* data = content.data();
+    size_t remaining = content.size();
+    while (remaining > 0) {
+#ifdef _WIN32
+        int n2 = _write(fd, data, static_cast<unsigned>(
+            remaining > 0x7fffffff ? 0x7fffffff : remaining));
+#else
+        ssize_t n2 = ::write(fd, data, remaining);
+        if (n2 < 0 && errno == EINTR) continue;
+#endif
+        if (n2 <= 0) {
+            std::string err = std::string("write to '") + p.string()
+                + "' failed: " + explain_errno(errno);
+#ifdef _WIN32
+            _close(fd);
+#else
+            ::close(fd);
+#endif
+            cleanup_tmp();
+            return err;
+        }
+        data += n2;
+        remaining -= static_cast<size_t>(n2);
+    }
+
+    // fsync temp: data is durable before the rename publishes it.
+#ifdef _WIN32
+    (void)_commit(fd);
+    _close(fd);
+#else
+    if (had_mode) (void)::fchmod(fd, target_mode);
+    // Linux/FreeBSD have fdatasync (skips metadata flush, slightly faster);
+    // macOS only has fsync. The durability guarantee we need is the same —
+    // file contents committed to disk before the rename publishes them —
+    // so falling back to fsync on Apple costs a metadata block at most.
+#if defined(__APPLE__)
+    (void)::fsync(fd);
+#else
+    (void)::fdatasync(fd);
+#endif
+    ::close(fd);
+#endif
+
+    // Atomic publish. Windows MoveFileExW with REPLACE_EXISTING is atomic on
+    // NTFS (single MFT update); WRITE_THROUGH flushes the directory entry.
+    // POSIX rename() is atomic by spec when src/dst are on the same FS.
+#ifdef _WIN32
+    auto tmp_w = tmp.wstring();
+    auto dst_w = p.wstring();
+    if (!::MoveFileExW(tmp_w.c_str(), dst_w.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DWORD e = ::GetLastError();
+        cleanup_tmp();
+        return "atomic rename to '" + p.string() + "' failed (GLE=" + std::to_string(e) + ")";
+    }
+#else
+    if (::rename(tmp.c_str(), p.c_str()) != 0) {
+        std::string err = std::string("atomic rename to '") + p.string()
+            + "' failed: " + explain_errno(errno);
+        cleanup_tmp();
+        return err;
+    }
+    // fsync parent dir so the rename itself survives power loss.
+    if (!parent.empty()) {
+        int dfd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd >= 0) { (void)::fsync(dfd); ::close(dfd); }
+    }
+#endif
+    return {};
+}
+
+fs::path normalize_path(std::string_view s) {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t'))  s.remove_suffix(1);
+    if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"')
+                          || (s.front() == '\'' && s.back() == '\''))) {
+        s.remove_prefix(1);
+        s.remove_suffix(1);
+    }
+    // Tilde expansion. The model writes paths the way a shell would
+    // (`~/projects/foo`); without expansion they round-trip into
+    // `<cwd>/~/projects/foo`, which doesn't exist, and the tool either
+    // returns NotFound or — on filesystems that handle the bizarre
+    // prefix slowly — sits on stat() long enough to hit the watchdog.
+    // The shell convention: bare `~` or `~/...` expands to $HOME.
+    // (`~user/...` per-user expansion isn't supported here; we'd need
+    // getpwnam_r for that and the model's never seen it work.)
+    std::string expanded;
+    if (!s.empty() && s.front() == '~' && (s.size() == 1 || s[1] == '/')) {
+        if (const char* home = std::getenv("HOME"); home && *home) {
+            expanded = home;
+            expanded.append(s.data() + 1, s.size() - 1);
+            s = expanded;
+        }
+    }
+    fs::path p{s};
+    std::error_code ec;
+    if (!p.is_absolute()) p = fs::absolute(p, ec);
+    return p;
+}
+
+namespace {
+
+// Function-local static so the default value is the cwd at first call,
+// regardless of static-initialisation order. Tests that don't call
+// set_workspace_root() still get a sensible default.
+fs::path& mutable_workspace_root() {
+    static fs::path root = [] {
+        std::error_code ec;
+        auto cwd = fs::current_path(ec);
+        return ec ? fs::path{"/"} : cwd;
+    }();
+    return root;
+}
+
+} // namespace
+
+void set_workspace_root(fs::path root) {
+    std::error_code ec;
+    auto canon = fs::weakly_canonical(root, ec);
+    mutable_workspace_root() = ec ? std::move(root) : std::move(canon);
+}
+
+const fs::path& workspace_root() {
+    return mutable_workspace_root();
+}
+
+bool is_within_workspace(const fs::path& target) {
+    if (target.empty()) return false;
+    std::error_code ec;
+    // weakly_canonical resolves what exists and leaves the rest as-is —
+    // perfect for write targets where the file doesn't exist yet but the
+    // parent directory does, and it resolves symlinks so an in-workspace
+    // link pointing at /etc fails the prefix check.
+    auto canon_target = fs::weakly_canonical(target, ec);
+    if (ec) {
+        // weakly_canonical failed (e.g. a parent component is a dangling
+        // symlink, or EACCES walking the chain). Do NOT fall back to a
+        // plain absolute() — that skips symlink resolution and would let
+        // a crafted link escape the boundary. Retry on the parent dir
+        // (the common write-target case: file doesn't exist yet but the
+        // directory does, and canonicalising it still resolves symlinks),
+        // then re-attach the filename. If even that fails, deny.
+        std::error_code pec;
+        auto parent = fs::weakly_canonical(target.parent_path(), pec);
+        if (pec || parent.empty()) return false;
+        canon_target = parent / target.filename();
+    }
+    auto canon_root = workspace_root();   // already canonicalised on set
+    // Component-wise prefix check. Plain string startsWith would let
+    // /home/user/project-other through when root is /home/user/project.
+    auto rt = canon_root.begin();
+    auto tt = canon_target.begin();
+    for (; rt != canon_root.end() && tt != canon_target.end(); ++rt, ++tt) {
+        if (*rt != *tt) return false;
+    }
+    return rt == canon_root.end();
+}
+
+// ── Read-only allowlist roots ───────────────────────────────────────────
+namespace {
+
+// Canonicalised roots the READ gate also accepts (skill directories
+// under ~/.agentty/skills etc.). Guarded by its own mutex — reads come
+// from tool threads, registration from the skills scanner.
+struct ReadRoots {
+    std::mutex mu;
+    std::vector<fs::path> roots;
+};
+
+[[nodiscard]] ReadRoots& read_roots() {
+    static ReadRoots r;
+    return r;
+}
+
+// Component-wise "target under root" — same shape as the workspace
+// prefix check above; factored so both gates share the symlink-safe
+// canonicalisation rules.
+[[nodiscard]] bool under_root(const fs::path& canon_target, const fs::path& root) {
+    auto rt = root.begin();
+    auto tt = canon_target.begin();
+    for (; rt != root.end() && tt != canon_target.end(); ++rt, ++tt)
+        if (*rt != *tt) return false;
+    return rt == root.end();
+}
+
+} // namespace
+
+void allow_read_root(const fs::path& root) {
+    std::error_code ec;
+    auto canon = fs::weakly_canonical(root, ec);
+    if (ec || canon.empty()) return;
+    auto& rr = read_roots();
+    std::lock_guard lk{rr.mu};
+    if (std::find(rr.roots.begin(), rr.roots.end(), canon) == rr.roots.end())
+        rr.roots.push_back(std::move(canon));
+}
+
+bool is_read_allowlisted(const fs::path& target) {
+    if (target.empty()) return false;
+    std::error_code ec;
+    auto canon = fs::weakly_canonical(target, ec);
+    if (ec) return false;   // reads need the file to exist; no parent retry
+    auto& rr = read_roots();
+    std::lock_guard lk{rr.mu};
+    for (const auto& r : rr.roots)
+        if (under_root(canon, r)) return true;
+    return false;
+}
+
+std::expected<NormalizedPath, ToolError>
+make_workspace_path(std::string_view raw, std::string_view tool_name) {
+    NormalizedPath p{raw};
+    if (!is_within_workspace(p.path())) {
+        // Helpful, actionable message: name the offending path, the
+        // active root, and the two ways out (restart in a wider dir or
+        // pass --workspace). The model can read this and either ask the
+        // user to widen the scope or pick a different path.
+        return std::unexpected(ToolError::out_of_workspace(
+            "tool '" + std::string{tool_name} + "' refused: '"
+            + p.string() + "' is outside the workspace root '"
+            + workspace_root().string() + "'. "
+            "Restart agentty in a parent directory or pass "
+            "--workspace <dir> to widen the scope."));
+    }
+    return p;
+}
+
+// ── WorkspacePath factories ───────────────────────────────────────
+std::expected<WorkspacePath, ToolError>
+make_workspace_path_checked(std::string_view raw, std::string_view tool_name) {
+    auto np = make_workspace_path(raw, tool_name);
+    if (!np) return std::unexpected(std::move(np.error()));
+    return WorkspacePath{std::move(*np)};
+}
+
+std::expected<WorkspacePath, ToolError>
+promote_to_workspace_path(NormalizedPath p, std::string_view tool_name) {
+    if (!is_within_workspace(p.path())) {
+        return std::unexpected(ToolError::out_of_workspace(
+            "tool '" + std::string{tool_name} + "' refused: '"
+            + p.string() + "' is outside the workspace root '"
+            + workspace_root().string() + "'."));
+    }
+    return WorkspacePath{std::move(p)};
+}
+
+std::expected<WorkspacePath, ToolError>
+make_readable_path_checked(std::string_view raw, std::string_view tool_name) {
+    NormalizedPath p{raw};
+    if (is_within_workspace(p.path()) || is_read_allowlisted(p.path()))
+        return WorkspacePath{std::move(p)};
+    return std::unexpected(ToolError::out_of_workspace(
+        "tool '" + std::string{tool_name} + "' refused: '"
+        + p.string() + "' is outside the workspace root '"
+        + workspace_root().string() + "' and not under any skill "
+        "directory. Restart agentty in a parent directory or pass "
+        "--workspace <dir> to widen the scope."));
+}
+
+// ── Checked read/write delegates ────────────────────────────────
+std::string read_file(const WorkspacePath& p) {
+    return read_file(p.path());
+}
+
+std::string write_file(const WorkspacePath& p, std::string_view content) {
+    return write_file(p.path(), content);
+}
+
+bool should_skip_dir(std::string_view name) noexcept {
+    static const std::vector<std::string_view> skip = {
+        ".git", "node_modules", "build", "target", "__pycache__",
+        ".cache", "vendor", "dist", "out", ".next", ".venv",
+        "cmake-build-debug", "cmake-build-release", ".idea", ".vscode",
+        "_deps", "third_party", "thirdparty", "3rdparty", "external",
+    };
+    for (auto s : skip) if (name == s) return true;
+    return false;
+}
+
+bool is_binary_file(const fs::path& p) {
+    std::ifstream ifs(p, std::ios::binary);
+    // Can't open (permission denied, transient lock, race-deleted): NOT
+    // a binary verdict. Returning `true` here made grep/glob silently
+    // skip the file and made read/edit report a bogus "cannot read
+    // binary file". Return `false` so the caller's real read runs and
+    // surfaces the actual open error instead of masking it.
+    if (!ifs) return false;
+    char buf[512];
+    ifs.read(buf, sizeof(buf));
+    auto n = ifs.gcount();
+    for (int i = 0; i < n; ++i)
+        if (buf[i] == '\0') return true;
+    return false;
+}
+
+// ── File snapshot cache ────────────────────────────────────────────────────
+namespace {
+
+struct FileCache {
+    std::mutex mu;
+    std::unordered_map<std::string, FileSnapshot> by_path;
+};
+
+[[nodiscard]] FileCache& file_cache() {
+    static FileCache c;
+    return c;
+}
+
+// Canonicalise without requiring the file to exist (write target might
+// not exist yet at the moment we record). Falls back to the lexically-
+// normal absolute form when weakly_canonical errors out — we still get
+// a stable key per file across calls, just not symlink-aware.
+[[nodiscard]] std::string canon_key(const fs::path& p) noexcept {
+    std::error_code ec;
+    auto canon = fs::weakly_canonical(p, ec);
+    if (!ec) return canon.string();
+    if (p.is_absolute()) return p.lexically_normal().string();
+    auto abs = fs::absolute(p, ec);
+    if (!ec) return abs.lexically_normal().string();
+    return p.string();
+}
+
+} // namespace
+
+void record_file_seen(const fs::path& path,
+                      fs::file_time_type mtime,
+                      std::uintmax_t size,
+                      std::uint64_t content_hash) noexcept {
+    auto key = canon_key(path);
+    if (key.empty()) return;
+    auto& c = file_cache();
+    std::lock_guard lk{c.mu};
+    c.by_path[std::move(key)] = FileSnapshot{mtime, size, content_hash};
+}
+
+std::optional<FileSnapshot> last_seen_file(const fs::path& path) noexcept {
+    auto key = canon_key(path);
+    if (key.empty()) return std::nullopt;
+    auto& c = file_cache();
+    std::lock_guard lk{c.mu};
+    auto it = c.by_path.find(key);
+    if (it == c.by_path.end()) return std::nullopt;
+    return it->second;
+}
+
+StaleVerdict staleness_of(const fs::path& path) noexcept {
+    auto snap = last_seen_file(path);
+    if (!snap) return StaleVerdict::Unknown;
+    std::error_code ec;
+    auto cur_mtime = fs::last_write_time(path, ec);
+    if (ec) return StaleVerdict::Unknown;
+    auto cur_size  = fs::file_size(path, ec);
+    if (ec) cur_size = 0;
+    // mtime granularity is filesystem-dependent (HFS+ 1 s, ext4 ns, FAT
+    // 2 s). Compare strictly: any difference — forward OR backward —
+    // counts as stale. Size mismatch is also a stale signal even when
+    // mtime didn't change (some tools touch-without-updating-mtime).
+    if (snap->mtime == cur_mtime && snap->size == cur_size)
+        return StaleVerdict::Fresh;
+    return StaleVerdict::Stale;
+}
+
+} // namespace mcp::tools::util

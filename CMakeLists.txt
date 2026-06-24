@@ -45,7 +45,8 @@ target_compile_features(mcp INTERFACE cxx_std_23)
 option(MCP_BUILD_TOOLS "Build the batteries-included mcp::tools toolset" ON)
 if(MCP_BUILD_TOOLS)
     file(GLOB MCP_TOOLS_SOURCES CONFIGURE_DEPENDS
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/*.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/*.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/util/*.cpp)
     add_library(mcp_tools STATIC ${MCP_TOOLS_SOURCES})
     add_library(mcp::tools ALIAS mcp_tools)
     target_include_directories(mcp_tools
