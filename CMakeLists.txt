@@ -55,6 +55,14 @@ if(MCP_BUILD_TOOLS)
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/tools)
     target_link_libraries(mcp_tools PUBLIC mcp::mcp)
     target_compile_features(mcp_tools PUBLIC cxx_std_23)
+    # MSVC defaults the execution charset to the system code page (CP1252 on
+    # most Windows installs), NOT UTF-8. Narrow string literals containing
+    # non-ASCII characters — em dashes, curly quotes, box-drawing — then get
+    # encoded as single CP1252 bytes (e.g. U+2014 "—" → 0x97), which is invalid
+    # UTF-8. Those literals live in tool descriptions that a host serializes
+    # onto the JSON wire, where the encoder rejects them (json type_error.316).
+    # /utf-8 forces both the source and execution charsets to UTF-8.
+    target_compile_options(mcp_tools PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
 endif()
 
 if(MCP_BUILD_TESTS)
