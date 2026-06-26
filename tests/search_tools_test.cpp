@@ -179,6 +179,11 @@ int main() {
         auto st = call(*provider, "git_status", sargs);
         assert(!st.is_error);
         assert(read_effects(st).has(Effect::ReadFs));
+        // Readable short format: a `## ` branch header (v1 --branch), NOT the
+        // v2 machine rows (`# branch.head` / `1 .M N... <modes> <sha>`) the
+        // tool card body would render as gibberish.
+        assert(st.text.find("## ") != std::string::npos);
+        assert(st.text.find("branch.head") == std::string::npos);
         std::puts("git_status: ok");
 
         // git_commit stages everything and commits

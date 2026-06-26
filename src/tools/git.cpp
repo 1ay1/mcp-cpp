@@ -101,11 +101,35 @@ std::expected<GitStatusArgs, ToolError> parse_git_status_args(const json& j) {
 ExecResult run_git_status(const GitStatusArgs& a) {
     auto wp = util::make_workspace_path_checked(a.root, "git_status");
     if (!wp) return std::unexpected(std::move(wp.error()));
+    // porcelain=v1 (the `git status -s` short format: `XY path`, one line per
+    // change, plus a `## branch...upstream [ahead/behind]` header). Stable
+    // and script-parseable like v2, but READABLE — v2's
+    // `1 .M N... 100644 100644 100644 <sha> <sha> path` machine rows are
+    // gibberish to a human and to the model. The tool card body shows this
+    // verbatim, so it must be the form a person would want to read.
     auto out = run_git({"git", "-C", wp->string(), "status",
-                        "--porcelain=v2", "--branch"}, "git_status");
+                        "--porcelain=v1", "--branch"}, "git_status");
     if (!out) return std::unexpected(std::move(out.error()));
     std::string output = std::move(*out);
-    if (output.empty()) output = "working tree clean";
+    // With --branch the output is never empty (the `## ` line always prints),
+    // so a clean tree is the lone branch line; spell that out.
+    if (output.empty()) {
+        output = "working tree clean";
+    } else {
+        // Clean iff there is exactly the one `## ` branch line (no change
+        // rows). find('\n') past the first line tells us if more follow.
+        const auto nl = output.find('\n');
+        const bool only_branch =
+            output.rfind("## ", 0) == 0
+            && (nl == std::string::npos
+                || output.find_first_not_of(" \r\n", nl) == std::string::npos);
+        if (only_branch) {
+            while (!output.empty()
+                   && (output.back() == '\n' || output.back() == '\r'))
+                output.pop_back();
+            output += "\nworking tree clean";
+        }
+    }
     if (!a.display_description.empty())
         output = a.display_description + "\n" + output;
     return ToolOutput{std::move(output), std::nullopt};
