@@ -91,9 +91,24 @@ Diff compute(const std::string& path,
         int old_start = -1, new_start = -1;
         int old_len = 0, new_len = 0;
         std::ostringstream patch;
+        // Emit deletions before insertions within each contiguous change run
+        // (git convention). The LCS backtrace can group inserts ahead of
+        // deletes; rendered through a two-column diff gutter that ordering
+        // makes the old/new line numbers read out of sequence (new line 2
+        // appearing above old line 2). Buffer each run and flush "-" before
+        // "+" on the next context line so both gutter columns stay monotonic
+        // and the changed lines line up.
+        std::string del_buf, ins_buf;
+        auto flush_run = [&] {
+            if (!del_buf.empty()) patch << del_buf;
+            if (!ins_buf.empty()) patch << ins_buf;
+            del_buf.clear();
+            ins_buf.clear();
+        };
         for (size_t i2 = start; i2 <= end; ++i2) {
             const auto& e = edits[i2];
             if (e.k == Edit::Keep) {
+                flush_run();
                 if (old_start < 0) old_start = e.a_idx + 1;
                 if (new_start < 0) new_start = e.b_idx + 1;
                 old_len++; new_len++;
@@ -101,15 +116,16 @@ Diff compute(const std::string& path,
             } else if (e.k == Edit::Del) {
                 if (old_start < 0) old_start = e.a_idx + 1;
                 old_len++;
-                patch << "-" << a[e.a_idx] << "\n";
+                del_buf += "-"; del_buf += a[e.a_idx]; del_buf += "\n";
                 removed++;
             } else {
                 if (new_start < 0) new_start = e.b_idx + 1;
                 new_len++;
-                patch << "+" << b[e.b_idx] << "\n";
+                ins_buf += "+"; ins_buf += b[e.b_idx]; ins_buf += "\n";
                 added++;
             }
         }
+        flush_run();
         h.old_start = std::max(1, old_start);
         h.new_start = std::max(1, new_start);
         h.old_len = old_len;
