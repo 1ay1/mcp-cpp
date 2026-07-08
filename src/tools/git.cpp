@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cctype>
 #include <expected>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -83,6 +84,56 @@ run_git(const std::vector<std::string>& argv, std::string_view op,
     return out;
 }
 
+// Resolve the repository directory to run git in. Given a raw path (a
+// directory OR a file — the workspace-checked string for the tool's
+// `path`/first `files[]` entry), ask git for the enclosing worktree
+// toplevel so every subcommand runs against the RIGHT repo regardless
+// of the process cwd. Falls back to the checked path's own directory
+// (or the workspace root when no path was given) so the classic
+// "cwd isn't the repo" failure can't happen. The returned directory is
+// always inside the workspace: `checked` already passed the containment
+// gate, and rev-parse only ever walks UP to an ancestor that still
+// contains it — we clamp the result back to the workspace root if git
+// somehow reports a toplevel above it.
+std::string resolve_git_dir(std::string_view checked) {
+    namespace fs = std::filesystem;
+    fs::path start = checked.empty()
+        ? util::workspace_root()
+        : fs::path{std::string{checked}};
+    std::error_code ec;
+    // If `start` is a file, its parent is the directory to probe.
+    fs::path dir = start;
+    if (!checked.empty() && !fs::is_directory(start, ec))
+        dir = start.parent_path();
+    if (dir.empty()) dir = util::workspace_root();
+
+    auto r = util::run_argv_s(
+        {"git", "-C", dir.string(), "rev-parse", "--show-toplevel"}, 4096);
+    if (r.started && !r.timed_out && r.exit_code == 0) {
+        std::string top = std::move(r.output);
+        while (!top.empty() && (top.back() == '\n' || top.back() == '\r'))
+            top.pop_back();
+        if (!top.empty()) {
+            // Clamp: the repo must contain the workspace-checked path, so
+            // its toplevel is at or below the workspace root. If git
+            // reports an ancestor ABOVE the workspace (nested-checkout
+            // edge), prefer the workspace root — never escape the gate.
+            const fs::path& ws = util::workspace_root();
+            fs::path topc = fs::weakly_canonical(fs::path{top}, ec);
+            fs::path wsc  = fs::weakly_canonical(ws, ec);
+            auto within = [&](const fs::path& a, const fs::path& b) {
+                auto ra = a.string(), rb = b.string();
+                return ra.size() >= rb.size() && ra.compare(0, rb.size(), rb) == 0;
+            };
+            if (within(topc, wsc)) return top;
+            return ws.string();
+        }
+    }
+    // rev-parse failed (not a repo yet, or git missing) — fall back to the
+    // directory itself; the subcommand's own error is clearer than ours.
+    return dir.string();
+}
+
 // ── git_status ─────────────────────────────────────────────────────────
 
 struct GitStatusArgs {
@@ -101,13 +152,14 @@ std::expected<GitStatusArgs, ToolError> parse_git_status_args(const json& j) {
 ExecResult run_git_status(const GitStatusArgs& a) {
     auto wp = util::make_workspace_path_checked(a.root, "git_status");
     if (!wp) return std::unexpected(std::move(wp.error()));
+    const std::string git_dir = resolve_git_dir(wp->string());
     // porcelain=v1 (the `git status -s` short format: `XY path`, one line per
     // change, plus a `## branch...upstream [ahead/behind]` header). Stable
     // and script-parseable like v2, but READABLE — v2's
     // `1 .M N... 100644 100644 100644 <sha> <sha> path` machine rows are
     // gibberish to a human and to the model. The tool card body shows this
     // verbatim, so it must be the form a person would want to read.
-    auto out = run_git({"git", "-C", wp->string(), "status",
+    auto out = run_git({"git", "-C", git_dir, "status",
                         "--porcelain=v1", "--branch"}, "git_status");
     if (!out) return std::unexpected(std::move(out.error()));
     std::string output = std::move(*out);
@@ -155,14 +207,22 @@ std::expected<GitDiffArgs, ToolError> parse_git_diff_args(const json& j) {
 }
 
 ExecResult run_git_diff(const GitDiffArgs& a) {
-    std::vector<std::string> argv = {"git", "diff", "--stat", "-p"};
-    if (a.staged) argv.push_back("--cached");
-    if (!a.ref.empty()) argv.push_back(a.ref);
+    std::string checked;
+    std::string pathspec;
     if (!a.path.empty()) {
         auto wp = util::make_workspace_path_checked(a.path, "git_diff");
         if (!wp) return std::unexpected(std::move(wp.error()));
+        checked  = wp->string();
+        pathspec = wp->string();
+    }
+    const std::string git_dir = resolve_git_dir(checked);
+    std::vector<std::string> argv = {"git", "-C", git_dir, "diff",
+                                     "--stat", "-p"};
+    if (a.staged) argv.push_back("--cached");
+    if (!a.ref.empty()) argv.push_back(a.ref);
+    if (!pathspec.empty()) {
         argv.push_back("--");
-        argv.push_back(wp->string());
+        argv.push_back(pathspec);
     }
     auto out = run_git(argv, "git_diff", 50'000);
     if (!out) return std::unexpected(std::move(out.error()));
@@ -199,7 +259,16 @@ ExecResult run_git_log(const GitLogArgs& a) {
     if (n <= 0) n = 20;
     if (n > 1000) n = 1000;
 
-    std::vector<std::string> argv = {"git", "log"};
+    std::string checked;
+    std::string pathspec;
+    if (!a.path.empty()) {
+        auto wp = util::make_workspace_path_checked(a.path, "git_log");
+        if (!wp) return std::unexpected(std::move(wp.error()));
+        checked  = wp->string();
+        pathspec = wp->string();
+    }
+    const std::string git_dir = resolve_git_dir(checked);
+    std::vector<std::string> argv = {"git", "-C", git_dir, "log"};
     if (a.oneline) {
         argv.push_back("--oneline");
     } else {
@@ -208,11 +277,9 @@ ExecResult run_git_log(const GitLogArgs& a) {
     }
     argv.push_back("-" + std::to_string(n));
     argv.push_back(a.ref.empty() ? std::string{"HEAD"} : a.ref);
-    if (!a.path.empty()) {
-        auto wp = util::make_workspace_path_checked(a.path, "git_log");
-        if (!wp) return std::unexpected(std::move(wp.error()));
+    if (!pathspec.empty()) {
         argv.push_back("--");
-        argv.push_back(wp->string());
+        argv.push_back(pathspec);
     }
     auto out = run_git(argv, "git_log");
     if (!out) return std::unexpected(std::move(out.error()));
@@ -229,6 +296,7 @@ struct GitCommitArgs {
     std::string message;
     std::vector<std::string> files;
     bool stage_all;
+    std::string path;
     std::string display_description;
 };
 
@@ -262,24 +330,45 @@ std::expected<GitCommitArgs, ToolError> parse_git_commit_args(const json& j) {
         std::move(msg),
         std::move(files),
         ar.boolean("stage_all", false),
+        ar.str("path", ""),
         ar.str("display_description", ""),
     };
 }
 
 ExecResult run_git_commit(const GitCommitArgs& a) {
+    // Resolve the repo to commit in from (in priority order): the explicit
+    // `path` arg, the first staged file, else the workspace root. This is
+    // what makes committing files in a sibling checkout Just Work instead
+    // of failing with "not inside a git repository" when the process cwd
+    // happens to be elsewhere.
+    std::string repo_hint;
+    if (!a.path.empty()) {
+        auto wp = util::make_workspace_path_checked(a.path, "git_commit");
+        if (!wp) return std::unexpected(std::move(wp.error()));
+        repo_hint = wp->string();
+    } else if (!a.files.empty()) {
+        auto wp = util::make_workspace_path_checked(a.files.front(),
+                                                    "git_commit");
+        if (!wp) return std::unexpected(std::move(wp.error()));
+        repo_hint = wp->string();
+    }
+    const std::string git_dir = resolve_git_dir(repo_hint);
+
     if (a.stage_all) {
-        if (auto r = run_git({"git", "add", "-A"}, "git_commit (add -A)"); !r)
+        if (auto r = run_git({"git", "-C", git_dir, "add", "-A"},
+                             "git_commit (add -A)"); !r)
             return std::unexpected(std::move(r.error()));
     }
     for (const auto& f : a.files) {
         auto wp = util::make_workspace_path_checked(f, "git_commit");
         if (!wp) return std::unexpected(std::move(wp.error()));
-        if (auto r = run_git({"git", "add", "--", wp->string()},
-                             "git_commit (add)"); !r)
+        if (auto r = run_git({"git", "-C", git_dir, "add", "--",
+                              wp->string()}, "git_commit (add)"); !r)
             return std::unexpected(std::move(r.error()));
     }
 
-    auto r = util::run_argv_s({"git", "commit", "-m", a.message});
+    auto r = util::run_argv_s(
+        {"git", "-C", git_dir, "commit", "-m", a.message});
     if (!r.started || r.timed_out || r.exit_code != 0) {
         std::string_view out = r.output;
         if (out.find("nothing to commit") != std::string_view::npos
@@ -346,6 +435,8 @@ json git_commit_schema() {
             {"files",     {{"type","array"}, {"items",{{"type","string"}}},
                            {"description","Files to stage before committing"}}},
             {"stage_all", {{"type","boolean"}, {"description","Stage all changes (default: false)"}}},
+            {"path",      {{"type","string"}, {"description","Repository path "
+                           "(default: derived from files, else workspace root)"}}},
         }},
     };
 }
