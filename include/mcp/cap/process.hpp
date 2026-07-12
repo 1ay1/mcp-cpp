@@ -5,10 +5,11 @@
 //
 //   This is the missing piece for a *client that spawns its own servers*:
 //   StdioTransport wants std::istream&/std::ostream&, but a spawned MCP
-//   server's stdio are raw OS pipe FDs. We bridge them with libstdc++'s
-//   __gnu_cxx::stdio_filebuf — zero extra buffering, no new dependency.
+//   server's stdio are raw OS pipe FDs/handles. We bridge them with a small
+//   self-contained std::streambuf over the pipe — no libstdc++ extensions,
+//   so it builds on libc++ (Android/Termux, macOS) and MSVC too.
 //
-//   POSIX-only (Linux/macOS). Header-only, like the rest of mcp-cpp.
+//   Header-only, like the rest of mcp-cpp.
 //
 #pragma once
 
@@ -358,8 +359,6 @@ private:
 
 #else  // !_WIN32 — POSIX backend (fork/exec/pipe)
 
-#include <ext/stdio_filebuf.h>   // __gnu_cxx::stdio_filebuf (libstdc++)
-
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -369,6 +368,7 @@ private:
 #include <memory>
 #include <ostream>
 #include <stdexcept>
+#include <streambuf>
 #include <string>
 #include <vector>
 
@@ -377,6 +377,75 @@ private:
 #include <unistd.h>
 
 namespace mcp::cap {
+
+// A std::streambuf backed by a POSIX pipe FD. Historically this was
+// __gnu_cxx::stdio_filebuf, but that lives in <ext/stdio_filebuf.h> — a
+// libstdc++ extension that libc++ (Android/Termux, some macOS toolchains)
+// doesn't ship. Same shape as the Windows handle_streambuf above: owns the
+// FD, blocking read()/write(), buffered get/put areas sized for the
+// line-buffered JSON-RPC frames StdioTransport exchanges.
+class fd_streambuf final : public std::streambuf {
+public:
+    explicit fd_streambuf(int fd) noexcept : fd_(fd) {
+        setg(in_, in_ + sizeof(in_), in_ + sizeof(in_));  // empty → underflow
+        setp(out_, out_ + sizeof(out_));
+    }
+    ~fd_streambuf() override { sync(); close(); }
+
+    fd_streambuf(const fd_streambuf&)            = delete;
+    fd_streambuf& operator=(const fd_streambuf&) = delete;
+
+    void close() noexcept {
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
+
+protected:
+    // ── reading: refill the get area from the pipe ────────────────────
+    int_type underflow() override {
+        if (!valid()) return traits_type::eof();
+        ssize_t got;
+        do {
+            got = ::read(fd_, in_, sizeof(in_));
+        } while (got < 0 && errno == EINTR);
+        if (got <= 0) return traits_type::eof();   // 0 = writer closed
+        setg(in_, in_, in_ + got);
+        return traits_type::to_int_type(in_[0]);
+    }
+
+    // ── writing: flush the put area to the pipe ─────────────────────
+    int_type overflow(int_type ch) override {
+        if (!flush_put_area()) return traits_type::eof();
+        if (!traits_type::eq_int_type(ch, traits_type::eof())) {
+            *pptr() = traits_type::to_char_type(ch);
+            pbump(1);
+        }
+        return traits_type::not_eof(ch);
+    }
+
+    int sync() override { return flush_put_area() ? 0 : -1; }
+
+private:
+    [[nodiscard]] bool flush_put_area() noexcept {
+        const char* p = pbase();
+        const char* e = pptr();
+        while (p < e) {
+            if (!valid()) return false;
+            ssize_t n;
+            do {
+                n = ::write(fd_, p, static_cast<std::size_t>(e - p));
+            } while (n < 0 && errno == EINTR);
+            if (n <= 0) return false;   // EPIPE etc. — reader gone
+            p += n;
+        }
+        setp(out_, out_ + sizeof(out_));
+        return true;
+    }
+
+    int  fd_ = -1;
+    char in_[4096];
+    char out_[4096];
+};
 
 // Move-only owner of a single pipe-end FD. Closes on scope exit unless
 // release()'d, so the spawn prologue's leak-ladder (close every FD opened so
@@ -464,13 +533,13 @@ public:
 
         // ── parent ──────────────────────────────────────────────────────
         // Drop the child-side ends (guards close them on destruction); the
-        // parent-side ends are release()'d into the stdio_filebufs, which now
+        // parent-side ends are release()'d into the fd_streambufs, which now
         // own the FDs and close them via shutdown(). Commit point: from here
         // on the streams hold the only references.
         in_rd.reset();    // child's stdin read end — parent doesn't use it
         out_wr.reset();   // child's stdout write end — parent doesn't use it
-        in_buf_  = std::make_unique<__gnu_cxx::stdio_filebuf<char>>(out_rd.release(), std::ios::in);
-        out_buf_ = std::make_unique<__gnu_cxx::stdio_filebuf<char>>(in_wr.release(),  std::ios::out);
+        in_buf_  = std::make_unique<fd_streambuf>(out_rd.release());
+        out_buf_ = std::make_unique<fd_streambuf>(in_wr.release());
         in_stream_  = std::make_unique<std::istream>(in_buf_.get());
         out_stream_ = std::make_unique<std::ostream>(out_buf_.get());
     }
@@ -524,8 +593,8 @@ public:
 
 private:
     int pid_ = -1;
-    std::unique_ptr<__gnu_cxx::stdio_filebuf<char>> in_buf_;
-    std::unique_ptr<__gnu_cxx::stdio_filebuf<char>> out_buf_;
+    std::unique_ptr<fd_streambuf> in_buf_;
+    std::unique_ptr<fd_streambuf> out_buf_;
     std::unique_ptr<std::istream> in_stream_;
     std::unique_ptr<std::ostream> out_stream_;
 };
