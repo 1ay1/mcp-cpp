@@ -27,9 +27,19 @@
 #  include <fcntl.h>
 #  include <poll.h>
 #  include <signal.h>
-#  include <spawn.h>
 #  include <sys/wait.h>
 #  include <unistd.h>
+// posix_spawn lives in <spawn.h>, but on Bionic that header is gated behind
+// __ANDROID_API__ >= 28 and is simply absent from the sysroot on lower API
+// levels (Termux on some devices). Prefer it when available; otherwise fall
+// back to the fork/exec path below, which needs no special header and works
+// on every POSIX/Android target regardless of API level.
+#  if __has_include(<spawn.h>)
+#    include <spawn.h>
+#    define MCP_HAVE_POSIX_SPAWN 1
+#  else
+#    define MCP_HAVE_POSIX_SPAWN 0
+#  endif
 extern char** environ;
 #endif
 
@@ -402,23 +412,6 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
 #endif
     (void)::fcntl(pipefd[0], F_SETFL, ::fcntl(pipefd[0], F_GETFL) | O_NONBLOCK);
 
-    // file_actions: redirect stdin from /dev/null (so the child can't
-    // steal terminal input from the TUI), and stdout+stderr to the pipe
-    // write end. Close the read end in the child so grandchildren that
-    // inherit fds don't hold it open after the child itself exits.
-    posix_spawn_file_actions_t actions;
-    if (::posix_spawn_file_actions_init(&actions) != 0) {
-        ::close(pipefd[0]); ::close(pipefd[1]);
-        r.started = false; r.start_error = "posix_spawn_file_actions_init failed";
-        return r;
-    }
-    ::posix_spawn_file_actions_addopen(&actions, STDIN_FILENO,
-        "/dev/null", O_RDONLY, 0);
-    ::posix_spawn_file_actions_adddup2 (&actions, pipefd[1], STDOUT_FILENO);
-    ::posix_spawn_file_actions_adddup2 (&actions, pipefd[1], STDERR_FILENO);
-    ::posix_spawn_file_actions_addclose(&actions, pipefd[1]);
-    ::posix_spawn_file_actions_addclose(&actions, pipefd[0]);
-
     // Build child argv. Shell form goes through `/bin/sh -c <cmd>` so
     // pipes / redirects / globs work; argv form bypasses the shell for
     // exact-arg fidelity (matters for `git commit -m "msg with $vars"`
@@ -426,7 +419,6 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     std::vector<std::string> argv_storage;
     if (use_shell) {
         if (argv_in.empty()) {
-            ::posix_spawn_file_actions_destroy(&actions);
             ::close(pipefd[0]); ::close(pipefd[1]);
             r.started = false; r.start_error = "empty shell command";
             return r;
@@ -441,16 +433,61 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     arg_ptrs.push_back(nullptr);
 
     pid_t pid = -1;
-    int rc = ::posix_spawnp(&pid, arg_ptrs[0], &actions, nullptr,
-                            arg_ptrs.data(), environ);
+    int   rc  = 0;
+
+#if MCP_HAVE_POSIX_SPAWN
+    // Preferred path: posix_spawn. file_actions redirect stdin from
+    // /dev/null (so the child can't steal terminal input from the TUI),
+    // and stdout+stderr to the pipe write end. Close the read end in the
+    // child so grandchildren that inherit fds don't hold it open after the
+    // child itself exits.
+    posix_spawn_file_actions_t actions;
+    if (::posix_spawn_file_actions_init(&actions) != 0) {
+        ::close(pipefd[0]); ::close(pipefd[1]);
+        r.started = false; r.start_error = "posix_spawn_file_actions_init failed";
+        return r;
+    }
+    ::posix_spawn_file_actions_addopen(&actions, STDIN_FILENO,
+        "/dev/null", O_RDONLY, 0);
+    ::posix_spawn_file_actions_adddup2 (&actions, pipefd[1], STDOUT_FILENO);
+    ::posix_spawn_file_actions_adddup2 (&actions, pipefd[1], STDERR_FILENO);
+    ::posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+    ::posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+
+    rc = ::posix_spawnp(&pid, arg_ptrs[0], &actions, nullptr,
+                        arg_ptrs.data(), environ);
     ::posix_spawn_file_actions_destroy(&actions);
+#else
+    // Fallback path (Bionic without <spawn.h> on API < 28, and any target
+    // where posix_spawn is unavailable): classic fork + exec. Performs the
+    // SAME fd wiring as the file_actions above, but in the forked child
+    // before exec. execvp honours PATH just like posix_spawnp.
+    pid = ::fork();
+    if (pid == 0) {
+        // ---- child ----
+        int devnull = ::open("/dev/null", O_RDONLY);
+        if (devnull >= 0) { ::dup2(devnull, STDIN_FILENO); ::close(devnull); }
+        ::dup2(pipefd[1], STDOUT_FILENO);
+        ::dup2(pipefd[1], STDERR_FILENO);
+        ::close(pipefd[1]);
+        ::close(pipefd[0]);
+        ::execvp(arg_ptrs[0], arg_ptrs.data());
+        // execvp only returns on failure. Report via errno and _exit so we
+        // don't run parent atexit handlers / flush shared buffers twice.
+        ::_exit(127);
+    } else if (pid < 0) {
+        rc = errno;   // fork failed; mirror posix_spawn's errno-return API
+    }
+#endif
+
     ::close(pipefd[1]);   // parent never writes
     pipefd[1] = -1;
 
-    if (rc != 0) {
+    if (rc != 0 || pid < 0) {
         ::close(pipefd[0]);
         r.started = false;
-        r.start_error = "spawn failed: " + std::string{std::strerror(rc)};
+        r.start_error = "spawn failed: " +
+            std::string{std::strerror(rc != 0 ? rc : errno)};
         return r;
     }
 
