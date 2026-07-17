@@ -17,7 +17,13 @@
 #include <fstream>
 #include <string>
 
-#include <unistd.h>
+#ifdef _WIN32
+#  include <process.h>   // _getpid
+#  define mcp_getpid _getpid
+#else
+#  include <unistd.h>    // getpid
+#  define mcp_getpid getpid
+#endif
 
 using namespace mcp::tools;
 namespace fs = std::filesystem;
@@ -34,7 +40,7 @@ static void write_file(const fs::path& p, const std::string& s) {
 }
 
 int main() {
-    auto root = fs::temp_directory_path() / ("mcp_search_test_" + std::to_string(::getpid()));
+    auto root = fs::temp_directory_path() / ("mcp_search_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
     util::set_workspace_root(root);
     // git_status/log/commit invoke `git` in the process cwd; agentty runs

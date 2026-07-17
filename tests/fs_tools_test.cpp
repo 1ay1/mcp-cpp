@@ -15,7 +15,13 @@
 #include <filesystem>
 #include <string>
 
-#include <unistd.h>
+#ifdef _WIN32
+#  include <process.h>   // _getpid
+#  define mcp_getpid _getpid
+#else
+#  include <unistd.h>    // getpid
+#  define mcp_getpid getpid
+#endif
 
 using namespace mcp::tools;
 namespace fs = std::filesystem;
@@ -28,7 +34,7 @@ static mcp::cap::Result call(mcp::cap::CapabilityProvider& p,
 static mcp::Json obj() { return mcp::Json::object(); }
 
 int main() {
-    auto root = fs::temp_directory_path() / ("mcp_fs_test_" + std::to_string(::getpid()));
+    auto root = fs::temp_directory_path() / ("mcp_fs_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
     util::set_workspace_root(root);
 
