@@ -470,8 +470,27 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     ::posix_spawn_file_actions_addclose(&actions, pipefd[1]);
     ::posix_spawn_file_actions_addclose(&actions, pipefd[0]);
 
-    rc = ::posix_spawnp(&pid, arg_ptrs[0], &actions, nullptr,
+    // Detach the child into its own session so it has NO controlling
+    // terminal. Redirecting stdin/out/err to /dev/null + pipe isn't
+    // enough: git (and any tool that wants a real tty for progress
+    // meters, credential/pager prompts, or coloured advice) reaches
+    // PAST its std fds by opening /dev/tty directly. That write lands
+    // on the actual terminal — OUTSIDE agentty's alt-screen — as stray
+    // CSI glyphs in native scrollback (the reported "r r" leak beside
+    // `git add` cards), and never passes through our clean_capture
+    // boundary. With no controlling tty in the new session, open("/dev/tty")
+    // fails ENXIO and git falls back to clean non-interactive behaviour.
+    posix_spawnattr_t attr;
+    bool have_attr = (::posix_spawnattr_init(&attr) == 0);
+    posix_spawnattr_t* attrp = nullptr;
+#ifdef POSIX_SPAWN_SETSID
+    if (have_attr && ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID) == 0)
+        attrp = &attr;
+#endif
+
+    rc = ::posix_spawnp(&pid, arg_ptrs[0], &actions, attrp,
                         arg_ptrs.data(), environ);
+    if (have_attr) ::posix_spawnattr_destroy(&attr);
     ::posix_spawn_file_actions_destroy(&actions);
 #else
     // Fallback path (Bionic without <spawn.h> on API < 28, and any target
@@ -481,6 +500,12 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     pid = ::fork();
     if (pid == 0) {
         // ---- child ----
+        // New session → no controlling terminal, so a child that opens
+        // /dev/tty directly (git progress/pager/credential prompts) gets
+        // ENXIO and stays non-interactive instead of scribbling raw CSI
+        // onto the real terminal outside agentty's alt-screen. Mirrors
+        // POSIX_SPAWN_SETSID on the posix_spawn path above.
+        ::setsid();
         int devnull = ::open("/dev/null", O_RDONLY);
         if (devnull >= 0) { ::dup2(devnull, STDIN_FILENO); ::close(devnull); }
         ::dup2(pipefd[1], STDOUT_FILENO);

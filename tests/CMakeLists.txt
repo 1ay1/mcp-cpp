@@ -43,4 +43,11 @@ if(MCP_BUILD_TOOLS)
     add_executable(mcp_terminal_strip_test terminal_strip_test.cpp)
     target_link_libraries(mcp_terminal_strip_test PRIVATE mcp::tools)
     add_test(NAME mcp_terminal_strip_test COMMAND mcp_terminal_strip_test)
+
+    # /dev/tty detach check is POSIX-only (no /dev/tty on Windows).
+    if(NOT WIN32)
+        add_executable(mcp_subprocess_tty_test subprocess_tty_test.cpp)
+        target_link_libraries(mcp_subprocess_tty_test PRIVATE mcp::tools)
+        add_test(NAME mcp_subprocess_tty_test COMMAND mcp_subprocess_tty_test)
+    endif()
 endif()
