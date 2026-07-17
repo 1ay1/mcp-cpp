@@ -45,6 +45,10 @@ using util::ExecResult;
 
 namespace {
 
+// Forward decl — defined below near is_literal_pattern; used by run_glob.
+[[nodiscard]] bool glob_hit(std::string_view pattern,
+                            const fs::path& file, const fs::path& root);
+
 // ═══════════════════════════════════════════════════════════════════════
 //  glob
 // ═══════════════════════════════════════════════════════════════════════
@@ -99,6 +103,11 @@ ExecResult run_glob(const GlobArgs& a) {
         }
         bool hit = has_glob ? util::glob_match(pat, fn)
                             : fn.find(pat) != std::string::npos;
+        // Slash-bearing patterns ('src/*.cpp', '**/util/*.hpp') are PATH
+        // patterns — match them against the workspace-relative path, not
+        // just the basename, so directory-scoped globs work as users expect.
+        if (!hit && has_glob && pat.find('/') != std::string::npos)
+            hit = glob_hit(pat, it->path(), wp->path());
         if (hit) {
             bool is_link = it->is_symlink(ec);
             uintmax_t sz = 0;
@@ -190,15 +199,30 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
 
     static int rg_available = -1;
     if (rg_available < 0) {
-        auto r = util::run_command_s("rg --version", 5000, std::chrono::seconds{2});
-        rg_available = (r.started && r.exit_code == 0) ? 1 : 0;
+        auto probe = util::Subprocess::run(util::SubprocessOptions{
+            .argv      = std::vector<std::string>{"rg", "--version"},
+            .timeout   = std::chrono::seconds(2),
+            .max_bytes = 1024,
+        });
+        rg_available = (probe.started && probe.exit_code == 0) ? 1 : 0;
     }
 
     if (rg_available == 1) {
-        std::string cmd = "rg -n -H --no-heading -M 500 -m 50 "
-            "--type-add 'code:*.{cpp,hpp,c,h,cc,hh,cxx,hxx,py,js,ts,jsx,tsx,go,rs,java,kt,rb,swift,zig,lua}' "
-            "-t code -e '" + rg_pattern + "' '" + wp->path().string() + "'";
-        auto r = util::run_command_s(cmd, 100000, std::chrono::seconds{30});
+        // Pass every argument via argv — the pattern contains regex meta
+        // (|, (), \b, <, >, *) that a shell string would mangle or, worse,
+        // interpret. argv form reaches rg byte-for-byte.
+        std::vector<std::string> argv = {
+            "rg", "-n", "-H", "--no-heading", "--no-config", "-M", "500", "-m", "50",
+            "--type-add",
+            "code:*.{cpp,hpp,c,h,cc,hh,cxx,hxx,py,js,ts,jsx,tsx,go,rs,java,kt,rb,swift,zig,lua,cs,scala,dart,ex,exs,ml,hs,php,pl,pm,sh,bash}",
+            "-t", "code", "-e", rg_pattern,
+            wp->path().string(),
+        };
+        auto r = util::Subprocess::run(util::SubprocessOptions{
+            .argv      = std::move(argv),
+            .timeout   = std::chrono::seconds(30),
+            .max_bytes = 100000,
+        });
         if (r.started && (r.exit_code == 0 || r.exit_code == 1)) {
             if (r.output.empty() || r.exit_code == 1) {
                 return ToolOutput{"no definitions found for '" + a.symbol + "'", std::nullopt};
@@ -251,6 +275,8 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
             ".cpp", ".hpp", ".c", ".h", ".cc", ".hh", ".cxx", ".hxx",
             ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs",
             ".java", ".kt", ".rb", ".swift", ".zig", ".lua",
+            ".cs", ".scala", ".dart", ".ex", ".exs", ".ml", ".hs",
+            ".php", ".pl", ".pm", ".sh", ".bash",
         };
         bool is_code = false;
         for (const auto& e : code_exts) { if (ext == e) { is_code = true; break; } }
@@ -329,6 +355,34 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
     return p.find_first_of(meta) == std::string_view::npos;
 }
 
+// Match a glob against a file, choosing filename-vs-path semantics from the
+// pattern shape. A pattern with no '/' (e.g. "*.cpp", "test_*") matches the
+// BASENAME anywhere in the tree — the historical, least-surprising default.
+// A pattern that contains '/' (e.g. "src/*.cpp", "**/util/*.hpp") is a PATH
+// pattern: it's matched against the workspace-relative path with normalised
+// forward slashes, and a leading "**/" is allowed to match at any depth.
+// This is the behaviour users coming from ripgrep/git already expect, and
+// it was previously silently broken (slash patterns matched nothing because
+// only filename() was ever tested).
+[[nodiscard]] bool glob_hit(std::string_view pattern,
+                            const fs::path& file,
+                            const fs::path& root) {
+    if (pattern.find('/') == std::string_view::npos)
+        return util::glob_match(pattern, file.filename().string());
+
+    std::error_code rec;
+    fs::path rel = fs::relative(file, root, rec);
+    std::string rp = (rec || rel.empty() ? file : rel).generic_string();
+    while (rp.starts_with("./")) rp.erase(0, 2);
+
+    if (util::glob_match(pattern, rp)) return true;
+    // "**/" prefix (or a bare "**") should also match paths at the root with
+    // no leading directory — strip it and retry so "**/foo.c" hits "foo.c".
+    if (pattern.starts_with("**/"))
+        return util::glob_match(pattern.substr(3), rp);
+    return false;
+}
+
 [[nodiscard]] bool likely_binary_ext(const fs::path& p) {
     static const std::unordered_set<std::string> bins = {
         ".exe", ".dll", ".lib", ".a", ".o", ".obj", ".pdb", ".so", ".dylib",
@@ -363,16 +417,29 @@ void scan_literal(std::string_view content, std::string_view needle,
         }
         return;
     }
-    std::string lower(content.size(), '\0');
-    std::ranges::transform(content, lower.begin(),
-        [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-    std::string nl(needle.size(), '\0');
-    std::ranges::transform(needle, nl.begin(),
-        [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-    std::size_t pos = 0;
-    while ((pos = lower.find(nl, pos)) != std::string::npos) {
-        if (!record(pos)) return;
-        pos += nl.size();
+    // Case-insensitive: search in place instead of lowercasing the whole
+    // file into two heap strings (the old path allocated 2x content.size()
+    // per file, dominating scan time on large trees). Fold only the first
+    // needle byte to find candidate starts, then compare the remainder
+    // byte-for-byte with ASCII case folding. ASCII-only fold matches the
+    // previous std::tolower behaviour on the default C locale.
+    auto fold = [](unsigned char c) -> unsigned char {
+        return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c - 'A' + 'a') : c;
+    };
+    const unsigned char n0 = fold(static_cast<unsigned char>(needle[0]));
+    const std::size_t nsz = needle.size();
+    const std::size_t limit = content.size() >= nsz ? content.size() - nsz + 1 : 0;
+    for (std::size_t i = 0; i < limit; ++i) {
+        if (fold(static_cast<unsigned char>(content[i])) != n0) continue;
+        std::size_t k = 1;
+        for (; k < nsz; ++k) {
+            if (fold(static_cast<unsigned char>(content[i + k]))
+                != fold(static_cast<unsigned char>(needle[k]))) break;
+        }
+        if (k == nsz) {
+            if (!record(i)) return;
+            i += nsz - 1;   // non-overlapping, matches the exact-path stride
+        }
     }
 }
 
@@ -711,7 +778,7 @@ ExecResult run_builtin(const GrepArgs& a) {
             if (!entry.is_regular_file(ec)) continue;
             if (fn.starts_with(".")) continue;
             if (!a.file_glob.empty()
-                && !util::glob_match(a.file_glob, fn)) continue;
+                && !glob_hit(a.file_glob, entry.path(), fs::path{a.root})) continue;
             if (likely_binary_ext(entry.path())) continue;
             std::error_code sec;
             auto sz = entry.file_size(sec);
@@ -921,7 +988,7 @@ json grep_schema() {
                 {"description","One-line summary shown in the UI. Optional."}}},
             {"pattern",        {{"type","string"}, {"description","Regex pattern to search for"}}},
             {"path",           {{"type","string"}, {"description","Directory to search (default: cwd)"}}},
-            {"glob",           {{"type","string"}, {"description","File extension filter (e.g. *.cpp)"}}},
+            {"glob",           {{"type","string"}, {"description","Filter files by glob. A bare pattern like `*.cpp` matches the filename anywhere; a slash pattern like `src/*.ts` or `**/test/*.py` matches the workspace-relative path."}}},
             {"case_sensitive", {{"type","boolean"}, {"description","Case-sensitive match (default: false)"}}},
             {"offset",         {{"type","integer"}, {"description","Skip this many matches (for pagination)"}}},
         }},
@@ -942,8 +1009,10 @@ void register_search_tools(Shells& sh) {
 
     sh.add("glob",
         "Find files by glob pattern. Supports `*` (any run), `?` (one char), "
-        "`[abc]` classes, and bare substrings. Matches against filename "
-        "(not full path). Case-insensitive on Windows.",
+        "`[abc]` classes, and bare substrings. A pattern with no slash matches "
+        "the FILENAME anywhere in the tree (`*.cpp`); a pattern containing a "
+        "slash matches the workspace-relative PATH (`src/*.ts`, `**/util/*.hpp`). "
+        "Case-insensitive on Windows.",
         glob_schema(), EffectSet{Effect::ReadFs},
         body<GlobArgs>(run_glob, parse_glob_args), 25'000);
 

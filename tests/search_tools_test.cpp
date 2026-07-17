@@ -85,6 +85,44 @@ int main() {
         std::puts("grep: glob filter ok");
     }
 
+    // ── grep is case-insensitive by default ──────────────────────────────
+    {
+        auto args = obj();
+        args["pattern"] = "needle_MARKER";   // different case than on disk
+        args["path"]    = root.string();
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("alpha.cpp") != std::string::npos);
+        assert(r.text.find("beta.txt") != std::string::npos);
+        std::puts("grep: case-insensitive default ok");
+    }
+
+    // ── grep case_sensitive=true respects case ───────────────────────────
+    {
+        auto args = obj();
+        args["pattern"]        = "needle_marker";  // lowercase, on-disk is NEEDLE
+        args["path"]           = root.string();
+        args["case_sensitive"] = true;
+        auto r = call(*provider, "grep", args);
+        // No lowercase occurrence exists → no matches.
+        assert(r.is_error || r.text.find("No match") != std::string::npos
+                          || r.text.find("alpha.cpp") == std::string::npos);
+        std::puts("grep: case_sensitive=true ok");
+    }
+
+    // ── grep slash file-glob scopes to a subdirectory path ───────────────
+    {
+        auto args = obj();
+        args["pattern"] = "compute_total";
+        args["path"]    = root.string();
+        args["glob"]    = "sub/*.py";   // path pattern, not just basename
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("gamma.py") != std::string::npos);
+        assert(r.text.find("alpha.cpp") == std::string::npos);
+        std::puts("grep: slash path-glob ok");
+    }
+
     // ── grep blank pattern rejected ──────────────────────────────────────
     {
         auto args = obj(); args["pattern"] = "   "; args["path"] = root.string();
@@ -110,6 +148,26 @@ int main() {
         assert(!r.is_error);
         assert(r.text.find("alpha.cpp") != std::string::npos);
         std::puts("glob: substring fallback ok");
+    }
+
+    // ── glob slash pattern matches the workspace-relative path ───────────
+    {
+        auto args = obj(); args["pattern"] = "sub/*.py"; args["path"] = root.string();
+        auto r = call(*provider, "glob", args);
+        assert(!r.is_error);
+        assert(r.text.find("gamma.py") != std::string::npos);
+        // A top-level .py sibling must NOT be reported for a sub/-scoped glob.
+        assert(r.text.find("alpha.cpp") == std::string::npos);
+        std::puts("glob: slash path pattern ok");
+    }
+
+    // ── glob '**' spans directories ──────────────────────────────────────
+    {
+        auto args = obj(); args["pattern"] = "**/*.py"; args["path"] = root.string();
+        auto r = call(*provider, "glob", args);
+        assert(!r.is_error);
+        assert(r.text.find("gamma.py") != std::string::npos);
+        std::puts("glob: ** cross-directory ok");
     }
 
     // ── find_definition locates the function ─────────────────────────────
