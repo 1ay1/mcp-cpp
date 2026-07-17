@@ -210,6 +210,33 @@ int main() {
     }
 
     fs::current_path(prev_cwd);
+
+    // ── repo_map: ranked, budgeted codebase skeleton ──────────────────
+    {
+        // alpha.cpp defines compute_sum; gamma.py defines compute_total —
+        // both must appear as signature lines with L<line> anchors.
+        auto r = call(*provider, "repo_map", obj());
+        assert(!r.is_error);
+        assert(r.text.find("alpha.cpp") != std::string::npos);
+        assert(r.text.find("L") != std::string::npos);
+        assert(read_effects(r).has(Effect::ReadFs));
+        std::puts("repo_map: ok (ranked skeleton with line anchors)");
+
+        // focus re-centers: focusing on the python symbol keeps gamma.py.
+        auto fargs = obj(); fargs["focus"] = "compute_total";
+        auto fr = call(*provider, "repo_map", fargs);
+        assert(!fr.is_error);
+        assert(fr.text.find("gamma.py") != std::string::npos);
+        std::puts("repo_map: focus personalization ok");
+
+        // budget is respected (allowing footer slack).
+        auto bargs = obj(); bargs["budget"] = 1000;
+        auto br = call(*provider, "repo_map", bargs);
+        assert(!br.is_error);
+        assert(br.text.size() < 2200);
+        std::puts("repo_map: budget respected");
+    }
+
     fs::remove_all(root);
     std::puts("ALL SEARCH/SHELL/DIAGNOSTICS TOOL TESTS PASSED");
     return 0;

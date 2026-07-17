@@ -21,6 +21,7 @@ EffectSet effects_for_builtin(const std::string& name) {
         {"grep",            EffectSet{E::ReadFs}},
         {"glob",            EffectSet{E::ReadFs}},
         {"find_definition", EffectSet{E::ReadFs}},
+        {"repo_map",        EffectSet{E::ReadFs}},
         {"write",           EffectSet{E::WriteFs}},
         {"edit",            EffectSet{E::WriteFs}},
         {"bash",            EffectSet{E::Exec, E::ReadFs, E::WriteFs, E::Net}},
