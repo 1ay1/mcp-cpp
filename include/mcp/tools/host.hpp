@@ -226,6 +226,12 @@ struct HostServices {
     std::shared_ptr<TodoSink>       todo;       // todo
     std::shared_ptr<SkillResolver>  skills;     // skill
     std::shared_ptr<DocRetriever>   retriever;  // search_docs
+    // Semantic CODE retrieval — the hybrid complement to grep: embeddings/
+    // BM25 over source chunks catch CONCEPTUAL queries ("where do we handle
+    // rate limiting") that share no token with the code. Same interface as
+    // the docs retriever; the host decides how code is chunked/indexed.
+    // Null ⇒ no search_code tool.
+    std::shared_ptr<DocRetriever>   code_retriever;  // search_code
     std::shared_ptr<SubagentRunner> subagent;   // task
     std::shared_ptr<HttpClient>     http;       // web_fetch / web_search
 };

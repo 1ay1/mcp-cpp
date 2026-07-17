@@ -69,6 +69,7 @@ void register_memory_tools(Shells&, const std::shared_ptr<MemoryStore>&);
 void register_todo_tool(Shells&, const std::shared_ptr<TodoSink>&);
 void register_skill_tool(Shells&, const std::shared_ptr<SkillResolver>&);
 void register_search_docs_tool(Shells&, const std::shared_ptr<DocRetriever>&);
+void register_search_code_tool(Shells&, const std::shared_ptr<DocRetriever>&);
 void register_task_tool(Shells&, const std::shared_ptr<SubagentRunner>&);
 // Tier-1 (self-contained) tool families, gated on ToolsetConfig toggles:
 void register_fs_tools(Shells&);       // read, write, edit, list_dir

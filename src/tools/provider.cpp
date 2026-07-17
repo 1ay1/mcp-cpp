@@ -25,6 +25,7 @@ void register_memory_tools(Shells&, const std::shared_ptr<MemoryStore>&);
 void register_todo_tool(Shells&, const std::shared_ptr<TodoSink>&);
 void register_skill_tool(Shells&, const std::shared_ptr<SkillResolver>&);
 void register_search_docs_tool(Shells&, const std::shared_ptr<DocRetriever>&);
+void register_search_code_tool(Shells&, const std::shared_ptr<DocRetriever>&);
 void register_task_tool(Shells&, const std::shared_ptr<SubagentRunner>&);
 } // namespace detail
 
@@ -55,6 +56,7 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
     detail::register_todo_tool(shells, svc.todo);
     detail::register_skill_tool(shells, svc.skills);
     detail::register_search_docs_tool(shells, svc.retriever);
+    detail::register_search_code_tool(shells, svc.code_retriever);
     detail::register_task_tool(shells, svc.subagent);
 
     // Self-contained Tier-1 tools land here, gated on cfg.* toggles, once the

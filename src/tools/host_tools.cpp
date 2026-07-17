@@ -147,6 +147,66 @@ void register_search_docs_tool(Shells& sh, const std::shared_ptr<DocRetriever>& 
         });
 }
 
+// ── search_code ────────────────────────────────────────────────────
+// Semantic code retrieval — the CONCEPTUAL complement to grep. grep answers
+// exact/structural questions ("where is X defined"); this answers meaning
+// questions ("where do we throttle requests") where the code shares no token
+// with the query. Same DocRetriever seam as search_docs; the host owns the
+// code chunking/indexing/invalidation strategy.
+void register_search_code_tool(Shells& sh, const std::shared_ptr<DocRetriever>& ret) {
+    if (!ret) return;
+    sh.add(
+        "search_code",
+        "Semantic search over SOURCE CODE by meaning, not literal text. Use "
+        "when you don't know the identifier: conceptual queries (\"where is "
+        "retry backoff handled\", \"code that validates auth tokens\") "
+        "match relevant functions even with zero shared keywords. For exact "
+        "names/strings, grep is better.",
+        Json{
+            {"type","object"},
+            {"required", {"query"}},
+            {"properties", {
+                {"query", {{"type","string"}, {"description","Natural-language description of the code you're looking for."}}},
+                {"k",     {{"type","integer"},{"description","Number of code passages to return (default 6, max 20)."}}},
+                {"display_description", {{"type","string"},
+                    {"description","One-line summary shown in the UI. Optional."}}},
+            }},
+        },
+        EffectSet{Effect::ReadFs, Effect::Net},
+        [ret](const Json& args) -> mcp::cap::Result {
+            DocQuery q;
+            q.query = args.value("query", std::string{});
+            if (q.query.empty())
+                return mcp::cap::Result::error("search_code: `query` is required.");
+            q.k = args.value("k", 6);
+            if (q.k < 1)  q.k = 1;
+            if (q.k > 20) q.k = 20;
+
+            std::string mode, err;
+            auto hits = ret->retrieve(q, mode, err);
+            if (!err.empty()) return mcp::cap::Result::error("search_code: " + err);
+
+            std::string desc = args.value("display_description", std::string{});
+            std::string body;
+            if (!desc.empty()) body += desc + "\n";
+            if (hits.empty())
+                return mcp::cap::Result::ok(body + "No semantically similar code for: "
+                                            + q.query + "\nTry grep for exact tokens.");
+
+            body += std::to_string(hits.size()) + " results (mode: " +
+                    (mode.empty() ? "default" : mode) + ")\n";
+            char score_buf[32];
+            for (const auto& h : hits) {
+                std::snprintf(score_buf, sizeof score_buf, "%.4f", h.score);
+                body += "\n\u2500\u2500 " + h.path + ":" +
+                        std::to_string(h.line_start) + "-" + std::to_string(h.line_end) +
+                        "  (score " + score_buf + ")\n" + h.text;
+                if (!body.empty() && body.back() != '\n') body += '\n';
+            }
+            return mcp::cap::Result::ok(body);
+        });
+}
+
 // ── task ─────────────────────────────────────────────────────────────────
 void register_task_tool(Shells& sh, const std::shared_ptr<SubagentRunner>& runner) {
     if (!runner) return;
