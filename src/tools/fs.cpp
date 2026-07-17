@@ -571,10 +571,10 @@ ExecResult run_list_dir(const ListDirArgs& a) {
         std::vector<fs::directory_entry> entries;
         for (auto& e : fs::directory_iterator(wp->path(), ec))
             entries.push_back(e);
-        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
-            bool da = a.is_directory(), db = b.is_directory();
+        std::sort(entries.begin(), entries.end(), [](const auto& x, const auto& y) {
+            bool da = x.is_directory(), db = y.is_directory();
             if (da != db) return da > db;
-            return a.path().filename() < b.path().filename();
+            return x.path().filename() < y.path().filename();
         });
         for (auto& e : entries) list_entry(e, 0);
     }

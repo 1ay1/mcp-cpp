@@ -1351,8 +1351,8 @@ ExecResult run_web_search(HttpClient& client, const WebSearchArgs& a) {
             std::string_view p{prefix};
             if (url.size() >= p.size()
                 && std::equal(p.begin(), p.end(), url.begin(),
-                              [](char a, char b){
-                                  return std::tolower(a) == std::tolower(b);
+                              [](char x, char y){
+                                  return std::tolower(x) == std::tolower(y);
                               }))
             { url.remove_prefix(p.size()); break; }
         }
@@ -1366,8 +1366,8 @@ ExecResult run_web_search(HttpClient& client, const WebSearchArgs& a) {
             std::string_view p{pfx};
             if (host.size() > p.size()
                 && std::equal(p.begin(), p.end(), host.begin(),
-                              [](char a, char b){
-                                  return std::tolower(a) == std::tolower(b);
+                              [](char x, char y){
+                                  return std::tolower(x) == std::tolower(y);
                               }))
             { host.remove_prefix(p.size()); break; }
         }

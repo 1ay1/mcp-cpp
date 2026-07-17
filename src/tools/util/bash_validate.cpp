@@ -86,10 +86,40 @@ std::string validate_bash_command(std::string_view cmd) {
                    "Pass -m \"<message>\" to commit non-interactively, or use the "
                    "git_commit tool.";
     }
+    // Root-wipe patterns need the `/` to be a WHOLE argument, not a
+    // path prefix — otherwise `rm -rf /home/x/build` (a legitimate
+    // absolute-path delete) is falsely refused because it contains the
+    // substring "rm -rf /". Match only when the slash is the target:
+    // end-of-command, followed by whitespace, or the `/*` glob.
+    {
+        static constexpr std::string_view kRmPrefixes[] = {
+            "rm -rf ", "rm -fr ", "rm -r -f ", "rm -f -r ",
+        };
+        for (auto pre : kRmPrefixes) {
+            size_t p = 0;
+            while ((p = cmd.find(pre, p)) != std::string::npos) {
+                size_t a = p + pre.size();
+                while (a < cmd.size() && (cmd[a] == ' ' || cmd[a] == '\t')) a++;
+                if (a < cmd.size() && cmd[a] == '/') {
+                    size_t after = a + 1;
+                    bool root_target =
+                        after == cmd.size()
+                        || cmd[after] == ' ' || cmd[after] == '\t'
+                        || cmd[after] == ';' || cmd[after] == '&'
+                        || cmd[after] == '|' || cmd[after] == '\n'
+                        || (cmd[after] == '*');
+                    if (root_target)
+                        return "refusing wide rm that could wipe the filesystem root";
+                }
+                if (a < cmd.size() && cmd[a] == '~'
+                    && (a + 1 == cmd.size() || cmd[a + 1] == ' '
+                        || cmd[a + 1] == '\t' || cmd[a + 1] == '/'))
+                    return "refusing to recursively delete the home directory";
+                p += pre.size();
+            }
+        }
+    }
     static const std::vector<std::pair<std::string_view, std::string_view>> danger = {
-        {"rm -rf /",               "refusing wide rm that could wipe the filesystem root"},
-        {"rm -rf /*",              "refusing wide rm that could wipe the filesystem root"},
-        {"rm -rf ~",               "refusing to recursively delete the home directory"},
         {":(){ :|:& };:",          "fork-bomb pattern refused"},
         {"mkfs",                   "refusing mkfs — would reformat a filesystem"},
         {"dd if=",                 "refusing raw `dd` write — can corrupt disks if misdirected"},
