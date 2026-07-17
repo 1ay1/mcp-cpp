@@ -48,6 +48,10 @@ if(MCP_BUILD_TOOLS)
     target_link_libraries(mcp_bash_validate_test PRIVATE mcp::tools)
     add_test(NAME mcp_bash_validate_test COMMAND mcp_bash_validate_test)
 
+    add_executable(mcp_fuzzy_match_test fuzzy_match_test.cpp)
+    target_link_libraries(mcp_fuzzy_match_test PRIVATE mcp::tools)
+    add_test(NAME mcp_fuzzy_match_test COMMAND mcp_fuzzy_match_test)
+
     # /dev/tty detach check is POSIX-only (no /dev/tty on Windows).
     if(NOT WIN32)
         add_executable(mcp_subprocess_tty_test subprocess_tty_test.cpp)

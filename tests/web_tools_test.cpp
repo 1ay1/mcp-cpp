@@ -93,6 +93,46 @@ int main() {
         std::puts("web_fetch: SSRF refusal ok");
     }
 
+    // ── web_fetch blocks ENCODED loopback/metadata forms ─────────────────
+    // A dotted-quad-only guard is bypassed by the integer/hex/octal/short
+    // spellings that libc's inet_aton accepts and connect() honours. Each
+    // of these resolves to a private/loopback/metadata address and must be
+    // refused just like the plain dotted-quad.
+    {
+        const char* evil[] = {
+            "https://2130706433/",        // 127.0.0.1 as 32-bit decimal
+            "https://0x7f000001/",        // 127.0.0.1 as 32-bit hex
+            "https://017700000001/",      // 127.0.0.1 as 32-bit octal
+            "https://127.1/",             // 127.0.0.1 short A.D form
+            "https://0x7f.0.0.1/",        // mixed-radix per-part
+            "https://2852039166/",        // 169.254.169.254 (cloud metadata)
+            "https://192.168.1.1/",       // plain private (control)
+        };
+        for (const char* u : evil) {
+            auto args = obj(); args["url"] = u;
+            auto r = call(*provider, "web_fetch", args);
+            assert(r.is_error);
+            assert(r.text.find("SSRF") != std::string::npos
+                || r.text.find("loopback") != std::string::npos
+                || r.text.find("private") != std::string::npos);
+        }
+        std::puts("web_fetch: encoded-IP SSRF bypass forms blocked");
+    }
+
+    // ── a genuinely public numeric IP is NOT over-blocked ────────────────
+    {
+        // 8.8.8.8 is public; the guard must let it through to the client
+        // (which the fake resolves). Refusal here would be a false positive.
+        auto args = obj(); args["url"] = "https://8.8.8.8/";
+        auto r = call(*provider, "web_fetch", args);
+        // Not blocked for SSRF reasons: either succeeds or fails for a
+        // non-SSRF reason, but never the SSRF refusal message.
+        assert(!(r.is_error
+                 && (r.text.find("SSRF") != std::string::npos
+                     || r.text.find("loopback") != std::string::npos)));
+        std::puts("web_fetch: public numeric IP not over-blocked");
+    }
+
     // ── web_fetch rejects non-https ──────────────────────────────────────
     {
         auto args = obj(); args["url"] = "http://example.com";
