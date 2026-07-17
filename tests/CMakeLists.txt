@@ -39,4 +39,8 @@ if(MCP_BUILD_TOOLS)
     add_executable(mcp_arg_reader_test arg_reader_test.cpp)
     target_link_libraries(mcp_arg_reader_test PRIVATE mcp::tools)
     add_test(NAME mcp_arg_reader_test COMMAND mcp_arg_reader_test)
+
+    add_executable(mcp_terminal_strip_test terminal_strip_test.cpp)
+    target_link_libraries(mcp_terminal_strip_test PRIVATE mcp::tools)
+    add_test(NAME mcp_terminal_strip_test COMMAND mcp_terminal_strip_test)
 endif()

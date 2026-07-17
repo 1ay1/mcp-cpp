@@ -39,41 +39,12 @@ using util::ExecResult;
 
 namespace {
 
-// Strip ANSI / OSC escape sequences from captured subprocess output.
-std::string strip_ansi_escapes(std::string_view in) {
-    std::string out;
-    out.reserve(in.size());
-    for (std::size_t i = 0; i < in.size(); ) {
-        unsigned char b = static_cast<unsigned char>(in[i]);
-        if (b != 0x1b) {              // not an escape — keep verbatim
-            out.push_back(in[i]);
-            ++i;
-            continue;
-        }
-        if (i + 1 >= in.size()) { ++i; continue; }   // dangling ESC
-        unsigned char next = static_cast<unsigned char>(in[i + 1]);
-        if (next == '[') {
-            i += 2;
-            while (i < in.size()) {
-                unsigned char c = static_cast<unsigned char>(in[i++]);
-                if (c >= 0x40 && c <= 0x7e) break;
-            }
-        } else if (next == ']') {
-            i += 2;
-            std::size_t cap = std::min(in.size(), i + 4096);
-            while (i < cap) {
-                unsigned char c = static_cast<unsigned char>(in[i]);
-                if (c == 0x07) { ++i; break; }
-                if (c == 0x1b && i + 1 < in.size()
-                    && in[i + 1] == '\\') { i += 2; break; }
-                ++i;
-            }
-        } else {
-            i += 2;
-        }
-    }
-    return out;
-}
+// (ANSI/OSC stripping moved to the subprocess capture boundary itself —
+// util::strip_terminal_controls in tools/util/utf8.cpp — so LIVE progress
+// snapshots are cleaned too, not just the final output. The local
+// strip_ansi_escapes that used to live here handled only the settled
+// body, which is exactly why running bash cards painted stray CSI
+// parameter bytes mid-stream.)
 
 struct BashArgs {
     std::string command;
@@ -144,7 +115,6 @@ ExecResult run_bash(const BashArgs& a) {
     constexpr std::size_t kSpillPreviewTail = 1000;   // last 1 KB
     auto r = util::sandbox::run_shell_command(effective, kCaptureCap,
                                               std::chrono::seconds{tmo_s});
-    r.output = strip_ansi_escapes(r.output);
 
     std::string spill_path;
     std::size_t spill_total = 0;
