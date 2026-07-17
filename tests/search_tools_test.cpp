@@ -52,6 +52,9 @@ int main() {
     write_file(root / "alpha.cpp",
         "#include <cstdio>\n"
         "int compute_total(int a, int b) {\n"
+        "    if (a > b) {  // control-flow, not a def\n"
+        "        return a - b;\n"
+        "    }\n"
         "    return a + b;  // NEEDLE_marker here\n"
         "}\n");
     write_file(root / "beta.txt", "just some plain text\nwith a NEEDLE_marker too\n");
@@ -299,6 +302,28 @@ int main() {
         assert(!br.is_error);
         assert(br.text.size() < 2200);
         std::puts("repo_map: budget respected");
+
+        // Binary-search budget fit: the rendered map must LAND UNDER the
+        // budget (aider targets within ~15%), not overshoot it. The greedy
+        // packer could exceed budget on its last block; the binary search
+        // guarantees header+blocks+footer ≤ budget whenever ≥1 file fits.
+        {
+            auto b2 = obj(); b2["budget"] = 4000;
+            auto r2 = call(*provider, "repo_map", b2);
+            assert(!r2.is_error);
+            assert(r2.text.size() <= 4000
+                   && "repo_map must not overshoot its byte budget");
+            std::puts("repo_map: binary-search budget fit stays under budget");
+        }
+
+        // Robustness: control-flow / statement lines must NEVER surface as
+        // definition signatures. alpha.cpp's body has `if (a > b) {` and
+        // `return …` lines — neither may appear as an `L<n>: ` def line
+        // (guarded by both the def-regex shape and the keyword stop-list).
+        assert(r.text.find(": if (") == std::string::npos
+            && r.text.find(": if(") == std::string::npos);
+        assert(r.text.find(": return ") == std::string::npos);
+        std::puts("repo_map: no control-flow / statement false-positive defs");
     }
 
     fs::remove_all(root);

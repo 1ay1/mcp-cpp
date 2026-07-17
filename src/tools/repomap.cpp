@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -90,14 +91,22 @@ struct Def {
     std::string name;
     int         line = 0;
     std::string signature;   // the trimmed definition line
+    // Inbound references from OTHER files (filled in the linking pass) — how
+    // many distinct files mention this symbol. Drives both edge weight and
+    // the symbol-level rank used to pack the budget aider-style: a widely-
+    // referenced def in a mid-ranked file beats 20 trivial defs in a
+    // god-file.
+    int         inbound = 0;
+    double      rank = 0.0;  // this symbol's share of its file's PageRank
 };
 
 struct FileNode {
     std::string      rel;      // workspace-relative path
     std::vector<Def> defs;
     // Names referenced in this file that are DEFINED in another file — the
-    // outbound edges. Filled in the linking pass.
-    std::unordered_map<std::uint32_t, int> out_edges;   // file idx → count
+    // outbound edges, weighted by sqrt(#refs)/#definers. Filled in the
+    // linking pass.
+    std::unordered_map<std::uint32_t, double> out_edges;   // file idx → weight
     double rank = 0.0;
 };
 
@@ -132,7 +141,12 @@ void identifiers(std::string_view text, std::unordered_set<std::string>& out) {
     }
 }
 
-// Stop-list: identifiers so common they'd wire every file to every file.
+// Stop-list: identifiers so common they'd wire every file to every file,
+// PLUS control-flow / operator keywords that the greedy C-family function
+// regex would otherwise mis-capture as a "function name" (`if (x)`,
+// `while (y)`, `switch (z)`, `return foo()`, `sizeof(T)`, `catch (e)`). A
+// def whose captured name is one of these is a false positive — dropping it
+// keeps the graph honest and stops phantom `L42: if (...)` signature lines.
 bool is_stopword(const std::string& s) {
     static const std::unordered_set<std::string> kStop = {
         "int", "char", "bool", "void", "auto", "const", "static", "return",
@@ -141,6 +155,14 @@ bool is_stopword(const std::string& s) {
         "continue", "public", "private", "protected", "class", "struct",
         "def", "function", "import", "from", "include", "namespace", "using",
         "new", "delete", "sizeof", "typedef", "template", "typename",
+        // Control-flow / operator keywords: never a real definition name, but
+        // the `<type> <name>(...)` function regex captures them from lines
+        // like `if (cond) {` or `switch (x) {`.
+        "if", "switch", "catch", "case", "do", "goto", "throw", "try",
+        "where", "async", "await", "yield", "defer", "select", "match",
+        "and", "not", "with", "assert", "print", "println", "printf",
+        "sizeof", "alignof", "decltype", "static_cast", "reinterpret_cast",
+        "dynamic_cast", "const_cast", "co_await", "co_return", "co_yield",
     };
     return kStop.contains(s);
 }
@@ -235,24 +257,60 @@ const RepoGraph& build_graph(const fs::path& root) {
     }
 
     // Linking pass: symbol name → defining file(s), then per-file identifier
-    // scan produces the reference edges.
+    // scan produces the reference edges. We also count, per referenced symbol,
+    // how many DISTINCT files mention it — that count both (a) weights the
+    // edge (aider: an edge carries sqrt(#refs), so a symbol used ten times is
+    // a stronger vote than one used once, but sub-linearly so a single hub
+    // can't dominate) and (b) accumulates onto the DEFINITION's `inbound`
+    // tally, which later drives symbol-level budget packing.
     std::unordered_map<std::string, std::vector<std::uint32_t>> def_sites;
     for (std::uint32_t i = 0; i < g.files.size(); ++i)
         for (const auto& d : g.files[i].defs)
             def_sites[d.name].push_back(i);
 
+    // First tally raw reference counts per (referencing-file, symbol) so we
+    // can sqrt-scale the edge weight instead of adding one unit per identifier
+    // occurrence. `idents` is a SET, so each symbol counts once per file —
+    // presence, not frequency; that already matches aider's per-file model and
+    // avoids a giant file inflating an edge purely by repetition.
     std::unordered_set<std::string> idents;
+    std::unordered_map<std::string, int> global_refs;  // symbol → #referring files
+    std::vector<std::unordered_set<std::string>> file_refs(g.files.size());
     for (std::uint32_t i = 0; i < g.files.size(); ++i) {
         idents.clear();
         identifiers(bodies[i], idents);
         for (const auto& id : idents) {
             if (is_stopword(id)) continue;
+            if (!def_sites.count(id)) continue;
+            file_refs[i].insert(id);
+            ++global_refs[id];
+        }
+    }
+
+    for (std::uint32_t i = 0; i < g.files.size(); ++i) {
+        for (const auto& id : file_refs[i]) {
             auto it = def_sites.find(id);
             if (it == def_sites.end()) continue;
-            // Symbols defined in >8 files are too generic to rank on.
-            if (it->second.size() > 8) continue;
-            for (auto j : it->second)
-                if (j != i) g.files[i].out_edges[j] += 1;
+            // Symbols defined in many files are generic (a `run`/`build`/
+            // `Config` everyone has). Rather than a hard cutoff that erases
+            // them from the graph, down-weight: an ident defined in D files
+            // contributes 1/D of an edge, so a symbol defined once is a
+            // full-strength vote and a ubiquitous one barely moves the rank.
+            const std::size_t defcount = it->second.size();
+            if (defcount > 16) continue;   // pathological — still drop the worst
+            // Edge weight: sqrt of how many files reference this symbol
+            // (sub-linear), scaled down by how many files define it.
+            const int refs = global_refs[id];
+            double w = std::sqrt(static_cast<double>(std::max(refs, 1)))
+                     / static_cast<double>(defcount);
+            for (auto j : it->second) {
+                if (j == i) continue;
+                g.files[i].out_edges[j] += w;
+                // Credit the specific definition in the defining file with an
+                // inbound reference (used for symbol-level ranking below).
+                for (auto& d : g.files[j].defs)
+                    if (d.name == id) { ++d.inbound; break; }
+            }
         }
     }
     return g;
@@ -289,6 +347,23 @@ void pagerank(RepoGraph& g, const std::vector<double>& personalize) {
         rank.swap(next);
     }
     for (std::size_t i = 0; i < n; ++i) g.files[i].rank = rank[i];
+
+    // Symbol-level rank (aider's key move): a file's PageRank is a property of
+    // the FILE, but the budget is packed by SYMBOL, so distribute each file's
+    // rank across its definitions in proportion to how referenced each is.
+    // A def with many inbound refs claims most of its file's rank; unreferenced
+    // defs share a small floor so a brand-new symbol nobody calls yet still
+    // ranks above nothing. This is what lets a single widely-used function in
+    // a mid-ranked file out-pack twenty trivial helpers in a god-file.
+    for (std::size_t i = 0; i < n; ++i) {
+        double total_in = 0.0;
+        for (const auto& d : g.files[i].defs)
+            total_in += static_cast<double>(d.inbound) + 0.25;  // 0.25 floor
+        if (total_in <= 0.0) continue;
+        for (auto& d : g.files[i].defs)
+            d.rank = g.files[i].rank
+                   * ((static_cast<double>(d.inbound) + 0.25) / total_in);
+    }
 }
 
 struct RepoMapArgs {
@@ -358,36 +433,83 @@ mcp::cap::Result run_repo_map(const Json& args) {
         return g.files[x].rel < g.files[y].rel;
     });
 
-    // Greedy budget packing: highest-ranked files first, each rendered as
-    //   path:
-    //     L42: <signature>
-    // Files with no extracted defs still get a bare path line (they exist
-    // and rank — e.g. DSL files the def regexes don't parse).
-    std::ostringstream out;
-    out << "Repository map (" << g.files.size() << " files ranked";
-    if (!a.focus.empty()) out << ", focused on '" << a.focus << "'";
-    out << "; PageRank over the def/ref graph):\n\n";
-    int emitted_files = 0;
-    for (auto idx : order) {
-        const auto& f = g.files[idx];
+    // Render ONE file's block: its path, then its definitions ordered by
+    // SYMBOL rank (most-referenced first) so that when a file has more defs
+    // than the per-file cap, the ones shown are the architecturally important
+    // ones — not just whatever appeared first in the file. Line order is
+    // preserved as the tie-break so the block still reads top-to-bottom for
+    // equally-ranked symbols. Files with no extracted defs still get a bare
+    // path line (they exist and rank — e.g. DSL files the def regexes don't
+    // parse).
+    auto render_block = [](const FileNode& f) {
+        std::vector<const Def*> ds;
+        ds.reserve(f.defs.size());
+        for (const auto& d : f.defs) ds.push_back(&d);
+        std::sort(ds.begin(), ds.end(), [](const Def* x, const Def* y) {
+            if (x->rank != y->rank) return x->rank > y->rank;
+            return x->line < y->line;
+        });
         std::ostringstream block;
         block << f.rel << ":\n";
         std::size_t shown = 0;
-        for (const auto& d : f.defs) {
-            block << "  L" << d.line << ": " << d.signature << "\n";
-            if (++shown >= 24) {
-                block << "  … +" << (f.defs.size() - shown) << " more defs\n";
-                break;
-            }
+        // For the shown subset, restore LINE order so the signatures read in
+        // source order (rank chose WHICH to show; line chooses the order).
+        constexpr std::size_t kCap = 24;
+        std::vector<const Def*> pick(ds.begin(),
+            ds.begin() + std::min<std::size_t>(kCap, ds.size()));
+        std::sort(pick.begin(), pick.end(),
+                  [](const Def* x, const Def* y) { return x->line < y->line; });
+        for (const auto* d : pick) {
+            block << "  L" << d->line << ": " << d->signature << "\n";
+            ++shown;
         }
-        std::string s = block.str();
-        if (static_cast<int>(out.tellp()) + static_cast<int>(s.size())
-            > a.budget) {
-            if (emitted_files > 0) break;   // always emit at least one
-        }
-        out << s;
+        if (f.defs.size() > shown)
+            block << "  \xe2\x80\xa6 +" << (f.defs.size() - shown)
+                  << " more defs\n";
+        return block.str();
+    };
+
+    // Header (fixed) + binary-search the file COUNT that best fills the
+    // budget. Greedy packing overshoots on the last block or stops early;
+    // aider binary-searches to land within ~15% of budget. We do the same:
+    // find the largest prefix of `order` whose rendered size fits, then emit
+    // it. Blocks are memoized so we render each file at most twice.
+    std::ostringstream header;
+    header << "Repository map (" << g.files.size() << " files ranked";
+    if (!a.focus.empty()) header << ", focused on '" << a.focus << "'";
+    header << "; PageRank over the def/ref graph):\n\n";
+    const std::string header_str = header.str();
+
+    std::vector<std::string> blocks(order.size());
+    auto block_at = [&](std::size_t k) -> const std::string& {
+        if (blocks[k].empty()) blocks[k] = render_block(g.files[order[k]]);
+        return blocks[k];
+    };
+    // Footer is ~90 bytes; reserve room so the closing line never pushes past
+    // budget. cumulative size of the first `count` blocks + header + footer.
+    constexpr int kFooterReserve = 110;
+    auto fits = [&](std::size_t count) {
+        long long total = static_cast<long long>(header_str.size()) + kFooterReserve;
+        for (std::size_t k = 0; k < count; ++k)
+            total += static_cast<long long>(block_at(k).size());
+        return total <= a.budget;
+    };
+
+    // Binary search for the largest prefix that fits. Always emit ≥1 file.
+    std::size_t lo = 1, hi = order.size(), best = 1;
+    while (lo <= hi) {
+        std::size_t mid = lo + (hi - lo) / 2;
+        if (fits(mid)) { best = mid; lo = mid + 1; }
+        else { if (mid == 0) break; hi = mid - 1; }
+    }
+    if (order.empty()) best = 0;
+
+    std::ostringstream out;
+    out << header_str;
+    std::size_t emitted_files = 0;
+    for (std::size_t k = 0; k < best; ++k) {
+        out << block_at(k);
         ++emitted_files;
-        if (static_cast<int>(out.tellp()) >= a.budget) break;
     }
     out << "\n(" << emitted_files << " of " << g.files.size()
         << " files shown, budget " << a.budget << " bytes. Re-run with "
