@@ -100,8 +100,18 @@ void register_search_docs_tool(Shells& sh, const std::shared_ptr<DocRetriever>& 
     if (!ret) return;
     sh.add(
         "search_docs",
-        "Search the user's knowledge base / documentation corpus (NOT source "
-        "code \u2014 use grep/read for code) and return the most relevant passages.",
+        "Search the user's KNOWLEDGE BASE — their documentation, your installed "
+        "SKILLS, and your LEARNED MEMORY (facts remembered across sessions) — "
+        "and return the most relevant passages, each tagged with its source "
+        "(docs:/skill:/memory:) and path. This is separate from source code: "
+        "for code use grep/read/search_code, NOT this.\n"
+        "CALL THIS when the user references project conventions, past decisions, "
+        "domain terms, an in-house tool/DSL, or anything you might have stored "
+        "or been given docs about — even if no docs directory is configured, "
+        "skills and learned memory are always indexed and searchable. A hit on "
+        "a skill:// path means a SKILL covers that topic: activate it with the "
+        "`skill` tool. Cheaper and more precise than guessing from training "
+        "data on anything project-specific.",
         Json{
             {"type","object"},
             {"required", {"query"}},
