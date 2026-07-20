@@ -339,11 +339,13 @@ struct DPMatch {
 std::vector<DPMatch> run_line_dp(std::string_view file,
                                  std::string_view needle,
                                  const std::vector<Line>& fl,
-                                 const std::vector<Line>& nl) {
-    if (nl.empty() || fl.empty()) return {};
+                                 const std::vector<Line>& nl,
+                                 std::size_t b_lo,
+                                 std::size_t b_hi) {
+    if (nl.empty() || fl.empty() || b_lo >= b_hi) return {};
 
     const std::size_t Q = nl.size();          // query rows
-    const std::size_t B = fl.size();          // buffer rows
+    const std::size_t B = b_hi - b_lo;         // buffer rows IN THIS BAND
     const std::size_t cols = B + 1;
     const std::size_t rows = Q + 1;
 
@@ -369,7 +371,7 @@ std::vector<DPMatch> run_line_dp(std::string_view file,
     for (std::size_t r = 1; r <= Q; ++r) {
         std::string_view qline = needle_tr[r - 1];
         for (std::size_t c = 1; c <= B; ++c) {
-            std::string_view bline = trimmed_of(file, fl[c - 1]);
+            std::string_view bline = trimmed_of(file, fl[b_lo + c - 1]);
 
             std::uint32_t up = dp[(r - 1) * cols + c].cost;
             up = (up > std::numeric_limits<std::uint32_t>::max() - DELETION_COST)
@@ -427,7 +429,7 @@ std::vector<DPMatch> run_line_dp(std::string_view file,
                 // same line". Counting those inflates the match ratio
                 // and makes the quality gate accept garbage.
                 std::string_view qline = needle_tr[r - 1];
-                std::string_view bline = trimmed_of(file, fl[c - 1]);
+                std::string_view bline = trimmed_of(file, fl[b_lo + c - 1]);
                 if (qline == bline || fuzzy_eq(qline, bline)) ++matched;
                 --r; --c;
             } else if (d == Dir::Up) {
@@ -436,15 +438,125 @@ std::vector<DPMatch> run_line_dp(std::string_view file,
                 --c;
             }
         }
-        std::size_t row_start = c;            // first buffer row used
-        std::size_t row_end   = end_col - 1;  // inclusive last buffer row
-        std::size_t buf_rows  = end_col - row_start;
+        std::size_t row_start = b_lo + c;            // first buffer row used
+        std::size_t row_end   = b_lo + end_col - 1;  // inclusive last buffer row
+        std::size_t buf_rows  = end_col - c;         // band-local span (rows used)
         double ratio = static_cast<double>(matched)
                      / static_cast<double>(std::max(buf_rows, Q));
         if (ratio >= MATCH_RATIO)
             matches.push_back({row_start, row_end, best_cost});
     }
     return matches;
+}
+
+// ── Candidate banding ────────────────────────────────────────────────────
+// The DP is O(Q * B). Running it over the WHOLE file is wasteful (and hits
+// MAX_DP_CELLS on large files, returning a false "no match"). Instead we
+// find ANCHOR rows — buffer lines that exact- or fuzzy-match the needle's
+// most distinctive line — and run the DP only in a small window around each.
+// This turns the common case into O(Q * band) and lets huge files match.
+//
+// Falls back to a single full-file band when no anchor is found (e.g. a
+// needle whose every line is blank/duplicated) AND the file fits the cap.
+struct Band { std::size_t lo, hi; };
+
+std::vector<Band> candidate_bands(std::string_view file, std::string_view needle,
+                                  const std::vector<Line>& fl,
+                                  const std::vector<Line>& nl) {
+    const std::size_t B = fl.size();
+    const std::size_t Q = nl.size();
+    // Slack lets the DP absorb inserted/deleted lines around the anchor.
+    const std::size_t slack = std::max<std::size_t>(Q, 8);
+
+    // Pick the most DISTINCTIVE needle line as the anchor: the longest
+    // non-blank trimmed line is least likely to occur spuriously. Cheap and
+    // far more selective than always using line 0 (often `{` or blank).
+    std::size_t anchor_ni = SIZE_MAX;
+    std::size_t anchor_len = 0;
+    std::size_t anchor_off = 0;  // needle-row index of the anchor (for windowing)
+    for (std::size_t i = 0; i < Q; ++i) {
+        std::string_view t = trimmed_of(needle, nl[i]);
+        if (t.size() > anchor_len) { anchor_len = t.size(); anchor_ni = i; anchor_off = i; }
+    }
+
+    std::vector<Band> bands;
+    if (anchor_ni != SIZE_MAX && anchor_len >= 3) {
+        std::string_view atext = trimmed_of(needle, nl[anchor_ni]);
+        const std::size_t alen = atext.size();
+        for (std::size_t r = 0; r < B; ++r) {
+            std::string_view btext = trimmed_of(file, fl[r]);
+            // Cheap length gate first: fuzzy_eq can't pass the 0.8 threshold
+            // when the lengths differ by >20%, so skip the O(n*m) Levenshtein
+            // for the overwhelming majority of non-matching lines. Exact hits
+            // still take the fast equality path.
+            bool hit = (btext == atext);
+            if (!hit && btext.size() >= 3) {
+                const std::size_t blen = btext.size();
+                const std::size_t lo = std::min(alen, blen), hi = std::max(alen, blen);
+                if (hi != 0 && static_cast<double>(lo) / static_cast<double>(hi) >= 0.8)
+                    hit = fuzzy_eq(atext, btext);
+            }
+            if (hit) {
+                // Window: anchor may be `anchor_off` rows into the needle, so
+                // reach back that far (plus slack) and forward for the rest.
+                std::size_t back = anchor_off + slack;
+                std::size_t fwd  = (Q - anchor_off) + slack;
+                std::size_t lo = (r > back) ? r - back : 0;
+                std::size_t hi = std::min(B, r + fwd);
+                bands.push_back({lo, hi});
+            }
+        }
+        // Coalesce overlapping/adjacent windows so the DP isn't re-run over
+        // the same rows (and duplicate matches don't inflate the count).
+        if (!bands.empty()) {
+            std::sort(bands.begin(), bands.end(),
+                      [](const Band& a, const Band& b){ return a.lo < b.lo; });
+            std::vector<Band> merged;
+            merged.push_back(bands.front());
+            for (std::size_t i = 1; i < bands.size(); ++i) {
+                if (bands[i].lo <= merged.back().hi)
+                    merged.back().hi = std::max(merged.back().hi, bands[i].hi);
+                else
+                    merged.push_back(bands[i]);
+            }
+            return merged;
+        }
+    }
+
+    // No anchor hit. One full-file band — the DP's own cap guards cost.
+    return {{0, B}};
+}
+
+// Run the DP across every candidate band and union the results.
+std::vector<DPMatch> run_banded_dp(std::string_view file, std::string_view needle,
+                                   const std::vector<Line>& fl,
+                                   const std::vector<Line>& nl) {
+    auto bands = candidate_bands(file, needle, fl, nl);
+    std::vector<DPMatch> all;
+    for (const auto& b : bands) {
+        auto part = run_line_dp(file, needle, fl, nl, b.lo, b.hi);
+        for (auto& m : part) all.push_back(m);
+    }
+    // A match can surface from two overlapping bands post-coalesce only if
+    // coalescing missed it; dedup by (row_start,row_end) defensively so the
+    // ambiguity count stays honest.
+    std::sort(all.begin(), all.end(), [](const DPMatch& a, const DPMatch& b){
+        if (a.row_start != b.row_start) return a.row_start < b.row_start;
+        return a.row_end < b.row_end;
+    });
+    all.erase(std::unique(all.begin(), all.end(), [](const DPMatch& a, const DPMatch& b){
+        return a.row_start == b.row_start && a.row_end == b.row_end;
+    }), all.end());
+    // Keep only the globally-minimum-cost matches (each band reported its own
+    // best; across bands the true best cost may be lower in one of them).
+    if (!all.empty()) {
+        std::uint32_t best = all.front().cost;
+        for (const auto& m : all) best = std::min(best, m.cost);
+        std::vector<DPMatch> keep;
+        for (auto& m : all) if (m.cost == best) keep.push_back(m);
+        return keep;
+    }
+    return all;
 }
 
 } // namespace
@@ -490,7 +602,7 @@ FuzzyMatch fuzzy_find(std::string_view file,
     auto fl = scan_lines(file);
     auto nl = scan_lines(needle);
 
-    auto matches = run_line_dp(file, needle, fl, nl);
+    auto matches = run_banded_dp(file, needle, fl, nl);
     if (matches.empty()) {
         // Re-check exact-count for the caller's diagnostic — if exact was
         // ambiguous and DP found nothing better, surface the exact count.

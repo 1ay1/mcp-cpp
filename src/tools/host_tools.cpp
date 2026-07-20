@@ -117,7 +117,7 @@ void register_search_docs_tool(Shells& sh, const std::shared_ptr<DocRetriever>& 
             {"required", {"query"}},
             {"properties", {
                 {"query", {{"type","string"}, {"description","Natural-language or keyword query."}}},
-                {"k",     {{"type","integer"},{"description","Number of passages to return (default 6, max 20)."}}},
+                {"k",     {{"type","integer"},{"description","Number of passages to return (default 6, max 20). Raise to 10-15 for BROAD/survey questions (\"how does X work end-to-end\", \"what are all the Y\") where one facet per passage isn't enough; keep the default for pinpoint lookups."}}},
                 {"display_description", {{"type","string"},
                     {"description","One-line summary shown in the UI. Optional."}}},
             }},
@@ -177,7 +177,7 @@ void register_search_code_tool(Shells& sh, const std::shared_ptr<DocRetriever>& 
             {"required", {"query"}},
             {"properties", {
                 {"query", {{"type","string"}, {"description","Natural-language description of the code you're looking for."}}},
-                {"k",     {{"type","integer"},{"description","Number of code passages to return (default 6, max 20)."}}},
+                {"k",     {{"type","integer"},{"description","Number of code passages to return (default 6, max 20). Raise to 10-15 when tracing a feature across MANY files (\"everywhere we handle retries\"); keep the default when hunting one function."}}},
                 {"display_description", {{"type","string"},
                     {"description","One-line summary shown in the UI. Optional."}}},
             }},

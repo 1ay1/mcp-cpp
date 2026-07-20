@@ -169,11 +169,62 @@ int main() {
         }
     }
 
-    // ── 8. empty needle is refused ───────────────────────────────────────
+    // ── 8. empty needle is refused ────────────────────────────────
     {
         std::string file = "anything\n";
         auto m = fuzzy_find(file, "");
         CHECK(!m.ok);
+    }
+
+    // ── 9. BANDING: a fuzzy match in a HUGE file that used to exceed the
+    //    O(Q*B) DP cell cap (returning a false "no match"). The anchor-band
+    //    driver runs the DP only around the distinctive needle line, so this
+    //    now lands — and does so fast. 60k lines * a 3-line needle would be
+    //    180k*3 = 540k*... cells full-file; banded it's a few hundred.
+    {
+        std::string file;
+        file.reserve(2'000'000);
+        for (int i = 0; i < 60'000; ++i) {
+            file += "filler line ";
+            file += std::to_string(i);
+            file += '\n';
+        }
+        // Bury a distinctive 3-line block deep in the file.
+        const std::size_t marker_at = file.size();
+        file += "void QuoxFrobnicate(int distinctiveArgument) {\n";
+        file += "    return compute_the_thing(distinctiveArgument);\n";
+        file += "}\n";
+        for (int i = 0; i < 20'000; ++i) file += "more filler\n";
+
+        // Needle with a one-char typo (Frobnicate->Frobnicat) to force the
+        // fuzzy path, not the exact fast path.
+        auto m = fuzzy_find(file,
+            "void QuoxFrobnicat(int distinctiveArgument) {\n"
+            "    return compute_the_thing(distinctiveArgument);\n"
+            "}\n");
+        CHECK(m.ok);
+        CHECK(m.pos == marker_at);
+        CHECK(matched(file, m).find("QuoxFrobnicate") != std::string_view::npos);
+    }
+
+    // ── 10. BANDING keeps ambiguity honest: the same distinctive block in
+    //     two far-apart places must still report count>=2 (no false unique
+    //     just because the two hits fell in different bands).
+    {
+        std::string block =
+            "int veryDistinctiveHelperName(int a, int b) {\n"
+            "    return a * b + 42;\n"
+            "}\n";
+        std::string file;
+        for (int i = 0; i < 5'000; ++i) { file += "pad\n"; }
+        file += block;
+        for (int i = 0; i < 5'000; ++i) { file += "pad\n"; }
+        file += block;
+        for (int i = 0; i < 5'000; ++i) { file += "pad\n"; }
+
+        auto m = fuzzy_find(file, block);
+        CHECK(!m.ok);
+        CHECK(m.count >= 2);
     }
 
     if (g_failures == 0) {
