@@ -60,7 +60,11 @@ void register_todo_tool(Shells& sh, const std::shared_ptr<TodoSink>& sink) {
                     items.push_back(TodoItem{content, status});
                 }
             }
-            if (sink) sink->set(std::move(items));
+            if (sink) {
+                std::string set_err = sink->set(std::move(items));
+                if (!set_err.empty())
+                    return mcp::cap::Result::error(std::move(set_err));
+            }
             return mcp::cap::Result::ok(out);
         });
 }

@@ -13,14 +13,59 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <streambuf>
 #include <string>
 
-#include <ext/stdio_filebuf.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 using namespace mcp;
+
+// A minimal std::streambuf over a raw file descriptor, using POSIX read/write.
+// Replaces __gnu_cxx::stdio_filebuf (a libstdc++-only GNU extension that is
+// absent under libc++, e.g. Termux/Android) so the example builds on every
+// standard library. Unbuffered on the write side (each overflow flushes) —
+// fine for a line-oriented JSON-RPC demo.
+class FdStreambuf final : public std::streambuf {
+public:
+    explicit FdStreambuf(int fd) : fd_(fd) {}
+    ~FdStreambuf() override { sync(); }
+
+protected:
+    // ── output ──
+    int_type overflow(int_type ch) override {
+        if (ch != traits_type::eof()) {
+            char c = static_cast<char>(ch);
+            if (::write(fd_, &c, 1) != 1) return traits_type::eof();
+        }
+        return ch;
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        std::streamsize written = 0;
+        while (written < n) {
+            ssize_t w = ::write(fd_, s + written, static_cast<size_t>(n - written));
+            if (w <= 0) break;
+            written += w;
+        }
+        return written;
+    }
+    int sync() override { return 0; }
+
+    // ── input ── (single-byte buffer; the transport reads line by line)
+    int_type underflow() override {
+        if (gptr() < egptr()) return traits_type::to_int_type(*gptr());
+        ssize_t n = ::read(fd_, &in_ch_, 1);
+        if (n <= 0) return traits_type::eof();
+        setg(&in_ch_, &in_ch_, &in_ch_ + 1);
+        return traits_type::to_int_type(in_ch_);
+    }
+
+private:
+    int  fd_;
+    char in_ch_ = 0;
+};
 
 // Spawn `argv[0]`, wiring our pipes to its stdio. Returns child pid and two
 // FILE* (write to child stdin, read from child stdout).
@@ -49,9 +94,9 @@ int main(int argc, char** argv) {
     }
     Child child = spawn(argv[1]);
 
-    // Build C++ streams over the pipe fds via __gnu_cxx::stdio_filebuf.
-    __gnu_cxx::stdio_filebuf<char> in_buf(child.from_child, std::ios::in);
-    __gnu_cxx::stdio_filebuf<char> out_buf(child.to_child, std::ios::out);
+    // Build C++ streams over the pipe fds via a portable fd streambuf.
+    FdStreambuf in_buf(child.from_child);
+    FdStreambuf out_buf(child.to_child);
     std::istream child_out(&in_buf);
     std::ostream child_in(&out_buf);
 
@@ -98,7 +143,8 @@ int main(int argc, char** argv) {
     int rc = drive().get();
 
     // Tear down: close child stdin → server sees EOF and exits.
-    out_buf.close();
+    child_in.flush();
+    ::close(child.to_child);
     int status = 0;
     waitpid(child.pid, &status, 0);
     transport.stop();
