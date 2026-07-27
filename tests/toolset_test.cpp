@@ -67,6 +67,15 @@ public:
     }
 };
 
+// Mirrors AgenttyMemoryStore in a workspace where PROJECT scope is
+// unavailable (root "/" / unwritable): scopes() omits "project", so the
+// shell's default scope becomes "user" and a no-scope remember() succeeds
+// instead of failing on the first call. Reuses FakeStore's persistence.
+class UserOnlyStore : public FakeStore {
+public:
+    std::vector<std::string> scopes() const override { return {"user"}; }
+};
+
 class FakeSkills : public SkillResolver {
 public:
     std::optional<std::string> load(const std::string& name, std::string& err) override {
@@ -179,6 +188,42 @@ int main() {
     auto rw1 = call(*p, "wipe_memory", {{"scope", "user"}, {"confirm", true}});
     check(!rw1.is_error && store->records.size() == total_before - user_count,
           "wipe with confirm removed exactly the user scope");
+
+    // ── project-unavailable workspace: no-scope remember must NOT fail ────
+    // Regression for the "remember always fails first" bug: when the store
+    // omits "project" (unwritable workspace root), the shell's default
+    // scope becomes "user", so a remember() with no scope succeeds on the
+    // FIRST call instead of erroring and forcing a retry.
+    {
+        auto uo = std::make_shared<UserOnlyStore>();
+        HostServices svc_uo; svc_uo.memory = uo;
+        auto puo = make_provider(svc_uo);
+
+        // Schema advertises user as the (only) default, never project.
+        std::string scope_desc;
+        for (auto& t : puo->list())
+            if (t.name == "remember" && t.inputSchema.properties)
+                scope_desc = t.inputSchema.properties->value("scope", mcp::Json::object())
+                                 .value("description", std::string{});
+        check(scope_desc.find("default: user") != std::string::npos,
+              "project-unavailable: schema defaults scope to user");
+        check(scope_desc.find("project") == std::string::npos,
+              "project-unavailable: project not offered in scope enum");
+
+        // The reported bug: a no-scope remember succeeds immediately.
+        auto ok = call(*puo, "remember", {{"text", "first-call fact"}});
+        check(!ok.is_error,
+              "project-unavailable: no-scope remember succeeds on first call");
+        check(!uo->records.empty() && uo->records.back().scope == "user",
+              "project-unavailable: no-scope fact lands in user scope");
+
+        // An explicit project request fails cleanly at the shell (no
+        // silent promotion to user → no cross-workspace memory bleed).
+        auto pj = call(*puo, "remember",
+                       {{"text", "x"}, {"scope", "project"}});
+        check(pj.is_error,
+              "project-unavailable: explicit project scope rejected, not bled");
+    }
 
     if (fails == 0) {
         // ── todo / skill / search_docs / task shells ──────────────────────
