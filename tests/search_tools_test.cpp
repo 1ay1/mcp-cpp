@@ -113,6 +113,34 @@ int main() {
         std::puts("grep: case_sensitive=true ok");
     }
 
+    // ── case-fold literal scanner: non-letter lead byte + mixed-case ─────
+    // Guards the memchr-driven dual-scan (lowercase + uppercase first byte)
+    // and the non-overlapping stride after a hit. "_zZz" leads with '_'
+    // (single fold form) and its body mixes case against on-disk "_ZzZ".
+    {
+        write_file(root / "fold.txt", "prefix _ZzZ middle _zZz tail\n");
+        auto args = obj();
+        args["pattern"] = "_zzz";        // all-lowercase probe, default ci
+        args["path"]    = root.string();
+        args["glob"]    = "fold.txt";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("fold.txt") != std::string::npos);
+        std::puts("grep: case-fold scanner (non-letter lead) ok");
+    }
+
+    // ── case-fold scanner: alpha lead byte matches either case ──────────
+    {
+        auto args = obj();
+        args["pattern"] = "zzz";         // leads with a letter → dual memchr
+        args["path"]    = root.string();
+        args["glob"]    = "fold.txt";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("fold.txt") != std::string::npos);
+        std::puts("grep: case-fold scanner (alpha lead) ok");
+    }
+
     // ── grep slash file-glob scopes to a subdirectory path ───────────────
     {
         auto args = obj();

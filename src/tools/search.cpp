@@ -337,7 +337,9 @@ constexpr int         kPerPage      = 20;
 constexpr int         kContext      = 2;
 constexpr int         kMaxScanned   = 500;
 constexpr std::size_t kMaxOutputBytes = 20'000;
-constexpr unsigned    kMaxWorkers   = 8;
+// File-parallel scan scales with cores; cap high enough to saturate a big
+// CI box but bounded so we never spawn hundreds of threads on a huge tree.
+constexpr unsigned    kMaxWorkers   = 32;
 
 struct GrepArgs {
     std::string pattern;   // non-blank by construction
@@ -447,7 +449,40 @@ void scan_literal(std::string_view content, std::string_view needle,
     };
     const unsigned char n0 = fold(static_cast<unsigned char>(needle[0]));
     const std::size_t nsz = needle.size();
-    const std::size_t limit = content.size() >= nsz ? content.size() - nsz + 1 : 0;
+    if (content.size() < nsz) return;
+    const std::size_t limit = content.size() - nsz + 1;
+    const char* base = content.data();
+
+    // Fast path: when the needle's first byte is NOT a letter it has a single
+    // case-fold form, so a SIMD-vectorised memchr can skip non-matching runs
+    // a cache line at a time. (For an alpha first byte the two possible source
+    // bytes would force two memchr passes per step, which is pathologically
+    // slow when that letter is common — so that case keeps the scalar loop.)
+    // The two branches are separate loops so neither carries the other's test.
+    if (!(n0 >= 'a' && n0 <= 'z')) {
+        std::size_t i = 0;
+        while (i < limit) {
+            const char* p = static_cast<const char*>(
+                std::memchr(base + i, n0, limit - i));
+            if (!p) return;
+            i = static_cast<std::size_t>(p - base);
+            std::size_t k = 1;
+            for (; k < nsz; ++k) {
+                if (fold(static_cast<unsigned char>(content[i + k]))
+                    != fold(static_cast<unsigned char>(needle[k]))) break;
+            }
+            if (k == nsz) {
+                if (!record(i)) return;
+                i += nsz;   // non-overlapping
+            } else {
+                ++i;
+            }
+        }
+        return;
+    }
+
+    // Alpha first byte: tight scalar fold+compare (memchr can't help without a
+    // second pass per candidate).
     for (std::size_t i = 0; i < limit; ++i) {
         if (fold(static_cast<unsigned char>(content[i])) != n0) continue;
         std::size_t k = 1;
