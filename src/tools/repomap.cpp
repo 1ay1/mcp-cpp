@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -85,6 +86,29 @@ const std::vector<std::regex>& def_patterns() {
         return v;
     }();
     return kPatterns;
+}
+
+// Cheap pre-filter: can this line POSSIBLY be a definition the regex set
+// matches? Patterns 1-3 and 5 each require a specific leading keyword
+// (class/struct/enum/union/namespace/interface/trait/impl/module | def/fn/
+// func/function | const/let/var/type | #define); pattern 4 (the C-family
+// `<type> <name>(...)` function) requires a '('. A line containing NEITHER a
+// '(' NOR any of those keyword substrings cannot match ANY pattern, so we
+// skip the five std::regex_search calls entirely. On real source the vast
+// majority of lines (bodies, comments, blanks, closing braces) are rejected
+// here — turning the O(lines×patterns) regex cost into O(defs×patterns) plus
+// an O(line) substring scan. Keywords are checked as SUBSTRINGS (a superset
+// of the anchored regex), so this can only ADMIT extra lines, never reject a
+// real def — the regex still does the exact matching after admission.
+[[nodiscard]] bool maybe_def_line(std::string_view s) noexcept {
+    if (s.find('(') != std::string_view::npos) return true;   // function pattern
+    static constexpr std::string_view kw[] = {
+        "class", "struct", "enum", "union", "namespace", "interface",
+        "trait", "impl", "module", "def", "fn", "func", "function",
+        "const", "let", "var", "type", "#define",
+    };
+    for (auto k : kw) if (s.find(k) != std::string_view::npos) return true;
+    return false;
 }
 
 struct Def {
@@ -168,11 +192,18 @@ bool is_stopword(const std::string& s) {
 }
 
 // Build (or reuse) the def/ref graph for `root`. Guarded by the caller's
-// mutex; the cache holds one graph per process (workspace tools are
-// single-rooted in practice).
+// mutex. The cache holds up to kCacheSlots graphs keyed by root path, so
+// alternating between the workspace root and a `path=` subdir (or between
+// two projects in one session) doesn't force a full re-parse each call —
+// the single-slot cache it replaced thrashed to zero hit-rate the moment a
+// second root appeared. LRU eviction keeps the memory bounded.
 const RepoGraph& build_graph(const fs::path& root) {
-    static RepoGraph g;
-    static std::string g_root;
+    struct CacheSlot { std::string root; RepoGraph graph; std::uint64_t seq; };
+    static std::vector<CacheSlot> cache;
+    static std::uint64_t seq_counter = 0;
+    constexpr std::size_t kCacheSlots = 4;
+
+    const std::string root_key = root.string();
 
     // Walk pass 1: enumerate files + stat signature.
     struct Cand { fs::path abs; std::string rel; std::uint64_t sig; };
@@ -187,6 +218,16 @@ const RepoGraph& build_graph(const fs::path& root) {
         if (ec) { ec.clear(); continue; }
         const auto& entry = *it;
         std::error_code e2;
+        // SYMLINK LOOP GUARD: recursive_directory_iterator follows directory
+        // symlinks by default, so a cyclic link (a/link -> a, or two dirs
+        // pointing at each other) makes the walk run forever and re-parse
+        // the same files. Never recurse THROUGH a symlinked directory, and
+        // never treat a symlinked file as a source node (it would be counted
+        // twice — once at the link, once at the target inside the tree).
+        if (entry.is_symlink(e2)) {
+            if (entry.is_directory(e2)) it.disable_recursion_pending();
+            continue;
+        }
         if (entry.is_directory(e2)) {
             auto name = entry.path().filename().string();
             if (util::should_skip_dir(name)
@@ -197,7 +238,9 @@ const RepoGraph& build_graph(const fs::path& root) {
         if (!entry.is_regular_file(e2)) continue;
         if (!is_map_source(entry.path())) continue;
         auto sz = entry.file_size(e2);
-        if (e2 || sz > 512 * 1024) continue;   // skip minified/generated
+        // Skip empty files (no defs, no refs) and minified/generated blobs
+        // (a 400KB single-line bundle is all noise and blows the parse time).
+        if (e2 || sz == 0 || sz > 512 * 1024) continue;
         auto mt = fs::last_write_time(entry.path(), e2);
         std::uint64_t fsig = static_cast<std::uint64_t>(sz)
             ^ static_cast<std::uint64_t>(mt.time_since_epoch().count());
@@ -207,21 +250,43 @@ const RepoGraph& build_graph(const fs::path& root) {
         cands.push_back({entry.path(), std::move(rel), fsig});
     }
 
-    if (g_root == root.string() && g.signature == sig && !g.files.empty())
-        return g;   // unchanged — reuse the parsed graph
+    // Cache lookup: a slot with the same root AND an unchanged stat
+    // signature is an exact hit. Touch its LRU seq and return it.
+    for (auto& slot : cache) {
+        if (slot.root == root_key && slot.graph.signature == sig
+            && !slot.graph.files.empty()) {
+            slot.seq = ++seq_counter;
+            return slot.graph;
+        }
+    }
 
-    // Parse pass: definitions + raw text (kept transiently for linking).
-    g = RepoGraph{};
+    // Miss (new root, or the tree changed). Parse into a fresh graph.
+    RepoGraph g;
     g.signature = sig;
-    g_root = root.string();
     std::vector<std::string> bodies;
     bodies.reserve(cands.size());
     const auto& pats = def_patterns();
+    // Walltime budget: on a pathological tree (thousands of large files, a
+    // slow network mount) the regex parse could stall the whole turn. Cap the
+    // parse pass; whatever was parsed before the deadline still yields a
+    // useful (if partial) map rather than a hang. Generous — a normal repo
+    // parses in tens of ms.
+    const auto parse_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
     for (auto& c : cands) {
+        if (std::chrono::steady_clock::now() > parse_deadline) break;
         std::ifstream in(c.abs, std::ios::binary);
         if (!in) continue;
         std::string body((std::istreambuf_iterator<char>(in)),
                           std::istreambuf_iterator<char>());
+        // Binary/blob guard: a NUL byte in the first 512 bytes means this is
+        // not text the def regexes can meaningfully parse (a mis-extensioned
+        // binary, a UTF-16 file). Skip it — running regex over binary is both
+        // slow and produces garbage "symbols".
+        {
+            const std::size_t probe = std::min<std::size_t>(body.size(), 512);
+            if (body.find('\0', 0) < probe) continue;
+        }
         FileNode node;
         node.rel = std::move(c.rel);
         // Line scan for definitions.
@@ -233,11 +298,15 @@ const RepoGraph& build_graph(const fs::path& root) {
             std::string_view line{body.data() + pos,
                 (eol == std::string::npos ? body.size() : eol) - pos};
             ++lineno;
-            if (!line.empty() && line.size() < 500) {
-                std::string ls{line};
-                std::smatch m;
+            if (!line.empty() && line.size() < 500 && maybe_def_line(line)) {
+                std::cmatch m;
                 for (const auto& re : pats) {
-                    if (std::regex_search(ls, m, re) && m.size() >= 2) {
+                    // Match on the string_view's iterators directly — no
+                    // per-line std::string allocation. On a big repo the def
+                    // scan visits hundreds of thousands of admitted lines;
+                    // the copy this replaces was a heap alloc per line.
+                    if (std::regex_search(line.begin(), line.end(), m, re)
+                        && m.size() >= 2) {
                         std::string name = m[1].str();
                         if (!is_stopword(name) && name.size() >= 3) {
                             std::string sigline = trim(line);
@@ -313,15 +382,40 @@ const RepoGraph& build_graph(const fs::path& root) {
             }
         }
     }
-    return g;
+
+    // Install into the cache under root_key. Reuse an existing slot for the
+    // same root (tree changed) if present; else evict the LRU slot once full.
+    CacheSlot* dst = nullptr;
+    for (auto& slot : cache)
+        if (slot.root == root_key) { dst = &slot; break; }
+    if (!dst) {
+        if (cache.size() < kCacheSlots) {
+            cache.push_back(CacheSlot{});
+            dst = &cache.back();
+        } else {
+            dst = &*std::min_element(
+                cache.begin(), cache.end(),
+                [](const CacheSlot& a, const CacheSlot& b) { return a.seq < b.seq; });
+        }
+    }
+    dst->root = root_key;
+    dst->graph = std::move(g);
+    dst->seq = ++seq_counter;
+    return dst->graph;
 }
 
-// PageRank with optional personalization. Damping 0.85, 24 iterations —
-// converged well past display precision at these graph sizes.
+// PageRank with optional personalization. Damping 0.85. Iterates until the
+// L1 change between sweeps falls below kEps (power iteration converges
+// geometrically at rate kD, so this is typically 8-14 sweeps — roughly half
+// the old fixed 24) with a hard cap so a pathological graph can't spin. The
+// teleport + dangling-mass redistribution keeps total rank normalised to 1.0
+// every sweep, so the L1 delta is a true convergence signal.
 void pagerank(RepoGraph& g, const std::vector<double>& personalize) {
     const std::size_t n = g.files.size();
     if (n == 0) return;
     constexpr double kD = 0.85;
+    constexpr double kEps = 1e-6;       // L1 convergence threshold
+    constexpr int    kMaxIter = 100;    // safety cap (never reached in practice)
     std::vector<double> rank(n, 1.0 / static_cast<double>(n));
     std::vector<double> next(n, 0.0);
     // Restart distribution: uniform, or the caller's personalization.
@@ -331,7 +425,7 @@ void pagerank(RepoGraph& g, const std::vector<double>& personalize) {
     if (psum > 0.0)
         for (std::size_t i = 0; i < n; ++i) restart[i] = personalize[i] / psum;
 
-    for (int iter = 0; iter < 24; ++iter) {
+    for (int iter = 0; iter < kMaxIter; ++iter) {
         std::fill(next.begin(), next.end(), 0.0);
         double dangling = 0.0;
         for (std::size_t i = 0; i < n; ++i) {
@@ -344,7 +438,13 @@ void pagerank(RepoGraph& g, const std::vector<double>& personalize) {
         }
         for (std::size_t i = 0; i < n; ++i)
             next[i] += (1.0 - kD) * restart[i] + kD * dangling * restart[i];
+        // L1 delta: sum |next - rank|. Below kEps means the ranking has
+        // stopped moving to display precision — stop early.
+        double delta = 0.0;
+        for (std::size_t i = 0; i < n; ++i)
+            delta += std::fabs(next[i] - rank[i]);
         rank.swap(next);
+        if (delta < kEps) break;
     }
     for (std::size_t i = 0; i < n; ++i) g.files[i].rank = rank[i];
 
@@ -376,11 +476,21 @@ mcp::cap::Result run_repo_map(const Json& args) {
     RepoMapArgs a;
     if (args.is_object()) {
         a.focus  = args.value("focus", std::string{});
-        a.root   = args.value("path", std::string{"."});
+        a.root   = args.value("path", std::string{});
         a.budget = args.value("budget", 8000);
     }
     if (a.budget < 1000)  a.budget = 1000;
     if (a.budget > 60000) a.budget = 60000;
+
+    // Default to the WORKSPACE ROOT, not cwd. The tool documents "default:
+    // workspace root", and the model calls repo_map to survey the whole
+    // project — resolving an omitted path against cwd made the tool fail with
+    // "outside the workspace" whenever the process was launched from a
+    // subdirectory (or cwd was later changed), which is exactly the FIRST
+    // call a fresh session makes on a big repo. An explicit relative `path`
+    // still resolves against cwd as usual.
+    if (a.root.empty() || a.root == ".")
+        a.root = util::workspace_root().string();
 
     auto wp = util::make_workspace_path_checked(a.root, "repo_map");
     if (!wp) return mcp::cap::Result::error(wp.error().detail);

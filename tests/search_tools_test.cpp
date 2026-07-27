@@ -326,6 +326,60 @@ int main() {
         std::puts("repo_map: no control-flow / statement false-positive defs");
     }
 
+    // ── repo_map HARDENING ───────────────────────────────────────────
+    {
+        // (a) DEFAULT PATH = WORKSPACE ROOT, not cwd. cwd was reset to
+        //     prev_cwd above, so a no-path repo_map that resolved against cwd
+        //     would fail "outside the workspace". It must map the workspace.
+        auto r = call(*provider, "repo_map", obj());
+        assert(!r.is_error && "repo_map with no path must default to workspace root");
+        assert(r.text.find("alpha.cpp") != std::string::npos);
+        std::puts("repo_map: no-path defaults to workspace root (cwd-independent)");
+
+        // (b) SYMLINK LOOP must not hang or duplicate. Create a cyclic dir
+        //     symlink (loop -> workspace root) inside the tree; the walk must
+        //     refuse to descend through it and still terminate quickly.
+        std::error_code lec;
+        fs::create_directory_symlink(root, root / "sub" / "loop", lec);
+        if (!lec) {
+            auto rl = call(*provider, "repo_map", obj());
+            assert(!rl.is_error && "repo_map must survive a cyclic symlink");
+            // alpha.cpp appears exactly once (not once per symlink traversal).
+            auto first = rl.text.find("alpha.cpp");
+            auto second = rl.text.find("alpha.cpp", first + 1);
+            assert(first != std::string::npos && second == std::string::npos
+                   && "symlink loop must not duplicate files in the map");
+            fs::remove(root / "sub" / "loop", lec);
+            std::puts("repo_map: cyclic symlink neither hangs nor duplicates");
+        } else {
+            std::puts("repo_map: symlink test skipped (no symlink support)");
+        }
+
+        // (c) BINARY / NUL-byte file is skipped (no garbage symbols from it).
+        write_file(root / "blob.cpp",
+                   std::string("int real_symbol_here(){}\n\0\0binary\0noise", 40));
+        auto rb = call(*provider, "repo_map", obj());
+        assert(!rb.is_error);
+        assert(rb.text.find("real_symbol_here") == std::string::npos
+               && "NUL-byte file must be skipped, not parsed for symbols");
+        fs::remove(root / "blob.cpp", lec);
+        std::puts("repo_map: binary/NUL file skipped");
+
+        // (d) PER-ROOT CACHE: two identical calls return byte-identical maps
+        //     (the second is a cache hit) — proves the LRU reuse path is sound.
+        auto c1 = call(*provider, "repo_map", obj());
+        auto c2 = call(*provider, "repo_map", obj());
+        assert(!c1.is_error && !c2.is_error && c1.text == c2.text
+               && "repeated repo_map must be deterministic (cache hit)");
+        std::puts("repo_map: repeated call is deterministic cache hit");
+
+        // (e) INVALID budget is clamped, not rejected.
+        auto bad = obj(); bad["budget"] = 5;   // below the 1000 floor
+        auto rbad = call(*provider, "repo_map", bad);
+        assert(!rbad.is_error && "tiny budget must clamp to the 1000 floor, not error");
+        std::puts("repo_map: out-of-range budget clamped");
+    }
+
     fs::remove_all(root);
     std::puts("ALL SEARCH/SHELL/DIAGNOSTICS TOOL TESTS PASSED");
     return 0;

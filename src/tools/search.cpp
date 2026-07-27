@@ -98,6 +98,17 @@ ExecResult run_glob(const GlobArgs& a) {
         if (ec) { ec.clear(); continue; }
         auto fn = it->path().filename().string();
         bool is_dir_entry = it->is_directory(ec);
+        // Symlink-loop guard: don't recurse THROUGH a symlinked directory
+        // (a cyclic link makes recursive_directory_iterator spin forever).
+        // Symlinked entries are still reported below via the is_symlink flag
+        // when they match, but we never descend into them.
+        {
+            std::error_code lec;
+            if (it->is_symlink(lec) && is_dir_entry) {
+                it.disable_recursion_pending();
+                continue;
+            }
+        }
         if (is_dir_entry) {
             if (util::should_skip_dir(fn)) { it.disable_recursion_pending(); continue; }
         }
@@ -260,6 +271,14 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
         auto fn = entry.path().filename().string();
         const bool is_dir = entry.is_directory(ec);
 
+        // Symlink-loop guard: never descend into a symlinked directory.
+        {
+            std::error_code lec;
+            if (is_dir && entry.is_symlink(lec)) {
+                it.disable_recursion_pending();
+                continue;
+            }
+        }
         if (is_dir && util::should_skip_dir(fn)) {
             it.disable_recursion_pending();
             continue;
@@ -772,6 +791,8 @@ ExecResult run_builtin(const GrepArgs& a) {
             const auto& entry = *it;
             auto fn = entry.path().filename().string();
             if (entry.is_directory(ec)) {
+                std::error_code lec;
+                if (entry.is_symlink(lec)) { it.disable_recursion_pending(); continue; }
                 if (util::should_skip_dir(fn)) it.disable_recursion_pending();
                 continue;
             }

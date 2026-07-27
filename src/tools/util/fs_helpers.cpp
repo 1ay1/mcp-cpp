@@ -463,8 +463,17 @@ bool should_skip_dir(std::string_view name) noexcept {
         ".cache", "vendor", "dist", "out", ".next", ".venv",
         "cmake-build-debug", "cmake-build-release", ".idea", ".vscode",
         "_deps", "third_party", "thirdparty", "3rdparty", "external",
+        ".mypy_cache", ".pytest_cache", ".tox", ".gradle", "Pods",
+        "bazel-bin", "bazel-out", "DerivedData", ".terraform",
     };
     for (auto s : skip) if (name == s) return true;
+    // Prefix families: out-of-source CMake build trees are conventionally
+    // named build/, build-*, cmake-build-* (CLion), and they are FULL of
+    // generated + fetched (_deps) source that would otherwise flood the
+    // repo map / grep / find_definition walks with thousands of non-project
+    // files. Match the whole family, not just the bare "build" name.
+    if (name.starts_with("build-") || name.starts_with("cmake-build"))
+        return true;
     return false;
 }
 
