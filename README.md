@@ -74,6 +74,31 @@ is represented and round-trips. Concretely:
 - **Tasks** (durable requests, SEP-1686) — `tasks/get`, `tasks/result`,
   `tasks/cancel`, `tasks/list`, status notifications, task-augmented params.
 
+### Stateless core (2026-07-28)
+
+The headline of the new revision: MCP becomes a request/response **stateless**
+protocol. This library implements both halves, dual-era, so a modern peer and a
+legacy handshake peer both interoperate:
+
+- **Per-request `_meta`** — `protocolVersion` / `clientInfo` / `clientCapabilities`
+  ride under reverse-DNS `_meta` keys on *every* request, replacing the
+  `initialize` session. `Client::enable_modern_metadata()` sets them once;
+  `IncomingRequest` reads them back server-side with no session.
+- **`server/discover`** — the stateless replacement for the initialize
+  handshake; `Server` answers it out of the box (supported versions,
+  capabilities, instructions, `serverInfo`, cache hint). `Client::discover()`.
+- **MRTR** (Multi Round-Trip Requests) — a server answers a request with a
+  non-final `input_required` result carrying an opaque, HMAC-signed
+  `requestState`; the client fulfils the sampling / elicitation / roots
+  sub-requests locally and retries. `run_mrtr()` / `Client::call_tool_interactive()`
+  drive the client loop; `input_required()` + `RequestStateCodec` +
+  `IncomingRequest` build the server side. No sticky session anywhere.
+- **Cacheable lists** (SEP-2549) — `tools/list` / `prompts/list` /
+  `resources/list` / `resources/read` carry `ttlMs` + `cacheScope`, emitted with
+  a deterministic order so client + prompt caches stay stable across reconnects.
+- **`UnsupportedProtocolVersion` / `MissingRequiredClientCapability`** error
+  codes for inline version negotiation.
+
 The schema's seven closing discriminated unions (`JSONRPCMessage`,
 `ClientRequest`, `ServerRequest`, `ClientNotification`, `ServerNotification`,
 `ClientResult`, `ServerResult`) are modelled as real `Sum` types. On top of
@@ -222,6 +247,8 @@ exactly where it must.
 | `mcp/coro.hpp`       | optional `mcp::co::Task<T>` coroutine surface             |
 | `mcp/client.hpp`     | typed host-side `Client`                                  |
 | `mcp/server.hpp`     | typed `Server` with a tool/resource/prompt registry       |
+| `mcp/mrtr.hpp`       | MRTR client driver (`run_mrtr`, input_required fulfilment) |
+| `mcp/server_stateless.hpp` | stateless server tools (`IncomingRequest`, `RequestStateCodec`, `input_required`, cache hints) |
 | `mcp/cap/cap.hpp`    | capability layer umbrella (`Registry`, `LocalProvider`, …) |
 | `mcp/cap/scheduler.hpp` | effect-aware parallel tool scheduling (see above)      |
 | `mcp/tools/toolset.hpp` | compiled batteries-included toolset (`MCP_BUILD_TOOLS`) |

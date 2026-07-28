@@ -157,15 +157,19 @@ template <> struct CodecOf<PaginatedParams> {
 //==============================================================================
 using ListResourcesParams = PaginatedParams;
 struct ListResourcesResult {
-    List<Resource>     resources;
-    Maybe<std::string> nextCursor;
-    Json               meta = Json::object();
+    List<Resource>      resources;
+    Maybe<std::string>  nextCursor;
+    Maybe<std::int64_t> ttlMs;
+    Maybe<std::string>  cacheScope;
+    Json                meta = Json::object();
 };
 template <> struct CodecOf<ListResourcesResult> {
     static Codec<ListResourcesResult> get() {
         return record<ListResourcesResult>(
             defaulted("resources",  &ListResourcesResult::resources, List<Resource>{}),
             optional ("nextCursor", &ListResourcesResult::nextCursor),
+            optional ("ttlMs",      &ListResourcesResult::ttlMs),
+            optional ("cacheScope", &ListResourcesResult::cacheScope),
             meta     ("_meta",      &ListResourcesResult::meta));
     }
 };
@@ -193,12 +197,19 @@ template <> struct CodecOf<ReadResourceParams> {
             meta    ("_meta", &ReadResourceParams::meta));
     }
 };
-struct ReadResourceResult { List<ResourceContents> contents; Json meta = Json::object(); };
+struct ReadResourceResult {
+    List<ResourceContents> contents;
+    Maybe<std::int64_t>    ttlMs;
+    Maybe<std::string>     cacheScope;
+    Json                   meta = Json::object();
+};
 template <> struct CodecOf<ReadResourceResult> {
     static Codec<ReadResourceResult> get() {
         return record<ReadResourceResult>(
-            required("contents", &ReadResourceResult::contents),
-            meta    ("_meta",    &ReadResourceResult::meta));
+            required("contents",   &ReadResourceResult::contents),
+            optional("ttlMs",      &ReadResourceResult::ttlMs),
+            optional("cacheScope", &ReadResourceResult::cacheScope),
+            meta    ("_meta",      &ReadResourceResult::meta));
     }
 };
 
@@ -222,15 +233,19 @@ template <> struct CodecOf<UnsubscribeParams> {
 //==============================================================================
 using ListPromptsParams = PaginatedParams;
 struct ListPromptsResult {
-    List<Prompt>       prompts;
-    Maybe<std::string> nextCursor;
-    Json               meta = Json::object();
+    List<Prompt>        prompts;
+    Maybe<std::string>  nextCursor;
+    Maybe<std::int64_t> ttlMs;
+    Maybe<std::string>  cacheScope;
+    Json                meta = Json::object();
 };
 template <> struct CodecOf<ListPromptsResult> {
     static Codec<ListPromptsResult> get() {
         return record<ListPromptsResult>(
             defaulted("prompts",    &ListPromptsResult::prompts, List<Prompt>{}),
             optional ("nextCursor", &ListPromptsResult::nextCursor),
+            optional ("ttlMs",      &ListPromptsResult::ttlMs),
+            optional ("cacheScope", &ListPromptsResult::cacheScope),
             meta     ("_meta",      &ListPromptsResult::meta));
     }
 };
@@ -284,15 +299,21 @@ template <> struct CodecOf<GetPromptResult> {
 //==============================================================================
 using ListToolsParams = PaginatedParams;
 struct ListToolsResult {
-    List<Tool>         tools;
-    Maybe<std::string> nextCursor;
-    Json               meta = Json::object();
+    List<Tool>          tools;
+    Maybe<std::string>  nextCursor;
+    // Caching utility (SEP-2549): how long this catalog stays fresh + at what
+    // scope, so a client can cache it and keep prompt caches stable.
+    Maybe<std::int64_t> ttlMs;
+    Maybe<std::string>  cacheScope;
+    Json                meta = Json::object();
 };
 template <> struct CodecOf<ListToolsResult> {
     static Codec<ListToolsResult> get() {
         return record<ListToolsResult>(
             defaulted("tools",      &ListToolsResult::tools, List<Tool>{}),
             optional ("nextCursor", &ListToolsResult::nextCursor),
+            optional ("ttlMs",      &ListToolsResult::ttlMs),
+            optional ("cacheScope", &ListToolsResult::cacheScope),
             meta     ("_meta",      &ListToolsResult::meta));
     }
 };

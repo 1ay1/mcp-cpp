@@ -24,7 +24,9 @@
 #pragma once
 
 #include <mcp/rpc.hpp>
+#include <mcp/server_stateless.hpp>
 
+#include <algorithm>
 #include <unordered_map>
 
 namespace mcp {
@@ -97,6 +99,20 @@ public:
     void set_info(Implementation info)         { info_ = std::move(info); }
     void set_capabilities(ServerCapabilities c){ caps_ = std::move(c); }
     void set_instructions(std::string s)       { instructions_ = std::move(s); }
+
+    // ---------------------------------------------------- stateless (2026-07-28)
+    // Secret used to sign the opaque `requestState` blob carried across MRTR
+    // rounds. Set once at startup; a handler seals its resume-context with
+    // state_codec().seal(json) and the peer echoes it back verbatim.
+    void set_state_secret(std::string secret) {
+        state_codec_ = RequestStateCodec{std::move(secret)};
+    }
+    const RequestStateCodec& state_codec() const noexcept { return state_codec_; }
+
+    // Cache hint advertised on `server/discover` (and available to list
+    // handlers via discover_cache()). ttl_ms == 0 ⇒ not cacheable.
+    void set_discover_cache(CacheHint h) { discover_cache_ = h; }
+    const CacheHint& discover_cache() const noexcept { return discover_cache_; }
 
     // ------------------------------------------------------- handler override
     // Install raw handlers (advanced). Overrides anything the registry set up.
@@ -182,6 +198,27 @@ private:
         // ping: spec requires an empty-object reply.
         engine_.on_request(std::string(method::Ping),
             [](const RpcId&, const Json&) -> Maybe<Json> { return Just<Json>(Json::object()); });
+        // server/discover: the stateless (2026-07-28) alternative to initialize.
+        // A client can learn our supported versions, capabilities, identity and
+        // instructions in ONE round-trip with no session state — then send any
+        // RPC inline with per-request `_meta`. The reply is cacheable when a
+        // discover-cache hint has been configured.
+        engine_.on_request(std::string(method::Discover),
+            [this](const RpcId&, const Json&) -> Maybe<Json> {
+                DiscoverResult r;
+                r.resultType = "complete";
+                for (auto v : kSupportedProtocolVersions)
+                    r.supportedVersions.push_back(std::string(v));
+                r.capabilities = caps_;
+                if (!instructions_.empty()) r.instructions = instructions_;
+                if (discover_cache_.ttl_ms > 0) {
+                    r.ttlMs      = discover_cache_.ttl_ms;
+                    r.cacheScope = discover_cache_.scope;
+                }
+                r.meta = Json::object();
+                r.meta[std::string(meta_key::ServerInfo)] = to_json(info_);
+                return Just<Json>(to_json(r));
+            });
     }
 
     template <class Params, class Result, class F>
@@ -223,6 +260,14 @@ private:
             [this](const RpcId&, const Json&) -> Maybe<Json> {
                 ListToolsResult r;
                 for (const auto& [_, e] : tools_) r.tools.push_back(e.spec);
+                // Deterministic order (2026-07-28): a stable list keeps client
+                // caches + prompt caches consistent across reconnects.
+                std::sort(r.tools.begin(), r.tools.end(),
+                          [](const Tool& a, const Tool& b) { return a.name < b.name; });
+                if (discover_cache_.ttl_ms > 0) {
+                    r.ttlMs = discover_cache_.ttl_ms;
+                    r.cacheScope = discover_cache_.scope;
+                }
                 return Just<Json>(to_json(r));
             });
         engine_.on_request(std::string(method::CallTool),
@@ -273,6 +318,8 @@ private:
     Implementation     info_;
     ServerCapabilities caps_{};
     std::string        instructions_;
+    RequestStateCodec  state_codec_{};
+    CacheHint          discover_cache_{};
 
     std::function<InitializeResult(const InitializeParams&)> on_initialize_;
     std::function<void()>                                    on_initialized_;

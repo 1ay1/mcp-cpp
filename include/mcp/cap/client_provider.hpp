@@ -47,20 +47,38 @@ public:
     void refresh_tools() {
         std::vector<Tool> all;
         Maybe<std::string> cursor = Nothing;
+        Maybe<std::int64_t> ttl;
         do {
             ListToolsResult res = client_->list_tools(cursor).get();
             for (auto& t : res.tools) all.push_back(std::move(t));
             cursor = res.nextCursor;
+            if (res.ttlMs.has_value()) ttl = res.ttlMs;   // first page's hint
         } while (cursor.has_value());
-        std::lock_guard<std::mutex> lk(state_mu_); tools_ = std::move(all);
+        std::lock_guard<std::mutex> lk(state_mu_);
+        tools_ = std::move(all);
+        tools_fresh_until_ = deadline_from_ttl(ttl);
     }
+    // True while a cached tools list is still within its server-declared TTL —
+    // callers may skip a redundant refresh. Always false when no TTL was given.
+    [[nodiscard]] bool tools_cache_fresh() const {
+        std::lock_guard<std::mutex> lk(state_mu_);
+        return tools_fresh_until_.time_since_epoch().count() != 0 &&
+               std::chrono::steady_clock::now() < tools_fresh_until_;
+    }
+    // Refresh only if the cache TTL has lapsed (or none was advertised).
+    void refresh_tools_if_stale() { if (!tools_cache_fresh()) refresh_tools(); }
     void refresh() { refresh_tools(); }   // back-compat alias
 
     [[nodiscard]] Result execute(const Request& req) override {
         if (!alive()) return Result::error("mcp server '" + origin_ + "' is not running");
         try {
             std::lock_guard<std::mutex> lk(call_mu_);
-            return result_from_call(client_->call_tool(req.tool, req.args).get());
+            // call_tool_interactive drives MCP 2026-07-28 MRTR: if the remote
+            // server answers input_required (asking us to sample / elicit /
+            // list roots), we fulfil it locally with this client's handlers
+            // and retry — transparently to the agent loop. Falls back to a
+            // single round for a legacy server that never asks.
+            return result_from_call(client_->call_tool_interactive(req.tool, req.args));
         } catch (const std::exception& e) {
             return Result::error(std::string{"mcp call failed: "} + e.what());
         } catch (...) {
@@ -176,10 +194,27 @@ protected:
         // the handshake requests carry the modern metadata.
         client_->enable_modern_metadata(client_info, ClientCapabilities{});
 
+        // MCP 2026-07-28: prefer the stateless `server/discover` step over the
+        // legacy initialize handshake. If the server answers it, we learn its
+        // capabilities in ONE round-trip with no session. A legacy server
+        // replies MethodNotFound — we fall through to initialize. Either way we
+        // end up with server_caps_ populated.
+        bool discovered = false;
         try {
-            InitializeResult init = client_->initialize(std::move(client_info)).get();
-            server_caps_ = init.capabilities;
-            client_->initialized();
+            DiscoverResult disc = client_->discover().get();
+            server_caps_ = disc.capabilities;
+            discovered   = true;
+        } catch (...) {
+            discovered = false;   // legacy server (MethodNotFound) or transport hiccup
+        }
+
+        try {
+            if (!discovered) {
+                // Legacy path: full initialize handshake.
+                InitializeResult init = client_->initialize(client_info).get();
+                server_caps_ = init.capabilities;
+                client_->initialized();
+            }
             refresh_tools();
             if (server_caps_.resources.has_value()) { try { refresh_resources(); } catch (...) {} }
             if (server_caps_.prompts.has_value())   { try { refresh_prompts();   } catch (...) {} }
@@ -201,10 +236,18 @@ protected:
     Client*     client_ptr()  noexcept { return client_.get(); }
     void        reset_client() noexcept { client_.reset(); }
 
+    // Convert a server-declared ttlMs into a steady-clock deadline. A zero /
+    // absent TTL yields the epoch (interpreted as "no cache" by tools_cache_fresh).
+    static std::chrono::steady_clock::time_point deadline_from_ttl(Maybe<std::int64_t> ttl) {
+        if (!ttl.has_value() || *ttl <= 0) return {};
+        return std::chrono::steady_clock::now() + std::chrono::milliseconds(*ttl);
+    }
+
     std::string                 origin_;
     std::unique_ptr<Client>     client_;
     ServerCapabilities          server_caps_;
     std::vector<Tool>           tools_;
+    std::chrono::steady_clock::time_point tools_fresh_until_{};  // 2026-07-28 cache TTL
     std::vector<Resource>       resources_;
     std::vector<ResourceTemplate> resource_templates_;
     std::vector<Prompt>         prompts_;
