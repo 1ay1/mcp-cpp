@@ -56,6 +56,29 @@ int main() {
         // Garbage is rejected, not crashed.
         CHECK(!codec.open("not-a-valid-token").has_value());
         CHECK(!codec.open("").has_value());
+        CHECK(!codec.open(".").has_value());
+        CHECK(!codec.open("AAAA.").has_value());
+
+        // Base64URL round-trips EVERY byte value 0..255 (binary-safe) — the
+        // sealed state may embed arbitrary UTF-8 / non-ASCII context. Drive it
+        // through a JSON string field so the whole path is exercised.
+        std::string all_bytes;
+        for (int i = 1; i < 256; ++i) all_bytes.push_back(char(i));  // skip NUL (JSON strings)
+        Json binstate = {{"blob", all_bytes}, {"len", (int)all_bytes.size()}};
+        std::string sb = codec.seal(binstate);
+        auto ob = codec.open(sb);
+        CHECK(ob.has_value());
+        CHECK((*ob)["blob"].get<std::string>() == all_bytes);
+
+        // Length variety: payloads of every residue mod 3 (b64 tail cases).
+        for (int len = 0; len <= 6; ++len) {
+            Json s = {{"pad", std::string(len, 'x')}};
+            CHECK(codec.open(codec.seal(s)).has_value());
+        }
+
+        // The MAC is endianness-stable by construction (fnv1a_u64 folds the
+        // 64-bit inner state MSB-first, no object-representation reinterpret),
+        // so a token sealed here verifies on any host of any endianness.
     }
 
     // ── loopback wiring: real Server ⟷ real Client ───────────────────────

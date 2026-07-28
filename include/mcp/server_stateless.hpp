@@ -43,6 +43,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace mcp {
 
@@ -113,14 +114,26 @@ inline std::uint64_t fnv1a(std::string_view bytes, std::uint64_t seed) noexcept 
     return h;
 }
 
+// Fold a 64-bit value into an FNV state byte-by-byte in a FIXED (big-endian,
+// most-significant-first) order, so the MAC is identical regardless of host
+// endianness — no reinterpret_cast over the object representation.
+inline std::uint64_t fnv1a_u64(std::uint64_t v, std::uint64_t seed) noexcept {
+    constexpr std::uint64_t kPrime = 0x00000100000001b3ULL;
+    std::uint64_t h = seed;
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        h ^= (unsigned char)((v >> shift) & 0xFF);
+        h *= kPrime;
+    }
+    return h;
+}
+
 // Keyed MAC over `msg`: HMAC-style two-pass FNV so key material never appears
-// linearly next to the message. 64-bit tag, hex-encoded.
+// linearly next to the message. 64-bit tag, hex-encoded. Endianness-stable.
 inline std::string keyed_mac(std::string_view msg, std::string_view key) {
     constexpr std::uint64_t kOffset = 0xcbf29ce484222325ULL;
-    std::uint64_t inner = fnv1a(msg, fnv1a(key, kOffset) ^ 0x3636363636363636ULL);
-    std::uint64_t outer = fnv1a(std::string_view{reinterpret_cast<const char*>(&inner),
-                                                 sizeof inner},
-                                fnv1a(key, kOffset) ^ 0x5c5c5c5c5c5c5c5cULL);
+    const std::uint64_t k = fnv1a(key, kOffset);
+    const std::uint64_t inner = fnv1a(msg, k ^ 0x3636363636363636ULL);
+    const std::uint64_t outer = fnv1a_u64(inner, k ^ 0x5c5c5c5c5c5c5c5cULL);
     static constexpr char hex[] = "0123456789abcdef";
     std::string tag(16, '0');
     for (int i = 0; i < 16; ++i) tag[15 - i] = hex[(outer >> (i * 4)) & 0xF];
@@ -156,7 +169,12 @@ public:
     explicit RequestStateCodec(std::string secret) : secret_(std::move(secret)) {}
 
     [[nodiscard]] std::string seal(const Json& state) const {
-        const std::string payload = detail::b64url_encode(state.dump());
+        // CBOR (not text JSON) as the payload: binary-exact (no UTF-8
+        // validation that dump() would throw on), more compact, and faster to
+        // (de)serialise — the blob is opaque to the client anyway.
+        const std::vector<std::uint8_t> cbor = Json::to_cbor(state);
+        const std::string payload = detail::b64url_encode(
+            std::string_view{reinterpret_cast<const char*>(cbor.data()), cbor.size()});
         return payload + "." + detail::keyed_mac(payload, secret_);
     }
 
@@ -169,7 +187,9 @@ public:
             return std::nullopt;                       // tampered or wrong key
         auto raw = detail::b64url_decode(payload);
         if (!raw) return std::nullopt;
-        Json j = Json::parse(*raw, nullptr, /*allow_exceptions=*/false);
+        // from_cbor with exceptions off: a malformed (but correctly-signed)
+        // blob yields discarded rather than throwing.
+        Json j = Json::from_cbor(*raw, /*strict=*/true, /*allow_exceptions=*/false);
         if (j.is_discarded()) return std::nullopt;
         return j;
     }
@@ -210,8 +230,11 @@ public:
     }
     // True iff the declared version is one this build serves.
     bool version_supported() const {
-        const std::string v = protocol_version();
-        if (v.empty()) return true;                    // legacy / handshake path
+        if (!meta_) return true;                       // legacy / handshake path
+        auto it = meta_->find(meta_key::ProtocolVersion.data());
+        if (it == meta_->end() || !it->is_string()) return true;
+        const std::string_view v = it->get_ref<const std::string&>();
+        if (v.empty()) return true;
         for (auto s : kSupportedProtocolVersions)
             if (v == s) return true;
         return false;
@@ -219,31 +242,27 @@ public:
 
     // Who is calling (name/version), if the client attached it. Optional.
     std::optional<Implementation> client_info() const {
-        if (!meta_) return std::nullopt;
-        auto it = meta_->find(std::string(meta_key::ClientInfo));
-        if (it == meta_->end() || !it->is_object()) return std::nullopt;
-        return from_json<Implementation>(*it);
+        if (const Json* v = meta_obj(meta_key::ClientInfo))
+            return from_json<Implementation>(*v);
+        return std::nullopt;
     }
 
     // The client's declared capabilities (for MissingRequiredClientCapability
     // enforcement), if attached.
     std::optional<ClientCapabilities> client_capabilities() const {
-        if (!meta_) return std::nullopt;
-        auto it = meta_->find(std::string(meta_key::ClientCapabilities));
-        if (it == meta_->end() || !it->is_object()) return std::nullopt;
-        return from_json<ClientCapabilities>(*it);
+        if (const Json* v = meta_obj(meta_key::ClientCapabilities))
+            return from_json<ClientCapabilities>(*v);
+        return std::nullopt;
     }
 
     // Fulfilled answers to a PRIOR input_required round: { "<key>": <result> }.
     // Empty object if this is the first round.
     const Json& input_responses() const {
-        if (meta_) {
-            auto it = meta_->find(std::string(meta_key::InputResponses));
-            if (it != meta_->end() && it->is_object()) return *it;
-        }
+        if (const Json* v = meta_obj(meta_key::InputResponses)) return *v;
         return empty();
     }
-    // Convenience: the fulfilled result for one input key, or null.
+    // Convenience: the fulfilled result for one input key, or null. `key` is
+    // caller-supplied so we can't assume null-termination — materialise it.
     Json input_response(std::string_view key) const {
         const Json& all = input_responses();
         auto it = all.find(std::string(key));
@@ -263,9 +282,17 @@ public:
 
 private:
     static const Json& empty() { static const Json e = Json::object(); return e; }
+    // Allocation-free _meta lookups: meta_key values are literal-backed,
+    // null-terminated string_views, so .data() is a valid C-string and
+    // nlohmann's find(const char*) needs no temporary std::string.
+    const Json* meta_obj(std::string_view key) const {
+        if (!meta_) return nullptr;
+        auto it = meta_->find(key.data());
+        return (it != meta_->end() && it->is_object()) ? &*it : nullptr;
+    }
     std::string meta_str(std::string_view key) const {
         if (!meta_) return {};
-        auto it = meta_->find(std::string(key));
+        auto it = meta_->find(key.data());
         return (it != meta_->end() && it->is_string()) ? it->get<std::string>() : std::string{};
     }
     const Json& params_;
