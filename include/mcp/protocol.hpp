@@ -238,6 +238,8 @@ namespace dict {
     using GetTaskPayload        = Rpc<"tasks/result",                 TaskIdParams,                 GetTaskPayloadResult>;
     using ListTasks             = Rpc<"tasks/list",                   PaginatedParams,              ListTasksResult>;
     using CancelTask            = Rpc<"tasks/cancel",                 TaskIdParams,                 CancelTaskResult>;
+    using UpdateTask            = Rpc<"tasks/update",                 UpdateTaskParams,             UpdateTaskResult>;
+    using SubscriptionsListen   = Rpc<"subscriptions/listen",        SubscriptionsListenParams,    EmptyResult>;
 
     // ── Server → Client requests (schema.ts ServerRequest) ──────────────────
     using CreateMessage         = Rpc<"sampling/createMessage",      CreateMessageParams,          CreateMessageResult>;

@@ -97,7 +97,23 @@ legacy handshake peer both interoperate:
   `resources/list` / `resources/read` carry `ttlMs` + `cacheScope`, emitted with
   a deterministic order so client + prompt caches stay stable across reconnects.
 - **`UnsupportedProtocolVersion` / `MissingRequiredClientCapability`** error
-  codes for inline version negotiation.
+  codes for inline version negotiation. `require_capabilities()` enforces a
+  needed client capability server-side (SEP), and `routing_headers_match()`
+  validates the `Mcp-Method`/`Mcp-Name` header-based routing (SEP-2243)
+  against the body (confused-deputy guard).
+- **Authorization** (`mcp/auth.hpp`, SEP-2468/837/2352) — a dependency-free
+  OAuth 2.1 + PKCE(S256) client flow with the revision's hardening baked in:
+  RFC 9207 `iss` validation (AS-mix-up guard, enforced *before* code
+  redemption), `application_type=native` DCR so loopback CLI redirects aren't
+  rejected, issuer-bound access tokens (no cross-AS replay), CIMD client-id
+  URLs, and RFC 9728 `WWW-Authenticate` challenge parsing. Includes a portable
+  SHA-256 + base64url so it pulls in no crypto library.
+- **Tasks extension** (SEP-2663) — `tasks/update` + `subscriptions/listen`
+  (the single opt-in notification stream) alongside the existing poll-based
+  `tasks/get`, under the `io.modelcontextprotocol/tasks` extension key.
+- **Deprecations** (SEP-2577) — Roots, Sampling, Logging, and legacy HTTP+SSE
+  are marked deprecated (still fully functional); `is_deprecated_method()`
+  answers for tooling that wants to steer new code off them.
 
 The schema's seven closing discriminated unions (`JSONRPCMessage`,
 `ClientRequest`, `ServerRequest`, `ClientNotification`, `ServerNotification`,
@@ -249,6 +265,7 @@ exactly where it must.
 | `mcp/server.hpp`     | typed `Server` with a tool/resource/prompt registry       |
 | `mcp/mrtr.hpp`       | MRTR client driver (`run_mrtr`, input_required fulfilment) |
 | `mcp/server_stateless.hpp` | stateless server tools (`IncomingRequest`, `RequestStateCodec`, `input_required`, cache hints) |
+| `mcp/auth.hpp`       | OAuth 2.1 + PKCE client flow, RFC 9207 iss validation (2026-07-28 hardening) |
 | `mcp/cap/cap.hpp`    | capability layer umbrella (`Registry`, `LocalProvider`, …) |
 | `mcp/cap/scheduler.hpp` | effect-aware parallel tool scheduling (see above)      |
 | `mcp/tools/toolset.hpp` | compiled batteries-included toolset (`MCP_BUILD_TOOLS`) |

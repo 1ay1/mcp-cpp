@@ -17,6 +17,7 @@
 #include <mcp/protocol.hpp>
 #include <mcp/mrtr.hpp>
 #include <mcp/server_stateless.hpp>
+#include <mcp/auth.hpp>
 #include <mcp/stdio.hpp>
 #include <mcp/client.hpp>
 #include <mcp/server.hpp>

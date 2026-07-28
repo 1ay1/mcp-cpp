@@ -40,6 +40,7 @@
 
 #include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -322,6 +323,100 @@ inline Json input_required(Json requests, std::string state = {}) {
 // One sub-request builder: input_request(method::Elicit, to_json(params)).
 inline Json input_request(std::string_view method, Json params) {
     return Json{{"method", std::string(method)}, {"params", std::move(params)}};
+}
+
+//==============================================================================
+//  Capability enforcement (2026-07-28). A stateless server that needs the
+//  client to support e.g. elicitation (because the tool may go MRTR) can
+//  REQUIRE it up front and reject with MissingRequiredClientCapability rather
+//  than emitting an input_required the client can't fulfil. The client declared
+//  its capabilities under _meta[clientCapabilities] (IncomingRequest reads it).
+//==============================================================================
+enum class ClientCap { Roots, Sampling, Elicitation, Tasks };
+
+inline bool client_has(const ClientCapabilities& c, ClientCap cap) noexcept {
+    switch (cap) {
+        case ClientCap::Roots:       return c.roots.has_value();
+        case ClientCap::Sampling:    return c.sampling.has_value();
+        case ClientCap::Elicitation: return c.elicitation.has_value();
+        case ClientCap::Tasks:       return c.tasks.has_value();
+    }
+    return false;
+}
+
+inline std::string_view cap_name(ClientCap cap) noexcept {
+    switch (cap) {
+        case ClientCap::Roots:       return "roots";
+        case ClientCap::Sampling:    return "sampling";
+        case ClientCap::Elicitation: return "elicitation";
+        case ClientCap::Tasks:       return "tasks";
+    }
+    return "";
+}
+
+// Throw MissingRequiredClientCapability (errc -32021) if the incoming request's
+// client didn't declare EVERY capability in `needed`. If the client attached no
+// clientCapabilities at all (legacy / omitted), we conservatively allow it —
+// the operation will still surface its own error if it truly can't proceed.
+// The thrown RpcError propagates as a proper JSON-RPC error from a handler.
+inline void require_capabilities(const IncomingRequest& req,
+                                 std::initializer_list<ClientCap> needed) {
+    auto caps = req.client_capabilities();
+    if (!caps) return;                       // nothing declared — don't over-reject
+    for (ClientCap cap : needed) {
+        if (!client_has(*caps, cap)) {
+            const std::string name(cap_name(cap));
+            throw RpcError(errc::MissingRequiredClientCapability,
+                           "missing required client capability: " + name,
+                           Json{{"capability", name}});
+        }
+    }
+}
+
+//==============================================================================
+//  Header-based routing (SEP-2243). On Streamable HTTP a client MUST send
+//  `Mcp-Method` (and, for tools/call, `Mcp-Name`) so a gateway/server can route
+//  and authorize WITHOUT parsing the body. A server that trusts these headers
+//  for routing MUST verify they match the body, else a caller could route as
+//  one method while the body invokes another (confused-deputy). These helpers
+//  do that check for the host's HTTP server layer.
+//==============================================================================
+struct RoutingHeaders {
+    std::string_view method;   // Mcp-Method header value ("" if absent)
+    std::string_view name;     // Mcp-Name header value  ("" if absent)
+};
+
+// Extract the routing signal from a parsed JSON-RPC request body.
+inline RoutingHeaders routing_from_body(const Json& body) {
+    RoutingHeaders h{};
+    if (body.is_object()) {
+        if (auto it = body.find("method"); it != body.end() && it->is_string())
+            h.method = it->get_ref<const std::string&>();
+        if (h.method == "tools/call")
+            if (auto p = body.find("params"); p != body.end() && p->is_object())
+                if (auto n = p->find("name"); n != p->end() && n->is_string())
+                    h.name = n->get_ref<const std::string&>();
+    }
+    return h;
+}
+
+// Returns true iff the declared headers are consistent with the body. An absent
+// header is permitted (a header MAY be omitted; only a PRESENT-and-WRONG header
+// is a routing lie). `err` receives a reason on mismatch.
+inline bool routing_headers_match(const RoutingHeaders& hdr, const Json& body,
+                                  std::string& err) {
+    const RoutingHeaders want = routing_from_body(body);
+    if (!hdr.method.empty() && hdr.method != want.method) {
+        err = "Mcp-Method header '" + std::string(hdr.method) +
+              "' does not match request method '" + std::string(want.method) + "'";
+        return false;
+    }
+    if (!hdr.name.empty() && hdr.name != want.name) {
+        err = "Mcp-Name header '" + std::string(hdr.name) +
+              "' does not match tool name '" + std::string(want.name) + "'";
+        return false;
+    }
+    return true;
 }
 
 //==============================================================================

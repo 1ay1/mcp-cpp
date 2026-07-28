@@ -14,6 +14,10 @@ add_executable(mcp_server_stateless_test server_stateless_test.cpp)
 target_link_libraries(mcp_server_stateless_test PRIVATE mcp::mcp)
 add_test(NAME mcp_server_stateless_test COMMAND mcp_server_stateless_test)
 
+add_executable(mcp_auth_test auth_test.cpp)
+target_link_libraries(mcp_auth_test PRIVATE mcp::mcp)
+add_test(NAME mcp_auth_test COMMAND mcp_auth_test)
+
 add_executable(mcp_protocol_test protocol_test.cpp)
 target_link_libraries(mcp_protocol_test PRIVATE mcp::mcp)
 add_test(NAME mcp_protocol_test COMMAND mcp_protocol_test)

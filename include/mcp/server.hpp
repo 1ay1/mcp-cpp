@@ -62,6 +62,9 @@ struct ServerHandlers {
     std::function<GetTaskPayloadResult        (const TaskIdParams&)>               on_get_task_payload;
     std::function<CancelTaskResult            (const TaskIdParams&)>               on_cancel_task;
     std::function<ListTasksResult             (const PaginatedParams&)>            on_list_tasks;
+    // Tasks extension (2026-07-28, SEP-2663): mutate a task + opt-in stream.
+    std::function<UpdateTaskResult            (const UpdateTaskParams&)>           on_update_task;
+    std::function<void (const SubscriptionsListenParams&)>                        on_subscriptions_listen;
 };
 
 //==============================================================================
@@ -253,6 +256,12 @@ private:
         if (h.on_get_task_payload)        engine_.on<TaskIdParams, GetTaskPayloadResult>(std::string(method::GetTaskPayload), h.on_get_task_payload);
         if (h.on_cancel_task)             engine_.on<TaskIdParams, CancelTaskResult>(std::string(method::CancelTask), h.on_cancel_task);
         if (h.on_list_tasks)              engine_.on<PaginatedParams, ListTasksResult>(std::string(method::ListTasks), h.on_list_tasks);
+        if (h.on_update_task)             engine_.on<UpdateTaskParams, UpdateTaskResult>(std::string(method::UpdateTask), h.on_update_task);
+        if (h.on_subscriptions_listen)
+            engine_.on<SubscriptionsListenParams, EmptyResult>(std::string(method::SubscriptionsListen),
+                [cb = h.on_subscriptions_listen](const SubscriptionsListenParams& p) -> EmptyResult {
+                    cb(p); return EmptyResult{};
+                });
     }
 
     void wire_tool_registry() {

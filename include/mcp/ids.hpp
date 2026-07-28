@@ -132,6 +132,10 @@ inline constexpr std::string_view ServerInfo         = "io.modelcontextprotocol/
 // the retry request.
 inline constexpr std::string_view InputResponses     = "io.modelcontextprotocol/inputResponses";
 inline constexpr std::string_view RequestState       = "io.modelcontextprotocol/requestState";
+// Tasks extension (2026-07-28, SEP-2663): Tasks left the experimental core for
+// the io.modelcontextprotocol/tasks extension. A task-augmented request carries
+// its task metadata under this key.
+inline constexpr std::string_view Tasks              = "io.modelcontextprotocol/tasks";
 } // namespace meta_key
 
 } // namespace mcp

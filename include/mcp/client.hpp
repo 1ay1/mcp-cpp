@@ -193,6 +193,16 @@ public:
         return engine_.request<ListTasksResult>(method::ListTasks,
                                                PaginatedParams{std::move(cursor), Json::object()});
     }
+    // tasks/update (2026-07-28, SEP-2663): update a task's status/metadata.
+    [[nodiscard]] std::future<UpdateTaskResult> update_task(const UpdateTaskParams& p) {
+        return engine_.request<UpdateTaskResult>(method::UpdateTask, p);
+    }
+    // subscriptions/listen (2026-07-28, SEP-2663): opt into a notification
+    // stream, listing the notification methods to receive.
+    [[nodiscard]] std::future<Unit> subscriptions_listen(List<std::string> notifications) {
+        return engine_.request<Unit>(method::SubscriptionsListen,
+            SubscriptionsListenParams{std::move(notifications), Json::object()});
+    }
 
     // ─── outbound notifications ──────────────────────────────────────────
     void notify_roots_changed() { engine_.notify_raw(method::RootsListChanged, Json::object()); }

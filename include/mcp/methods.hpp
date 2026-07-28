@@ -42,6 +42,11 @@ inline constexpr std::string_view GetTask             = "tasks/get";
 inline constexpr std::string_view GetTaskPayload      = "tasks/result";
 inline constexpr std::string_view CancelTask          = "tasks/cancel";
 inline constexpr std::string_view ListTasks           = "tasks/list";
+// 2026-07-28 (SEP-2663): Tasks moved to the io.modelcontextprotocol/tasks
+// extension with a poll-based tasks/get and a NEW tasks/update, and change
+// notifications flow over a single subscriptions/listen stream clients opt into.
+inline constexpr std::string_view UpdateTask          = "tasks/update";
+inline constexpr std::string_view SubscriptionsListen = "subscriptions/listen";
 
 // Notifications.
 inline constexpr std::string_view Cancelled              = "notifications/cancelled";
@@ -56,6 +61,32 @@ inline constexpr std::string_view LoggingMessage         = "notifications/messag
 inline constexpr std::string_view TaskStatus             = "notifications/tasks/status";
 inline constexpr std::string_view ElicitationComplete    = "notifications/elicitation/complete";
 } // namespace method
+
+//==============================================================================
+//  Deprecations (2026-07-28, SEP-2577). Roots, Sampling, and Logging are
+//  deprecated — they still work (guaranteed ≥ 12 months) but new
+//  implementations should not adopt them. The legacy HTTP+SSE transport is
+//  likewise deprecated. We keep FULL support (nothing removed) and expose this
+//  registry so tooling / servers can warn or steer. is_deprecated_method()
+//  answers for a wire-method literal.
+//==============================================================================
+namespace deprecated_2026_07_28 {
+inline constexpr std::string_view kMethods[] = {
+    method::CreateMessage,   // sampling/createMessage
+    method::ListRoots,       // roots/list
+    method::SetLevel,        // logging/setLevel
+    method::LoggingMessage,  // notifications/message
+    method::RootsListChanged // notifications/roots/list_changed
+};
+// The legacy HTTP+SSE transport (superseded by Streamable HTTP) is deprecated.
+inline constexpr std::string_view kLegacyHttpSseTransport = "http+sse";
+} // namespace deprecated_2026_07_28
+
+// True iff `m` is a wire method deprecated in 2026-07-28 (still functional).
+inline constexpr bool is_deprecated_method(std::string_view m) noexcept {
+    for (auto d : deprecated_2026_07_28::kMethods) if (m == d) return true;
+    return false;
+}
 
 //==============================================================================
 //  initialize
@@ -671,6 +702,40 @@ template <> struct CodecOf<ListTasksResult> {
             defaulted("tasks",      &ListTasksResult::tasks, List<Task>{}),
             optional ("nextCursor", &ListTasksResult::nextCursor),
             meta     ("_meta",      &ListTasksResult::meta));
+    }
+};
+
+//  tasks/update (2026-07-28, SEP-2663) — the Tasks extension's new mutator: a
+//  client (or the owning peer) updates a task's status/metadata; the result is
+//  the updated Task. status is an opaque string in the extension
+//  ("working" | "input_required" | "completed" | "failed" | "cancelled" ...).
+struct UpdateTaskParams {
+    std::string        taskId;
+    Maybe<std::string> status;
+    Json               meta = Json::object();
+};
+template <> struct CodecOf<UpdateTaskParams> {
+    static Codec<UpdateTaskParams> get() {
+        return record<UpdateTaskParams>(
+            required("taskId", &UpdateTaskParams::taskId),
+            optional("status", &UpdateTaskParams::status),
+            meta    ("_meta",  &UpdateTaskParams::meta));
+    }
+};
+using UpdateTaskResult = Task;   // Result & Task, like GetTaskResult.
+
+//  subscriptions/listen (2026-07-28, SEP-2663) — the single opt-in stream that
+//  replaces the old HTTP-GET notification channel. A client lists the
+//  notification methods it wants delivered on this stream.
+struct SubscriptionsListenParams {
+    List<std::string> notifications;   // e.g. ["notifications/tasks/status"]
+    Json              meta = Json::object();
+};
+template <> struct CodecOf<SubscriptionsListenParams> {
+    static Codec<SubscriptionsListenParams> get() {
+        return record<SubscriptionsListenParams>(
+            defaulted("notifications", &SubscriptionsListenParams::notifications, List<std::string>{}),
+            meta     ("_meta",         &SubscriptionsListenParams::meta));
     }
 };
 

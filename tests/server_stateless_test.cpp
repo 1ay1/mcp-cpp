@@ -205,6 +205,55 @@ int main() {
         CHECK(lt.cacheScope.has_value() && *lt.cacheScope == "public");
     }
 
+    // ── 6. capability enforcement (MissingRequiredClientCapability) ──────
+    {
+        // Client declared elicitation (ClientHandlers.on_elicit → capability).
+        Json meta = Json::object();
+        meta[std::string(meta_key::ClientCapabilities)] =
+            to_json(ClientCapabilities{Nothing, Nothing,
+                                       SamplingCapability{}, ElicitationCapability{}, Nothing});
+        Json params = {{"name", "x"}, {"_meta", meta}};
+        IncomingRequest req(params);
+        // has elicitation + sampling → OK
+        bool ok = true;
+        try { require_capabilities(req, {ClientCap::Elicitation, ClientCap::Sampling}); }
+        catch (...) { ok = false; }
+        CHECK(ok);
+        // requires roots → throws MissingRequiredClientCapability
+        bool threw = false;
+        try { require_capabilities(req, {ClientCap::Roots}); }
+        catch (const RpcError& e) {
+            threw = (e.code == errc::MissingRequiredClientCapability);
+        }
+        CHECK(threw);
+        // No caps declared at all → don't over-reject.
+        IncomingRequest bare(Json{{"name", "x"}});
+        bool ok2 = true;
+        try { require_capabilities(bare, {ClientCap::Roots}); } catch (...) { ok2 = false; }
+        CHECK(ok2);
+    }
+
+    // ── 7. header-based routing validation (SEP-2243) ────────────────────
+    {
+        Json body = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                     {"params", {{"name", "read"}, {"arguments", Json::object()}}}};
+        std::string err;
+        // matching headers → OK
+        CHECK(routing_headers_match(RoutingHeaders{"tools/call", "read"}, body, err));
+        // absent headers → allowed (MAY be omitted)
+        CHECK(routing_headers_match(RoutingHeaders{"", ""}, body, err));
+        // wrong method header → rejected
+        CHECK(!routing_headers_match(RoutingHeaders{"tools/list", ""}, body, err));
+        CHECK(!err.empty());
+        // wrong tool name → rejected (confused-deputy guard)
+        err.clear();
+        CHECK(!routing_headers_match(RoutingHeaders{"tools/call", "bash"}, body, err));
+        CHECK(!err.empty());
+        // routing_from_body extracts both
+        auto rf = routing_from_body(body);
+        CHECK(rf.method == "tools/call" && rf.name == "read");
+    }
+
     if (g_failures == 0) {
         std::cout << "server_stateless_test: ALL PASS\n";
         return 0;
