@@ -300,12 +300,22 @@ const RepoGraph& build_graph(const fs::path& root) {
             ++lineno;
             if (!line.empty() && line.size() < 500 && maybe_def_line(line)) {
                 std::cmatch m;
+                // Match on the string_view's underlying char range directly —
+                // no per-line std::string allocation. On a big repo the def
+                // scan visits hundreds of thousands of admitted lines; the
+                // copy this replaces was a heap alloc per line.
+                //
+                // Use data()/data()+size() (raw const char*) rather than
+                // begin()/end(): libstdc++ and libc++ make string_view's
+                // iterator a plain const char*, but MSVC's is a checked
+                // iterator class, which does not bind to the const char*
+                // overload std::cmatch (match_results<const char*>) requires
+                // — giving C2672 'no matching overloaded function'. Raw
+                // pointers are const char* everywhere.
+                const char* const first = line.data();
+                const char* const last  = line.data() + line.size();
                 for (const auto& re : pats) {
-                    // Match on the string_view's iterators directly — no
-                    // per-line std::string allocation. On a big repo the def
-                    // scan visits hundreds of thousands of admitted lines;
-                    // the copy this replaces was a heap alloc per line.
-                    if (std::regex_search(line.begin(), line.end(), m, re)
+                    if (std::regex_search(first, last, m, re)
                         && m.size() >= 2) {
                         std::string name = m[1].str();
                         if (!is_stopword(name) && name.size() >= 3) {
