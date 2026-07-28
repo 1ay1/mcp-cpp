@@ -1,8 +1,9 @@
 # mcp-cpp
 
 A modern, **type-theoretic** C++23 implementation of the
-[Model Context Protocol](https://modelcontextprotocol.io/specification/2025-11-25)
-(revision **2025-11-25**). Header-only, single dependency (nlohmann/json),
+[Model Context Protocol](https://modelcontextprotocol.io/specification/2026-07-28)
+(revision **2026-07-28** — the stateless core — with **dual-era** interop back
+to **2025-11-25**). Header-only, single dependency (nlohmann/json),
 no codegen.
 
 The protocol is encoded *in the type system*: every wire message is a closed

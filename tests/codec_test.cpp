@@ -124,7 +124,7 @@ int main() {
         p.clientInfo = Implementation{"host", "1.0", std::string("Host"), Nothing, Nothing, Nothing};
         p.capabilities.roots = RootsCapability{true};
         Json j = to_json(p);
-        CHECK(j["protocolVersion"] == "2025-11-25");
+        CHECK(j["protocolVersion"] == "2026-07-28");
         CHECK(j["clientInfo"]["name"] == "host");
         CHECK(j["capabilities"]["roots"]["listChanged"] == true);
         roundtrip(p, "InitializeParams");

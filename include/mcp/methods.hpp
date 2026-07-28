@@ -17,6 +17,7 @@ namespace mcp {
 //==============================================================================
 namespace method {
 inline constexpr std::string_view Initialize          = "initialize";
+inline constexpr std::string_view Discover            = "server/discover";
 inline constexpr std::string_view Ping                = "ping";
 inline constexpr std::string_view Complete            = "completion/complete";
 inline constexpr std::string_view SetLevel            = "logging/setLevel";
@@ -90,6 +91,52 @@ template <> struct CodecOf<InitializeResult> {
             required("serverInfo",      &InitializeResult::serverInfo),
             optional("instructions",    &InitializeResult::instructions),
             meta    ("_meta",           &InitializeResult::meta));
+    }
+};
+
+//==============================================================================
+//  server/discover (MCP 2026-07-28) — query a server's supported protocol
+//  versions, capabilities, and identity BEFORE sending any other request. The
+//  modern, stateless replacement for the initialize handshake as a discovery
+//  step; optional for clients (any RPC may be sent inline and a version
+//  mismatch handled via UnsupportedProtocolVersionError). Cacheable.
+//==============================================================================
+struct DiscoverParams {
+    // Body carries no parameters beyond the standard per-request `_meta`
+    // (protocolVersion / clientInfo / clientCapabilities), which the engine
+    // injects. This holds any caller-supplied extra `_meta`.
+    Json meta = Json::object();
+};
+template <> struct CodecOf<DiscoverParams> {
+    static Codec<DiscoverParams> get() {
+        return record<DiscoverParams>(
+            meta("_meta", &DiscoverParams::meta));
+    }
+};
+
+struct DiscoverResult {
+    // "complete" for a normal reply (MRTR-shaped results use "input_required").
+    std::string             resultType = "complete";
+    List<std::string>       supportedVersions;
+    ServerCapabilities      capabilities{};
+    Maybe<std::string>      instructions;
+    // Cache directives (schema.ts caching utility): time-to-live in ms and the
+    // cache scope ("public" | "private").
+    Maybe<std::int64_t>     ttlMs;
+    Maybe<std::string>      cacheScope;
+    // serverInfo travels under _meta["io.modelcontextprotocol/serverInfo"].
+    Json                    meta = Json::object();
+};
+template <> struct CodecOf<DiscoverResult> {
+    static Codec<DiscoverResult> get() {
+        return record<DiscoverResult>(
+            defaulted("resultType",       &DiscoverResult::resultType, std::string("complete")),
+            defaulted("supportedVersions", &DiscoverResult::supportedVersions, List<std::string>{}),
+            defaulted("capabilities",     &DiscoverResult::capabilities, ServerCapabilities{}),
+            optional ("instructions",     &DiscoverResult::instructions),
+            optional ("ttlMs",            &DiscoverResult::ttlMs),
+            optional ("cacheScope",       &DiscoverResult::cacheScope),
+            meta     ("_meta",            &DiscoverResult::meta));
     }
 };
 

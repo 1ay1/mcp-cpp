@@ -222,6 +222,7 @@ namespace dict {
     // ── Client → Server requests (schema.ts ClientRequest) ─────────────────
     using Ping                  = Rpc<"ping",                         Unit,                         EmptyResult>;
     using Initialize            = Rpc<"initialize",                   InitializeParams,             InitializeResult>;
+    using Discover              = Rpc<"server/discover",             DiscoverParams,               DiscoverResult>;
     using Complete              = Rpc<"completion/complete",          CompleteParams,               CompleteResult>;
     using SetLevel              = Rpc<"logging/setLevel",             SetLevelParams,               EmptyResult>;
     using GetPrompt             = Rpc<"prompts/get",                  GetPromptParams,              GetPromptResult>;

@@ -2,5 +2,5 @@
 #pragma once
 #include <string_view>
 namespace mcp {
-inline constexpr std::string_view kLibraryVersion = "0.1.0";
+inline constexpr std::string_view kLibraryVersion = "0.2.0";
 } // namespace mcp

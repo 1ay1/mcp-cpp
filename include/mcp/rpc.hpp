@@ -58,6 +58,13 @@ inline constexpr int InternalError  = -32603;
 // MCP-specific: a URL-mode elicitation is required to proceed (schema.ts
 // URL_ELICITATION_REQUIRED).
 inline constexpr int UrlElicitationRequired = -32042;
+// MCP 2026-07-28 (stateless core) protocol-negotiation errors. A modern
+// server rejects a request whose declared protocol version it does not
+// implement, or that omits a client capability the operation requires
+// (schema.ts UnsupportedProtocolVersionError / MissingRequiredClientCapability
+// Error).
+inline constexpr int UnsupportedProtocolVersion    = -32020;
+inline constexpr int MissingRequiredClientCapability = -32021;
 // Engine-local synthetic codes (never sent by a conforming peer).
 inline constexpr int Timeout        = -32001;   // request deadline exceeded
 inline constexpr int Cancelled      = -32002;   // request cancelled locally
@@ -156,6 +163,21 @@ public:
     // explicit timeout. Zero (the default) means "wait forever".
     void set_default_timeout(std::chrono::milliseconds d) {
         default_timeout_.store(d.count(), std::memory_order_relaxed);
+    }
+
+    // MCP 2026-07-28 stateless core: the per-request `_meta` object merged into
+    // every outbound request (protocolVersion + clientInfo + clientCapabilities
+    // under their reverse-DNS keys). Pass a Json OBJECT whose keys are the
+    // reverse-DNS `_meta` keys. Merged non-destructively (a caller's own
+    // `_meta` wins on key collision), so this is safe to set once at connect.
+    // Use Client::enable_modern_metadata() rather than calling this directly.
+    void set_request_meta(Json meta) {
+        std::lock_guard lk(mu_);
+        request_meta_ = meta.is_object() ? std::move(meta) : Json::object();
+    }
+    void clear_request_meta() {
+        std::lock_guard lk(mu_);
+        request_meta_ = Json::object();
     }
 
     // ---------------------------------------------------------------- handlers
@@ -316,7 +338,24 @@ public:
         if (has_deadline) ensure_timer();
 
         Json env = {{"jsonrpc", "2.0"}, {"id", id}, {"method", std::string(method)}};
-        if (!params.is_null()) env["params"] = params;
+        Json p = params;
+        // MCP 2026-07-28 stateless core: attach the per-request protocol
+        // metadata (protocolVersion / clientInfo / clientCapabilities under
+        // their reverse-DNS `_meta` keys) to EVERY outbound request. Set once
+        // via set_request_meta(); merged non-destructively so a caller's own
+        // `_meta` (e.g. a progressToken) is preserved. A legacy peer simply
+        // ignores unknown `_meta` keys, so this is safe to always send.
+        {
+            std::lock_guard lk(mu_);
+            if (!request_meta_.empty()) {
+                if (!p.is_object()) p = Json::object();
+                Json& m = p["_meta"];
+                if (!m.is_object()) m = Json::object();
+                for (auto it = request_meta_.begin(); it != request_meta_.end(); ++it)
+                    if (!m.contains(it.key())) m[it.key()] = it.value();
+            }
+        }
+        if (!p.is_null()) env["params"] = std::move(p);
         write_line(env.dump());
         if (has_deadline) timer_cv_.notify_all();
         return fut;
@@ -606,6 +645,10 @@ private:
     WireTrace     trace_;
     ErrorCallback on_error_;
     std::atomic<long long> default_timeout_{0};   // ms; 0 == no timeout
+
+    // MCP 2026-07-28 per-request `_meta` merged into every outbound request
+    // (guarded by mu_). Empty object == legacy mode (send nothing extra).
+    Json request_meta_ = Json::object();
 
     // Deadline monitor — a lazily-started background thread that fails any
     // waiter whose deadline has passed. Started on the first timed request.

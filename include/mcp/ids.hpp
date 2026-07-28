@@ -87,7 +87,51 @@ template <> struct CodecOf<TaskStatus> {
 
 //==============================================================================
 //  Protocol revision pinned to this build.
+//
+//  MCP 2026-07-28 made the protocol core STATELESS: there is no initialize
+//  handshake and no protocol-level session. Instead every request carries its
+//  protocol version, client identity, and client capabilities as per-request
+//  `_meta` fields (the "modern" era). 2025-11-25 and earlier are "legacy"
+//  (session established via an initialize handshake). This SDK is DUAL-ERA:
+//  it prefers modern per-request metadata and falls back to the legacy
+//  handshake for servers that only speak the older revisions.
 //==============================================================================
-inline constexpr std::string_view kProtocolVersion = "2025-11-25";
+
+// The newest (modern, stateless) revision this build implements + advertises.
+inline constexpr std::string_view kProtocolVersion = "2026-07-28";
+
+// The last legacy (handshake/session) revision, retained for interop with
+// servers that have not yet moved to the stateless core.
+inline constexpr std::string_view kLegacyProtocolVersion = "2025-11-25";
+
+// True iff `v` is a modern (>= 2026-07-28), per-request-metadata revision.
+// The date-string format is lexicographically ordered, so a plain compare
+// works for the foreseeable calendar-versioned future.
+inline constexpr bool is_modern_protocol(std::string_view v) noexcept {
+    return v >= std::string_view{"2026-07-28"};
+}
+
+// Every revision this build can serve/consume, newest first. Advertised in a
+// server/discover response and used to answer an inline version mismatch.
+inline constexpr std::string_view kSupportedProtocolVersions[] = {
+    "2026-07-28",
+    "2025-11-25",
+    "2025-06-18",
+};
+
+// Reverse-DNS `_meta` keys that carry the modern per-request protocol metadata
+// (schema.ts: io.modelcontextprotocol/{protocolVersion,clientInfo,
+// clientCapabilities,serverInfo}). Single source of truth for the wire keys.
+namespace meta_key {
+inline constexpr std::string_view ProtocolVersion    = "io.modelcontextprotocol/protocolVersion";
+inline constexpr std::string_view ClientInfo         = "io.modelcontextprotocol/clientInfo";
+inline constexpr std::string_view ClientCapabilities = "io.modelcontextprotocol/clientCapabilities";
+inline constexpr std::string_view ServerInfo         = "io.modelcontextprotocol/serverInfo";
+// MRTR (Multi Round-Trip Requests): the client echoes the server's opaque
+// requestState and returns the fulfilled inputResponses under these keys on
+// the retry request.
+inline constexpr std::string_view InputResponses     = "io.modelcontextprotocol/inputResponses";
+inline constexpr std::string_view RequestState       = "io.modelcontextprotocol/requestState";
+} // namespace meta_key
 
 } // namespace mcp

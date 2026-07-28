@@ -105,7 +105,7 @@ int main() {
         auto r = client.initialize(
             Implementation{"demo-client", "1.0", Nothing, Nothing, Nothing, Nothing},
             ClientCapabilities{}).get();
-        CHECK(r.protocolVersion == "2025-11-25");
+        CHECK(r.protocolVersion == "2026-07-28");
         CHECK(r.serverInfo.name == "demo-server");
         CHECK(r.instructions.has_value() && *r.instructions == "A demo MCP server.");
         client.initialized();

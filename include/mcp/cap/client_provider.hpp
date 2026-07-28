@@ -165,6 +165,17 @@ protected:
             [this](const Json&) { try { refresh_prompts(); } catch (...) {} if (on_list_changed_) on_list_changed_(); });
 
         client_->set_default_timeout(handshake_timeout);
+
+        // MCP 2026-07-28 stateless core (DUAL-ERA): attach the modern
+        // per-request protocol metadata (protocolVersion + clientInfo +
+        // clientCapabilities) to EVERY subsequent request. A modern server
+        // then authenticates/versions each request independently — no session
+        // needed. A legacy server simply ignores the unknown `_meta` keys, so
+        // we ALSO still perform the legacy initialize handshake below for
+        // backward compatibility. Enabling this before initialize means even
+        // the handshake requests carry the modern metadata.
+        client_->enable_modern_metadata(client_info, ClientCapabilities{});
+
         try {
             InitializeResult init = client_->initialize(std::move(client_info)).get();
             server_caps_ = init.capabilities;

@@ -20,6 +20,7 @@
 #pragma once
 
 #include <mcp/rpc.hpp>
+#include <mcp/mrtr.hpp>
 
 namespace mcp {
 
@@ -81,6 +82,39 @@ public:
     }
     void initialized() { engine_.notify_raw(method::Initialized, Json::object()); }
 
+    // ─── MCP 2026-07-28 stateless core ───────────────────────────────────
+    //
+    // Enable the modern (stateless) protocol: attach per-request protocol
+    // metadata (protocolVersion + clientInfo + clientCapabilities under their
+    // reverse-DNS `_meta` keys) to EVERY subsequent outbound request. After
+    // this, no initialize handshake is required — the server authenticates and
+    // versions each request independently. Legacy servers ignore the unknown
+    // `_meta` keys, so a dual-era client can safely call this AND still fall
+    // back to initialize() if the server only speaks a legacy revision.
+    //
+    // `version` defaults to the newest revision this build advertises; pass a
+    // negotiated older-but-modern version to pin it.
+    void enable_modern_metadata(Implementation client_info,
+                                ClientCapabilities caps = {},
+                                std::string_view version = kProtocolVersion) {
+        Json meta = Json::object();
+        meta[std::string(meta_key::ProtocolVersion)]    = std::string(version);
+        meta[std::string(meta_key::ClientInfo)]         = to_json(client_info);
+        meta[std::string(meta_key::ClientCapabilities)] = to_json(caps);
+        engine_.set_request_meta(std::move(meta));
+    }
+    // Revert to legacy mode (stop attaching per-request protocol metadata).
+    void disable_modern_metadata() { engine_.clear_request_meta(); }
+
+    // server/discover — query the server's supported versions, capabilities,
+    // and identity without an initialize handshake (MCP 2026-07-28). Optional:
+    // a client may skip discovery and send any RPC inline, handling an
+    // UnsupportedProtocolVersionError (errc::UnsupportedProtocolVersion) if the
+    // server rejects the declared version.
+    [[nodiscard]] std::future<DiscoverResult> discover() {
+        return engine_.request<DiscoverResult>(method::Discover, DiscoverParams{});
+    }
+
     [[nodiscard]] std::future<Unit> ping() { return engine_.request<Unit>(method::Ping, Unit{}); }
 
     // ─── tools ─────────────────────────────────────────────────────────────
@@ -93,6 +127,19 @@ public:
     }
     [[nodiscard]] std::future<CallToolResult> call_tool(std::string name, Json arguments = Json::object()) {
         return call_tool(CallToolParams{std::move(name), std::move(arguments), Nothing, Json::object()});
+    }
+
+    // MCP 2026-07-28 MRTR: call a tool, transparently fulfilling any
+    // input_required rounds (sampling / elicitation / roots) the server asks
+    // for, using this client's own handlers. Blocking (drives the retry loop),
+    // so call it off the reader thread. Requires enable_modern_metadata().
+    [[nodiscard]] CallToolResult call_tool_interactive(const CallToolParams& p) {
+        Json final = run_mrtr(engine_, method::CallTool, to_json(p), mrtr_handlers_);
+        return from_json<CallToolResult>(final);
+    }
+    [[nodiscard]] CallToolResult call_tool_interactive(std::string name, Json arguments = Json::object()) {
+        return call_tool_interactive(
+            CallToolParams{std::move(name), std::move(arguments), Nothing, Json::object()});
     }
 
     // ─── resources ───────────────────────────────────────────────────────
@@ -183,8 +230,22 @@ private:
         if (h.on_tools_changed)     engine_.on_notification(std::string(method::ToolsListChanged),     [f=h.on_tools_changed](const Json&){ f(); });
         if (h.on_resources_changed) engine_.on_notification(std::string(method::ResourcesListChanged), [f=h.on_resources_changed](const Json&){ f(); });
         if (h.on_prompts_changed)   engine_.on_notification(std::string(method::PromptsListChanged),   [f=h.on_prompts_changed](const Json&){ f(); });
+
+        // Mirror the sampling / elicitation / roots handlers into raw-Json form
+        // for MRTR fulfilment (call_tool_interactive). Same user callbacks,
+        // just driven by the client loop instead of a server-initiated request.
+        if (h.on_create_message)
+            mrtr_handlers_.on_create_message =
+                [f = h.on_create_message](const Json& p) { return to_json(f(from_json<CreateMessageParams>(p))); };
+        if (h.on_elicit)
+            mrtr_handlers_.on_elicit =
+                [f = h.on_elicit](const Json& p) { return to_json(f(from_json<ElicitParams>(p))); };
+        if (h.on_list_roots)
+            mrtr_handlers_.on_list_roots =
+                [f = h.on_list_roots](const Json&) { return to_json(f()); };
     }
 
+    MrtrHandlers mrtr_handlers_;
     RpcEngine engine_;
 };
 
