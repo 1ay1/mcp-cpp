@@ -363,10 +363,41 @@ ExecResult run_git_commit(const GitCommitArgs& a) {
             return std::unexpected(std::move(r.error()));
     }
     for (const auto& f : a.files) {
-        auto wp = util::make_workspace_path_checked(f, "git_commit");
-        if (!wp) return std::unexpected(std::move(wp.error()));
+        // Relative file lists are conventionally relative to the repository
+        // named by `path`, not to agentty's workspace root. The old code always
+        // resolved them against the workspace, so committing
+        // path="maya", files=["include/…"] tried to stage
+        // <workspace>/include/… and failed before git ran. Still accept an
+        // explicitly workspace-relative path ("maya/include/…") when it
+        // already falls inside this repo.
+        fs::path stage_path;
+        fs::path raw{f};
+        if (raw.is_absolute()) {
+            auto wp = util::make_workspace_path_checked(f, "git_commit");
+            if (!wp) return std::unexpected(std::move(wp.error()));
+            stage_path = fs::path{wp->string()};
+        } else {
+            auto workspace_path = util::make_workspace_path_checked(f, "git_commit");
+            if (!workspace_path)
+                return std::unexpected(std::move(workspace_path.error()));
+
+            std::error_code ec;
+            const fs::path checked_workspace{workspace_path->string()};
+            auto rel = fs::relative(checked_workspace, fs::path{*git_dir}, ec);
+            const bool inside_repo = !ec && !rel.empty()
+                && *rel.begin() != fs::path{".."};
+            if (inside_repo) {
+                stage_path = checked_workspace;
+            } else {
+                auto repo_relative = util::make_workspace_path_checked(
+                    (fs::path{*git_dir} / raw).string(), "git_commit");
+                if (!repo_relative)
+                    return std::unexpected(std::move(repo_relative.error()));
+                stage_path = fs::path{repo_relative->string()};
+            }
+        }
         if (auto r = run_git({"git", "-C", *git_dir, "add", "--",
-                              wp->string()}, "git_commit (add)"); !r)
+                              stage_path.string()}, "git_commit (add)"); !r)
             return std::unexpected(std::move(r.error()));
     }
 

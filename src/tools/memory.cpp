@@ -73,7 +73,8 @@ void register_memory_tools(Shells& sh, const std::shared_ptr<MemoryStore>& mem) 
             {"required", {"text"}},
             {"properties", {
                 {"text",      {{"type","string"}, {"description","The fact to remember; one short self-contained sentence."}}},
-                {"scope",     {{"type","string"}, {"description", scope_desc}}},
+                {"scope",     {{"type","string"}, {"enum", scopes},
+                                {"description", scope_desc}}},
                 {"pin",       {{"type","boolean"},{"description","Mark cap-exempt; pinned facts survive cap rollover."}}},
                 {"tags",      {{"type","array"}, {"items",{{"type","string"}}}, {"description","Optional grouping labels."}}},
                 {"supersedes",{{"type","string"}, {"description","Record id to atomically replace."}}},

@@ -297,6 +297,29 @@ int main() {
         assert(lg.text.find("seed commit") != std::string::npos);
         std::puts("git_log: ok");
 
+        // Relative files are resolved against an explicit nested repository,
+        // not accidentally against the outer workspace root.
+        auto ng = obj(); ng["command"] =
+            "mkdir nested && git -C nested init -q && "
+            "git -C nested config user.email t@t.t && "
+            "git -C nested config user.name T && "
+            "printf nested > nested/inside.txt";
+        auto ngi = call(*provider, "bash", ng);
+        assert(!ngi.is_error);
+
+        auto nc = obj();
+        nc["path"] = "nested";
+        nc["files"] = mcp::Json::array({"inside.txt"});
+        nc["message"] = "nested commit";
+        auto nci = call(*provider, "git_commit", nc);
+        assert(!nci.is_error);
+
+        auto nl = obj(); nl["path"] = "nested"; nl["oneline"] = true;
+        auto nlg = call(*provider, "git_log", nl);
+        assert(!nlg.is_error);
+        assert(nlg.text.find("nested commit") != std::string::npos);
+        std::puts("git_commit: nested repo-relative files ok");
+
         // git_commit with empty message rejected
         auto bad = obj(); bad["message"] = "   ";
         auto br = call(*provider, "git_commit", bad);
