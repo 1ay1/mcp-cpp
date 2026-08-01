@@ -257,6 +257,10 @@ public:
         out_buf_.reset();   // closes child's stdin HANDLE
     }
 
+    void interrupt_output() noexcept {
+        if (in_buf_) in_buf_->close();
+    }
+
     // Stop/reap the process but keep the read stream object alive so a
     // concurrent output reader can observe EOF and join safely.
     void terminate() noexcept {
@@ -368,6 +372,7 @@ private:
 
 #else  // !_WIN32 — POSIX backend (fork/exec/pipe)
 
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -382,6 +387,7 @@ private:
 #include <vector>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -398,21 +404,53 @@ public:
     explicit fd_streambuf(int fd) noexcept : fd_(fd) {
         setg(in_, in_ + sizeof(in_), in_ + sizeof(in_));  // empty → underflow
         setp(out_, out_ + sizeof(out_));
+        int wake[2] = {-1, -1};
+        if (::pipe(wake) == 0) {
+            wake_rd_ = wake[0];
+            wake_wr_ = wake[1];
+            (void)::fcntl(wake_rd_, F_SETFD, ::fcntl(wake_rd_, F_GETFD) | FD_CLOEXEC);
+            (void)::fcntl(wake_wr_, F_SETFD, ::fcntl(wake_wr_, F_GETFD) | FD_CLOEXEC);
+            (void)::fcntl(wake_wr_, F_SETFL, ::fcntl(wake_wr_, F_GETFL) | O_NONBLOCK);
+        }
     }
     ~fd_streambuf() override { sync(); close(); }
 
     fd_streambuf(const fd_streambuf&)            = delete;
     fd_streambuf& operator=(const fd_streambuf&) = delete;
 
+    // Wake a thread blocked in underflow() without closing an FD underneath
+    // read(2). The owner joins that thread before destroying this streambuf.
+    void interrupt() noexcept {
+        interrupted_.store(true, std::memory_order_release);
+        if (wake_wr_ >= 0) {
+            const char byte = 1;
+            (void)::write(wake_wr_, &byte, 1);
+        }
+    }
+
     void close() noexcept {
+        interrupt();
         if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+        if (wake_rd_ >= 0) { ::close(wake_rd_); wake_rd_ = -1; }
+        if (wake_wr_ >= 0) { ::close(wake_wr_); wake_wr_ = -1; }
     }
     [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
 
 protected:
     // ── reading: refill the get area from the pipe ────────────────────
     int_type underflow() override {
-        if (!valid()) return traits_type::eof();
+        if (!valid() || interrupted_.load(std::memory_order_acquire))
+            return traits_type::eof();
+        if (wake_rd_ >= 0) {
+            pollfd fds[2] = {{fd_, POLLIN, 0}, {wake_rd_, POLLIN, 0}};
+            int ready;
+            do {
+                ready = ::poll(fds, 2, -1);
+            } while (ready < 0 && errno == EINTR);
+            if (ready <= 0 || (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) ||
+                interrupted_.load(std::memory_order_acquire))
+                return traits_type::eof();
+        }
         ssize_t got;
         do {
             got = ::read(fd_, in_, sizeof(in_));
@@ -452,6 +490,9 @@ private:
     }
 
     int  fd_ = -1;
+    int  wake_rd_ = -1;
+    int  wake_wr_ = -1;
+    std::atomic<bool> interrupted_{false};
     char in_[4096];
     char out_[4096];
 };
@@ -511,6 +552,11 @@ public:
             throw std::runtime_error("mcp::cap: pipe() failed (stdout)");
         FdGuard out_rd{out_pipe[0]}, out_wr{out_pipe[1]};
 
+        int ready_pipe[2] = {-1, -1};
+        if (::pipe(ready_pipe) != 0)
+            throw std::runtime_error("mcp::cap: pipe() failed (ready)");
+        FdGuard ready_rd{ready_pipe[0]}, ready_wr{ready_pipe[1]};
+
         pid_ = ::fork();
         if (pid_ < 0)
             throw std::runtime_error("mcp::cap: fork() failed");
@@ -520,6 +566,15 @@ public:
             // ── child ────────────────────────────────────────────────────
             // Raw FDs: this is the forked child; the parent's guards are
             // copies in a separate address space and irrelevant here.
+            // Give the whole subprocess tree a private session/process group.
+            // The parent waits for the byte below before exposing pid(), so a
+            // prompt terminate() can safely signal -pid without racing setsid.
+            if (::setsid() < 0) (void)::setpgid(0, 0);
+            ready_rd.reset();
+            const char ready = 1;
+            (void)::write(ready_pipe[1], &ready, 1);
+            ready_wr.reset();
+
             ::dup2(in_pipe[0],  STDIN_FILENO);
             ::dup2(out_pipe[1], STDOUT_FILENO);
             if (s.merge_stderr) ::dup2(out_pipe[1], STDERR_FILENO);
@@ -553,6 +608,15 @@ public:
         // parent-side ends are release()'d into the fd_streambufs, which now
         // own the FDs and close them via shutdown(). Commit point: from here
         // on the streams hold the only references.
+        // Wait until the child has established its private group/session.
+        // EOF is also sufficient (the child failed before signalling).
+        ready_wr.reset();
+        char ready = 0;
+        ssize_t ready_n;
+        do { ready_n = ::read(ready_rd.get(), &ready, 1); }
+        while (ready_n < 0 && errno == EINTR);
+        ready_rd.reset();
+
         in_rd.reset();    // child's stdin read end — parent doesn't use it
         out_wr.reset();   // child's stdout write end — parent doesn't use it
         in_buf_  = std::make_unique<fd_streambuf>(out_rd.release());
@@ -586,25 +650,55 @@ public:
         out_buf_.reset();   // closes child's stdin FD
     }
 
-    // Stop/reap the process while retaining the read stream object. The child
-    // closing stdout wakes a concurrent reader, which can be joined before the
-    // stream itself is destroyed.
+    void interrupt_output() noexcept {
+        if (in_buf_) in_buf_->interrupt();
+    }
+
+    // Stop/reap the entire process group with bounded waits. SIGTERM gives
+    // cooperative children two seconds; SIGKILL guarantees TERM-resistant
+    // children and descendants cannot retain stdout indefinitely.
     void terminate() noexcept {
         out_stream_.reset();
         out_buf_.reset();
-        if (pid_ > 0) {
+        if (pid_ <= 0) return;
+
+        const pid_t leader = pid_;
+        bool leader_reaped = false;
+        auto reap_leader = [&] {
+            if (leader_reaped) return;
             int status = 0;
-            for (int i = 0; i < 50; ++i) {
-                pid_t r = ::waitpid(pid_, &status, WNOHANG);
-                if (r == pid_ || r < 0) { pid_ = -1; break; }
-                ::usleep(10'000);
-            }
-            if (pid_ > 0) {
-                ::kill(pid_, SIGTERM);
-                ::waitpid(pid_, &status, 0);
+            const pid_t result = ::waitpid(leader, &status, WNOHANG);
+            if (result == leader || (result < 0 && errno == ECHILD)) {
+                leader_reaped = true;
                 pid_ = -1;
             }
-        }
+        };
+        auto group_alive = [&] {
+            if (::kill(-leader, 0) == 0) return true;
+            return errno == EPERM;
+        };
+        auto wait_for = [&](int attempts, bool require_group_gone) {
+            for (int i = 0; i < attempts; ++i) {
+                reap_leader();
+                if (leader_reaped && (!require_group_gone || !group_alive()))
+                    return true;
+                ::usleep(10'000);
+            }
+            return false;
+        };
+        auto signal_group = [&](int signal) {
+            if (::kill(-leader, signal) != 0 && errno == ESRCH && !leader_reaped)
+                (void)::kill(leader, signal);
+        };
+
+        // A child that exits on stdin EOF needs no signal, but descendants
+        // may still own stdout; only return early when the whole group is gone.
+        if (wait_for(50, true)) return;
+        signal_group(SIGTERM);
+        if (wait_for(200, true)) return;
+        signal_group(SIGKILL);
+        (void)wait_for(100, true);
+        reap_leader();
     }
 
     // Close child stdin (EOF → graceful exit), poll briefly, then SIGTERM.

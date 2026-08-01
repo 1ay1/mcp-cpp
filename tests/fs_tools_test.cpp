@@ -11,6 +11,7 @@
 #include <mcp/cap/local.hpp>
 
 #include <cassert>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -119,6 +120,28 @@ int main() {
         assert(bad.is_error);
         assert(bad.text.find("appears") != std::string::npos);
         std::puts("edit: ambiguous match errors correctly");
+    }
+
+    // ── oversized sparse target is rejected before whole-file loading ─────
+    {
+        auto large_path = (root / "large-sparse.txt").string();
+        std::FILE* f = std::fopen(large_path.c_str(), "wb");
+        assert(f);
+#ifdef _WIN32
+        assert(_chsize_s(_fileno(f), 2u * 1024u * 1024u) == 0);
+#else
+        assert(ftruncate(fileno(f), 2u * 1024u * 1024u) == 0);
+#endif
+        std::fclose(f);
+
+        auto e = obj(); e["old_text"] = "needle"; e["new_text"] = "replacement";
+        auto args = obj(); args["path"] = large_path; args["edits"] = mcp::Json::array({e});
+        auto too_large = call(*provider, "edit", args);
+        assert(too_large.is_error);
+        assert(too_large.text.find("1 MiB edit cap") != std::string::npos);
+        assert(too_large.text.find("rejected before reading") != std::string::npos);
+        assert(fs::file_size(large_path) == 2u * 1024u * 1024u);
+        std::puts("edit: oversized sparse target rejected before read");
     }
 
     // ── list_dir shows the files ─────────────────────────────────────────

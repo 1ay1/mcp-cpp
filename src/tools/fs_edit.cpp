@@ -20,6 +20,7 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -591,6 +592,20 @@ ExecResult run_edit(const EditArgs& a) {
         return std::unexpected(ToolError::not_a_file(
             "not a regular file: " + a.path.string()
             + " (is it a directory or symlink to one?)"));
+    constexpr std::uintmax_t kMaxEditBytes = 1024u * 1024u;
+    const std::uintmax_t size = fs::file_size(p, ec);
+    if (ec)
+        return std::unexpected(ToolError::io(
+            "cannot determine file size before editing: " + a.path.string()
+            + " (" + ec.message() + ")"));
+    if (size > kMaxEditBytes)
+        return std::unexpected(ToolError::too_large(std::format(
+            "file is {} KiB (> 1 MiB edit cap). `edit` must load the whole "
+            "target to match and apply replacements, so it was rejected before "
+            "reading. Use `read` with offset/limit to inspect it, then use a "
+            "streaming/scripted transformation (for example via `bash`) or split "
+            "the file into smaller files.",
+            size / 1024)));
     if (util::is_binary_file(p))
         return std::unexpected(ToolError::binary(
             "refusing to edit binary file: " + a.path.string()
@@ -607,7 +622,26 @@ ExecResult run_edit(const EditArgs& a) {
             "making further edits.\n\n";
     }
 
-    std::string original = util::read_file(a.path);
+    // Read through a hard cap as well as checking metadata above. The path may
+    // grow or be replaced between stat and open; a size-only preflight is not
+    // a memory bound. Reading at most cap+1 makes that race fail closed.
+    std::ifstream bounded(p, std::ios::binary);
+    if (!bounded)
+        return std::unexpected(ToolError::io(
+            "cannot open file for bounded edit read: " + a.path.string()));
+    std::string original(static_cast<std::size_t>(kMaxEditBytes) + 1, '\0');
+    bounded.read(original.data(), static_cast<std::streamsize>(original.size()));
+    original.resize(static_cast<std::size_t>(bounded.gcount()));
+    bounded.close();
+    if (original.size() > kMaxEditBytes)
+        return std::unexpected(ToolError::too_large(
+            "file exceeded the 1 MiB edit cap while being opened/read; edit "
+            "was aborted without applying changes. Re-read the target and use "
+            "a streaming transformation or split it into smaller files."));
+    if (original.find('\0') != std::string::npos)
+        return std::unexpected(ToolError::binary(
+            "refusing to edit binary file: " + a.path.string()
+            + " (the bounded read contains NUL bytes)."));
     std::string updated  = original;
 
     struct EditOutcome {

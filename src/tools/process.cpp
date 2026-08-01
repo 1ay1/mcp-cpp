@@ -71,7 +71,14 @@ struct Session {
         std::lock_guard<std::mutex> lock(stop_mu);
         if (stopped) return;
         stopped = true;
-        if (child) child->terminate();
+        if (child) {
+            child->terminate();
+            // A failed session/group setup or unrelated inherited descriptor
+            // must not leave process_stop blocked forever in stream.get().
+            // POSIX fd_streambuf uses a wake pipe, so this does not close an
+            // FD underneath the reader thread.
+            child->interrupt_output();
+        }
         if (reader.joinable()) reader.join();
         child.reset();
     }

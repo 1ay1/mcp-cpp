@@ -489,9 +489,23 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     posix_spawnattr_t attr;
     bool have_attr = (::posix_spawnattr_init(&attr) == 0);
     posix_spawnattr_t* attrp = nullptr;
+    [[maybe_unused]] bool group_attr = false;
 #ifdef POSIX_SPAWN_SETSID
-    if (have_attr && ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID) == 0)
+    if (have_attr && ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID) == 0) {
         attrp = &attr;
+        group_attr = true;
+    }
+#endif
+#ifdef POSIX_SPAWN_SETPGROUP
+    // Some libcs expose SETSID but reject it at runtime. Fall back to a
+    // dedicated process group rather than silently spawning an uncontained
+    // child whose descendants cannot be cancelled as a unit.
+    if (have_attr && !group_attr
+        && ::posix_spawnattr_setpgroup(&attr, 0) == 0
+        && ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP) == 0) {
+        attrp = &attr;
+        group_attr = true;
+    }
 #endif
 
     rc = ::posix_spawnp(&pid, arg_ptrs[0], &actions, attrp,
@@ -578,12 +592,22 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
         last_emit = clock::now();
     };
 
-    // Main poll loop. Exits as soon as we've got both EOF on the pipe AND
-    // a reaped child — the order can vary (child can exit before its
-    // last bytes drain on a heavily-buffered pipe; pipe can EOF before
-    // waitpid completes if the child is being reparented).
+    auto signal_group = [&](int signal) {
+        // Every POSIX child is started as a session leader where supported;
+        // signal the group so shells and their descendants cannot outlive a
+        // timeout/cancellation or retain the capture pipe. Fall back to the
+        // leader only on platforms where spawn-time session creation failed.
+        if (::kill(-pid, signal) != 0 && errno == ESRCH)
+            (void)::kill(pid, signal);
+    };
+
+    // Main poll loop. Exits as soon as we've got EOF and a reaped child.
+    // After timeout/cancellation it additionally waits (bounded) for the
+    // private process group to disappear, even if the leader exits first.
     bool reaped = false;
-    while (!eof || !reaped) {
+    bool group_done = false;
+    auto cleanup_deadline = clock::time_point::max();
+    while (!eof || !reaped || (sent_term && !group_done)) {
         auto now = clock::now();
 
         // Idle-deadline state machine. SIGTERM first (cooperative
@@ -594,20 +618,27 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
         // successful drain below, so reaching it means the child has
         // gone silent for at least `opts.timeout` seconds.
         if (!sent_term && opts.cancelled && opts.cancelled()) {
-            ::kill(pid, SIGTERM);
+            signal_group(SIGTERM);
             sent_term = true;
             cancelled = true;
             kill_at = now + kKillGrace;
         }
         if (!sent_term && has_idle_window && now >= idle_deadline) {
-            ::kill(pid, SIGTERM);
+            signal_group(SIGTERM);
             sent_term = true;
             timed_out = true;
             kill_at   = now + kKillGrace;
         }
         if (sent_term && !sent_kill && now >= kill_at) {
-            ::kill(pid, SIGKILL);
+            signal_group(SIGKILL);
             sent_kill = true;
+            cleanup_deadline = now + std::chrono::seconds{1};
+        }
+        if (sent_term) {
+            group_done = (::kill(-pid, 0) != 0 && errno == ESRCH);
+            // Do not let an unreaped descendant zombie controlled by another
+            // parent defeat the bounded lifecycle guarantee.
+            if (sent_kill && now >= cleanup_deadline) group_done = true;
         }
 
         // Compute the next event we care about and bound the poll

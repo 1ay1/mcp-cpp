@@ -14,13 +14,21 @@
 // having the child attempt exactly that and report the outcome on its
 // (piped, captured) stdout.
 
+#include <mcp/cap/process.hpp>
 #include <mcp/tools/util/subprocess.hpp>
 
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 
+#include <unistd.h>
+
+using mcp::tools::util::Subprocess;
+using mcp::tools::util::SubprocessOptions;
 using mcp::tools::util::run_command_s;
 
 static int failures = 0;
@@ -55,6 +63,60 @@ int main() {
                            std::chrono::seconds{10});
     CHECK(s.output.find("hello-stdout") != std::string::npos,
           "normal stdout capture still works");
+
+    // Cancellation must target the session, not just its shell leader. Both
+    // processes ignore TERM, forcing the 2-second KILL escalation. The
+    // descendant inherits stdout, reproducing the pipe-holder hang.
+    SubprocessOptions cancelled;
+    cancelled.shell_command =
+        "trap '' TERM; (trap '' TERM; while :; do sleep 1; done) & "
+        "echo DESCENDANT:$!; wait";
+    cancelled.timeout = std::chrono::seconds{30};
+    const auto cancel_start = std::chrono::steady_clock::now();
+    cancelled.cancelled = [cancel_start] {
+        return std::chrono::steady_clock::now() - cancel_start >
+               std::chrono::milliseconds{100};
+    };
+    auto killed = Subprocess::run(std::move(cancelled));
+    const auto cancel_elapsed = std::chrono::steady_clock::now() - cancel_start;
+    CHECK(killed.cancelled, "cancellation reported");
+    CHECK(cancel_elapsed < std::chrono::seconds{5},
+          "cancellation is bounded despite TERM-resistant descendant");
+    const auto marker = killed.output.find("DESCENDANT:");
+    CHECK(marker != std::string::npos, "descendant pid captured");
+    if (marker != std::string::npos) {
+        const pid_t descendant = static_cast<pid_t>(std::strtol(
+            killed.output.c_str() + marker + 11, nullptr, 10));
+        errno = 0;
+        CHECK(descendant > 0 && ::kill(descendant, 0) < 0 && errno == ESRCH,
+              "cancellation killed descendant process");
+    }
+
+    // Exercise the long-running process primitive used by process_stop.
+    // terminate() must escalate for a TERM-resistant tree and
+    // interrupt_output() must safely wake the blocked iostream reader.
+    mcp::cap::ChildProcess::Spawn spawn;
+    spawn.command = "/bin/sh";
+    spawn.args = {"-c", "trap '' TERM; (trap '' TERM; while :; do sleep 1; done) & "
+                         "echo $!; wait"};
+    spawn.merge_stderr = true;
+    mcp::cap::ChildProcess child{spawn};
+    pid_t held_descendant = -1;
+    child.out() >> held_descendant;
+    std::thread reader([&] {
+        char byte = 0;
+        child.out().get(byte); // blocks: descendant deliberately retains stdout
+    });
+    const auto stop_start = std::chrono::steady_clock::now();
+    child.terminate();
+    child.interrupt_output();
+    reader.join();
+    const auto stop_elapsed = std::chrono::steady_clock::now() - stop_start;
+    CHECK(stop_elapsed < std::chrono::seconds{5},
+          "process stop primitive is bounded");
+    errno = 0;
+    CHECK(held_descendant > 0 && ::kill(held_descendant, 0) < 0 && errno == ESRCH,
+          "process stop killed stdout-holding descendant");
 
     if (failures == 0) std::puts("all subprocess-tty tests passed");
     return failures ? 1 : 0;

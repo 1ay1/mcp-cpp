@@ -13,6 +13,7 @@
 #include <mcp/tools/meta.hpp>
 #include <mcp/cap/local.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <map>
@@ -59,6 +60,10 @@ public:
         for (auto& r : records)
             if (needle.empty() || r.text.find(needle) != std::string::npos) out.push_back(r);
         return out;
+    }
+    std::optional<std::size_t> preview_wipe(const std::string& scope) override {
+        return std::count_if(records.begin(), records.end(),
+            [&](const MemoryRecord& r){ return r.scope == scope; });
     }
     std::optional<std::size_t> wipe(const std::string& scope) override {
         auto n = records.size();
@@ -179,17 +184,37 @@ int main() {
     auto rf = call(*p, "forget", {{"substring", "fish"}});
     check(!rf.is_error && store->records.size() == before - 1, "forget removed one");
 
-    // wipe requires confirm
+    // wipe preview reports the exact selected-scope count and never mutates
     call(*p, "remember", {{"text", "user-scope fact"}, {"scope", "user"}});
-    auto rw0 = call(*p, "wipe_memory", {{"scope", "user"}});
-    check(!rw0.is_error, "wipe preview ok");
+    call(*p, "remember", {{"text", "second user fact"}, {"scope", "user"}});
+    call(*p, "remember", {{"text", "project-scope fact"}, {"scope", "project"}});
     std::size_t user_count = 0;
-    for (auto& r : store->records) if (r.scope == "user") ++user_count;
-    check(user_count >= 1, "a user-scope record exists before wipe");
+    std::size_t project_count = 0;
+    for (auto& r : store->records) {
+        if (r.scope == "user") ++user_count;
+        if (r.scope == "project") ++project_count;
+    }
     auto total_before = store->records.size();
+    auto rw0 = call(*p, "wipe_memory", {{"scope", "user"}});
+    check(!rw0.is_error && store->records.size() == total_before,
+          "wipe preview does not mutate");
+    check(rw0.text.find("wipe " + std::to_string(user_count) + " record(s)")
+              != std::string::npos,
+          "wipe preview reports exact user-scope count");
+    check(rw0.text.find("scope 'user'") != std::string::npos,
+          "wipe preview names selected user scope");
+    auto rp0 = call(*p, "wipe_memory", {{"scope", "project"}});
+    check(!rp0.is_error
+              && rp0.text.find("wipe " + std::to_string(project_count) + " record(s)")
+                     != std::string::npos,
+          "wipe preview reports exact project-scope count");
     auto rw1 = call(*p, "wipe_memory", {{"scope", "user"}, {"confirm", true}});
     check(!rw1.is_error && store->records.size() == total_before - user_count,
           "wipe with confirm removed exactly the user scope");
+    check(std::count_if(store->records.begin(), store->records.end(),
+                       [](const MemoryRecord& r){ return r.scope == "project"; })
+              == project_count,
+          "confirmed user wipe preserves project records");
 
     // ── project-unavailable workspace: no-scope remember must NOT fail ────
     // Regression for the "remember always fails first" bug: when the store

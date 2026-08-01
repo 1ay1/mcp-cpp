@@ -106,6 +106,11 @@ public:
     [[nodiscard]] virtual std::vector<MemoryRecord>
         preview_forget(const std::string& needle) = 0;
 
+    // Preview an entire scope without mutating. Returns the exact record count,
+    // or nullopt if the scope is unresolvable.
+    [[nodiscard]] virtual std::optional<std::size_t>
+        preview_wipe(const std::string& scope) = 0;
+
     // Wipe an entire scope. Returns count removed, or nullopt if the scope is
     // unresolvable. The confirm gate lives in the shell; this always wipes.
     [[nodiscard]] virtual std::optional<std::size_t> wipe(const std::string& scope) = 0;

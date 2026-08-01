@@ -178,9 +178,12 @@ void register_memory_tools(Shells& sh, const std::shared_ptr<MemoryStore>& mem) 
                 return mcp::cap::Result::error("wipe_memory: unknown scope '" + scope + "'.");
             bool confirm = args.value("confirm", false);
             if (!confirm) {
-                auto preview = mem->preview_forget("");   // host may return all for empty
+                auto n = mem->preview_wipe(scope);
+                if (!n) return mcp::cap::Result::error(
+                    "wipe_memory: scope '" + scope + "' unresolvable.");
                 return mcp::cap::Result::ok(
-                    "This will wipe scope '" + scope + "'. Re-call with confirm:true to proceed.");
+                    "This will wipe " + std::to_string(*n) + " record(s) from scope '"
+                    + scope + "'. Re-call with confirm:true to proceed.");
             }
             auto n = mem->wipe(scope);
             if (!n) return mcp::cap::Result::error("wipe_memory: scope '" + scope + "' unresolvable.");
