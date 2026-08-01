@@ -104,7 +104,9 @@ public:
 class FakeRunner : public SubagentRunner {
 public:
     bool ok = true;
-    bool available() const override { return ok; }
+    std::string unavailable_reason() const override {
+        return ok ? std::string{} : "test backend is offline";
+    }
     std::string run(const SubagentRequest& r, bool& is_error) override {
         is_error = false; return "report for: " + r.prompt;
     }
@@ -260,6 +262,8 @@ int main() {
         runner->ok = false;
         auto rtask2 = call(*p2, "task", {{"prompt","x"}});
         check(rtask2.is_error, "task refuses when unavailable");
+        check(rtask2.text.find("test backend is offline") != std::string::npos,
+              "task reports exact unavailability reason");
     }
 
     if (fails == 0) std::printf("mcp_toolset_test: all checks passed\n");

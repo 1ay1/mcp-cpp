@@ -178,9 +178,10 @@ struct SubagentRequest {
 class SubagentRunner {
 public:
     virtual ~SubagentRunner() = default;
-    // True when a subagent can run right now (host installed + depth budget
-    // available). The shell refuses with a clear message when false.
-    [[nodiscard]] virtual bool available() const = 0;
+    // Empty when a subagent can run right now; otherwise an actionable reason
+    // suitable for returning directly as a tool execution error.
+    [[nodiscard]] virtual std::string unavailable_reason() const = 0;
+    [[nodiscard]] bool available() const { return unavailable_reason().empty(); }
     // Run a subagent to completion and return its condensed report. On
     // failure returns the error text and sets `is_error`.
     [[nodiscard]] virtual std::string

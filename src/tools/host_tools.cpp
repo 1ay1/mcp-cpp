@@ -243,9 +243,8 @@ void register_task_tool(Shells& sh, const std::shared_ptr<SubagentRunner>& runne
         },
         EffectSet{Effect::ReadFs, Effect::Net},
         [runner](const Json& args) -> mcp::cap::Result {
-            if (!runner->available())
-                return mcp::cap::Result::error(
-                    "task: subagent unavailable (not configured, or max nesting depth reached).");
+            if (auto reason = runner->unavailable_reason(); !reason.empty())
+                return mcp::cap::Result::error("task: " + std::move(reason));
             SubagentRequest req;
             req.prompt = args.value("prompt", std::string{});
             if (req.prompt.empty())
