@@ -34,3 +34,16 @@ struct Scope {
 };
 
 } // namespace mcp::tools::util::progress
+
+namespace mcp::tools::util::cancellation {
+using Probe = std::function<bool()>;
+void set(Probe probe);
+void clear();
+[[nodiscard]] bool requested();
+struct Scope {
+    explicit Scope(Probe probe) { set(std::move(probe)); }
+    ~Scope() { clear(); }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+};
+} // namespace mcp::tools::util::cancellation

@@ -165,6 +165,8 @@ public:
         std::string              command;   // executable (PATH-resolved)
         std::vector<std::string> args;      // NOT including argv[0]
         std::vector<std::string> env_kv;    // extra "KEY=VALUE" entries
+        std::string              cwd;        // empty inherits parent cwd
+        bool                     merge_stderr = false;
     };
 
     explicit ChildProcess(const Spawn& s) {
@@ -194,7 +196,8 @@ public:
         si.dwFlags    = STARTF_USESTDHANDLES;
         si.hStdInput  = child_stdin_rd.get();
         si.hStdOutput = child_stdout_wr.get();
-        si.hStdError  = ::GetStdHandle(STD_ERROR_HANDLE);   // inherit parent stderr
+        si.hStdError  = s.merge_stderr ? child_stdout_wr.get()
+                                       : ::GetStdHandle(STD_ERROR_HANDLE);
 
         std::string cmdline = build_command_line_(s);
         std::string env_block;
@@ -208,7 +211,7 @@ public:
             /*bInheritHandles=*/TRUE,
             /*creationFlags=*/0,
             /*lpEnvironment=*/have_env ? env_block.data() : nullptr,
-            /*lpCurrentDirectory=*/nullptr,
+            /*lpCurrentDirectory=*/s.cwd.empty() ? nullptr : s.cwd.c_str(),
             &si, &pi);
 
         // The child owns its ends now; drop ours regardless of success.
@@ -254,20 +257,26 @@ public:
         out_buf_.reset();   // closes child's stdin HANDLE
     }
 
-    // Close child stdin (EOF → graceful exit), wait briefly, then terminate.
-    // Idempotent; also called by the destructor.
-    void shutdown() noexcept {
+    // Stop/reap the process but keep the read stream object alive so a
+    // concurrent output reader can observe EOF and join safely.
+    void terminate() noexcept {
         if (out_stream_) out_stream_->flush();
         out_stream_.reset();
-        out_buf_.reset();             // EOF to the child
+        out_buf_.reset();
         if (proc_) {
             if (::WaitForSingleObject(proc_, 500) == WAIT_TIMEOUT)
                 ::TerminateProcess(proc_, 1);
-            ::WaitForSingleObject(proc_, 2000);
+            ::WaitForSingleObject(proc_, INFINITE);
             ::CloseHandle(proc_);
             proc_ = nullptr;
-            pid_  = -1;
+            pid_ = -1;
         }
+    }
+
+    // Close child stdin (EOF → graceful exit), wait briefly, then terminate.
+    // Idempotent; also called by the destructor.
+    void shutdown() noexcept {
+        terminate();
         in_stream_.reset();
         in_buf_.reset();
     }
@@ -484,6 +493,8 @@ public:
         std::string              command;   // executable (PATH-resolved via execvp)
         std::vector<std::string> args;      // NOT including argv[0]
         std::vector<std::string> env_kv;    // extra "KEY=VALUE" entries
+        std::string              cwd;        // empty inherits parent cwd
+        bool                     merge_stderr = false;
     };
 
     explicit ChildProcess(const Spawn& s) {
@@ -511,6 +522,12 @@ public:
             // copies in a separate address space and irrelevant here.
             ::dup2(in_pipe[0],  STDIN_FILENO);
             ::dup2(out_pipe[1], STDOUT_FILENO);
+            if (s.merge_stderr) ::dup2(out_pipe[1], STDERR_FILENO);
+            if (!s.cwd.empty() && ::chdir(s.cwd.c_str()) != 0) {
+                std::fprintf(stderr, "mcp::cap: chdir '%s' failed: %s\n",
+                             s.cwd.c_str(), std::strerror(errno));
+                ::_exit(126);
+            }
             ::close(in_pipe[0]);  ::close(in_pipe[1]);
             ::close(out_pipe[0]); ::close(out_pipe[1]);
             for (const auto& kv : s.env_kv) {
@@ -569,14 +586,15 @@ public:
         out_buf_.reset();   // closes child's stdin FD
     }
 
-    // Close child stdin (EOF → graceful exit), poll briefly, then SIGTERM.
-    // Idempotent; also called by the destructor.
-    void shutdown() noexcept {
+    // Stop/reap the process while retaining the read stream object. The child
+    // closing stdout wakes a concurrent reader, which can be joined before the
+    // stream itself is destroyed.
+    void terminate() noexcept {
         out_stream_.reset();
-        out_buf_.reset();             // closes child's stdin → EOF
+        out_buf_.reset();
         if (pid_ > 0) {
             int status = 0;
-            for (int i = 0; i < 50; ++i) {        // ~500ms grace
+            for (int i = 0; i < 50; ++i) {
                 pid_t r = ::waitpid(pid_, &status, WNOHANG);
                 if (r == pid_ || r < 0) { pid_ = -1; break; }
                 ::usleep(10'000);
@@ -587,6 +605,12 @@ public:
                 pid_ = -1;
             }
         }
+    }
+
+    // Close child stdin (EOF → graceful exit), poll briefly, then SIGTERM.
+    // Idempotent; also called by the destructor.
+    void shutdown() noexcept {
+        terminate();
         in_stream_.reset();
         in_buf_.reset();
     }

@@ -1007,6 +1007,52 @@ ExecResult run_grep(const GrepArgs& a) {
     return r;
 }
 
+struct FindReferencesArgs {
+    std::string symbol;
+    std::string path;
+    std::string glob;
+    int offset = 0;
+};
+
+std::expected<FindReferencesArgs, ToolError> parse_find_references_args(const json& j) {
+    util::ArgReader ar(j);
+    auto symbol = ar.require_str("symbol");
+    if (!symbol || symbol->empty())
+        return std::unexpected(ToolError::invalid_args("symbol is required"));
+    return FindReferencesArgs{*symbol, ar.str("path", "."), ar.str("glob", ""),
+                              std::max(0, ar.integer("offset", 0))};
+}
+
+std::string regex_escape(std::string_view text) {
+    std::string out;
+    out.reserve(text.size() * 2);
+    constexpr std::string_view special = R"(\.^$|()[]{}*+?)";
+    for (char c : text) {
+        if (special.find(c) != std::string_view::npos) out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
+ExecResult run_find_references(const FindReferencesArgs& a) {
+    const std::string escaped = regex_escape(a.symbol);
+    GrepArgs grep{
+        "(^|[^A-Za-z0-9_])" + escaped + "([^A-Za-z0-9_]|$)",
+        a.path, a.glob, true, a.offset,
+        "References to " + a.symbol,
+    };
+    return run_grep(grep);
+}
+
+json find_references_schema() {
+    return json{{"type","object"}, {"required", {"symbol"}}, {"properties", {
+        {"symbol", {{"type","string"}, {"description","Exact identifier to find."}}},
+        {"path", {{"type","string"}, {"description","Directory to search (default workspace)."}}},
+        {"glob", {{"type","string"}, {"description","Optional file glob."}}},
+        {"offset", {{"type","integer"}, {"minimum",0}, {"description","Pagination offset."}}}
+    }}};
+}
+
 // ── Schemas ──────────────────────────────────────────────────────────────
 
 json glob_schema() {
@@ -1071,6 +1117,11 @@ void register_search_tools(Shells& sh) {
         "Case-insensitive on Windows.",
         glob_schema(), EffectSet{Effect::ReadFs},
         body<GlobArgs>(run_glob, parse_glob_args), 25'000);
+
+    sh.add("find_references",
+        "Find exact identifier references across the workspace with file, line, enclosing symbol, context, glob filtering, and pagination.",
+        find_references_schema(), EffectSet{Effect::ReadFs},
+        body<FindReferencesArgs>(run_find_references, parse_find_references_args), 30'000);
 
     sh.add("find_definition",
         "Find the definition of a symbol (function, class, struct, enum, type) "

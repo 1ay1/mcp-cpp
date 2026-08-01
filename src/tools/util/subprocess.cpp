@@ -282,7 +282,12 @@ SubprocessResult run_win32_cmdline(const std::string& cmdline,
     std::size_t last_total_seen = 0;
 
     bool timed_out = false;
+    bool cancelled = false;
     for (;;) {
+        if (opts.cancelled && opts.cancelled()) {
+            cancelled = true;
+            break;
+        }
         auto now = now_ms();
         // Reset the idle window if the reader thread has appended bytes
         // since our last check.  Snapshot is cheap (one mutex acquire +
@@ -320,10 +325,11 @@ SubprocessResult run_win32_cmdline(const std::string& cmdline,
     }
 
     DWORD exit_code = 0;
-    if (timed_out) {
+    if (timed_out || cancelled) {
         ::TerminateProcess(pi.hProcess, 1);
         ::WaitForSingleObject(pi.hProcess, 2000);
-        r.timed_out = true;
+        r.timed_out = timed_out;
+        r.cancelled = cancelled;
     } else {
         ::GetExitCodeProcess(pi.hProcess, &exit_code);
         r.exit_code = (int)exit_code;
@@ -558,6 +564,7 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     bool sent_term  = false;
     bool sent_kill  = false;
     bool timed_out  = false;
+    bool cancelled  = false;
     bool eof        = false;
     int  wait_status = 0;
 
@@ -586,6 +593,12 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
         // `idle_deadline` was reset to `now + idle_window` on every
         // successful drain below, so reaching it means the child has
         // gone silent for at least `opts.timeout` seconds.
+        if (!sent_term && opts.cancelled && opts.cancelled()) {
+            ::kill(pid, SIGTERM);
+            sent_term = true;
+            cancelled = true;
+            kill_at = now + kKillGrace;
+        }
         if (!sent_term && has_idle_window && now >= idle_deadline) {
             ::kill(pid, SIGTERM);
             sent_term = true;
@@ -668,6 +681,7 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     if      (WIFEXITED  (wait_status)) r.exit_code = WEXITSTATUS(wait_status);
     else if (WIFSIGNALED(wait_status)) r.exit_code = 128 + WTERMSIG(wait_status);
     r.timed_out = timed_out;
+    r.cancelled = cancelled;
     r.truncated = truncated;
     r.output    = clean_capture(out.str());
     return r;
@@ -679,6 +693,8 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
 
 SubprocessResult Subprocess::run(SubprocessOptions opts) {
     SubprocessResult r;
+    if (!opts.cancelled)
+        opts.cancelled = [] { return cancellation::requested(); };
 
     // Build a final command line appropriate for this platform.
 #ifdef _WIN32
@@ -760,7 +776,8 @@ std::string legacy_format(const SubprocessResult& r, std::chrono::seconds timeou
     if (!r.started) return "[" + r.start_error + "]";
     std::string o = r.output;
     if (r.truncated) o += "\n[output truncated]";
-    if (r.timed_out) o += "\n[timed out after " + std::to_string(timeout.count()) + "s]";
+    if (r.cancelled) o += "\n[cancelled]";
+    else if (r.timed_out) o += "\n[timed out after " + std::to_string(timeout.count()) + "s]";
     else if (r.exit_code != 0) o += "\n[exit code " + std::to_string(r.exit_code) + "]";
     return o;
 }

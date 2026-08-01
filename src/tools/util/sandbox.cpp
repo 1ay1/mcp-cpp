@@ -372,6 +372,22 @@ SubprocessResult run_shell_command(std::string_view cmd,
     return run_wrapped(cmd, max_bytes, timeout);
 }
 
+std::vector<std::string> prepare_shell_argv(std::string_view cmd) {
+    if (is_active()) {
+#if defined(__linux__)
+        return build_bwrap_argv(cmd);
+#elif defined(__APPLE__)
+        return {"sandbox-exec", "-p", build_profile(workspace_root().string()),
+                "/bin/sh", "-c", std::string{cmd}};
+#endif
+    }
+#ifdef _WIN32
+    return {"cmd.exe", "/d", "/s", "/c", std::string{cmd}};
+#else
+    return {"/bin/sh", "-lc", std::string{cmd}};
+#endif
+}
+
 SubprocessResult run_argv(const std::vector<std::string>& argv,
                           std::size_t max_bytes,
                           std::chrono::seconds timeout) {

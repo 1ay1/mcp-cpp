@@ -52,12 +52,14 @@ struct SubprocessOptions {
     // sequences that span pipe reads still render correctly on the next
     // flush — no need for delta-aware splitting on the caller side.
     std::function<void(std::string_view snapshot)> on_progress;
+    std::function<bool()> cancelled;
 };
 
 struct SubprocessResult {
     std::string output;                // captured stdout+stderr, UTF-8 valid
     int  exit_code   = 0;
     bool timed_out   = false;
+    bool cancelled   = false;
     bool truncated   = false;
     bool started     = true;           // false iff spawn itself failed
     std::string start_error;           // populated when started==false

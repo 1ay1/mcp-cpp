@@ -8,10 +8,12 @@
 #include "tool_body.hpp"
 
 #include <mcp/tools/util/arg_reader.hpp>
+#include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/sandbox.hpp>
 #include <mcp/tools/util/subprocess.hpp>
 #include <mcp/tools/util/error.hpp>
 
+#include <algorithm>
 #include <expected>
 #include <filesystem>
 #include <sstream>
@@ -40,21 +42,23 @@ enum class BuildSystem { None, CMake, Cargo, Go, Node, Make };
 
 [[nodiscard]] BuildSystem detect_build_system() noexcept {
     std::error_code ec;
-    if (fs::exists("build/build.ninja", ec) || fs::exists("build/Makefile", ec)) return BuildSystem::CMake;
-    if (fs::exists("Cargo.toml", ec))    return BuildSystem::Cargo;
-    if (fs::exists("go.mod", ec))        return BuildSystem::Go;
-    if (fs::exists("package.json", ec))  return BuildSystem::Node;
-    if (fs::exists("Makefile", ec))      return BuildSystem::Make;
+    const auto& root = util::workspace_root();
+    if (fs::exists(root / "build/build.ninja", ec) || fs::exists(root / "build/Makefile", ec)) return BuildSystem::CMake;
+    if (fs::exists(root / "Cargo.toml", ec))    return BuildSystem::Cargo;
+    if (fs::exists(root / "go.mod", ec))        return BuildSystem::Go;
+    if (fs::exists(root / "package.json", ec))  return BuildSystem::Node;
+    if (fs::exists(root / "Makefile", ec))      return BuildSystem::Make;
     return BuildSystem::None;
 }
 
 [[nodiscard]] std::vector<std::string> build_argv_for(BuildSystem bs) {
+    const auto root = util::workspace_root().string();
     switch (bs) {
-        case BuildSystem::CMake: return {"cmake", "--build", "build"};
-        case BuildSystem::Cargo: return {"cargo", "check"};
-        case BuildSystem::Go:    return {"go", "build", "./..."};
-        case BuildSystem::Node:  return {"npx", "tsc", "--noEmit"};
-        case BuildSystem::Make:  return {"make", "-n"};
+        case BuildSystem::CMake: return {"cmake", "--build", (util::workspace_root() / "build").string()};
+        case BuildSystem::Cargo: return {"cargo", "check", "--manifest-path", (util::workspace_root() / "Cargo.toml").string()};
+        case BuildSystem::Go:    return {"go", "-C", root, "build", "./..."};
+        case BuildSystem::Node:  return {"npm", "--prefix", root, "exec", "--", "tsc", "--noEmit"};
+        case BuildSystem::Make:  return {"make", "-C", root, "-n"};
         case BuildSystem::None:  return {};
     }
     return {};
@@ -125,6 +129,84 @@ ExecResult run_diagnostics(const DiagnosticsArgs& a) {
     return ToolOutput{std::move(body), std::nullopt};
 }
 
+struct TestArgs {
+    std::string command;
+    std::string filter;
+    int timeout_seconds = 120;
+    int repeat = 1;
+};
+
+std::expected<TestArgs, ToolError> parse_test_args(const json& j) {
+    util::ArgReader ar(j);
+    return TestArgs{
+        ar.str("command", ""),
+        ar.str("filter", ar.str("target", "")),
+        std::clamp(ar.integer("timeout_seconds", 120), 1, 1800),
+        std::clamp(ar.integer("repeat", 1), 1, 100),
+    };
+}
+
+std::vector<std::string> test_argv_for(BuildSystem bs, const TestArgs& a) {
+    std::vector<std::string> argv;
+    const auto root = util::workspace_root().string();
+    switch (bs) {
+        case BuildSystem::CMake:
+            argv = {"ctest", "--test-dir", (util::workspace_root() / "build").string(), "--output-on-failure"};
+            if (!a.filter.empty()) argv.insert(argv.end(), {"-R", a.filter});
+            if (a.repeat > 1) argv.insert(argv.end(), {"--repeat", "until-fail:" + std::to_string(a.repeat)});
+            break;
+        case BuildSystem::Cargo:
+            argv = {"cargo", "test", "--manifest-path", (util::workspace_root() / "Cargo.toml").string()};
+            if (!a.filter.empty()) argv.push_back(a.filter);
+            break;
+        case BuildSystem::Go:
+            argv = {"go", "-C", root, "test", "./..."};
+            if (!a.filter.empty()) argv.insert(argv.end(), {"-run", a.filter});
+            if (a.repeat > 1) argv.insert(argv.end(), {"-count", std::to_string(a.repeat)});
+            break;
+        case BuildSystem::Node:
+            argv = {"npm", "--prefix", root, "test", "--"};
+            if (!a.filter.empty()) argv.push_back(a.filter);
+            break;
+        case BuildSystem::Make:
+            argv = {"make", "-C", root, "test"};
+            break;
+        case BuildSystem::None:
+            break;
+    }
+    return argv;
+}
+
+ExecResult run_tests(const TestArgs& a) {
+    auto argv = a.command.empty() ? test_argv_for(detect_build_system(), a)
+                                  : std::vector<std::string>{};
+    if (a.command.empty() && argv.empty())
+        return std::unexpected(ToolError::not_found(
+            "no test runner detected; pass command explicitly"));
+    const auto timeout = std::chrono::seconds{a.timeout_seconds};
+    auto sub = a.command.empty()
+        ? util::sandbox::run_argv(argv, 200'000, timeout)
+        : util::sandbox::run_shell_command(a.command, 200'000, timeout);
+    std::string output = util::legacy_format(sub, timeout);
+    std::ostringstream summary;
+    summary << (sub.exit_code == 0 && !sub.timed_out ? "PASS" : "FAIL")
+            << " exit=" << sub.exit_code;
+    if (sub.timed_out) summary << " timeout=" << a.timeout_seconds << "s";
+    summary << '\n';
+    if (!output.empty()) summary << output;
+    return ToolOutput{summary.str(), std::nullopt};
+}
+
+json test_schema() {
+    return json{{"type","object"}, {"properties", {
+        {"command", {{"type","string"}, {"description","Custom test command; otherwise auto-detect."}}},
+        {"filter", {{"type","string"}, {"description","CTest regex, Cargo test name, Go -run regex, or npm test filter."}}},
+        {"target", {{"type","string"}, {"description","Alias for filter."}}},
+        {"timeout_seconds", {{"type","integer"}, {"minimum",1}, {"maximum",1800}, {"default",120}}},
+        {"repeat", {{"type","integer"}, {"minimum",1}, {"maximum",100}, {"default",1}}}
+    }}};
+}
+
 json diagnostics_schema() {
     return json{
         {"type","object"},
@@ -145,6 +227,14 @@ void register_diagnostics_tool(Shells& sh) {
         "Auto-detects build system (CMake, cargo, go, npm, make).",
         diagnostics_schema(), EffectSet{Effect::Exec},
         body<DiagnosticsArgs>(run_diagnostics, parse_diagnostics_args), 30'000);
+}
+
+void register_test_tool(Shells& sh) {
+    sh.add("test",
+        "Run focused project tests with structured pass/fail status, live output, filtering, repetition, and timeout. "
+        "Auto-detects CTest, Cargo, Go, npm, or Make; pass command for custom runners.",
+        test_schema(), EffectSet{Effect::Exec},
+        body<TestArgs>(run_tests, parse_test_args), 40'000);
 }
 
 } // namespace mcp::tools::detail

@@ -25,6 +25,7 @@
 
 namespace mcp::tools::detail {
 
+namespace fs = std::filesystem;
 using json = nlohmann::json;
 using util::ToolError;
 using util::ToolOutput;
@@ -88,14 +89,11 @@ run_git(const std::vector<std::string>& argv, std::string_view op,
 // directory OR a file — the workspace-checked string for the tool's
 // `path`/first `files[]` entry), ask git for the enclosing worktree
 // toplevel so every subcommand runs against the RIGHT repo regardless
-// of the process cwd. Falls back to the checked path's own directory
-// (or the workspace root when no path was given) so the classic
-// "cwd isn't the repo" failure can't happen. The returned directory is
-// always inside the workspace: `checked` already passed the containment
-// gate, and rev-parse only ever walks UP to an ancestor that still
-// contains it — we clamp the result back to the workspace root if git
-// somehow reports a toplevel above it.
-std::string resolve_git_dir(std::string_view checked) {
+// of the process cwd. A repository rooted above the workspace is rejected:
+// merely replacing its path with the workspace is not containment because
+// Git would discover the same parent repository again.
+std::expected<std::string, ToolError>
+resolve_git_dir(std::string_view checked) {
     namespace fs = std::filesystem;
     fs::path start = checked.empty()
         ? util::workspace_root()
@@ -114,19 +112,20 @@ std::string resolve_git_dir(std::string_view checked) {
         while (!top.empty() && (top.back() == '\n' || top.back() == '\r'))
             top.pop_back();
         if (!top.empty()) {
-            // Clamp: the repo must contain the workspace-checked path, so
-            // its toplevel is at or below the workspace root. If git
-            // reports an ancestor ABOVE the workspace (nested-checkout
-            // edge), prefer the workspace root — never escape the gate.
             const fs::path& ws = util::workspace_root();
             fs::path topc = fs::weakly_canonical(fs::path{top}, ec);
             fs::path wsc  = fs::weakly_canonical(ws, ec);
-            auto within = [&](const fs::path& a, const fs::path& b) {
-                auto ra = a.string(), rb = b.string();
-                return ra.size() >= rb.size() && ra.compare(0, rb.size(), rb) == 0;
+            auto under = [](const fs::path& child, const fs::path& root) {
+                auto ci = child.begin();
+                auto ri = root.begin();
+                for (; ri != root.end() && ci != child.end(); ++ri, ++ci)
+                    if (*ri != *ci) return false;
+                return ri == root.end();
             };
-            if (within(topc, wsc)) return top;
-            return ws.string();
+            if (under(topc, wsc)) return top;
+            return std::unexpected(ToolError::out_of_workspace(
+                "git repository root '" + topc.string()
+                + "' is outside workspace root '" + wsc.string() + "'"));
         }
     }
     // rev-parse failed (not a repo yet, or git missing) — fall back to the
@@ -152,14 +151,15 @@ std::expected<GitStatusArgs, ToolError> parse_git_status_args(const json& j) {
 ExecResult run_git_status(const GitStatusArgs& a) {
     auto wp = util::make_workspace_path_checked(a.root, "git_status");
     if (!wp) return std::unexpected(std::move(wp.error()));
-    const std::string git_dir = resolve_git_dir(wp->string());
+    auto git_dir = resolve_git_dir(wp->string());
+    if (!git_dir) return std::unexpected(std::move(git_dir.error()));
     // porcelain=v1 (the `git status -s` short format: `XY path`, one line per
     // change, plus a `## branch...upstream [ahead/behind]` header). Stable
     // and script-parseable like v2, but READABLE — v2's
     // `1 .M N... 100644 100644 100644 <sha> <sha> path` machine rows are
     // gibberish to a human and to the model. The tool card body shows this
     // verbatim, so it must be the form a person would want to read.
-    auto out = run_git({"git", "-C", git_dir, "status",
+    auto out = run_git({"git", "-C", *git_dir, "status",
                         "--porcelain=v1", "--branch"}, "git_status");
     if (!out) return std::unexpected(std::move(out.error()));
     std::string output = std::move(*out);
@@ -215,8 +215,9 @@ ExecResult run_git_diff(const GitDiffArgs& a) {
         checked  = wp->string();
         pathspec = wp->string();
     }
-    const std::string git_dir = resolve_git_dir(checked);
-    std::vector<std::string> argv = {"git", "-C", git_dir, "diff",
+    auto git_dir = resolve_git_dir(checked);
+    if (!git_dir) return std::unexpected(std::move(git_dir.error()));
+    std::vector<std::string> argv = {"git", "-C", *git_dir, "diff",
                                      "--stat", "-p"};
     if (a.staged) argv.push_back("--cached");
     if (!a.ref.empty()) argv.push_back(a.ref);
@@ -267,8 +268,9 @@ ExecResult run_git_log(const GitLogArgs& a) {
         checked  = wp->string();
         pathspec = wp->string();
     }
-    const std::string git_dir = resolve_git_dir(checked);
-    std::vector<std::string> argv = {"git", "-C", git_dir, "log"};
+    auto git_dir = resolve_git_dir(checked);
+    if (!git_dir) return std::unexpected(std::move(git_dir.error()));
+    std::vector<std::string> argv = {"git", "-C", *git_dir, "log"};
     if (a.oneline) {
         argv.push_back("--oneline");
     } else {
@@ -352,23 +354,24 @@ ExecResult run_git_commit(const GitCommitArgs& a) {
         if (!wp) return std::unexpected(std::move(wp.error()));
         repo_hint = wp->string();
     }
-    const std::string git_dir = resolve_git_dir(repo_hint);
+    auto git_dir = resolve_git_dir(repo_hint);
+    if (!git_dir) return std::unexpected(std::move(git_dir.error()));
 
     if (a.stage_all) {
-        if (auto r = run_git({"git", "-C", git_dir, "add", "-A"},
+        if (auto r = run_git({"git", "-C", *git_dir, "add", "-A"},
                              "git_commit (add -A)"); !r)
             return std::unexpected(std::move(r.error()));
     }
     for (const auto& f : a.files) {
         auto wp = util::make_workspace_path_checked(f, "git_commit");
         if (!wp) return std::unexpected(std::move(wp.error()));
-        if (auto r = run_git({"git", "-C", git_dir, "add", "--",
+        if (auto r = run_git({"git", "-C", *git_dir, "add", "--",
                               wp->string()}, "git_commit (add)"); !r)
             return std::unexpected(std::move(r.error()));
     }
 
     auto r = util::run_argv_s(
-        {"git", "-C", git_dir, "commit", "-m", a.message});
+        {"git", "-C", *git_dir, "commit", "-m", a.message});
     if (!r.started || r.timed_out || r.exit_code != 0) {
         std::string_view out = r.output;
         if (out.find("nothing to commit") != std::string_view::npos
@@ -382,6 +385,82 @@ ExecResult run_git_commit(const GitCommitArgs& a) {
     if (!a.display_description.empty())
         output = a.display_description + "\n" + output;
     return ToolOutput{std::move(output), std::nullopt};
+}
+
+// ── git_show / git_blame ───────────────────────────────────────────────
+
+struct GitShowArgs {
+    std::string ref;
+    std::string path;
+    bool file_content = false;
+};
+
+std::expected<GitShowArgs, ToolError> parse_git_show_args(const json& j) {
+    util::ArgReader ar(j);
+    const auto format = ar.str("format", "commit");
+    if (format != "commit" && format != "file")
+        return std::unexpected(ToolError::invalid_args("format must be 'commit' or 'file'"));
+    auto path = ar.str("path", "");
+    if (format == "file" && path.empty())
+        return std::unexpected(ToolError::invalid_args("path is required when format=file"));
+    return GitShowArgs{ar.str("ref", "HEAD"), std::move(path), format == "file"};
+}
+
+ExecResult run_git_show(const GitShowArgs& a) {
+    std::string checked_path;
+    if (!a.path.empty()) {
+        auto wp = util::make_workspace_path_checked(a.path, "git_show");
+        if (!wp) return std::unexpected(wp.error());
+        checked_path = wp->string();
+    }
+    auto git_dir = resolve_git_dir(checked_path);
+    if (!git_dir) return std::unexpected(std::move(git_dir.error()));
+    std::vector<std::string> argv{"git", "-C", *git_dir, "show"};
+    if (a.file_content) {
+        std::error_code ec;
+        auto relative = fs::relative(checked_path, *git_dir, ec);
+        if (ec || relative.empty())
+            return std::unexpected(ToolError::invalid_args("path is not inside the repository"));
+        argv.push_back(a.ref + ":" + relative.generic_string());
+    } else {
+        argv.insert(argv.end(), {"--format=fuller", "--stat", "--patch", a.ref});
+        if (!checked_path.empty()) {
+            argv.push_back("--");
+            argv.push_back(checked_path);
+        }
+    }
+    auto out = run_git(argv, "git_show");
+    if (!out) return std::unexpected(out.error());
+    return ToolOutput{out->empty() ? "(no output)" : std::move(*out), std::nullopt};
+}
+
+struct GitBlameArgs { std::string path; std::string ref; int start = 0; int end = 0; };
+
+std::expected<GitBlameArgs, ToolError> parse_git_blame_args(const json& j) {
+    util::ArgReader ar(j);
+    auto path = ar.require_str("path");
+    if (!path || path->empty())
+        return std::unexpected(ToolError::invalid_args("path is required"));
+    int start = ar.integer("start_line", 0);
+    int end = ar.integer("end_line", 0);
+    if ((start > 0 || end > 0) && (start < 1 || end < start))
+        return std::unexpected(ToolError::invalid_args("line range must satisfy 1 <= start_line <= end_line"));
+    return GitBlameArgs{*path, ar.str("ref", "HEAD"), start, end};
+}
+
+ExecResult run_git_blame(const GitBlameArgs& a) {
+    auto wp = util::make_workspace_path_checked(a.path, "git_blame");
+    if (!wp) return std::unexpected(wp.error());
+    auto git_dir = resolve_git_dir(wp->string());
+    if (!git_dir) return std::unexpected(std::move(git_dir.error()));
+    std::vector<std::string> argv{"git", "-C", *git_dir, "blame", "--date=short"};
+    if (a.start > 0) argv.insert(argv.end(), {"-L", std::to_string(a.start) + "," + std::to_string(a.end)});
+    argv.push_back(a.ref);
+    argv.push_back("--");
+    argv.push_back(wp->string());
+    auto out = run_git(argv, "git_blame");
+    if (!out) return std::unexpected(out.error());
+    return ToolOutput{out->empty() ? "(no blame information)" : std::move(*out), std::nullopt};
 }
 
 // ── Schemas ────────────────────────────────────────────────────────────
@@ -424,6 +503,24 @@ json git_log_schema() {
     };
 }
 
+json git_show_schema() {
+    return json{{"type","object"}, {"properties", {
+        {"ref", {{"type","string"}, {"description","Commit/ref (default HEAD)."}}},
+        {"path", {{"type","string"}, {"description","Optional workspace file/path filter."}}},
+        {"format", {{"type","string"}, {"enum", {"commit","file"}},
+                    {"description","commit shows metadata+patch; file shows file contents at ref."}}}
+    }}};
+}
+
+json git_blame_schema() {
+    return json{{"type","object"}, {"required", {"path"}}, {"properties", {
+        {"path", {{"type","string"}, {"description","Workspace file to annotate."}}},
+        {"ref", {{"type","string"}, {"description","Commit/ref (default HEAD)."}}},
+        {"start_line", {{"type","integer"}, {"minimum",1}}},
+        {"end_line", {{"type","integer"}, {"minimum",1}}}
+    }}};
+}
+
 json git_commit_schema() {
     return json{
         {"type","object"},
@@ -460,6 +557,16 @@ void register_git_tools(Shells& sh) {
         "Show git commit history. Returns commit hash, author, date, and message.",
         git_log_schema(), EffectSet{Effect::ReadFs},
         body<GitLogArgs>(run_git_log, parse_git_log_args), 30'000);
+
+    sh.add("git_show",
+        "Show a commit with metadata and patch, or read one file exactly as it existed at a revision.",
+        git_show_schema(), EffectSet{Effect::ReadFs},
+        body<GitShowArgs>(run_git_show, parse_git_show_args), 60'000);
+
+    sh.add("git_blame",
+        "Annotate a file or line range with the commit, author, date, and source line that last changed it.",
+        git_blame_schema(), EffectSet{Effect::ReadFs},
+        body<GitBlameArgs>(run_git_blame, parse_git_blame_args), 40'000);
 
     sh.add("git_commit",
         "Stage files and create a git commit. Specify files to stage, "

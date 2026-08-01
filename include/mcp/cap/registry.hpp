@@ -20,6 +20,7 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -34,29 +35,36 @@ public:
         : always_namespace_(always_namespace) {}
 
     void add(std::shared_ptr<CapabilityProvider> provider) {
-        if (provider) {
-            // Forward each provider's list-changed up to the registry's own
-            // subscriber, and mark the route cache dirty so the next tools()/
-            // dispatch() rebuilds. The provider has already refreshed itself.
-            provider->set_on_list_changed([this] {
+        if (!provider) return;
+        provider->set_on_list_changed([this] {
+            std::function<void()> notify;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
                 dirty_ = true;
-                if (on_list_changed_) on_list_changed_();
-            });
-            providers_.push_back(std::move(provider));
-        }
+                notify = on_list_changed_;
+            }
+            if (notify) notify();
+        });
+        std::lock_guard<std::mutex> lock(mu_);
+        providers_.push_back(std::move(provider));
         dirty_ = true;
     }
 
-    // Host subscribes to ANY provider's list-changing. Fires after the
-    // provider refreshed + the route cache was invalidated.
-    void set_on_list_changed(std::function<void()> fn) { on_list_changed_ = std::move(fn); }
+    void set_on_list_changed(std::function<void()> fn) {
+        std::lock_guard<std::mutex> lock(mu_);
+        on_list_changed_ = std::move(fn);
+    }
 
-    [[nodiscard]] std::size_t provider_count() const noexcept { return providers_.size(); }
+    [[nodiscard]] std::size_t provider_count() const noexcept {
+        std::lock_guard<std::mutex> lock(mu_);
+        return providers_.size();
+    }
 
     // The union of all tools, with names resolved per the namespacing policy.
     // Each returned Tool's `name` is the EXPOSED (possibly namespaced) name —
     // exactly what you advertise to the model and pass back to dispatch().
     [[nodiscard]] std::vector<Tool> tools() const {
+        std::lock_guard<std::mutex> lock(mu_);
         rebuild_();
         std::vector<Tool> out;
         out.reserve(routes_.size());
@@ -71,13 +79,21 @@ public:
     // Route a request by its EXPOSED tool name (bare or "<origin>__<name>").
     // Never throws — an unknown tool yields Result::error.
     [[nodiscard]] Result dispatch(const Request& req) {
-        rebuild_();
-        auto it = routes_.find(req.tool);
-        if (it == routes_.end())
-            return Result::error("capability not found: '" + req.tool + "'");
-        // Forward with the provider's UNQUALIFIED name (strip namespace).
-        Request fwd{it->second.bare_name, req.args};
-        return it->second.provider->execute(fwd);
+        std::shared_ptr<CapabilityProvider> provider;
+        std::string bare_name;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            rebuild_();
+            auto it = routes_.find(req.tool);
+            if (it == routes_.end())
+                return Result::error("capability not found: '" + req.tool + "'");
+            provider = it->second.provider;
+            bare_name = it->second.bare_name;
+        }
+        // Execute outside the registry lock. The shared_ptr pins the provider;
+        // its own call mutex serializes only this server's transport.
+        return provider->execute(Request{std::move(bare_name), req.args,
+                                         req.progress, req.cancelled});
     }
 
     // Convenience overload.
@@ -90,15 +106,24 @@ public:
     // (globally unique by construction), so no namespacing is needed; we just
     // remember which provider owns each URI for read routing.
     [[nodiscard]] std::vector<Resource> resources() const {
-        rebuild_();
+        std::vector<std::shared_ptr<CapabilityProvider>> providers;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            providers = providers_;
+        }
         std::vector<Resource> out;
-        for (const auto& p : providers_)
+        for (const auto& p : providers)
             for (auto& r : p->resources()) out.push_back(std::move(r));
         return out;
     }
     [[nodiscard]] std::vector<ResourceTemplate> resource_templates() const {
+        std::vector<std::shared_ptr<CapabilityProvider>> providers;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            providers = providers_;
+        }
         std::vector<ResourceTemplate> out;
-        for (const auto& p : providers_)
+        for (const auto& p : providers)
             for (auto& r : p->resource_templates()) out.push_back(std::move(r));
         return out;
     }
@@ -107,10 +132,17 @@ public:
     [[nodiscard]] bool read_resource(const std::string& uri,
                                      std::vector<ResourceContents>& out,
                                      std::string& err) {
-        rebuild_();
-        if (auto it = resource_owner_.find(uri); it != resource_owner_.end())
-            return it->second->read_resource(uri, out, err);
-        for (const auto& p : providers_)
+        std::shared_ptr<CapabilityProvider> owner;
+        std::vector<std::shared_ptr<CapabilityProvider>> providers;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            rebuild_();
+            if (auto it = resource_owner_.find(uri); it != resource_owner_.end())
+                owner = it->second;
+            providers = providers_;
+        }
+        if (owner) return owner->read_resource(uri, out, err);
+        for (const auto& p : providers)
             if (p->read_resource(uri, out, err)) return true;
         if (err.empty()) err = "resource not found: '" + uri + "'";
         return false;
@@ -120,6 +152,7 @@ public:
     // Prompts are namespaced like tools (exposed name → owning provider +
     // bare name) so two servers can both expose "summarize".
     [[nodiscard]] std::vector<Prompt> prompts() const {
+        std::lock_guard<std::mutex> lock(mu_);
         rebuild_();
         std::vector<Prompt> out;
         out.reserve(prompt_routes_.size());
@@ -134,20 +167,30 @@ public:
                                   const std::vector<std::pair<std::string, std::string>>& args,
                                   GetPromptResult& out,
                                   std::string& err) {
-        rebuild_();
-        auto it = prompt_routes_.find(name);
-        if (it == prompt_routes_.end()) { err = "prompt not found: '" + name + "'"; return false; }
-        return it->second.provider->get_prompt(it->second.bare_name, args, out, err);
+        std::shared_ptr<CapabilityProvider> provider;
+        std::string bare_name;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            rebuild_();
+            auto it = prompt_routes_.find(name);
+            if (it == prompt_routes_.end()) {
+                err = "prompt not found: '" + name + "'";
+                return false;
+            }
+            provider = it->second.provider;
+            bare_name = it->second.bare_name;
+        }
+        return provider->get_prompt(bare_name, args, out, err);
     }
 
 private:
     struct Route {
-        CapabilityProvider* provider = nullptr;
+        std::shared_ptr<CapabilityProvider> provider;
         std::string         bare_name;   // the provider's own tool name
         Tool                tool;        // descriptor (bare name inside)
     };
     struct PromptRoute {
-        CapabilityProvider* provider = nullptr;
+        std::shared_ptr<CapabilityProvider> provider;
         std::string         bare_name;
         Prompt              prompt;
     };
@@ -172,26 +215,27 @@ private:
                 const bool collide = always_namespace_ || seen[t.name] > 1;
                 std::string exposed = collide ? (origin + "__" + t.name) : t.name;
                 routes_.emplace(std::move(exposed),
-                                Route{p.get(), t.name, t});
+                                Route{p, t.name, t});
             }
             for (auto& pr : p->prompts()) {
                 const bool collide = always_namespace_ || seen_prompt[pr.name] > 1;
                 std::string exposed = collide ? (origin + "__" + pr.name) : pr.name;
                 prompt_routes_.emplace(std::move(exposed),
-                                       PromptRoute{p.get(), pr.name, pr});
+                                       PromptRoute{p, pr.name, pr});
             }
             for (const auto& r : p->resources())
-                resource_owner_.emplace(r.uri, p.get());
+                resource_owner_.emplace(r.uri, p);
         }
         dirty_ = false;
     }
 
+    mutable std::mutex mu_;
     bool always_namespace_ = false;
     std::function<void()> on_list_changed_;
     std::vector<std::shared_ptr<CapabilityProvider>> providers_;
     mutable std::unordered_map<std::string, Route>       routes_;
     mutable std::unordered_map<std::string, PromptRoute> prompt_routes_;
-    mutable std::unordered_map<std::string, CapabilityProvider*> resource_owner_;
+    mutable std::unordered_map<std::string, std::shared_ptr<CapabilityProvider>> resource_owner_;
     mutable bool                                     dirty_ = true;
 };
 

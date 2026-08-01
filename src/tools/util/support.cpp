@@ -44,3 +44,10 @@ void set(Sink s)                     { g_sink = std::move(s); }
 void clear()                         { g_sink = nullptr; }
 void emit(std::string_view snapshot) { if (g_sink) g_sink(snapshot); }
 } // namespace mcp::tools::util::progress
+
+namespace mcp::tools::util::cancellation {
+namespace { thread_local Probe g_probe; }
+void set(Probe probe) { g_probe = std::move(probe); }
+void clear() { g_probe = nullptr; }
+bool requested() { return g_probe && g_probe(); }
+} // namespace mcp::tools::util::cancellation

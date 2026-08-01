@@ -24,7 +24,9 @@
 #include <mcp/cap/capability.hpp>
 #include <mcp/client.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,6 +38,12 @@ namespace mcp::cap {
 
 class ClientProvider : public CapabilityProvider {
 public:
+    struct Integration {
+        std::vector<Root> roots;
+        std::function<void(const ResourceUpdatedParams&)> on_resource_updated;
+        std::function<void(const LoggingMessageParams&)> on_log;
+    };
+
     [[nodiscard]] std::string_view origin() const noexcept override { return origin_; }
 
     [[nodiscard]] std::vector<Tool> list() const override {
@@ -70,15 +78,38 @@ public:
     void refresh() { refresh_tools(); }   // back-compat alias
 
     [[nodiscard]] Result execute(const Request& req) override {
+        if (poisoned_.load(std::memory_order_acquire))
+            return Result::error("mcp connection requires reconnect after cancellation");
         if (!alive()) return Result::error("mcp server '" + origin_ + "' is not running");
         try {
             std::lock_guard<std::mutex> lk(call_mu_);
+            {
+                std::lock_guard<std::mutex> progress_lock(progress_mu_);
+                active_progress_ = req.progress;
+            }
+            auto clear_progress = std::shared_ptr<void>{nullptr, [this](void*) {
+                std::lock_guard<std::mutex> lock(progress_mu_);
+                active_progress_ = {};
+            }};
             // call_tool_interactive drives MCP 2026-07-28 MRTR: if the remote
             // server answers input_required (asking us to sample / elicit /
             // list roots), we fulfil it locally with this client's handlers
             // and retry — transparently to the agent loop. Falls back to a
             // single round for a legacy server that never asks.
-            return result_from_call(client_->call_tool_interactive(req.tool, req.args));
+            if (!req.cancelled)
+                return result_from_call(client_->call_tool_interactive(req.tool, req.args));
+
+            auto pending = std::async(std::launch::async, [this, tool = req.tool, args = req.args] {
+                return client_->call_tool_interactive(tool, args);
+            });
+            using namespace std::chrono_literals;
+            while (pending.wait_for(20ms) != std::future_status::ready) {
+                if (!req.cancelled()) continue;
+                poisoned_.store(true, std::memory_order_release);
+                client_->engine().on_transport_closed("tool call cancelled");
+                break;
+            }
+            return result_from_call(pending.get());
         } catch (const std::exception& e) {
             return Result::error(std::string{"mcp call failed: "} + e.what());
         } catch (...) {
@@ -169,9 +200,42 @@ protected:
                  std::unique_ptr<Client> client,
                  Implementation client_info,
                  std::chrono::milliseconds handshake_timeout,
-                 std::chrono::milliseconds call_timeout) {
+                 std::chrono::milliseconds call_timeout,
+                 Integration integration = {}) {
         origin_ = "mcp:" + name;
+        poisoned_.store(false, std::memory_order_release);
         client_ = std::move(client);
+
+        ClientHandlers handlers;
+        const bool has_roots = !integration.roots.empty();
+        if (has_roots) {
+            auto roots = integration.roots;
+            handlers.on_list_roots = [roots = std::move(roots)] {
+                return ListRootsResult{roots, Json::object()};
+            };
+        }
+        handlers.on_progress = [this](const ProgressParams& update) {
+            std::function<void(std::string_view)> sink;
+            {
+                std::lock_guard<std::mutex> lock(progress_mu_);
+                sink = active_progress_;
+            }
+            if (!sink) return;
+            if (update.message && !update.message->empty()) {
+                sink(*update.message);
+                return;
+            }
+            std::string text = "MCP progress: " + std::to_string(update.progress);
+            if (update.total) text += " / " + std::to_string(*update.total);
+            sink(text);
+        };
+        handlers.on_resource_updated = std::move(integration.on_resource_updated);
+        handlers.on_log = std::move(integration.on_log);
+        client_->set_handlers(std::move(handlers));
+
+        ClientCapabilities client_caps;
+        if (has_roots)
+            client_caps.roots = RootsCapability{true};
 
         // *_list_changed → refresh + fire host callback. Installed via the
         // engine directly (the Client was constructed before we had `this`).
@@ -192,7 +256,7 @@ protected:
         // we ALSO still perform the legacy initialize handshake below for
         // backward compatibility. Enabling this before initialize means even
         // the handshake requests carry the modern metadata.
-        client_->enable_modern_metadata(client_info, ClientCapabilities{});
+        client_->enable_modern_metadata(client_info, client_caps);
 
         // MCP 2026-07-28: prefer the stateless `server/discover` step over the
         // legacy initialize handshake. If the server answers it, we learn its
@@ -233,6 +297,10 @@ protected:
     // subclass destructor (which must also reset client_ AFTER this).
     virtual void on_teardown() noexcept {}
 
+    [[nodiscard]] bool connection_poisoned() const noexcept {
+        return poisoned_.load(std::memory_order_acquire);
+    }
+
     Client*     client_ptr()  noexcept { return client_.get(); }
     void        reset_client() noexcept { client_.reset(); }
 
@@ -253,6 +321,9 @@ protected:
     std::vector<Prompt>         prompts_;
     mutable std::mutex          state_mu_;  // guards cached lists (reader writes)
     std::mutex                  call_mu_;   // serialize tool/resource/prompt calls
+    std::mutex                  progress_mu_;
+    std::function<void(std::string_view)> active_progress_;
+    std::atomic<bool> poisoned_{false};
 };
 
 } // namespace mcp::cap

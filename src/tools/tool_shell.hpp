@@ -74,9 +74,11 @@ void register_task_tool(Shells&, const std::shared_ptr<SubagentRunner>&);
 // Tier-1 (self-contained) tool families, gated on ToolsetConfig toggles:
 void register_fs_tools(Shells&);       // read, write, edit, list_dir
 void register_shell_tools(Shells&);    // bash
+void register_process_tools(Shells&);  // process_start/poll/stop
 void register_search_tools(Shells&);   // grep, glob, find_definition
 void register_repo_map_tool(Shells&);  // repo_map (PageRank codebase skeleton)
 void register_diagnostics_tool(Shells&);
+void register_test_tool(Shells&);
 void register_git_tools(Shells&);
 void register_web_tools(Shells&, const std::shared_ptr<HttpClient>&);
 

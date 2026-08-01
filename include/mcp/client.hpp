@@ -209,6 +209,14 @@ public:
     void progress(const ProgressParams& p) { engine_.notify(method::Progress, p); }
     void cancel(const CancelledParams& p)  { engine_.notify(method::Cancelled, p); }
 
+    // Capability adapters construct the transport/client before host-specific
+    // integration hooks are known. Installing an additional handler set is
+    // safe: RpcEngine replaces handlers by method and MRTR mirrors the latest
+    // callbacks.
+    void set_handlers(ClientHandlers handlers) {
+        install_handlers(std::move(handlers));
+    }
+
 private:
     void install_handlers(ClientHandlers h) {
         // ping always answered with {}.

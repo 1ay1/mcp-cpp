@@ -587,6 +587,95 @@ ExecResult run_list_dir(const ListDirArgs& a) {
 
 // ── Schemas / descriptions ─────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────
+//  safe move / remove
+// ─────────────────────────────────────────────────────────────────────────
+
+struct MoveArgs { fs::path source; fs::path destination; bool overwrite = false; };
+
+std::expected<MoveArgs, ToolError> parse_move_args(const json& j) {
+    util::ArgReader r{j};
+    auto source = r.require_str("source");
+    if (!source || source->empty())
+        return std::unexpected(ToolError::invalid_args("source is required"));
+    auto destination = r.require_str("destination");
+    if (!destination || destination->empty())
+        return std::unexpected(ToolError::invalid_args("destination is required"));
+    auto src = util::make_workspace_path_checked(*source, "move");
+    if (!src) return std::unexpected(src.error());
+    auto dst = util::make_workspace_path_checked(*destination, "move");
+    if (!dst) return std::unexpected(dst.error());
+    return MoveArgs{src->path(), dst->path(), r.boolean("overwrite", false)};
+}
+
+ExecResult run_move(const MoveArgs& a) {
+    std::error_code ec;
+    if (!fs::exists(a.source, ec))
+        return std::unexpected(ToolError::not_found(a.source.string()));
+    if (fs::exists(a.destination, ec)) {
+        if (!a.overwrite)
+            return std::unexpected(ToolError::ambiguous(
+                "destination exists; pass overwrite:true to replace it"));
+        if (fs::is_directory(a.destination, ec) && !fs::is_empty(a.destination, ec))
+            return std::unexpected(ToolError::invalid_args(
+                "refusing to replace a non-empty destination directory"));
+        fs::remove(a.destination, ec);
+        if (ec) return std::unexpected(ToolError::io(ec.message()));
+    }
+    fs::create_directories(a.destination.parent_path(), ec);
+    if (ec) return std::unexpected(ToolError::io(ec.message()));
+    fs::rename(a.source, a.destination, ec);
+    if (ec) return std::unexpected(ToolError::io("move failed: " + ec.message()));
+    return ToolOutput{std::format("Moved {} -> {}", a.source.string(), a.destination.string()), std::nullopt};
+}
+
+struct RemoveArgs { fs::path path; bool recursive = false; };
+
+std::expected<RemoveArgs, ToolError> parse_remove_args(const json& j) {
+    util::ArgReader r{j};
+    auto path = r.require_str("path");
+    if (!path || path->empty())
+        return std::unexpected(ToolError::invalid_args("path is required"));
+    auto checked = util::make_workspace_path_checked(*path, "remove");
+    if (!checked) return std::unexpected(checked.error());
+    if (checked->path() == util::workspace_root())
+        return std::unexpected(ToolError::invalid_args("refusing to remove the workspace root"));
+    return RemoveArgs{checked->path(), r.boolean("recursive", false)};
+}
+
+ExecResult run_remove(const RemoveArgs& a) {
+    std::error_code ec;
+    if (!fs::exists(a.path, ec))
+        return std::unexpected(ToolError::not_found(a.path.string()));
+    const bool directory = fs::is_directory(a.path, ec);
+    if (directory && !a.recursive && !fs::is_empty(a.path, ec))
+        return std::unexpected(ToolError::invalid_args(
+            "directory is not empty; pass recursive:true to remove its contents"));
+    const auto count = a.recursive ? fs::remove_all(a.path, ec)
+                                   : static_cast<std::uintmax_t>(fs::remove(a.path, ec));
+    if (ec) return std::unexpected(ToolError::io("remove failed: " + ec.message()));
+    return ToolOutput{std::format("Removed {} ({} filesystem entr{})", a.path.string(), count,
+                                  count == 1 ? "y" : "ies"), std::nullopt};
+}
+
+json move_schema() {
+    return json{{"type","object"}, {"required", {"source","destination"}},
+        {"properties", {
+            {"source", {{"type","string"}, {"description","Workspace-relative or absolute source path."}}},
+            {"destination", {{"type","string"}, {"description","Workspace-relative or absolute destination path."}}},
+            {"overwrite", {{"type","boolean"}, {"default",false}}}
+        }}};
+}
+
+json remove_schema() {
+    return json{{"type","object"}, {"required", {"path"}},
+        {"properties", {
+            {"path", {{"type","string"}, {"description","Workspace path to remove."}}},
+            {"recursive", {{"type","boolean"}, {"default",false},
+                {"description","Required for non-empty directories."}}}
+        }}};
+}
+
 json read_schema() {
     return json{
         {"type", "object"},
@@ -665,6 +754,18 @@ void register_fs_tools(Shells& sh) {
         "Use this to explore project structure before reading files.",
         list_dir_schema(), EffectSet{Effect::ReadFs},
         body<ListDirArgs>(run_list_dir, parse_list_dir_args), 25'000);
+
+    sh.add("move",
+        "Move or rename a file or directory within the workspace without invoking a shell. "
+        "The destination is never overwritten unless overwrite:true is explicit.",
+        move_schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
+        body<MoveArgs>(run_move, parse_move_args), 4'000);
+
+    sh.add("remove",
+        "Remove a file or directory within the workspace without invoking a shell. "
+        "Non-empty directories require recursive:true; the workspace root is always refused.",
+        remove_schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
+        body<RemoveArgs>(run_remove, parse_remove_args), 4'000);
 
     // edit (own TU — fuzzy splice logic is large)
     register_edit_tool(sh);

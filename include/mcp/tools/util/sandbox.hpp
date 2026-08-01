@@ -93,6 +93,11 @@ enum class Backend : std::uint8_t {
 // otherwise. Wraps without going through `sh -c`, preserving exact
 // argv semantics that matter for things like commit messages with
 // quotes / `$vars`.
+// Prepare the argv used to launch a shell command without running it. This is
+// the persistent-process counterpart to run_shell_command: process_start uses
+// it so dev servers receive the identical bwrap/sandbox-exec policy.
+[[nodiscard]] std::vector<std::string> prepare_shell_argv(std::string_view cmd);
+
 [[nodiscard]] SubprocessResult run_argv(
     const std::vector<std::string>& argv,
     std::size_t max_bytes,

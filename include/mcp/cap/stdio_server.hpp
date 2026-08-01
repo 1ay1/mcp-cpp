@@ -26,6 +26,7 @@
 
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -40,24 +41,27 @@ public:
         Implementation           client_info{"mcp-cpp", "0.1"};
         std::chrono::milliseconds handshake_timeout{10'000};
         std::chrono::milliseconds call_timeout{60'000};
+        ClientProvider::Integration integration;
     };
 
-    explicit StdioServerProvider(Config cfg) {
-        proc_      = std::make_unique<ChildProcess>(cfg.spawn);
-        transport_ = std::make_unique<StdioTransport>(proc_->out(), proc_->in());
-        auto client = std::make_unique<Client>(transport_->sink());
-        // IMPORTANT: Client::request() wraps results in std::async(deferred),
-        // so future::wait_for() returns `deferred` (never `ready`) and a manual
-        // timeout poll is meaningless. Instead the engine's deadline monitor
-        // (armed by set_default_timeout in connect()) makes a late .get() throw
-        // RpcError(Timeout). So everywhere we just .get().
-        transport_->start(client->engine());
+    explicit StdioServerProvider(Config cfg) : cfg_(std::move(cfg)) {
+        start_();
+    }
 
-        // From here the reader thread is LIVE and references the engine. If the
-        // handshake throws, connect() calls on_teardown() (stop the reader),
-        // then resets the client in the SAFE order before rethrowing.
-        connect(cfg.name, std::move(client), std::move(cfg.client_info),
-                cfg.handshake_timeout, cfg.call_timeout);
+    [[nodiscard]] Result execute(const Request& req) override {
+        std::lock_guard<std::mutex> lock(reconnect_mu_);
+        if (!alive() || connection_poisoned()) {
+            try {
+                teardown_();
+                reset_client();
+                proc_.reset();
+                start_();
+                if (on_list_changed_) on_list_changed_();
+            } catch (const std::exception& error) {
+                return Result::error(std::string{"mcp reconnect failed: "} + error.what());
+            }
+        }
+        return ClientProvider::execute(req);
     }
 
     ~StdioServerProvider() override { teardown_(); }
@@ -81,12 +85,23 @@ protected:
     }
 
 private:
+    void start_() {
+        proc_      = std::make_unique<ChildProcess>(cfg_.spawn);
+        transport_ = std::make_unique<StdioTransport>(proc_->out(), proc_->in());
+        auto client = std::make_unique<Client>(transport_->sink());
+        transport_->start(client->engine());
+        connect(cfg_.name, std::move(client), cfg_.client_info,
+                cfg_.handshake_timeout, cfg_.call_timeout, cfg_.integration);
+    }
+
     void teardown_() noexcept {
         on_teardown();      // stop reader (steps 1+2)
         reset_client();     // 3. now no thread touches the engine
         proc_.reset();      // 4. reap the child + close the read FD
     }
 
+    Config                           cfg_;
+    std::mutex                       reconnect_mu_;
     std::unique_ptr<ChildProcess>   proc_;
     std::unique_ptr<StdioTransport> transport_;
 };
