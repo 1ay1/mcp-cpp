@@ -429,6 +429,30 @@ int main() {
         auto rbad = call(*provider, "repo_map", bad);
         assert(!rbad.is_error && "tiny budget must clamp to the 1000 floor, not error");
         std::puts("repo_map: out-of-range budget clamped");
+
+        // (f) NESTED-PROJECT BOUNDARY: a submodule / vendored checkout / any
+        //     directory carrying its OWN `.git` must be a hard stop — its
+        //     source belongs to a different project and must NEVER pollute the
+        //     map. This is the exact sibling-project leak (maya-py/, mcp-cpp/)
+        //     the boundary guards against. Build a nested repo with a
+        //     uniquely-named symbol and prove it does not appear.
+        fs::create_directories(root / "vendored_dep");
+        write_file(root / "vendored_dep" / ".git",
+                   "gitdir: ../.git/modules/vendored_dep\n");  // submodule gitlink FILE
+        write_file(root / "vendored_dep" / "foreign.cpp",
+                   "int nested_project_symbol_xyz(){ return 7; }\n");
+        auto rn = call(*provider, "repo_map", obj());
+        assert(!rn.is_error);
+        assert(rn.text.find("nested_project_symbol_xyz") == std::string::npos
+               && "submodule/nested-repo source must be excluded from the map");
+        assert(rn.text.find("foreign.cpp") == std::string::npos
+               && "nested-project file must not appear in the map");
+        // The workspace's own source is unaffected — the boundary only stops
+        // NESTED roots, never the top-level walk.
+        assert(rn.text.find("alpha.cpp") != std::string::npos
+               && "workspace source must still be mapped");
+        fs::remove_all(root / "vendored_dep", lec);
+        std::puts("repo_map: nested project (.git boundary) excluded, workspace intact");
     }
 
     fs::remove_all(root);

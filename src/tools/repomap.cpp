@@ -191,6 +191,31 @@ bool is_stopword(const std::string& s) {
     return kStop.contains(s);
 }
 
+// Is `dir` a NESTED project root — a submodule, vendored checkout, or an
+// unrelated repo that happens to live under the workspace? The walk must NOT
+// descend into these: their source belongs to a DIFFERENT project and would
+// flood the map with sibling-project files (the exact `maya-py/`, `mcp-cpp/`
+// pollution this guards against). The universal, tool-agnostic signal is a
+// directory that carries its OWN repository/project marker. `.git` (dir OR
+// file — submodules use a `.git` FILE that points at the superproject's
+// modules dir) is the strongest; a handful of other unambiguous root markers
+// catch vendored non-git trees. The workspace root itself is exempt (checked
+// by the caller via depth>0), so the top-level project's own `.git` never
+// stops the walk before it starts.
+bool is_nested_project_root(const fs::path& dir) {
+    std::error_code ec;
+    // `.git` as either a directory (normal repo) or a file (submodule/worktree
+    // gitlink) marks a distinct repository boundary.
+    if (fs::exists(dir / ".git", ec)) return true;
+    // Other unambiguous project-root markers for vendored/non-git trees.
+    static constexpr std::string_view kMarkers[] = {
+        ".hg", ".svn", ".jj",           // other VCS roots
+    };
+    for (auto m : kMarkers)
+        if (fs::exists(dir / fs::path{m}, ec)) return true;
+    return false;
+}
+
 // Build (or reuse) the def/ref graph for `root`. Guarded by the caller's
 // mutex. The cache holds up to kCacheSlots graphs keyed by root path, so
 // alternating between the workspace root and a `path=` subdir (or between
@@ -231,12 +256,24 @@ const RepoGraph& build_graph(const fs::path& root) {
         if (entry.is_directory(e2)) {
             auto name = entry.path().filename().string();
             if (util::should_skip_dir(name)
-                || (it.depth() > 0 && name.starts_with(".")))
+                || (it.depth() > 0 && name.starts_with("."))
+                // NESTED-PROJECT BOUNDARY: never descend into a submodule /
+                // vendored checkout / unrelated nested repo. This is the hard
+                // stop that keeps sibling-project files (maya-py/, mcp-cpp/,
+                // …) out of the map no matter how the workspace is laid out.
+                || is_nested_project_root(entry.path()))
                 it.disable_recursion_pending();
             continue;
         }
         if (!entry.is_regular_file(e2)) continue;
         if (!is_map_source(entry.path())) continue;
+        // CONTAINMENT BACKSTOP: belt-and-suspenders re-assert that this file
+        // really is under the workspace root. The walk root was already gated
+        // by make_workspace_path_checked, and we never recurse through symlinks
+        // — but a `path=` subdir arg, a hardlink, or a future walk change could
+        // in principle surface a path outside the boundary. One cheap check per
+        // accepted source file makes the map pollution-proof unconditionally.
+        if (!util::is_within_workspace(entry.path())) continue;
         auto sz = entry.file_size(e2);
         // Skip empty files (no defs, no refs) and minified/generated blobs
         // (a 400KB single-line bundle is all noise and blows the parse time).
