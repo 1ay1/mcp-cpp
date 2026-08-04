@@ -17,6 +17,25 @@ namespace mcp::tools::detail {
 
 using mcp::Json;
 
+namespace {
+// Render the retriever's `mode` string as the results header. The adapter may
+// return a compact one-line mode ("hybrid+ctx, convex-fusion, confidence 0.82")
+// or a two-part mode whose first line is that headline and whose remaining
+// lines are an indented "funnel" showing the candidate set narrowing through
+// each pipeline stage. We keep the headline inline with the result count and
+// let the funnel flow onto its own lines — so the model and the user both see
+// exactly how the engine reached this result set, not just an opaque label.
+std::string render_mode_header(std::size_t n_results, const std::string& mode) {
+    const std::string label = mode.empty() ? std::string("default") : mode;
+    const auto nl = label.find('\n');
+    if (nl == std::string::npos)
+        return std::to_string(n_results) + " results (mode: " + label + ")\n";
+    // Headline inline, funnel (already indented by the adapter) on its own lines.
+    return std::to_string(n_results) + " results (mode: " + label.substr(0, nl) +
+           ")" + label.substr(nl) + "\n";
+}
+} // namespace
+
 // ── todo ──────────────────────────────────────────────────────────────────
 // The list is rendered to text the host's UI observes; an optional TodoSink
 // also receives the structured items for hosts that track session state.
@@ -146,8 +165,7 @@ void register_search_docs_tool(Shells& sh, const std::shared_ptr<DocRetriever>& 
             if (hits.empty())
                 return mcp::cap::Result::ok(body + "No matching documents for: " + q.query);
 
-            body += std::to_string(hits.size()) + " results (mode: " +
-                    (mode.empty() ? "default" : mode) + ")\n";
+            body += render_mode_header(hits.size(), mode);
             char score_buf[32];
             for (const auto& h : hits) {
                 std::snprintf(score_buf, sizeof score_buf, "%.4f", h.score);
@@ -207,8 +225,7 @@ void register_search_code_tool(Shells& sh, const std::shared_ptr<DocRetriever>& 
                 return mcp::cap::Result::ok(body + "No semantically similar code for: "
                                             + q.query + "\nTry grep for exact tokens.");
 
-            body += std::to_string(hits.size()) + " results (mode: " +
-                    (mode.empty() ? "default" : mode) + ")\n";
+            body += render_mode_header(hits.size(), mode);
             char score_buf[32];
             for (const auto& h : hits) {
                 std::snprintf(score_buf, sizeof score_buf, "%.4f", h.score);
