@@ -105,16 +105,16 @@ inline std::array<std::uint8_t, 32> sha256(std::string_view msg) {
 
     for (std::size_t off = 0; off < data.size(); off += 64) {
         std::uint32_t w[64];
-        for (int i = 0; i < 16; ++i)
-            w[i] = (std::uint8_t(data[off + i*4]) << 24) | (std::uint8_t(data[off + i*4+1]) << 16) |
-                   (std::uint8_t(data[off + i*4+2]) << 8) | std::uint8_t(data[off + i*4+3]);
-        for (int i = 16; i < 64; ++i) {
+        for (std::size_t i = 0; i < 16; ++i)
+            w[i] = (std::uint32_t(std::uint8_t(data[off + i*4])) << 24) | (std::uint32_t(std::uint8_t(data[off + i*4+1])) << 16) |
+                   (std::uint32_t(std::uint8_t(data[off + i*4+2])) << 8) | std::uint8_t(data[off + i*4+3]);
+        for (std::size_t i = 16; i < 64; ++i) {
             std::uint32_t s0 = rotr(w[i-15],7) ^ rotr(w[i-15],18) ^ (w[i-15] >> 3);
             std::uint32_t s1 = rotr(w[i-2],17) ^ rotr(w[i-2],19)  ^ (w[i-2] >> 10);
             w[i] = w[i-16] + s0 + w[i-7] + s1;
         }
         std::uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
-        for (int i = 0; i < 64; ++i) {
+        for (std::size_t i = 0; i < 64; ++i) {
             std::uint32_t S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25);
             std::uint32_t ch = (e & f) ^ (~e & g);
             std::uint32_t t1 = hh + S1 + ch + K[i] + w[i];
@@ -126,9 +126,9 @@ inline std::array<std::uint8_t, 32> sha256(std::string_view msg) {
         h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
     }
     std::array<std::uint8_t, 32> out{};
-    for (int i = 0; i < 8; ++i) {
-        out[i*4]   = (h[i] >> 24) & 0xFF; out[i*4+1] = (h[i] >> 16) & 0xFF;
-        out[i*4+2] = (h[i] >> 8)  & 0xFF; out[i*4+3] =  h[i]        & 0xFF;
+    for (std::size_t i = 0; i < 8; ++i) {
+        out[i*4]   = std::uint8_t((h[i] >> 24) & 0xFF); out[i*4+1] = std::uint8_t((h[i] >> 16) & 0xFF);
+        out[i*4+2] = std::uint8_t((h[i] >> 8)  & 0xFF); out[i*4+3] = std::uint8_t( h[i]        & 0xFF);
     }
     return out;
 }
@@ -137,7 +137,8 @@ inline std::array<std::uint8_t, 32> sha256(std::string_view msg) {
 inline std::string pct_encode(std::string_view s) {
     static constexpr char hex[] = "0123456789ABCDEF";
     std::string out; out.reserve(s.size() * 3);
-    for (unsigned char c : s) {
+    for (char ch : s) {
+        const unsigned char c = static_cast<unsigned char>(ch);
         if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
             (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~')
             out.push_back(char(c));

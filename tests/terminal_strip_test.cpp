@@ -35,10 +35,12 @@ static int g_checks   = 0;
     } while (0)
 
 static bool has_controls(std::string_view s) {
-    for (unsigned char c : s)
+    for (char ch : s) {
+        const unsigned char c = static_cast<unsigned char>(ch);
         if (c == 0x1b || c == '\r' || c == '\b'
             || (c < 0x20 && c != '\n' && c != '\t') || c == 0x7f)
             return true;
+    }
     return false;
 }
 

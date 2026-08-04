@@ -27,23 +27,43 @@ std::vector<std::string> split_lines(const std::string& s) {
 
 struct Edit { enum K { Keep, Del, Ins } k; int a_idx, b_idx; };
 
+// Cap on the LCS DP matrix. compute_edits builds an (n+1)*(m+1) int matrix,
+// so cost is O(n*m) ints. Above this product we skip the LCS entirely and
+// emit a degenerate "delete everything, then insert everything" edit script:
+// the diff is still correct, just not minimal. This bounds memory at ~64 MiB
+// (16M ints) and keeps a multi-MB paste from OOM-ing or hanging the host.
+constexpr std::size_t kMaxLcsCells = 16u * 1024u * 1024u;
+
+std::vector<Edit> full_replace_edits(std::size_t n, std::size_t m) {
+    std::vector<Edit> edits;
+    edits.reserve(n + m);
+    for (std::size_t i = 0; i < n; ++i)
+        edits.push_back({Edit::Del, static_cast<int>(i), -1});
+    for (std::size_t j = 0; j < m; ++j)
+        edits.push_back({Edit::Ins, -1, static_cast<int>(j)});
+    return edits;
+}
+
 std::vector<Edit> compute_edits(const std::vector<std::string>& a,
                                 const std::vector<std::string>& b) {
-    int n = (int)a.size(), m = (int)b.size();
+    const std::size_t n = a.size(), m = b.size();
+    if (n != 0 && m > kMaxLcsCells / n)
+        return full_replace_edits(n, m);
+
     std::vector<std::vector<int>> dp(n + 1, std::vector<int>(m + 1, 0));
-    for (int i = 1; i <= n; ++i)
-        for (int j = 1; j <= m; ++j)
+    for (std::size_t i = 1; i <= n; ++i)
+        for (std::size_t j = 1; j <= m; ++j)
             dp[i][j] = (a[i-1] == b[j-1]) ? dp[i-1][j-1] + 1
                                           : std::max(dp[i-1][j], dp[i][j-1]);
     std::vector<Edit> edits;
-    int i = n, j = m;
+    std::size_t i = n, j = m;
     while (i > 0 && j > 0) {
-        if (a[i-1] == b[j-1]) { edits.push_back({Edit::Keep, i-1, j-1}); --i; --j; }
-        else if (dp[i-1][j] >= dp[i][j-1]) { edits.push_back({Edit::Del, i-1, -1}); --i; }
-        else { edits.push_back({Edit::Ins, -1, j-1}); --j; }
+        if (a[i-1] == b[j-1]) { edits.push_back({Edit::Keep, static_cast<int>(i-1), static_cast<int>(j-1)}); --i; --j; }
+        else if (dp[i-1][j] >= dp[i][j-1]) { edits.push_back({Edit::Del, static_cast<int>(i-1), -1}); --i; }
+        else { edits.push_back({Edit::Ins, -1, static_cast<int>(j-1)}); --j; }
     }
-    while (i > 0) { edits.push_back({Edit::Del, --i, -1}); }
-    while (j > 0) { edits.push_back({Edit::Ins, -1, --j}); }
+    while (i > 0) { --i; edits.push_back({Edit::Del, static_cast<int>(i), -1}); }
+    while (j > 0) { --j; edits.push_back({Edit::Ins, -1, static_cast<int>(j)}); }
     std::reverse(edits.begin(), edits.end());
     return edits;
 }
@@ -112,16 +132,16 @@ Diff compute(const std::string& path,
                 if (old_start < 0) old_start = e.a_idx + 1;
                 if (new_start < 0) new_start = e.b_idx + 1;
                 old_len++; new_len++;
-                patch << " " << a[e.a_idx] << "\n";
+                patch << " " << a[static_cast<std::size_t>(e.a_idx)] << "\n";
             } else if (e.k == Edit::Del) {
                 if (old_start < 0) old_start = e.a_idx + 1;
                 old_len++;
-                del_buf += "-"; del_buf += a[e.a_idx]; del_buf += "\n";
+                del_buf += "-"; del_buf += a[static_cast<std::size_t>(e.a_idx)]; del_buf += "\n";
                 removed++;
             } else {
                 if (new_start < 0) new_start = e.b_idx + 1;
                 new_len++;
-                ins_buf += "+"; ins_buf += b[e.b_idx]; ins_buf += "\n";
+                ins_buf += "+"; ins_buf += b[static_cast<std::size_t>(e.b_idx)]; ins_buf += "\n";
                 added++;
             }
         }

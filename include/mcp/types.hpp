@@ -67,10 +67,10 @@ template <> struct CodecOf<Icons> {
 struct Implementation {
     std::string        name;
     std::string        version;
-    Maybe<std::string> title;
-    Maybe<std::string> description;
-    Maybe<std::string> websiteUrl;
-    Maybe<List<Icon>>  icons;
+    Maybe<std::string> title{};
+    Maybe<std::string> description{};
+    Maybe<std::string> websiteUrl{};
+    Maybe<List<Icon>>  icons{};
 };
 template <> struct CodecOf<Implementation> {
     static Codec<Implementation> get() {
@@ -168,13 +168,13 @@ template <> struct CodecOf<ToolsCapability> {
 };
 
 struct ServerCapabilities {
-    Maybe<Json>               experimental;
-    Maybe<Json>               logging;
-    Maybe<Json>               completions;
-    Maybe<PromptsCapability>  prompts;
-    Maybe<ResourcesCapability> resources;
-    Maybe<ToolsCapability>    tools;
-    Maybe<TasksCapability>    tasks;
+    Maybe<Json>               experimental{};
+    Maybe<Json>               logging{};
+    Maybe<Json>               completions{};
+    Maybe<PromptsCapability>  prompts{};
+    Maybe<ResourcesCapability> resources{};
+    Maybe<ToolsCapability>    tools{};
+    Maybe<TasksCapability>    tasks{};
 };
 template <> struct CodecOf<ServerCapabilities> {
     static Codec<ServerCapabilities> get() {

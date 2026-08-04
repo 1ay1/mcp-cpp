@@ -166,7 +166,8 @@ std::expected<ParsedUrl, std::string> parse_url(std::string_view url) {
     if (host.size() >= 2 && host.front() == '[' && host.back() == ']')
         host = host.substr(1, host.size() - 2);
     std::string h{host};
-    for (char& c : h) c = static_cast<char>(std::tolower(c));
+    for (char& c : h)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (h == "localhost" || h.ends_with(".localhost")) return true;
     if (h == "metadata" || h == "metadata.google.internal") return true;
     if (h == "0") return true;
@@ -281,9 +282,9 @@ void decode_entities(std::string& s) {
         bool ok = false;
         try {
             if (!body.empty() && (body.front() == 'x' || body.front() == 'X'))
-                code = std::stoul(std::string{body.substr(1)}, nullptr, 16);
+                code = static_cast<unsigned>(std::stoul(std::string{body.substr(1)}, nullptr, 16));
             else
-                code = std::stoul(std::string{body});
+                code = static_cast<unsigned>(std::stoul(std::string{body}));
             ok = true;
         } catch (...) {}
         if (ok && code >= 0x20 && code < 0x7f) {
@@ -1080,7 +1081,8 @@ std::string url_escape(std::string_view s) {
     static constexpr char hex[] = "0123456789ABCDEF";
     std::string out;
     out.reserve(s.size() * 3);
-    for (unsigned char c : s) {
+    for (char ch : s) {
+        const unsigned char c = static_cast<unsigned char>(ch);
         const bool unreserved =
             (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
             (c >= '0' && c <= '9') ||
@@ -1419,7 +1421,8 @@ ExecResult run_web_search(HttpClient& client, const WebSearchArgs& a) {
             if (url.size() >= p.size()
                 && std::equal(p.begin(), p.end(), url.begin(),
                               [](char x, char y){
-                                  return std::tolower(x) == std::tolower(y);
+                                  return std::tolower(static_cast<unsigned char>(x))
+                                       == std::tolower(static_cast<unsigned char>(y));
                               }))
             { url.remove_prefix(p.size()); break; }
         }
@@ -1434,11 +1437,13 @@ ExecResult run_web_search(HttpClient& client, const WebSearchArgs& a) {
             if (host.size() > p.size()
                 && std::equal(p.begin(), p.end(), host.begin(),
                               [](char x, char y){
-                                  return std::tolower(x) == std::tolower(y);
+                                  return std::tolower(static_cast<unsigned char>(x))
+                                       == std::tolower(static_cast<unsigned char>(y));
                               }))
             { host.remove_prefix(p.size()); break; }
         }
-        for (char c : host) out.push_back(static_cast<char>(std::tolower(c)));
+        for (char c : host)
+            out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
         if (slash != std::string_view::npos) out.append(url.substr(slash));
         while (!out.empty() && out.back() == '/') out.pop_back();
         return out;

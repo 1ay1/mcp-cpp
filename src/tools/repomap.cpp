@@ -613,7 +613,7 @@ mcp::cap::Result run_repo_map(const Json& args) {
         // source order (rank chose WHICH to show; line chooses the order).
         constexpr std::size_t kCap = 24;
         std::vector<const Def*> pick(ds.begin(),
-            ds.begin() + std::min<std::size_t>(kCap, ds.size()));
+            ds.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(kCap, ds.size())));
         std::sort(pick.begin(), pick.end(),
                   [](const Def* x, const Def* y) { return x->line < y->line; });
         for (const auto* d : pick) {

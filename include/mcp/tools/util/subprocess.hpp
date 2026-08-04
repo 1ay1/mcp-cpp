@@ -38,8 +38,8 @@ struct SubprocessOptions {
     // through cmd.exe/sh and gets its quoting rules; argv form is exec'd
     // directly so paths, refs, commit messages, and format strings survive
     // intact.
-    std::optional<std::string>              shell_command;
-    std::optional<std::vector<std::string>> argv;
+    std::optional<std::string>              shell_command = std::nullopt;
+    std::optional<std::vector<std::string>> argv = std::nullopt;
 
     std::chrono::seconds timeout{120};
     // Unsigned because a negative cap makes no sense and every compare
@@ -51,8 +51,8 @@ struct SubprocessOptions {
     // throttle. Passing the whole buffer each time means multi-byte UTF-8
     // sequences that span pipe reads still render correctly on the next
     // flush — no need for delta-aware splitting on the caller side.
-    std::function<void(std::string_view snapshot)> on_progress;
-    std::function<bool()> cancelled;
+    std::function<void(std::string_view snapshot)> on_progress = nullptr;
+    std::function<bool()> cancelled = nullptr;
 };
 
 struct SubprocessResult {

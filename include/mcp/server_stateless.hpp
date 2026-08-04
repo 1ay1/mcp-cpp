@@ -111,7 +111,7 @@ inline std::optional<std::string> b64url_decode(std::string_view in) {
 inline std::uint64_t fnv1a(std::string_view bytes, std::uint64_t seed) noexcept {
     constexpr std::uint64_t kPrime = 0x00000100000001b3ULL;
     std::uint64_t h = seed;
-    for (unsigned char c : bytes) { h ^= c; h *= kPrime; }
+    for (char ch : bytes) { h ^= static_cast<unsigned char>(ch); h *= kPrime; }
     return h;
 }
 
@@ -137,7 +137,7 @@ inline std::string keyed_mac(std::string_view msg, std::string_view key) {
     const std::uint64_t outer = fnv1a_u64(inner, k ^ 0x5c5c5c5c5c5c5c5cULL);
     static constexpr char hex[] = "0123456789abcdef";
     std::string tag(16, '0');
-    for (int i = 0; i < 16; ++i) tag[15 - i] = hex[(outer >> (i * 4)) & 0xF];
+    for (std::size_t i = 0; i < 16; ++i) tag[15 - i] = hex[(outer >> (i * 4)) & 0xF];
     return tag;
 }
 

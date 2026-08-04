@@ -521,14 +521,15 @@ ExecResult run_list_dir(const ListDirArgs& a) {
     int count = 0;
     auto format_size = [](uintmax_t bytes) -> std::string {
         char buf[32];
+        const double b = static_cast<double>(bytes);
         if (bytes < 1024) { std::snprintf(buf, sizeof(buf), "%juB", bytes); return buf; }
-        if (bytes < 1024*1024) { std::snprintf(buf, sizeof(buf), "%.1fK", bytes/1024.0); return buf; }
-        if (bytes < 1024*1024*1024) { std::snprintf(buf, sizeof(buf), "%.1fM", bytes/(1024.0*1024.0)); return buf; }
-        std::snprintf(buf, sizeof(buf), "%.1fG", bytes/(1024.0*1024.0*1024.0)); return buf;
+        if (bytes < 1024*1024) { std::snprintf(buf, sizeof(buf), "%.1fK", b/1024.0); return buf; }
+        if (bytes < 1024*1024*1024) { std::snprintf(buf, sizeof(buf), "%.1fM", b/(1024.0*1024.0)); return buf; }
+        std::snprintf(buf, sizeof(buf), "%.1fG", b/(1024.0*1024.0*1024.0)); return buf;
     };
     auto list_entry = [&](const fs::directory_entry& entry, int depth) {
         if (count > 1000) return;
-        std::string indent(depth * 2, ' ');
+        std::string indent(static_cast<std::size_t>(depth) * 2, ' ');
         auto fn = entry.path().filename().string();
         if (entry.is_directory(ec)) {
             out << indent << fn << "/\n";

@@ -91,7 +91,7 @@ public:
 
 class FakeRetriever : public DocRetriever {
 public:
-    std::vector<DocPassage> retrieve(const DocQuery& q, std::string& mode, std::string& err) override {
+    std::vector<DocPassage> retrieve(const DocQuery& q, std::string& mode, std::string& /*err*/) override {
         mode = "hybrid";
         if (q.query == "empty") return {};
         DocPassage p; p.source = "docs"; p.path = "a.md"; p.line_start = 1; p.line_end = 4;
@@ -211,8 +211,8 @@ int main() {
     auto rw1 = call(*p, "wipe_memory", {{"scope", "user"}, {"confirm", true}});
     check(!rw1.is_error && store->records.size() == total_before - user_count,
           "wipe with confirm removed exactly the user scope");
-    check(std::count_if(store->records.begin(), store->records.end(),
-                       [](const MemoryRecord& r){ return r.scope == "project"; })
+    check(static_cast<std::size_t>(std::count_if(store->records.begin(), store->records.end(),
+                       [](const MemoryRecord& r){ return r.scope == "project"; }))
               == project_count,
           "confirmed user wipe preserves project records");
 

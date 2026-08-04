@@ -72,7 +72,7 @@ int main() {
 
         // Length variety: payloads of every residue mod 3 (b64 tail cases).
         for (int len = 0; len <= 6; ++len) {
-            Json s = {{"pad", std::string(len, 'x')}};
+            Json s = {{"pad", std::string(static_cast<std::size_t>(len), 'x')}};
             CHECK(codec.open(codec.seal(s)).has_value());
         }
 

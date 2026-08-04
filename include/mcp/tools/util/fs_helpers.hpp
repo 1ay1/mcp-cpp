@@ -217,8 +217,8 @@ void record_file_seen(const fs::path& path,
     constexpr std::uint64_t kOffset = 0xcbf29ce484222325ULL;
     constexpr std::uint64_t kPrime  = 0x00000100000001b3ULL;
     std::uint64_t h = kOffset;
-    for (unsigned char c : bytes) {
-        h ^= static_cast<std::uint64_t>(c);
+    for (char ch : bytes) {
+        h ^= static_cast<std::uint64_t>(static_cast<unsigned char>(ch));
         h *= kPrime;
     }
     return h;

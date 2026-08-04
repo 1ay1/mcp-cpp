@@ -39,8 +39,8 @@ namespace mcp::cap {
 struct Request {
     std::string tool;
     Json        args = Json::object();
-    std::function<void(std::string_view)> progress;
-    std::function<bool()> cancelled;
+    std::function<void(std::string_view)> progress = nullptr;
+    std::function<bool()> cancelled = nullptr;
 };
 
 // The outcome of executing a capability. `text` is the human/model-facing
