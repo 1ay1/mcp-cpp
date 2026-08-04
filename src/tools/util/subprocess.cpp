@@ -571,6 +571,23 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     auto idle_deadline = has_idle_window
         ? start + idle_window
         : clock::time_point::max();
+    // Absolute wall-clock ceiling from spawn. NEVER resets on output, so a
+    // runaway that stays chatty forever (`yes`, `tail -f`, an infinite
+    // progress loop) is still reaped even though the idle watchdog never
+    // trips. Defaults to a generous multiple of the idle window when the
+    // caller didn't set one, so a legitimately long build/test is unharmed.
+    const auto hard_window = [&]() -> std::chrono::seconds {
+        if (opts.hard_timeout.count() > 0) return opts.hard_timeout;
+        if (!has_idle_window)              return std::chrono::seconds::zero();
+        // 20× the idle budget, floored at 10 min — comfortably above any
+        // real interactive build/test while still bounding a stuck-chatty child.
+        const auto scaled = idle_window * 20;
+        return std::max<std::chrono::seconds>(scaled, std::chrono::minutes{10});
+    }();
+    const bool has_hard_window = hard_window > std::chrono::seconds::zero();
+    const auto hard_deadline = has_hard_window
+        ? start + hard_window
+        : clock::time_point::max();
     constexpr auto kKillGrace = std::chrono::milliseconds{2000};
 
     auto last_emit  = start;
@@ -629,6 +646,15 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
             timed_out = true;
             kill_at   = now + kKillGrace;
         }
+        // Absolute ceiling: fires regardless of how recently the child
+        // wrote output. This is the only thing that stops a forever-chatty
+        // runaway.
+        if (!sent_term && has_hard_window && now >= hard_deadline) {
+            signal_group(SIGTERM);
+            sent_term = true;
+            timed_out = true;
+            kill_at   = now + kKillGrace;
+        }
         if (sent_term && !sent_kill && now >= kill_at) {
             signal_group(SIGKILL);
             sent_kill = true;
@@ -647,6 +673,8 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
         auto next = last_emit + kEmitGap;
         if (!sent_term && has_idle_window && idle_deadline < next)
             next = idle_deadline;
+        if (!sent_term && has_hard_window && hard_deadline < next)
+            next = hard_deadline;
         if (sent_term && !sent_kill && kill_at < next) next = kill_at;
         auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                            next - now).count();

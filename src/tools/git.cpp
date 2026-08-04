@@ -85,6 +85,19 @@ run_git(const std::vector<std::string>& argv, std::string_view op,
     return out;
 }
 
+// Reject a ref/range that would be parsed by git as an OPTION rather than a
+// revision. `a.ref` is pushed as a bare positional before the `--` separator,
+// so a value like "--output=/etc/x", "--upload-pack=…", or "-p" would smuggle
+// a git flag in. Every legitimate ref/range (HEAD~3, main..HEAD, abc:file,
+// v1.2.0, a raw sha) starts with an alnum, `_`, `.`, or `/` — never `-`.
+[[nodiscard]] std::expected<void, ToolError> validate_ref(std::string_view ref) {
+    if (!ref.empty() && ref.front() == '-')
+        return std::unexpected(ToolError::invalid_args(
+            "ref may not begin with '-' (looks like a git option, not a "
+            "revision): '" + std::string{ref} + "'"));
+    return {};
+}
+
 // Resolve the repository directory to run git in. Given a raw path (a
 // directory OR a file — the workspace-checked string for the tool's
 // `path`/first `files[]` entry), ask git for the enclosing worktree
@@ -207,6 +220,7 @@ std::expected<GitDiffArgs, ToolError> parse_git_diff_args(const json& j) {
 }
 
 ExecResult run_git_diff(const GitDiffArgs& a) {
+    if (auto v = validate_ref(a.ref); !v) return std::unexpected(std::move(v.error()));
     std::string checked;
     std::string pathspec;
     if (!a.path.empty()) {
@@ -256,6 +270,7 @@ std::expected<GitLogArgs, ToolError> parse_git_log_args(const json& j) {
 }
 
 ExecResult run_git_log(const GitLogArgs& a) {
+    if (auto v = validate_ref(a.ref); !v) return std::unexpected(std::move(v.error()));
     int n = a.count;
     if (n <= 0) n = 20;
     if (n > 1000) n = 1000;
@@ -438,6 +453,7 @@ std::expected<GitShowArgs, ToolError> parse_git_show_args(const json& j) {
 }
 
 ExecResult run_git_show(const GitShowArgs& a) {
+    if (auto v = validate_ref(a.ref); !v) return std::unexpected(std::move(v.error()));
     std::string checked_path;
     if (!a.path.empty()) {
         auto wp = util::make_workspace_path_checked(a.path, "git_show");
@@ -480,6 +496,7 @@ std::expected<GitBlameArgs, ToolError> parse_git_blame_args(const json& j) {
 }
 
 ExecResult run_git_blame(const GitBlameArgs& a) {
+    if (auto v = validate_ref(a.ref); !v) return std::unexpected(std::move(v.error()));
     auto wp = util::make_workspace_path_checked(a.path, "git_blame");
     if (!wp) return std::unexpected(wp.error());
     auto git_dir = resolve_git_dir(wp->string());

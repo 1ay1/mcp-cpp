@@ -18,6 +18,7 @@
 #include <mcp/tools/util/arg_reader.hpp>
 
 #include <cstdio>
+#include <limits>
 #include <string>
 
 using mcp::tools::util::ArgReader;
@@ -40,6 +41,20 @@ static void test_integer_coercion() {
     CHECK(ArgReader(json{{"offset", "nope"}}).integer("offset", 1) == 1);     // garbage → default
     CHECK(ArgReader(json{{"offset", nullptr}}).integer("offset", 1) == 1);    // null → default
     CHECK(ArgReader(json::object()).integer("offset", 1) == 1);               // missing → default
+    // Out-of-int64/int range must CLAMP, never throw json::type_error (which
+    // would surface to the model as an opaque "tool crashed").
+    CHECK(ArgReader(json{{"offset", 9999999999LL}}).integer("offset", 1)
+          == std::numeric_limits<int>::max());                                // > INT_MAX → clamp hi
+    CHECK(ArgReader(json{{"offset", -9999999999LL}}).integer("offset", 1)
+          == std::numeric_limits<int>::min());                                // < INT_MIN → clamp lo
+    CHECK(ArgReader(json{{"offset", 1e20}}).integer("offset", 1)
+          == std::numeric_limits<int>::max());                                // huge float → clamp hi
+    CHECK(ArgReader(json{{"offset", "9999999999"}}).integer("offset", 1)
+          == std::numeric_limits<int>::max());                                // huge string int → clamp
+    {
+        json j; j["offset"] = std::numeric_limits<double>::quiet_NaN();
+        CHECK(ArgReader(j).integer("offset", 42) == 42);                       // NaN → default
+    }
 }
 
 // ── 2. boolean() coercion ───────────────────────────────────────────────────

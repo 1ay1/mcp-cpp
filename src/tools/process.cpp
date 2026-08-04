@@ -67,6 +67,13 @@ struct Session {
         return !stopped && child && child->alive();
     }
 
+    // True if any produced output has not yet been handed to a poll caller.
+    // Used to keep an exited-but-unread session alive so its tail isn't lost.
+    bool has_pending_output() {
+        std::lock_guard<std::mutex> lock(output_mu);
+        return delivered < output_base + output.size();
+    }
+
     void stop() noexcept {
         std::lock_guard<std::mutex> lock(stop_mu);
         if (stopped) return;
@@ -121,9 +128,20 @@ ExecResult run_start(const StartArgs& args) {
     auto& manager = ProcessManager::instance();
     {
         std::lock_guard<std::mutex> lock(manager.mu);
+        // Garbage-collect sessions whose child already exited and whose
+        // output has been fully drained by a prior poll — a model that
+        // starts many short-lived processes and never calls process_stop
+        // would otherwise wedge at the cap with a confusing error.
+        for (auto it = manager.sessions.begin(); it != manager.sessions.end();) {
+            if (!it->second->running() && !it->second->has_pending_output())
+                it = manager.sessions.erase(it);
+            else
+                ++it;
+        }
         if (manager.sessions.size() >= 32)
             return std::unexpected(ToolError::invalid_args(
-                "process session limit reached (32); stop an existing session"));
+                "process session limit reached (32 live sessions); call "
+                "process_stop on one before starting another"));
     }
 
 #ifdef _WIN32
@@ -214,7 +232,13 @@ ExecResult run_poll(const PollArgs& args) {
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
     } while (true);
     std::string text = args.id + (running ? " running" : " exited") + "\n";
-    text += output.empty() ? "(no output yet)" : output;
+    if (!output.empty()) {
+        text += output;
+    } else if (running) {
+        text += "(no new output yet — process still running)";
+    } else {
+        text += "(process has exited; no further output — call process_stop to reap it)";
+    }
     return ToolOutput{std::move(text), std::nullopt};
 }
 

@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cmath>
+#include <limits>
 #include <span>
 
 namespace mcp::tools::util {
@@ -107,13 +109,27 @@ std::optional<std::string> ArgReader::require_str(std::string_view key) const {
 int ArgReader::integer(std::string_view key, int def) const {
     const json* v = raw(key);
     if (!v || v->is_null()) return def;
-    if (v->is_number_integer()) return v->get<int>();
-    if (v->is_number_float())   return static_cast<int>(v->get<double>());
+    // Read wide, then clamp: a weak model emitting `offset: 9999999999` or
+    // `limit: 1e20` must NOT throw json::type_error (surfaces as an opaque
+    // "tool crashed") — it should degrade to the int range.
+    auto clamp64 = [](long long x) -> int {
+        constexpr long long lo = std::numeric_limits<int>::min();
+        constexpr long long hi = std::numeric_limits<int>::max();
+        return static_cast<int>(x < lo ? lo : (x > hi ? hi : x));
+    };
+    if (v->is_number_integer()) return clamp64(v->get<long long>());
+    if (v->is_number_float()) {
+        double d = v->get<double>();
+        if (!std::isfinite(d)) return def;          // NaN / ±inf
+        if (d <= static_cast<double>(std::numeric_limits<int>::min())) return std::numeric_limits<int>::min();
+        if (d >= static_cast<double>(std::numeric_limits<int>::max())) return std::numeric_limits<int>::max();
+        return static_cast<int>(d);
+    }
     if (v->is_string()) {
         const auto& s = v->get_ref<const std::string&>();
-        int out = def;
+        long long out = def;
         auto r = std::from_chars(s.data(), s.data() + s.size(), out);
-        if (r.ec == std::errc{}) return out;
+        if (r.ec == std::errc{}) return clamp64(out);
     }
     return def;
 }

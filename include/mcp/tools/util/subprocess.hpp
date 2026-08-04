@@ -41,7 +41,16 @@ struct SubprocessOptions {
     std::optional<std::string>              shell_command = std::nullopt;
     std::optional<std::vector<std::string>> argv = std::nullopt;
 
+    // `timeout` is an IDLE watchdog: it fires only after this many seconds
+    // of *silence*, so a chatty build/test that keeps printing progress is
+    // never killed mid-flight. `hard_timeout` is an absolute wall-clock
+    // ceiling from spawn that NEVER resets — it exists solely to reap a
+    // runaway that stays chatty forever (`yes`, `tail -f`, an infinite
+    // progress loop) which the idle watchdog alone can never catch. 0 ⇒
+    // derive a generous default (see run_posix) so existing callers that
+    // only set `timeout` still get a real ceiling.
     std::chrono::seconds timeout{120};
+    std::chrono::seconds hard_timeout{0};
     // Unsigned because a negative cap makes no sense and every compare
     // site was already a `size_t` on the RHS; the old `int` caused
     // mixed-sign promotions and the occasional sign-compare warning.

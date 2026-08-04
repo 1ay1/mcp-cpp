@@ -178,20 +178,40 @@ std::vector<std::string> test_argv_for(BuildSystem bs, const TestArgs& a) {
 }
 
 ExecResult run_tests(const TestArgs& a) {
-    auto argv = a.command.empty() ? test_argv_for(detect_build_system(), a)
+    const auto bs = a.command.empty() ? detect_build_system() : BuildSystem::None;
+    auto argv = a.command.empty() ? test_argv_for(bs, a)
                                   : std::vector<std::string>{};
     if (a.command.empty() && argv.empty())
         return std::unexpected(ToolError::not_found(
             "no test runner detected; pass command explicitly"));
     const auto timeout = std::chrono::seconds{a.timeout_seconds};
-    auto sub = a.command.empty()
-        ? util::sandbox::run_argv(argv, 200'000, timeout)
-        : util::sandbox::run_shell_command(a.command, 200'000, timeout);
+
+    // CTest (until-fail:N) and Go (-count N) express `repeat` natively in the
+    // argv built above. Every other runner — Cargo, npm, make, and custom
+    // commands — has no repeat flag, so honor it with an outer loop instead
+    // of silently ignoring the arg the schema advertises. Stop early on the
+    // first failure (repeat is for confirming stability / hunting flakes).
+    const bool native_repeat = (bs == BuildSystem::CMake || bs == BuildSystem::Go);
+    const int loops = (a.repeat > 1 && !native_repeat) ? a.repeat : 1;
+
+    util::SubprocessResult sub;
+    int run_no = 0;
+    for (; run_no < loops; ++run_no) {
+        sub = a.command.empty()
+            ? util::sandbox::run_argv(argv, 200'000, timeout)
+            : util::sandbox::run_shell_command(a.command, 200'000, timeout);
+        if (sub.exit_code != 0 || sub.timed_out) break;
+    }
+    const int runs_done = std::min(run_no + 1, loops);
+
     std::string output = util::legacy_format(sub, timeout);
     std::ostringstream summary;
     summary << (sub.exit_code == 0 && !sub.timed_out ? "PASS" : "FAIL")
             << " exit=" << sub.exit_code;
     if (sub.timed_out) summary << " timeout=" << a.timeout_seconds << "s";
+    if (loops > 1)
+        summary << " (run " << runs_done << "/" << loops
+                << (sub.exit_code == 0 && !sub.timed_out ? " all passed" : " — stopped on failure") << ")";
     summary << '\n';
     if (!output.empty()) summary << output;
     return ToolOutput{summary.str(), std::nullopt};
