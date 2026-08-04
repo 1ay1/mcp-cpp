@@ -69,5 +69,11 @@ if(MCP_BUILD_TOOLS)
         add_executable(mcp_subprocess_tty_test subprocess_tty_test.cpp)
         target_link_libraries(mcp_subprocess_tty_test PRIVATE mcp::tools)
         add_test(NAME mcp_subprocess_tty_test COMMAND mcp_subprocess_tty_test)
+
+        # process_start/poll/stop e2e uses sh -c + exit codes (POSIX shell).
+        add_executable(mcp_process_tools_test process_tools_test.cpp)
+        find_package(Threads REQUIRED)
+        target_link_libraries(mcp_process_tools_test PRIVATE mcp::tools Threads::Threads)
+        add_test(NAME mcp_process_tools_test COMMAND mcp_process_tools_test)
     endif()
 endif()

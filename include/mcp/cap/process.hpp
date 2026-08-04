@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <istream>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <streambuf>
@@ -245,8 +246,15 @@ public:
 
     [[nodiscard]] bool alive() const noexcept {
         if (!proc_) return false;
-        return ::WaitForSingleObject(proc_, 0) == WAIT_TIMEOUT;
+        if (::WaitForSingleObject(proc_, 0) == WAIT_TIMEOUT) return true;
+        DWORD code = 0;
+        if (::GetExitCodeProcess(proc_, &code) && !exit_code_)
+            exit_code_ = static_cast<int>(code);
+        return false;
     }
+
+    // Exit status of the child once it has exited. nullopt while still running.
+    [[nodiscard]] std::optional<int> exit_code() const noexcept { return exit_code_; }
 
     // Close ONLY the child's stdin (our write end) → the server sees EOF and
     // begins exiting, which closes its stdout and unblocks a reader parked in
@@ -271,6 +279,9 @@ public:
             if (::WaitForSingleObject(proc_, 500) == WAIT_TIMEOUT)
                 ::TerminateProcess(proc_, 1);
             ::WaitForSingleObject(proc_, INFINITE);
+            DWORD code = 0;
+            if (::GetExitCodeProcess(proc_, &code) && !exit_code_)
+                exit_code_ = static_cast<int>(code);
             ::CloseHandle(proc_);
             proc_ = nullptr;
             pid_ = -1;
@@ -361,7 +372,8 @@ private:
     }
 
     HANDLE proc_ = nullptr;
-    int    pid_  = -1;
+    mutable int    pid_  = -1;
+    mutable std::optional<int> exit_code_;
     std::unique_ptr<handle_streambuf> in_buf_;
     std::unique_ptr<handle_streambuf> out_buf_;
     std::unique_ptr<std::istream>     in_stream_;
@@ -380,6 +392,7 @@ private:
 #include <cstring>
 #include <istream>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <streambuf>
@@ -637,8 +650,21 @@ public:
     [[nodiscard]] bool alive() const noexcept {
         if (pid_ <= 0) return false;
         int status = 0;
-        return ::waitpid(pid_, &status, WNOHANG) == 0;
+        const pid_t r = ::waitpid(pid_, &status, WNOHANG);
+        if (r == pid_) {                       // just reaped — remember why
+            record_exit_(status);
+            pid_ = -1;
+        } else if (r < 0 && errno == ECHILD) {
+            pid_ = -1;
+        }
+        return pid_ > 0;
     }
+
+    // Exit status of the child once it has been reaped (by alive()/terminate()).
+    // nullopt while the child is still running or was never observed to exit.
+    // A value >= 0 is the normal exit code; a value of 128+N encodes death by
+    // signal N (the shell convention), so the model reads one comparable number.
+    [[nodiscard]] std::optional<int> exit_code() const noexcept { return exit_code_; }
 
     // Close ONLY the child's stdin (our write end). A well-behaved server sees
     // EOF and begins exiting, which in turn closes its stdout — unblocking a
@@ -668,7 +694,11 @@ public:
             if (leader_reaped) return;
             int status = 0;
             const pid_t result = ::waitpid(leader, &status, WNOHANG);
-            if (result == leader || (result < 0 && errno == ECHILD)) {
+            if (result == leader) {
+                record_exit_(status);
+                leader_reaped = true;
+                pid_ = -1;
+            } else if (result < 0 && errno == ECHILD) {
                 leader_reaped = true;
                 pid_ = -1;
             }
@@ -710,7 +740,17 @@ public:
     }
 
 private:
-    int pid_ = -1;
+    // Translate a waitpid() status into the single comparable number the
+    // model sees: normal exit → its code; killed by signal N → 128+N (shell
+    // convention). Idempotent — only records the first observed exit.
+    void record_exit_(int status) const noexcept {
+        if (exit_code_) return;
+        if (WIFEXITED(status))        exit_code_ = WEXITSTATUS(status);
+        else if (WIFSIGNALED(status)) exit_code_ = 128 + WTERMSIG(status);
+    }
+
+    mutable int pid_ = -1;
+    mutable std::optional<int> exit_code_;
     std::unique_ptr<fd_streambuf> in_buf_;
     std::unique_ptr<fd_streambuf> out_buf_;
     std::unique_ptr<std::istream> in_stream_;

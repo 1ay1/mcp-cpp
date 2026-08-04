@@ -15,6 +15,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -40,6 +41,10 @@ struct Session {
     std::string output;
     std::size_t output_base = 0;
     std::size_t delivered = 0;
+    std::size_t dropped_unseen = 0;   // bytes evicted before any poll saw them
+    std::optional<int> cached_exit_;  // exit code captured before child.reset()
+    std::chrono::steady_clock::time_point started_at =
+        std::chrono::steady_clock::now();
     bool stopped = false;
 
     void append(std::string_view text) {
@@ -47,16 +52,26 @@ struct Session {
         output.append(text);
         if (output.size() > kRollingBytes) {
             const auto erased = output.size() - kRollingBytes;
+            // If the rolling buffer evicts bytes the caller never polled,
+            // remember how many so the next poll can honestly say output was
+            // dropped rather than silently losing the head of a burst.
+            if (output_base + erased > delivered)
+                dropped_unseen += (output_base + erased) - std::max(delivered, output_base);
             output.erase(0, erased);
             output_base += erased;
         }
     }
 
-    std::string take_new(std::size_t max_chars) {
+    // Returns freshly-produced output plus, via `dropped`, the count of bytes
+    // that scrolled out of the rolling buffer before this poll could see them.
+    std::string take_new(std::size_t max_chars, std::size_t* dropped = nullptr) {
         std::lock_guard<std::mutex> lock(output_mu);
+        if (dropped) { *dropped = dropped_unseen; dropped_unseen = 0; }
         const auto end = output_base + output.size();
         auto begin = std::max(delivered, output_base);
-        if (end - begin > max_chars) begin = end - max_chars;
+        std::size_t clipped = 0;
+        if (end - begin > max_chars) { clipped = (end - begin) - max_chars; begin = end - max_chars; }
+        if (dropped) *dropped += clipped;   // over-budget bytes are also unseen
         std::string result = output.substr(begin - output_base, end - begin);
         delivered = end;
         return result;
@@ -65,6 +80,20 @@ struct Session {
     bool running() {
         std::lock_guard<std::mutex> lock(stop_mu);
         return !stopped && child && child->alive();
+    }
+
+    // Exit code once the child has been reaped (running() observed false).
+    // 128+N encodes death by signal N. nullopt while still running. Cached so
+    // it survives stop() tearing the child down (child.reset()).
+    std::optional<int> exit_code() {
+        std::lock_guard<std::mutex> lock(stop_mu);
+        if (!cached_exit_ && child) cached_exit_ = child->exit_code();
+        return cached_exit_;
+    }
+
+    std::chrono::seconds age() const {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - started_at);
     }
 
     // True if any produced output has not yet been handed to a poll caller.
@@ -80,6 +109,7 @@ struct Session {
         stopped = true;
         if (child) {
             child->terminate();
+            if (!cached_exit_) cached_exit_ = child->exit_code();
             // A failed session/group setup or unrelated inherited descriptor
             // must not leave process_stop blocked forever in stream.get().
             // POSIX fd_streambuf uses a wake pipe, so this does not close an
@@ -205,37 +235,121 @@ ExecResult run_start(const StartArgs& args) {
         std::lock_guard<std::mutex> lock(manager.mu);
         manager.sessions.emplace(session->id, session);
     }
-    return ToolOutput{"Started " + session->id + " (pid "
-        + std::to_string(session->child->pid()) + "): " + args.command, std::nullopt};
+
+    // Give the child a beat to either start producing output or crash on the
+    // spot. A mistyped command, a missing binary, or a port-already-in-use
+    // server otherwise leaves the model to "start" successfully and only
+    // discover the failure on a later poll. Reporting it here — with the exit
+    // code and whatever it printed — turns a two-call surprise into one clear
+    // answer.
+    constexpr auto kSettleWindow = std::chrono::milliseconds{300};
+    const auto settle_deadline = std::chrono::steady_clock::now() + kSettleWindow;
+    while (std::chrono::steady_clock::now() < settle_deadline) {
+        if (!session->running()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+
+    const std::string head =
+        "Started " + session->id + " (pid "
+        + std::to_string(session->child->pid()) + "): " + args.command;
+
+    if (!session->running()) {
+        // Exited within the settle window — almost always a failure. Stop()
+        // first: it joins the reader thread so every last byte is appended
+        // before we drain. Then drop the session (nothing to poll) but
+        // surface the code.
+        session->stop();
+        auto early = session->take_new(4000);
+        const auto code = session->exit_code();
+        {
+            std::lock_guard<std::mutex> lock(manager.mu);
+            manager.sessions.erase(session->id);
+        }
+        std::string text = session->id + " exited immediately";
+        if (code) text += " (exit " + std::to_string(*code) + ")";
+        text += ": " + args.command;
+        if (!early.empty()) text += "\n" + early;
+        else text += "\n(no output)";
+        text += "\n\nThe process is no longer running — no session was kept. "
+                "Fix the command and call process_start again, or run a "
+                "one-shot command with bash instead.";
+        return ToolOutput{std::move(text), std::nullopt};
+    }
+
+    // Still alive: report any banner it already printed so the first poll
+    // isn't wasted on the startup line.
+    std::string early = session->take_new(4000);
+    std::string text = head + "\nStatus: running. Poll with process_poll \""
+        + session->id + "\", stop with process_stop.";
+    if (!early.empty()) text += "\n\n" + early;
+    return ToolOutput{std::move(text), std::nullopt};
 }
 
-struct PollArgs { std::string id; int max_chars = 30000; int wait_ms = 100; };
+struct PollArgs { std::string id; int max_chars = 30000; int wait_ms = 250; };
 std::expected<PollArgs, ToolError> parse_poll(const json& args) {
     util::ArgReader reader(args);
     auto id = reader.require_str("id");
     if (!id || id->empty()) return std::unexpected(ToolError::invalid_args("id is required"));
     return PollArgs{*id, std::clamp(reader.integer("max_chars", 30000), 1000, 100000),
-                    std::clamp(reader.integer("wait_ms", 100), 0, 5000)};
+                    std::clamp(reader.integer("wait_ms", 250), 0, 5000)};
+}
+
+// Human-friendly list of live session ids for recovery hints. Caller must NOT
+// already hold manager.mu.
+std::string live_session_hint_locked(ProcessManager& manager);
+std::string live_session_hint() {
+    auto& manager = ProcessManager::instance();
+    std::lock_guard<std::mutex> lock(manager.mu);
+    return live_session_hint_locked(manager);
+}
+
+// Same, for callers that already hold manager.mu.
+std::string live_session_hint_locked(ProcessManager& manager) {
+    if (manager.sessions.empty()) return " (no live sessions)";
+    std::string s = " (live sessions:";
+    for (const auto& [id, _] : manager.sessions) s += " " + id;
+    s += ")";
+    return s;
 }
 
 ExecResult run_poll(const PollArgs& args) {
     auto session = find_session(args.id);
-    if (!session) return std::unexpected(ToolError::not_found("unknown process session: " + args.id));
+    if (!session)
+        return std::unexpected(ToolError::not_found(
+            "unknown process session: " + args.id + live_session_hint()));
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds{args.wait_ms};
     std::string output;
+    std::size_t dropped = 0;
     bool running = false;
     do {
         running = session->running();
-        output = session->take_new(static_cast<std::size_t>(args.max_chars));
+        output = session->take_new(static_cast<std::size_t>(args.max_chars), &dropped);
         if (!output.empty() || !running || std::chrono::steady_clock::now() >= deadline) break;
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
     } while (true);
-    std::string text = args.id + (running ? " running" : " exited") + "\n";
+    // Re-check liveness after draining: a process that printed its last line
+    // and THEN exited during this same poll should report "exited (code)"
+    // together with that final output, not "running" — saving the model an
+    // extra poll just to learn it's done.
+    if (running) running = session->running();
+
+    std::string status = args.id;
+    if (running) {
+        status += " running (" + std::to_string(session->age().count()) + "s)";
+    } else {
+        status += " exited";
+        if (auto code = session->exit_code())
+            status += " (exit " + std::to_string(*code) + ")";
+    }
+    std::string text = std::move(status) + "\n";
+    if (dropped)
+        text += "[" + std::to_string(dropped) + " bytes of earlier output "
+                "scrolled past the buffer before this poll]\n";
     if (!output.empty()) {
         text += output;
     } else if (running) {
-        text += "(no new output yet — process still running)";
+        text += "(no new output yet — process still running; poll again)";
     } else {
         text += "(process has exited; no further output — call process_stop to reap it)";
     }
@@ -257,34 +371,50 @@ ExecResult run_stop(const StopArgs& args) {
         std::lock_guard<std::mutex> lock(manager.mu);
         auto it = manager.sessions.find(args.id);
         if (it == manager.sessions.end())
-            return std::unexpected(ToolError::not_found("unknown process session: " + args.id));
+            return std::unexpected(ToolError::not_found(
+                "unknown process session: " + args.id
+                + live_session_hint_locked(manager)));
         session = it->second;
         manager.sessions.erase(it);
     }
+    const bool was_running = session->running();
     session->stop();
-    auto output = session->take_new(30000);
-    std::string text = "Stopped " + args.id;
+    std::size_t dropped = 0;
+    auto output = session->take_new(30000, &dropped);
+    std::string text = (was_running ? "Stopped " : "Reaped ") + args.id;
+    if (auto code = session->exit_code())
+        text += " (exit " + std::to_string(*code) + ")";
+    if (dropped)
+        text += "\n[" + std::to_string(dropped) + " bytes of earlier output were dropped]";
     if (!output.empty()) text += "\n" + output;
     return ToolOutput{std::move(text), std::nullopt};
 }
 
 json start_schema() {
     return json{{"type","object"}, {"required", {"command"}}, {"properties", {
-        {"command", {{"type","string"}, {"description","Shell command for a long-running process."}}},
-        {"cwd", {{"type","string"}, {"description","Workspace directory (default workspace root)."}}}
+        {"command", {{"type","string"}, {"description",
+            "Shell command to run as a persistent background process (dev "
+            "server, file watcher, log tail). For a command that finishes on "
+            "its own, use bash instead."}}},
+        {"cwd", {{"type","string"}, {"description",
+            "Working directory, relative to the workspace root (default: "
+            "workspace root)."}}}
     }}};
 }
 json poll_schema() {
     return json{{"type","object"}, {"required", {"id"}}, {"properties", {
-        {"id", {{"type","string"}, {"description","Process session id returned by process_start."}}},
-        {"max_chars", {{"type","integer"}, {"minimum",1000}, {"maximum",100000}, {"default",30000}}},
-        {"wait_ms", {{"type","integer"}, {"minimum",0}, {"maximum",5000}, {"default",100},
-                     {"description","Wait this long for new/initial output before returning."}}}
+        {"id", {{"type","string"}, {"description","Session id returned by process_start."}}},
+        {"max_chars", {{"type","integer"}, {"minimum",1000}, {"maximum",100000}, {"default",30000},
+                       {"description","Cap on bytes of new output returned this poll (most recent kept)."}}},
+        {"wait_ms", {{"type","integer"}, {"minimum",0}, {"maximum",5000}, {"default",250},
+                     {"description","Block up to this long waiting for new output before returning "
+                                    "(returns early as soon as any arrives). Raise it when waiting on "
+                                    "a slow-to-boot server."}}}
     }}};
 }
 json stop_schema() {
     return json{{"type","object"}, {"required", {"id"}}, {"properties", {
-        {"id", {{"type","string"}, {"description","Process session id to terminate."}}}
+        {"id", {{"type","string"}, {"description","Session id to terminate and reap."}}}
     }}};
 }
 
@@ -292,15 +422,23 @@ json stop_schema() {
 
 void register_process_tools(Shells& shells) {
     shells.add("process_start",
-        "Start a long-running workspace process such as a dev server or watcher. Returns a session id; use process_poll for rolling output and process_stop for cleanup.",
+        "Start a long-running background process (dev server, watcher, log tail) "
+        "and return a session id. Waits ~300ms so an immediate crash is reported "
+        "right away with its exit code and output; otherwise it keeps running for "
+        "process_poll (incremental output) and process_stop (cleanup). Use bash "
+        "for commands that finish on their own.",
         start_schema(), EffectSet{Effect::Exec},
         body<StartArgs>(run_start, parse_start), 4000);
     shells.add("process_poll",
-        "Poll a long-running process session and return its status plus only stdout/stderr produced since the previous poll.",
+        "Fetch output produced by a background session SINCE THE LAST POLL, plus "
+        "its status (running + uptime, or exited + exit code). Blocks briefly for "
+        "new output. Reports if any output scrolled past the rolling buffer.",
         poll_schema(), EffectSet{Effect::Exec},
         body<PollArgs>(run_poll, parse_poll), 30000);
     shells.add("process_stop",
-        "Terminate and reap a long-running process session, returning only final output not delivered by earlier polls.",
+        "Terminate (SIGTERM→SIGKILL) and reap a background session, returning its "
+        "exit code and any final output not yet delivered by process_poll. Always "
+        "call this to clean up a session you started.",
         stop_schema(), EffectSet{Effect::Exec},
         body<StopArgs>(run_stop, parse_stop), 30000);
 }

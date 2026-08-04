@@ -284,9 +284,16 @@ fs::path normalize_path(std::string_view s) {
         }
     }
     fs::path p{s};
-    std::error_code ec;
-    if (!p.is_absolute()) p = fs::absolute(p, ec);
-    return p;
+    if (!p.is_absolute()) {
+        // Resolve relative to the WORKSPACE ROOT, not the process cwd. The
+        // tool schemas promise "relative to the workspace root", and a tool
+        // thread's cwd may differ from the workspace (e.g. process_start with
+        // cwd=".", or a host that chdir'd elsewhere). fs::absolute() would
+        // anchor to current_path() and then fail the workspace-containment
+        // check for a path the model reasonably expected to be in-bounds.
+        p = workspace_root() / p;
+    }
+    return p.lexically_normal();
 }
 
 namespace {
