@@ -175,13 +175,24 @@ ExecResult run_start(const StartArgs& args) {
     }
 
 #ifdef _WIN32
-    std::string escaped_cwd = args.cwd;
-    std::size_t quote_pos = 0;
-    while ((quote_pos = escaped_cwd.find('"', quote_pos)) != std::string::npos) {
-        escaped_cwd.insert(quote_pos, 1, '"');
-        quote_pos += 2;
-    }
-    const std::string command = "cd /d \"" + escaped_cwd + "\" && " + args.command;
+    // Build the payload for `cmd.exe /d /s /c "<payload>"`.
+    //
+    // cmd.exe does NOT understand backslash-escaped quotes: the previous
+    // `cd /d \"<cwd>\"` produced a literal backslash in the path and every
+    // process_start died with "The filename, directory name, or volume
+    // label syntax is incorrect." With /s, cmd strips exactly the first
+    // and last quote of the payload and runs the rest VERBATIM, so the
+    // inner quotes around the path must be plain, unescaped quotes.
+    //
+    // A cwd containing a quote can't be expressed this way at all (cmd has
+    // no escape for it) — but such a path also can't exist on Windows,
+    // where " is an illegal filename character. Reject it explicitly
+    // instead of emitting a command line that would re-parse into
+    // something else.
+    if (args.cwd.find('"') != std::string::npos)
+        return std::unexpected(ToolError::invalid_args(
+            "cwd contains a quote character, which cmd.exe cannot escape"));
+    const std::string command = "cd /d \"" + args.cwd + "\" && " + args.command;
 #else
     auto quote = [](std::string_view value) {
         std::string out{"'"};

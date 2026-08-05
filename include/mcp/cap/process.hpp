@@ -38,6 +38,8 @@
 #endif
 #include <windows.h>
 
+#include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <istream>
@@ -99,11 +101,30 @@ public:
     handle_streambuf& operator=(const handle_streambuf&) = delete;
 
     void close() noexcept {
+        // Wake any reader parked in ReadFile FIRST, then close. Closing a
+        // HANDLE out from under a blocked ReadFile is a use-after-free in
+        // disguise: the kernel can recycle the handle value for an
+        // unrelated object opened by another thread, and the blocked read
+        // then completes against THAT object. Cancel, then close.
+        interrupt();
         if (h_ != INVALID_HANDLE_VALUE && h_ != nullptr) {
             ::CloseHandle(h_);
             h_ = INVALID_HANDLE_VALUE;
         }
     }
+
+    // Wake a thread blocked in underflow() WITHOUT closing the handle under
+    // it — the Windows counterpart to the POSIX fd_streambuf wake pipe.
+    // CancelIoEx(h, nullptr) cancels I/O issued on this handle by every
+    // thread in the process, so the reader's blocking ReadFile returns
+    // FALSE/ERROR_OPERATION_ABORTED and underflow() reports EOF. The owner
+    // joins that reader before destroying the streambuf.
+    void interrupt() noexcept {
+        interrupted_.store(true, std::memory_order_release);
+        if (h_ != INVALID_HANDLE_VALUE && h_ != nullptr)
+            (void)::CancelIoEx(h_, nullptr);
+    }
+
     [[nodiscard]] bool valid() const noexcept {
         return h_ != INVALID_HANDLE_VALUE && h_ != nullptr;
     }
@@ -111,11 +132,16 @@ public:
 protected:
     // ── reading: fill the 1-byte get area from the pipe ──────────────────
     int_type underflow() override {
-        if (!valid()) return traits_type::eof();
+        if (!valid() || interrupted_.load(std::memory_order_acquire))
+            return traits_type::eof();
         DWORD got = 0;
-        // ReadFile blocks until ≥1 byte or the write end closes (→ got==0 /
-        // ERROR_BROKEN_PIPE), which we surface as EOF — mirroring POSIX read().
+        // ReadFile blocks until ≥1 byte, the write end closes (→ got==0 /
+        // ERROR_BROKEN_PIPE), or interrupt() cancels it (→ FALSE /
+        // ERROR_OPERATION_ABORTED). All three surface as EOF — mirroring
+        // POSIX read() plus the wake-pipe path.
         if (!::ReadFile(h_, in_, 1, &got, nullptr) || got == 0)
+            return traits_type::eof();
+        if (interrupted_.load(std::memory_order_acquire))
             return traits_type::eof();
         setg(in_, in_, in_ + 1);
         return traits_type::to_int_type(in_[0]);
@@ -152,6 +178,7 @@ protected:
 
 private:
     HANDLE h_;
+    std::atomic<bool> interrupted_{false};
     char   in_[1]{};
     char   out_[4096]{};
 };
@@ -205,12 +232,15 @@ public:
         const bool have_env = build_env_block_(s, env_block);
 
         PROCESS_INFORMATION pi{};
+        // CREATE_SUSPENDED so the child is assigned to the job BEFORE it can
+        // run and spawn grandchildren of its own; CREATE_BREAKAWAY_FROM_JOB
+        // is deliberately NOT set, so descendants stay in the job too.
         BOOL ok = ::CreateProcessA(
             /*lpApplicationName=*/nullptr,
             /*lpCommandLine=*/cmdline.data(),
             /*procAttrs=*/nullptr, /*threadAttrs=*/nullptr,
             /*bInheritHandles=*/TRUE,
-            /*creationFlags=*/0,
+            /*creationFlags=*/CREATE_SUSPENDED,
             /*lpEnvironment=*/have_env ? env_block.data() : nullptr,
             /*lpCurrentDirectory=*/s.cwd.empty() ? nullptr : s.cwd.c_str(),
             &si, &pi);
@@ -223,6 +253,27 @@ public:
             throw std::runtime_error("mcp::cap: CreateProcess('" + s.command +
                                      "') failed (err " +
                                      std::to_string(::GetLastError()) + ")");
+
+        // Put the child (and every descendant it spawns) in a job whose
+        // closure kills the tree. Without this, terminating a `cmd.exe /c`
+        // launcher leaves the real program orphaned and holding the stdout
+        // write end, so the reader thread never sees EOF and process_stop
+        // hangs. Best-effort: if any step fails we fall back to
+        // TerminateProcess on the launcher alone rather than failing spawn.
+        job_ = ::CreateJobObjectA(nullptr, nullptr);
+        if (job_) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+            limits.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (!::SetInformationJobObject(job_,
+                    JobObjectExtendedLimitInformation, &limits, sizeof(limits))
+                || !::AssignProcessToJobObject(job_, pi.hProcess)) {
+                ::CloseHandle(job_);
+                job_ = nullptr;
+            }
+        }
+
+        ::ResumeThread(pi.hThread);
         ::CloseHandle(pi.hThread);
         proc_   = pi.hProcess;
         pid_    = static_cast<int>(pi.dwProcessId);
@@ -266,7 +317,11 @@ public:
     }
 
     void interrupt_output() noexcept {
-        if (in_buf_) in_buf_->close();
+        // Cancel the blocking read; do NOT close the handle here. The reader
+        // thread is still inside ReadFile on it, and closing underneath a
+        // blocked read races handle-value recycling. close() happens later,
+        // in shutdown(), after the owner has joined the reader.
+        if (in_buf_) in_buf_->interrupt();
     }
 
     // Stop/reap the process but keep the read stream object alive so a
@@ -276,8 +331,21 @@ public:
         out_stream_.reset();
         out_buf_.reset();
         if (proc_) {
-            if (::WaitForSingleObject(proc_, 500) == WAIT_TIMEOUT)
-                ::TerminateProcess(proc_, 1);
+            if (::WaitForSingleObject(proc_, 500) == WAIT_TIMEOUT) {
+                // Kill the whole tree, not just the launcher. The child is
+                // `cmd.exe /c …`, which spawns the real program as a
+                // grandchild; TerminateProcess on cmd alone orphans that
+                // grandchild, which keeps the stdout write end open forever
+                // and wedges the reader in ReadFile. Closing the job (every
+                // process is assigned one at spawn, with
+                // KILL_ON_JOB_CLOSE) terminates the entire tree atomically.
+                if (job_) {
+                    ::CloseHandle(job_);   // KILL_ON_JOB_CLOSE fires here
+                    job_ = nullptr;
+                } else {
+                    ::TerminateProcess(proc_, 1);
+                }
+            }
             ::WaitForSingleObject(proc_, INFINITE);
             DWORD code = 0;
             if (::GetExitCodeProcess(proc_, &code) && !exit_code_)
@@ -286,6 +354,7 @@ public:
             proc_ = nullptr;
             pid_ = -1;
         }
+        if (job_) { ::CloseHandle(job_); job_ = nullptr; }
     }
 
     // Close child stdin (EOF → graceful exit), wait briefly, then terminate.
@@ -324,8 +393,51 @@ private:
 
     static std::string build_command_line_(const Spawn& s) {
         std::string cl = quote_arg_(s.command);
-        for (const auto& a : s.args) { cl.push_back(' '); cl += quote_arg_(a); }
+        // cmd.exe is NOT an MSVCRT argv parser. When the child is
+        // `cmd.exe /d /s /c <payload>`, the payload must be appended with a
+        // single pair of plain surrounding quotes and NO backslash escaping
+        // — /s tells cmd to strip exactly the outer quotes and execute the
+        // remainder verbatim. Running it through quote_arg_ (which escapes
+        // embedded quotes as \") made cmd see literal backslashes, which is
+        // why every quoted path in a process_start command failed. Detect
+        // the cmd /c form and hand its trailing payload through untouched.
+        std::size_t i = 0;
+        const bool is_cmd_shell = is_cmd_exe_(s.command);
+        for (const auto& a : s.args) {
+            ++i;
+            const bool last = (i == s.args.size());
+            if (is_cmd_shell && last && is_slash_c_(s.args, i - 1)) {
+                cl += " \"";
+                cl += a;          // verbatim — cmd has no escape syntax
+                cl += "\"";
+                continue;
+            }
+            cl.push_back(' ');
+            cl += quote_arg_(a);
+        }
         return cl;
+    }
+
+    // Is this executable cmd.exe? Matches "cmd", "cmd.exe", and any path
+    // ending in one of those, case-insensitively.
+    static bool is_cmd_exe_(const std::string& c) {
+        auto slash = c.find_last_of("\\/");
+        std::string base = (slash == std::string::npos) ? c : c.substr(slash + 1);
+        for (auto& ch : base)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        return base == "cmd" || base == "cmd.exe";
+    }
+
+    // Is the argument at `payload_idx` preceded by a /c or /k switch? Only
+    // then is the trailing token a command line rather than a normal argv
+    // token. Switches before it (/d, /s, /q) are ordinary arguments.
+    static bool is_slash_c_(const std::vector<std::string>& args,
+                            std::size_t payload_idx) {
+        if (payload_idx == 0) return false;
+        const std::string& prev = args[payload_idx - 1];
+        return prev.size() == 2 && (prev[0] == '/' || prev[0] == '-') &&
+               (prev[1] == 'c' || prev[1] == 'C' ||
+                prev[1] == 'k' || prev[1] == 'K');
     }
 
     // Build a merged environment block (parent env + s.env_kv overrides) in the
@@ -372,6 +484,7 @@ private:
     }
 
     HANDLE proc_ = nullptr;
+    HANDLE job_  = nullptr;   // kills the whole child tree when closed
     mutable int    pid_  = -1;
     mutable std::optional<int> exit_code_;
     std::unique_ptr<handle_streambuf> in_buf_;
