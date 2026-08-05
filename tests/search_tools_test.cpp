@@ -281,6 +281,23 @@ int main() {
         assert(st.text.find("branch.head") == std::string::npos);
         std::puts("git_status: ok");
 
+        // REGRESSION (`--workspace /`): when the access boundary is WIDER
+        // than the project, a no-path git_status must still find the repo at
+        // the process cwd, not run `git -C <boundary> status` and fail "not
+        // a git repository". Widen the boundary to the parent of root while
+        // cwd stays == root, then call git_status with NO path.
+        {
+            auto saved_ws = util::workspace_root();
+            util::set_workspace_root(root.parent_path());
+            auto wide = call(*provider, "git_status", obj());  // no `path`
+            assert(!wide.is_error
+                   && "no-path git_status must resolve the cwd project under a "
+                      "wider workspace boundary (`-w /`)");
+            assert(wide.text.find("## ") != std::string::npos);
+            util::set_workspace_root(saved_ws);
+            std::puts("git_status: wide-boundary (`-w /`) resolves cwd project");
+        }
+
         // git_commit stages everything and commits
         auto cargs = obj();
         cargs["message"]   = "seed commit";

@@ -98,25 +98,67 @@ run_git(const std::vector<std::string>& argv, std::string_view op,
     return {};
 }
 
+// Component-wise "child is under root" — a plain string startsWith would
+// let /home/user/project-other through when root is /home/user/project.
+[[nodiscard]] bool path_under(const std::filesystem::path& child,
+                              const std::filesystem::path& root) {
+    auto ci = child.begin();
+    auto ri = root.begin();
+    for (; ri != root.end() && ci != child.end(); ++ri, ++ci)
+        if (*ri != *ci) return false;
+    return ri == root.end();
+}
+
+// The directory to run git in WHEN no explicit `path` was given. The
+// workspace root is the filesystem *access* boundary and is routinely
+// widened all the way to `--workspace /` for full-disk power — but `-w /`
+// is not a claim that the user's project IS the filesystem root, and
+// `git -C / status` just fails with "not a git repository". agentty never
+// chdir's away from the directory it was launched in, so the PROCESS CWD
+// is the user's actual project. Prefer it (checkpoint.cpp resolves the
+// active repo the same way): probe from cwd, and if the enclosing repo
+// toplevel is inside the access boundary, that's the repo to use. Only
+// fall back to the workspace root itself when cwd is unusable or its repo
+// escapes the boundary.
+std::filesystem::path default_git_start() {
+    namespace fs = std::filesystem;
+    const fs::path& ws = util::workspace_root();
+    std::error_code ec;
+    fs::path cwd = fs::current_path(ec);
+    if (ec || cwd.empty()) return ws;
+
+    fs::path cwdc = fs::weakly_canonical(cwd, ec);
+    if (ec || cwdc.empty()) cwdc = cwd;
+    fs::path wsc = fs::weakly_canonical(ws, ec);
+    if (ec || wsc.empty()) wsc = ws;
+    // cwd must itself be inside the access boundary; if the user launched
+    // outside a wider `-w` scope (unusual) fall back to the boundary.
+    return path_under(cwdc, wsc) ? cwd : ws;
+}
+
 // Resolve the repository directory to run git in. Given a raw path (a
 // directory OR a file — the workspace-checked string for the tool's
 // `path`/first `files[]` entry), ask git for the enclosing worktree
 // toplevel so every subcommand runs against the RIGHT repo regardless
-// of the process cwd. A repository rooted above the workspace is rejected:
-// merely replacing its path with the workspace is not containment because
-// Git would discover the same parent repository again.
+// of the process cwd. When `checked` is empty (no explicit `path` arg),
+// start from default_git_start() — the process cwd (the project) — rather
+// than the raw access boundary, so `--workspace /` keeps full filesystem
+// power without breaking git on the project you launched in. A repository
+// rooted above the workspace is rejected: merely replacing its path with
+// the workspace is not containment because Git would discover the same
+// parent repository again.
 std::expected<std::string, ToolError>
 resolve_git_dir(std::string_view checked) {
     namespace fs = std::filesystem;
     fs::path start = checked.empty()
-        ? util::workspace_root()
+        ? default_git_start()
         : fs::path{std::string{checked}};
     std::error_code ec;
     // If `start` is a file, its parent is the directory to probe.
     fs::path dir = start;
     if (!checked.empty() && !fs::is_directory(start, ec))
         dir = start.parent_path();
-    if (dir.empty()) dir = util::workspace_root();
+    if (dir.empty()) dir = default_git_start();
 
     auto r = util::run_argv_s(
         {"git", "-C", dir.string(), "rev-parse", "--show-toplevel"}, 4096);
@@ -128,14 +170,7 @@ resolve_git_dir(std::string_view checked) {
             const fs::path& ws = util::workspace_root();
             fs::path topc = fs::weakly_canonical(fs::path{top}, ec);
             fs::path wsc  = fs::weakly_canonical(ws, ec);
-            auto under = [](const fs::path& child, const fs::path& root) {
-                auto ci = child.begin();
-                auto ri = root.begin();
-                for (; ri != root.end() && ci != child.end(); ++ri, ++ci)
-                    if (*ri != *ci) return false;
-                return ri == root.end();
-            };
-            if (under(topc, wsc)) return top;
+            if (path_under(topc, wsc)) return top;
             return std::unexpected(ToolError::out_of_workspace(
                 "git repository root '" + topc.string()
                 + "' is outside workspace root '" + wsc.string() + "'"));
@@ -155,16 +190,24 @@ struct GitStatusArgs {
 
 std::expected<GitStatusArgs, ToolError> parse_git_status_args(const json& j) {
     util::ArgReader ar(j);
+    // Default is empty, NOT ".": an empty path lets resolve_git_dir() pick
+    // the smart default (the process cwd / the project). A literal "." is
+    // workspace-checked into the access boundary, which under `--workspace /`
+    // becomes `/` and makes `git -C / status` fail "not a git repository".
     return GitStatusArgs{
-        ar.str("path", "."),
+        ar.str("path", ""),
         ar.str("display_description", ""),
     };
 }
 
 ExecResult run_git_status(const GitStatusArgs& a) {
-    auto wp = util::make_workspace_path_checked(a.root, "git_status");
-    if (!wp) return std::unexpected(std::move(wp.error()));
-    auto git_dir = resolve_git_dir(wp->string());
+    std::string checked;
+    if (!a.root.empty()) {
+        auto wp = util::make_workspace_path_checked(a.root, "git_status");
+        if (!wp) return std::unexpected(std::move(wp.error()));
+        checked = wp->string();
+    }
+    auto git_dir = resolve_git_dir(checked);
     if (!git_dir) return std::unexpected(std::move(git_dir.error()));
     // porcelain=v1 (the `git status -s` short format: `XY path`, one line per
     // change, plus a `## branch...upstream [ahead/behind]` header). Stable
@@ -354,10 +397,10 @@ std::expected<GitCommitArgs, ToolError> parse_git_commit_args(const json& j) {
 
 ExecResult run_git_commit(const GitCommitArgs& a) {
     // Resolve the repo to commit in from (in priority order): the explicit
-    // `path` arg, the first staged file, else the workspace root. This is
-    // what makes committing files in a sibling checkout Just Work instead
-    // of failing with "not inside a git repository" when the process cwd
-    // happens to be elsewhere.
+    // `path` arg, the first staged file, else the smart default (the process
+    // cwd — the project). This is what makes committing files in a sibling
+    // checkout Just Work instead of failing with "not inside a git
+    // repository" when the workspace boundary is wide (e.g. `--workspace /`).
     std::string repo_hint;
     if (!a.path.empty()) {
         auto wp = util::make_workspace_path_checked(a.path, "git_commit");
@@ -581,7 +624,7 @@ json git_commit_schema() {
                            {"description","Files to stage before committing"}}},
             {"stage_all", {{"type","boolean"}, {"description","Stage all changes (default: false)"}}},
             {"path",      {{"type","string"}, {"description","Repository path "
-                           "(default: derived from files, else workspace root)"}}},
+                           "(default: derived from files, else the current project)"}}},
         }},
     };
 }
