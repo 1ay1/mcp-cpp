@@ -12,6 +12,7 @@
 #include <mcp/cap/local.hpp>
 
 #include <cassert>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -488,6 +489,130 @@ int main() {
         assert(df.text.find("@@") != std::string::npos
                && "default git_diff must include the patch body");
         std::puts("git_diff: default includes patch body");
+    }
+
+    // ── git_stash: push / list / pop ──────────────────────────────────
+    {
+        // Make a tracked change to stash. amend_me.txt was committed earlier.
+        write_file(root / "amend_me.txt", "v1\nstash-me\n");
+        auto sp = obj(); sp["action"] = "push"; sp["message"] = "WIP test";
+        auto spr = call(*provider, "git_stash", sp);
+        assert(!spr.is_error);
+        assert(spr.text.find("stashed") != std::string::npos);
+        assert(read_effects(spr).has(Effect::WriteFs));
+        std::puts("git_stash: push ok");
+
+        // The working tree is clean again (a fresh diff shows nothing new).
+        auto sl = call(*provider, "git_stash", obj());   // action=list
+        assert(!sl.is_error);
+        assert(sl.text.find("WIP test") != std::string::npos
+               && "stash list must show the pushed entry's message");
+        std::puts("git_stash: list ok");
+
+        // pop restores the change.
+        auto spop = obj(); spop["action"] = "pop";
+        auto spopr = call(*provider, "git_stash", spop);
+        assert(!spopr.is_error);
+        assert(spopr.text.find("popped") != std::string::npos);
+        std::puts("git_stash: pop restores changes");
+
+        // Clean the working tree back up for the following tests.
+        auto cl = obj(); cl["command"] = "git checkout -- amend_me.txt";
+        (void)call(*provider, "bash", cl);
+
+        // push with nothing to stash is a friendly no-op, not an error.
+        auto spn = obj(); spn["action"] = "push";
+        auto spnr = call(*provider, "git_stash", spn);
+        assert(!spnr.is_error);
+        assert(spnr.text.find("nothing to stash") != std::string::npos);
+        std::puts("git_stash: empty push is a no-op");
+    }
+
+    // ── git_cherry_pick: apply a commit from another branch ────────────
+    {
+        // Build a side branch with a unique commit, return to master, then
+        // cherry-pick that commit in.
+        auto setup = obj(); setup["command"] =
+            "git switch -c cp-src -q && "
+            "printf cherry > cherry_file.txt && git add cherry_file.txt && "
+            "git commit -q -m 'cherry commit' && "
+            "echo SHA=$(git rev-parse HEAD) && git switch master -q";
+        auto sr = call(*provider, "bash", setup);
+        assert(!sr.is_error);
+        // Extract the printed SHA.
+        std::string txt = sr.text;
+        auto p = txt.find("SHA=");
+        assert(p != std::string::npos);
+        std::string sha = txt.substr(p + 4, 40);
+        // Trim to the hex run.
+        size_t hexlen = 0;
+        while (hexlen < sha.size() && std::isxdigit((unsigned char)sha[hexlen]))
+            ++hexlen;
+        sha.resize(hexlen);
+        assert(!sha.empty());
+
+        auto cp = obj(); cp["action"] = "pick";
+        cp["commits"] = mcp::Json::array({sha});
+        auto cpr = call(*provider, "git_cherry_pick", cp);
+        assert(!cpr.is_error && "cherry-pick of a clean commit must succeed");
+        assert(cpr.text.find("cherry-picked") != std::string::npos);
+        std::puts("git_cherry_pick: pick ok");
+
+        // The picked file now exists on master.
+        auto chk = call(*provider, "git_log", [] {
+            auto o = obj(); o["oneline"] = true; return o; }());
+        assert(!chk.is_error && chk.text.find("cherry commit") != std::string::npos);
+        std::puts("git_cherry_pick: commit landed on current branch");
+
+        // pick requires commits.
+        auto cpn = obj(); cpn["action"] = "pick";
+        auto cpnr = call(*provider, "git_cherry_pick", cpn);
+        assert(cpnr.is_error && "pick without commits must be rejected");
+        // continue with no cherry-pick in progress is a clear error.
+        auto cpc = obj(); cpc["action"] = "continue";
+        auto cpcr = call(*provider, "git_cherry_pick", cpc);
+        assert(cpcr.is_error);
+        std::puts("git_cherry_pick: guard rails ok");
+    }
+
+    // ── git_rebase: replay a branch onto an advanced master ─────────────
+    {
+        // master advances; a topic branch forked earlier gets rebased onto it.
+        auto setup = obj(); setup["command"] =
+            "git switch -c rb-topic -q && "
+            "printf topic > topic.txt && git add topic.txt && "
+            "git commit -q -m 'topic work' && "
+            "git switch master -q && "
+            "printf mainline > mainline.txt && git add mainline.txt && "
+            "git commit -q -m 'mainline work' && git switch rb-topic -q";
+        auto sr = call(*provider, "bash", setup);
+        assert(!sr.is_error);
+
+        auto rb = obj(); rb["action"] = "onto"; rb["upstream"] = "master";
+        auto rbr = call(*provider, "git_rebase", rb);
+        assert(!rbr.is_error && "clean rebase onto master must succeed");
+        assert(rbr.text.find("rebased onto master") != std::string::npos);
+        assert(read_effects(rbr).has(Effect::WriteFs));
+        std::puts("git_rebase: onto ok");
+
+        // After the rebase, mainline.txt is reachable from the topic branch.
+        auto chk = obj(); chk["command"] = "test -f mainline.txt && echo HAS_MAINLINE";
+        auto chkr = call(*provider, "bash", chk);
+        assert(!chkr.is_error && chkr.text.find("HAS_MAINLINE") != std::string::npos
+               && "rebase must replay topic on top of advanced master");
+        std::puts("git_rebase: topic replayed on advanced master");
+
+        // onto without upstream is rejected; continue with no rebase errors.
+        auto rbn = obj(); rbn["action"] = "onto";
+        auto rbnr = call(*provider, "git_rebase", rbn);
+        assert(rbnr.is_error && "onto without upstream must be rejected");
+        auto rbc = obj(); rbc["action"] = "continue";
+        auto rbcr = call(*provider, "git_rebase", rbc);
+        assert(rbcr.is_error && "continue with no rebase in progress must error");
+        std::puts("git_rebase: guard rails ok");
+
+        (void)call(*provider, "bash", [] {
+            auto o = obj(); o["command"] = "git switch master -q"; return o; }());
     }
 
     fs::current_path(prev_cwd);

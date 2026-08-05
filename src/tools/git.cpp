@@ -901,6 +901,304 @@ ExecResult run_git_branch(const GitBranchArgs& a) {
     return ToolOutput{"deleted branch " + a.name, std::nullopt};
 }
 
+// A conflict-aware epilogue shared by rebase / cherry-pick: when a git
+// sequencer operation stops with conflicts, git exits non-zero but the state
+// is RECOVERABLE (continue after resolving, or abort). Turn that into a clear,
+// actionable message naming the exact follow-up actions rather than a raw
+// "exit 1" dump. `op` is the tool name, `cont`/`abrt` the action words to
+// suggest (e.g. "continue"/"abort").
+ToolError sequencer_conflict(const util::SubprocessResult& r,
+                             std::string_view op,
+                             std::string_view verb) {
+    std::string_view o = r.output;
+    auto has = [&](std::string_view n) {
+        return o.find(n) != std::string_view::npos;
+    };
+    if (has("CONFLICT") || has("could not apply")
+     || has("Merge conflict") || has("needs merge")
+     || has("after resolving the conflicts")) {
+        return ToolError::subprocess(std::string{op} + ": " + std::string{verb}
+            + " stopped on conflicts. Resolve the conflicted files (edit + "
+              "stage them), then call " + std::string{op}
+            + " action=continue — or action=abort to restore the pre-"
+            + std::string{verb} + " state.\n\n" + std::string{o});
+    }
+    return classify_git_failure(r, op);
+}
+
+// ── git_stash ────────────────────────────────────────────────────────
+
+// Shelve / restore uncommitted work. action: list (default, read-only),
+// push (default when action omitted but changes exist — no, we keep list as
+// the safe default), pop, apply, drop, show. A stash `ref` (e.g. stash@{1})
+// targets a specific entry for pop/apply/drop/show; default is the latest.
+struct GitStashArgs {
+    std::string action;   // list | push | pop | apply | drop | show
+    std::string message;
+    std::string ref;
+    bool include_untracked = false;
+    std::string path;
+    std::string display_description;
+};
+
+std::expected<GitStashArgs, ToolError> parse_git_stash_args(const json& j) {
+    util::ArgReader ar(j);
+    std::string action = ar.str("action", "list");
+    if (action != "list" && action != "push" && action != "pop"
+     && action != "apply" && action != "drop" && action != "show")
+        return std::unexpected(ToolError::invalid_args(
+            "action must be one of: list, push, pop, apply, drop, show"));
+    std::string ref = ar.str("ref", "");
+    if (!ref.empty()) {
+        if (auto v = validate_ref(ref); !v)
+            return std::unexpected(std::move(v.error()));
+    }
+    return GitStashArgs{
+        std::move(action),
+        ar.str("message", ""),
+        std::move(ref),
+        ar.boolean("include_untracked", false),
+        ar.str("path", ""),
+        ar.str("display_description", ""),
+    };
+}
+
+ExecResult run_git_stash(const GitStashArgs& a) {
+    std::string checked;
+    if (!a.path.empty()) {
+        auto wp = util::make_workspace_path_checked(a.path, "git_stash");
+        if (!wp) return std::unexpected(std::move(wp.error()));
+        checked = wp->string();
+    }
+    auto git_dir = resolve_git_dir(checked);
+    if (!git_dir) return std::unexpected(std::move(git_dir.error()));
+    const std::string& d = *git_dir;
+
+    if (a.action == "list") {
+        auto out = run_git({"git", "-C", d, "stash", "list"}, "git_stash");
+        if (!out) return std::unexpected(std::move(out.error()));
+        return ToolOutput{out->empty() ? "(no stashes)" : std::move(*out),
+                          std::nullopt};
+    }
+
+    if (a.action == "push") {
+        std::vector<std::string> argv{"git", "-C", d, "stash", "push"};
+        if (a.include_untracked) argv.push_back("--include-untracked");
+        if (!a.message.empty()) { argv.push_back("-m"); argv.push_back(a.message); }
+        auto r = util::run_argv_s(argv);
+        if (!r.started || r.timed_out || r.exit_code != 0)
+            return std::unexpected(classify_git_failure(r, "git_stash (push)"));
+        std::string_view o = r.output;
+        if (o.find("No local changes") != std::string_view::npos)
+            return ToolOutput{"nothing to stash — working tree clean",
+                              std::nullopt};
+        return ToolOutput{"stashed working changes"
+            + (a.message.empty() ? std::string{} : ": " + a.message),
+            std::nullopt};
+    }
+
+    if (a.action == "show") {
+        std::vector<std::string> argv{"git", "-C", d, "stash", "show", "-p"};
+        if (!a.ref.empty()) argv.push_back(a.ref);
+        auto out = run_git(argv, "git_stash (show)", 50'000);
+        if (!out) return std::unexpected(std::move(out.error()));
+        return ToolOutput{out->empty() ? "(empty stash)" : std::move(*out),
+                          std::nullopt};
+    }
+
+    // pop | apply | drop
+    std::vector<std::string> argv{"git", "-C", d, "stash", a.action};
+    if (!a.ref.empty()) argv.push_back(a.ref);
+    auto r = util::run_argv_s(argv, 50'000);
+    if (!r.started || r.timed_out || r.exit_code != 0) {
+        std::string_view o = r.output;
+        // pop/apply can hit merge conflicts; the stash is preserved on pop
+        // failure so the user can resolve and retry.
+        if (o.find("CONFLICT") != std::string_view::npos
+         || o.find("conflict") != std::string_view::npos)
+            return std::unexpected(ToolError::subprocess(
+                "git_stash (" + a.action + "): applying the stash produced "
+                "conflicts. Resolve them; the stash entry is preserved so you "
+                "can retry or drop it.\n\n" + std::string{o}));
+        return std::unexpected(classify_git_failure(r, "git_stash (" + a.action + ")"));
+    }
+    std::string verb = a.action == "pop"   ? "popped"
+                     : a.action == "apply" ? "applied" : "dropped";
+    return ToolOutput{verb + " stash"
+        + (a.ref.empty() ? std::string{} : " " + a.ref)
+        + (a.action == "drop" ? "" : " — changes restored to the working tree"),
+        std::nullopt};
+}
+
+// ── git_rebase ───────────────────────────────────────────────────────
+
+// Reapply commits onto a new base, or drive an in-progress rebase.
+// action: onto (start a rebase onto <upstream>), continue, abort, skip.
+struct GitRebaseArgs {
+    std::string action;   // onto | continue | abort | skip
+    std::string upstream;
+    std::string branch;
+    std::string path;
+    std::string display_description;
+};
+
+std::expected<GitRebaseArgs, ToolError> parse_git_rebase_args(const json& j) {
+    util::ArgReader ar(j);
+    std::string action = ar.str("action", "");
+    if (action != "onto" && action != "continue"
+     && action != "abort" && action != "skip")
+        return std::unexpected(ToolError::invalid_args(
+            "action must be one of: onto, continue, abort, skip"));
+    std::string upstream = ar.str("upstream", "");
+    if (action == "onto" && upstream.empty())
+        return std::unexpected(ToolError::invalid_args(
+            "`upstream` (the ref to rebase onto) is required for action=onto"));
+    if (!upstream.empty()) {
+        if (auto v = validate_ref(upstream); !v)
+            return std::unexpected(std::move(v.error()));
+    }
+    std::string branch = ar.str("branch", "");
+    if (!branch.empty()) {
+        if (auto v = validate_ref(branch); !v)
+            return std::unexpected(std::move(v.error()));
+    }
+    return GitRebaseArgs{
+        std::move(action), std::move(upstream), std::move(branch),
+        ar.str("path", ""), ar.str("display_description", ""),
+    };
+}
+
+ExecResult run_git_rebase(const GitRebaseArgs& a) {
+    std::string checked;
+    if (!a.path.empty()) {
+        auto wp = util::make_workspace_path_checked(a.path, "git_rebase");
+        if (!wp) return std::unexpected(std::move(wp.error()));
+        checked = wp->string();
+    }
+    auto git_dir = resolve_git_dir(checked);
+    if (!git_dir) return std::unexpected(std::move(git_dir.error()));
+    const std::string& d = *git_dir;
+
+    std::vector<std::string> argv{"git", "-C", d, "rebase"};
+    if (a.action == "onto") {
+        argv.push_back(a.upstream);
+        if (!a.branch.empty()) argv.push_back(a.branch);
+    } else {
+        argv.push_back("--" + a.action);   // --continue / --abort / --skip
+    }
+    auto r = util::run_argv_s(argv, 50'000);
+    if (!r.started || r.timed_out || r.exit_code != 0) {
+        // continue with unresolved conflicts, or a fresh conflict during onto.
+        std::string_view o = r.output;
+        if (o.find("No rebase in progress") != std::string_view::npos)
+            return std::unexpected(ToolError::invalid_args(
+                "git_rebase: no rebase in progress — nothing to "
+                + a.action + ". Start one with action=onto upstream=<ref>."));
+        return std::unexpected(sequencer_conflict(r, "git_rebase", "rebase"));
+    }
+    std::string_view o = r.output;
+    if (a.action == "abort")
+        return ToolOutput{"rebase aborted — restored the pre-rebase state",
+                          std::nullopt};
+    if (o.find("up to date") != std::string_view::npos)
+        return ToolOutput{"already up to date — nothing to rebase",
+                          std::nullopt};
+    std::string msg = a.action == "onto"
+        ? "rebased onto " + a.upstream
+        : "rebase " + a.action + "d";
+    return ToolOutput{msg + "\n" + std::string{o}, std::nullopt};
+}
+
+// ── git_cherry_pick ──────────────────────────────────────────────────
+
+// Apply the changes from one or more existing commits onto HEAD, or drive an
+// in-progress cherry-pick. action: pick (default; needs `commits`), continue,
+// abort, skip.
+struct GitCherryPickArgs {
+    std::string action;   // pick | continue | abort | skip
+    std::vector<std::string> commits;
+    bool no_commit = false;   // stage the changes but don't commit (-n)
+    std::string path;
+    std::string display_description;
+};
+
+std::expected<GitCherryPickArgs, ToolError>
+parse_git_cherry_pick_args(const json& j) {
+    util::ArgReader ar(j);
+    std::string action = ar.str("action", "pick");
+    if (action != "pick" && action != "continue"
+     && action != "abort" && action != "skip")
+        return std::unexpected(ToolError::invalid_args(
+            "action must be one of: pick, continue, abort, skip"));
+    std::vector<std::string> commits;
+    if (const json* c = ar.raw("commits"); c) {
+        if (c->is_string()) {
+            auto s = c->get<std::string>();
+            if (!s.empty()) commits.push_back(std::move(s));
+        } else if (c->is_array()) {
+            for (const auto& el : *c)
+                if (el.is_string()) {
+                    auto s = el.get<std::string>();
+                    if (!s.empty()) commits.push_back(std::move(s));
+                }
+        }
+    }
+    if (action == "pick" && commits.empty())
+        return std::unexpected(ToolError::invalid_args(
+            "`commits` (one or more commit refs) is required for action=pick"));
+    for (const auto& c : commits)
+        if (auto v = validate_ref(c); !v)
+            return std::unexpected(std::move(v.error()));
+    return GitCherryPickArgs{
+        std::move(action), std::move(commits),
+        ar.boolean("no_commit", false),
+        ar.str("path", ""), ar.str("display_description", ""),
+    };
+}
+
+ExecResult run_git_cherry_pick(const GitCherryPickArgs& a) {
+    std::string checked;
+    if (!a.path.empty()) {
+        auto wp = util::make_workspace_path_checked(a.path, "git_cherry_pick");
+        if (!wp) return std::unexpected(std::move(wp.error()));
+        checked = wp->string();
+    }
+    auto git_dir = resolve_git_dir(checked);
+    if (!git_dir) return std::unexpected(std::move(git_dir.error()));
+    const std::string& d = *git_dir;
+
+    std::vector<std::string> argv{"git", "-C", d, "cherry-pick"};
+    if (a.action == "pick") {
+        if (a.no_commit) argv.push_back("--no-commit");
+        for (const auto& c : a.commits) argv.push_back(c);
+    } else {
+        argv.push_back("--" + a.action);
+    }
+    auto r = util::run_argv_s(argv, 50'000);
+    if (!r.started || r.timed_out || r.exit_code != 0) {
+        std::string_view o = r.output;
+        if (o.find("no cherry-pick") != std::string_view::npos
+         || o.find("no sequencer in progress") != std::string_view::npos)
+            return std::unexpected(ToolError::invalid_args(
+                "git_cherry_pick: no cherry-pick in progress — nothing to "
+                + a.action + ". Start one with action=pick commits=[<ref>]."));
+        return std::unexpected(
+            sequencer_conflict(r, "git_cherry_pick", "cherry-pick"));
+    }
+    if (a.action == "abort")
+        return ToolOutput{"cherry-pick aborted — restored the prior state",
+                          std::nullopt};
+    if (a.action == "pick") {
+        std::string picked;
+        for (size_t i = 0; i < a.commits.size(); ++i)
+            picked += (i ? ", " : "") + a.commits[i];
+        return ToolOutput{(a.no_commit ? "cherry-picked (staged, not committed): "
+                                       : "cherry-picked: ") + picked,
+                          std::nullopt};
+    }
+    return ToolOutput{"cherry-pick " + a.action + "d", std::nullopt};
+}
+
 // ── Schemas ────────────────────────────────────────────────────────────
 
 json git_status_schema() {
@@ -1003,6 +1301,69 @@ json git_branch_schema() {
     };
 }
 
+json git_stash_schema() {
+    return json{
+        {"type","object"},
+        {"properties", {
+            {"display_description", {{"type","string"},
+                {"description","One-line summary shown in the UI. Optional."}}},
+            {"action", {{"type","string"},
+                        {"enum", {"list","push","pop","apply","drop","show"}},
+                        {"description","list (default, read-only) | push (shelve "
+                         "changes) | pop | apply | drop | show"}}},
+            {"message", {{"type","string"}, {"description","Label for a push"}}},
+            {"ref",     {{"type","string"}, {"description","Stash entry for "
+                         "pop/apply/drop/show, e.g. stash@{1} (default: latest)"}}},
+            {"include_untracked", {{"type","boolean"}, {"description","push: also "
+                                   "stash untracked files (default: false)"}}},
+            {"path",    {{"type","string"}, {"description","Repository path "
+                         "(default: the current project)"}}},
+        }},
+    };
+}
+
+json git_rebase_schema() {
+    return json{
+        {"type","object"},
+        {"required", {"action"}},
+        {"properties", {
+            {"display_description", {{"type","string"},
+                {"description","One-line summary shown in the UI. Optional."}}},
+            {"action",   {{"type","string"},
+                          {"enum", {"onto","continue","abort","skip"}},
+                          {"description","onto (rebase onto <upstream>) | "
+                           "continue | abort | skip — drive an in-progress rebase"}}},
+            {"upstream", {{"type","string"}, {"description","Ref to rebase onto "
+                          "(required for action=onto), e.g. main or origin/main"}}},
+            {"branch",   {{"type","string"}, {"description","Branch to rebase "
+                          "(action=onto; default: current branch)"}}},
+            {"path",     {{"type","string"}, {"description","Repository path "
+                          "(default: the current project)"}}},
+        }},
+    };
+}
+
+json git_cherry_pick_schema() {
+    return json{
+        {"type","object"},
+        {"properties", {
+            {"display_description", {{"type","string"},
+                {"description","One-line summary shown in the UI. Optional."}}},
+            {"action",  {{"type","string"},
+                         {"enum", {"pick","continue","abort","skip"}},
+                         {"description","pick (default; apply `commits` onto HEAD) "
+                          "| continue | abort | skip"}}},
+            {"commits", {{"type","array"}, {"items",{{"type","string"}}},
+                         {"description","Commit ref(s) to apply (required for "
+                          "action=pick); a single string is also accepted"}}},
+            {"no_commit", {{"type","boolean"}, {"description","Stage the changes "
+                           "without committing (default: false)"}}},
+            {"path",    {{"type","string"}, {"description","Repository path "
+                         "(default: the current project)"}}},
+        }},
+    };
+}
+
 } // namespace
 
 void register_git_tools(Shells& sh) {
@@ -1044,6 +1405,26 @@ void register_git_tools(Shells& sh) {
         "is read-only; create/switch/delete take a `name`.",
         git_branch_schema(), EffectSet{Effect::WriteFs},
         body<GitBranchArgs>(run_git_branch, parse_git_branch_args), 20'000);
+
+    sh.add("git_stash",
+        "Shelve or restore uncommitted work. action=list (default) is "
+        "read-only; push/pop/apply/drop/show manage the stash.",
+        git_stash_schema(), EffectSet{Effect::WriteFs},
+        body<GitStashArgs>(run_git_stash, parse_git_stash_args), 50'000);
+
+    sh.add("git_rebase",
+        "Reapply commits onto a new base (action=onto upstream=<ref>), or "
+        "drive an in-progress rebase (continue/abort/skip).",
+        git_rebase_schema(), EffectSet{Effect::WriteFs},
+        body<GitRebaseArgs>(run_git_rebase, parse_git_rebase_args), 50'000);
+
+    sh.add("git_cherry_pick",
+        "Apply the changes from existing commit(s) onto HEAD "
+        "(action=pick commits=[...]), or drive one in progress "
+        "(continue/abort/skip).",
+        git_cherry_pick_schema(), EffectSet{Effect::WriteFs},
+        body<GitCherryPickArgs>(run_git_cherry_pick, parse_git_cherry_pick_args),
+        50'000);
 }
 
 } // namespace mcp::tools::detail
