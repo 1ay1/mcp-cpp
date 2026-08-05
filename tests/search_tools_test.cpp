@@ -279,6 +279,9 @@ int main() {
         // tool card body would render as gibberish.
         assert(st.text.find("## ") != std::string::npos);
         assert(st.text.find("branch.head") == std::string::npos);
+        // Model-facing digest sits above the porcelain: "On branch X · ...".
+        assert(st.text.find("On branch ") != std::string::npos
+               && "git_status must prepend a one-line summary for the model");
         std::puts("git_status: ok");
 
         // REGRESSION (`--workspace /`): when the access boundary is WIDER
@@ -305,6 +308,10 @@ int main() {
         auto ci = call(*provider, "git_commit", cargs);
         assert(!ci.is_error);
         assert(read_effects(ci).has(Effect::WriteFs));
+        // Clean synthesized result: "committed <hash> on <branch>" + subject.
+        assert(ci.text.find("committed ") != std::string::npos
+               && "git_commit must report a clean committed-<hash> summary");
+        assert(ci.text.find("seed commit") != std::string::npos);
         std::puts("git_commit: ok");
 
         // git_log shows the commit
@@ -396,6 +403,91 @@ int main() {
         auto br = call(*provider, "git_commit", bad);
         assert(br.is_error);
         std::puts("git_commit: empty message refused");
+    }
+
+    // ── git_branch: list / create / switch / delete ─────────────────────
+    {
+        // list shows the current branch marked with '*'.
+        auto bl = call(*provider, "git_branch", obj());   // action defaults to list
+        assert(!bl.is_error);
+        assert(bl.text.find("*") != std::string::npos
+               && "git_branch list must mark the current branch");
+        std::puts("git_branch: list ok");
+
+        // create a branch.
+        auto bc = obj(); bc["action"] = "create"; bc["name"] = "feature-x";
+        auto bcr = call(*provider, "git_branch", bc);
+        assert(!bcr.is_error);
+        assert(read_effects(bcr).has(Effect::WriteFs));
+        std::puts("git_branch: create ok");
+
+        // switch to it, then verify git_status reports the new branch.
+        auto bs = obj(); bs["action"] = "switch"; bs["name"] = "feature-x";
+        auto bsr = call(*provider, "git_branch", bs);
+        assert(!bsr.is_error);
+        auto stx = call(*provider, "git_status", obj());
+        assert(!stx.is_error);
+        assert(stx.text.find("On branch feature-x") != std::string::npos
+               && "switch must land us on the new branch");
+        std::puts("git_branch: switch ok");
+
+        // create-and-switch in one call via a fresh name.
+        auto bcs = obj(); bcs["action"] = "switch"; bcs["name"] = "feature-y";
+        auto bcsr = call(*provider, "git_branch", bcs);
+        assert(!bcsr.is_error);
+        assert(bcsr.text.find("created and switched") != std::string::npos);
+        std::puts("git_branch: create-and-switch ok");
+
+        // delete the now-unused feature-x (switch back to master first).
+        auto back = obj(); back["action"] = "switch"; back["name"] = "master";
+        (void)call(*provider, "git_branch", back);
+        auto bd = obj(); bd["action"] = "delete"; bd["name"] = "feature-x";
+        auto bdr = call(*provider, "git_branch", bd);
+        assert(!bdr.is_error && "merged branch delete must succeed");
+        std::puts("git_branch: delete ok");
+
+        // create/switch/delete require a name.
+        auto bn = obj(); bn["action"] = "create";
+        auto bnr = call(*provider, "git_branch", bn);
+        assert(bnr.is_error && "create without name must be rejected");
+        std::puts("git_branch: missing name refused");
+    }
+
+    // ── git_commit amend + git_diff stat_only ─────────────────────────
+    {
+        // Make a change, commit, then amend the message.
+        write_file(root / "amend_me.txt", "v1\n");
+        auto c1 = obj(); c1["message"] = "typo commmit"; c1["stage_all"] = true;
+        auto c1r = call(*provider, "git_commit", c1);
+        assert(!c1r.is_error);
+        auto am = obj(); am["amend"] = true; am["message"] = "fixed commit";
+        auto amr = call(*provider, "git_commit", am);
+        assert(!amr.is_error);
+        assert(amr.text.find("amended ") != std::string::npos);
+        auto lg2 = call(*provider, "git_log", [] { auto o = obj(); o["oneline"] = true; return o; }());
+        assert(!lg2.is_error);
+        assert(lg2.text.find("fixed commit") != std::string::npos
+               && lg2.text.find("typo commmit") == std::string::npos
+               && "amend must replace the previous commit's message");
+        std::puts("git_commit: amend ok");
+
+        // stat_only diff: change a file, assert the summary appears but no
+        // patch hunk lines (`@@`) do.
+        write_file(root / "amend_me.txt", "v1\nv2\n");
+        auto ds = obj(); ds["stat_only"] = true;
+        auto dsr = call(*provider, "git_diff", ds);
+        assert(!dsr.is_error);
+        assert(dsr.text.find("amend_me.txt") != std::string::npos);
+        assert(dsr.text.find("@@") == std::string::npos
+               && "stat_only must omit the patch body");
+        std::puts("git_diff: stat_only omits patch body");
+
+        // A normal diff DOES include the hunk.
+        auto df = call(*provider, "git_diff", obj());
+        assert(!df.is_error);
+        assert(df.text.find("@@") != std::string::npos
+               && "default git_diff must include the patch body");
+        std::puts("git_diff: default includes patch body");
     }
 
     fs::current_path(prev_cwd);
