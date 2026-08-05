@@ -181,6 +181,54 @@ resolve_git_dir(std::string_view checked) {
     return dir.string();
 }
 
+// Names of submodules under `git_dir` whose WORKING TREE is dirty (modified,
+// untracked-content, or a checked-out commit different from the one recorded
+// in the superproject). `git status --porcelain` marks these repo entries but
+// gives no detail, and — crucially — `git diff` shows NOTHING for a submodule
+// dirtied only by untracked content, so a user who sees `? mcp-cpp` in status
+// and then runs git_diff gets a confusing empty result. We surface the names
+// so the callers can point the user INTO the submodule. Best-effort: any
+// failure yields an empty list (never an error — this is only a hint).
+std::vector<std::string> dirty_submodules(const std::string& git_dir) {
+    std::vector<std::string> out;
+    // Fast path: no `.gitmodules` at the repo root ⇒ no submodules ⇒ don't
+    // pay for a `git submodule foreach` subprocess on every status/diff in
+    // the overwhelmingly common non-submodule repo.
+    std::error_code ec;
+    if (!fs::exists(fs::path{git_dir} / ".gitmodules", ec)) return out;
+    // `git submodule status` prefixes each line with a status char:
+    //   ' ' clean, '+' checked-out commit differs, '-' not initialised,
+    //   'U' merge conflicts. A trailing ` (dirty)`-style suffix isn't emitted
+    //   here, so we also consult `status --porcelain` for working-tree dirt.
+    // Path column of any porcelain row whose entry is a submodule shows up as
+    // a plain `?`/`M` against the submodule dir; `--porcelain` alone can't
+    // tell us it's a submodule. So ask git directly for the submodule paths
+    // that are not clean.
+    auto r = util::run_argv_s(
+        {"git", "-C", git_dir, "submodule", "--quiet", "foreach",
+         "--recursive",
+         // Print the submodule's display path when its own working tree is
+         // not clean. $displaypath and $sm_path are set by `foreach`.
+         "git diff --quiet && git diff --cached --quiet && "
+         "test -z \"$(git status --porcelain)\" || echo \"$displaypath\""},
+        8192);
+    if (!r.started || r.timed_out || r.exit_code != 0) return out;
+    std::string_view sv{r.output};
+    size_t pos = 0;
+    while (pos < sv.size()) {
+        size_t nl = sv.find('\n', pos);
+        std::string_view line = sv.substr(pos, nl == std::string_view::npos
+                                                    ? std::string_view::npos
+                                                    : nl - pos);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+            line.remove_suffix(1);
+        if (!line.empty()) out.emplace_back(line);
+        if (nl == std::string_view::npos) break;
+        pos = nl + 1;
+    }
+    return out;
+}
+
 // ── git_status ─────────────────────────────────────────────────────────
 
 struct GitStatusArgs {
@@ -238,6 +286,19 @@ ExecResult run_git_status(const GitStatusArgs& a) {
             output += "\nworking tree clean";
         }
     }
+    // A submodule shows up as a single `M`/`?` row (e.g. ` M mcp-cpp`) with no
+    // indication of WHAT changed inside it. Name the dirty ones so the user
+    // knows a git_diff/git_commit needs to target the submodule, not the
+    // superproject. Best-effort; skipped silently if there are none.
+    if (auto subs = dirty_submodules(*git_dir); !subs.empty()) {
+        while (!output.empty()
+               && (output.back() == '\n' || output.back() == '\r'))
+            output.pop_back();
+        output += "\n\nsubmodules with uncommitted changes (diff/commit inside "
+                  "them, not here): ";
+        for (size_t i = 0; i < subs.size(); ++i)
+            output += (i ? ", " : "") + subs[i];
+    }
     if (!a.display_description.empty())
         output = a.display_description + "\n" + output;
     return ToolOutput{std::move(output), std::nullopt};
@@ -285,7 +346,26 @@ ExecResult run_git_diff(const GitDiffArgs& a) {
     auto out = run_git(argv, "git_diff", 50'000);
     if (!out) return std::unexpected(std::move(out.error()));
     std::string output = std::move(*out);
-    if (output.empty()) return ToolOutput{"no changes", std::nullopt};
+    if (output.empty()) {
+        // `git diff` on a superproject shows nothing for a submodule that is
+        // dirty only in its working tree (esp. untracked content) — the
+        // recorded commit pointer hasn't moved. Without a hint the user sees
+        // "no changes" right after git_status flagged the submodule. Point
+        // them inside. Only for a whole-repo diff (no pathspec/ref).
+        if (pathspec.empty() && a.ref.empty()) {
+            auto subs = dirty_submodules(*git_dir);
+            if (!subs.empty()) {
+                std::string hint = "no changes in this repo, but these "
+                    "submodules have uncommitted changes: ";
+                for (size_t i = 0; i < subs.size(); ++i)
+                    hint += (i ? ", " : "") + subs[i];
+                hint += ".\nDiff inside one with e.g. git_diff path=\""
+                     + subs.front() + "\".";
+                return ToolOutput{std::move(hint), std::nullopt};
+            }
+        }
+        return ToolOutput{"no changes", std::nullopt};
+    }
     if (!a.display_description.empty())
         output = a.display_description + "\n" + output;
     return ToolOutput{std::move(output), std::nullopt};

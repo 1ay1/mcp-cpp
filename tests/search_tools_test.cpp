@@ -337,6 +337,60 @@ int main() {
         assert(nlg.text.find("nested commit") != std::string::npos);
         std::puts("git_commit: nested repo-relative files ok");
 
+        // ── SUBMODULE awareness ──────────────────────────────────────────
+        // Add a real submodule, dirty ONLY its working tree (untracked file),
+        // and assert both git_status and git_diff on the SUPERPROJECT point
+        // the user inside it. `git diff` on the superproject is empty in this
+        // state (the recorded commit pointer hasn't moved), so without the
+        // hint the user would see a bare "no changes".
+        {
+            auto sm = obj(); sm["command"] =
+                // A bare upstream to add as a submodule.
+                "git init -q --bare " + (root / "up.git").string() + " && "
+                "git clone -q " + (root / "up.git").string() + " seedwt && "
+                "cd seedwt && git config user.email t@t.t && "
+                "git config user.name T && echo hi > f.txt && "
+                "git add f.txt && git commit -q -m init && git push -q origin "
+                "HEAD:master && cd .. && "
+                // Add it into the workspace repo as a submodule.
+                "git -c protocol.file.allow=always submodule add -q "
+                + (root / "up.git").string() + " mod && "
+                "git commit -q -m 'add submodule' && "
+                // Dirty the submodule working tree with an untracked file.
+                "echo scratch > mod/untracked.txt";
+            auto smi = call(*provider, "bash", sm);
+            assert(!smi.is_error && "submodule setup must succeed");
+
+            // git_status names the dirty submodule.
+            auto ss = call(*provider, "git_status", obj());
+            assert(!ss.is_error);
+            assert(ss.text.find("submodules with uncommitted changes")
+                       != std::string::npos
+                   && "git_status must flag the dirty submodule");
+            assert(ss.text.find("mod") != std::string::npos);
+            std::puts("git_status: dirty submodule surfaced");
+
+            // git_diff on the superproject is empty here → must hint inside.
+            auto sd = call(*provider, "git_diff", obj());
+            assert(!sd.is_error);
+            assert(sd.text.find("submodules have uncommitted changes")
+                       != std::string::npos
+                   && "empty superproject git_diff must point into the "
+                      "dirty submodule");
+            assert(sd.text.find("git_diff path=") != std::string::npos);
+            std::puts("git_diff: empty superproject diff hints into submodule");
+
+            // A path INTO the submodule routes git tools to the submodule
+            // repo (resolve_git_dir → submodule toplevel), so git_status
+            // there shows the untracked file directly, no hint needed.
+            auto si = obj(); si["path"] = "mod";
+            auto sir = call(*provider, "git_status", si);
+            assert(!sir.is_error);
+            assert(sir.text.find("untracked.txt") != std::string::npos
+                   && "git_status path=mod must operate inside the submodule");
+            std::puts("git_status: path into submodule routes to submodule repo");
+        }
+
         // git_commit with empty message rejected
         auto bad = obj(); bad["message"] = "   ";
         auto br = call(*provider, "git_commit", bad);
