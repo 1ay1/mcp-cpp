@@ -83,6 +83,21 @@ int main() {
         std::puts("crash-at-start: ok");
     }
 
+    // ── 1b. FAST clean exit (exit 0) is not mislabeled as a failure ──────
+    {
+        mcp::Json a = mcp::Json::object();
+        a["command"] = "echo quickresult; exit 0";
+        auto r = call(*provider, "process_start", a);
+        CHECK(!r.is_error);
+        CHECK(contains(r.text, "exited immediately"));
+        CHECK(contains(r.text, "quickresult"));    // output preserved
+        // Exit 0 is SUCCESS — the guidance must NOT tell the model to "fix"
+        // a command that worked; it should point at bash for one-shot runs.
+        CHECK(contains(r.text, "cleanly"));
+        CHECK(!contains(r.text, "Fix the command"));
+        std::puts("clean-exit-0: ok");
+    }
+
     // ── 2. running process → poll shows running + incremental output ─────
     {
         mcp::Json a = mcp::Json::object();

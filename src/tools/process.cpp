@@ -281,9 +281,22 @@ ExecResult run_start(const StartArgs& args) {
         text += ": " + args.command;
         if (!early.empty()) text += "\n" + early;
         else text += "\n(no output)";
-        text += "\n\nThe process is no longer running — no session was kept. "
-                "Fix the command and call process_start again, or run a "
-                "one-shot command with bash instead.";
+        // Exit 0 is SUCCESS — a fast one-shot command that finished cleanly is
+        // not something to "fix". Only a nonzero (or signal) exit is a failure
+        // the model should act on. Tailor the guidance so a clean quick run
+        // isn't mislabeled as broken. (No exit code captured — e.g. killed
+        // before reap — is treated as the failure case.)
+        const bool clean = code && *code == 0;
+        if (clean)
+            text += "\n\nThe command finished cleanly (exit 0) before the "
+                    "background settle window — its full output is above and no "
+                    "session was kept. For commands that finish on their own, "
+                    "call `bash` instead of process_start; it's built for "
+                    "one-shot runs and returns the output directly.";
+        else
+            text += "\n\nThe process is no longer running — no session was kept. "
+                    "Fix the command and call process_start again, or run a "
+                    "one-shot command with bash instead.";
         return ToolOutput{std::move(text), std::nullopt};
     }
 
