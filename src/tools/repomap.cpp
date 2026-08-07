@@ -537,7 +537,7 @@ mcp::cap::Result run_repo_map(const Json& args) {
     // call a fresh session makes on a big repo. An explicit relative `path`
     // still resolves against cwd as usual.
     if (a.root.empty() || a.root == ".")
-        a.root = util::workspace_root().string();
+        a.root = util::project_root().string();
 
     auto wp = util::make_workspace_path_checked(a.root, "repo_map");
     if (!wp) return mcp::cap::Result::error(wp.error().detail);
