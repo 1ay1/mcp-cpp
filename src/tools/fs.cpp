@@ -314,14 +314,27 @@ ExecResult run_read(const ReadArgs& a) {
         }
     }
     if (a.offset > 1 || shown < total_lines) {
-        std::string hint = std::format("\n[showing lines {}-{} of {}",
-                                       a.offset, a.offset + shown - 1, total_lines);
-        int remaining = total_lines - (a.offset + shown - 1);
-        if (remaining > 0)
-            hint += std::format("; {} more — pass offset={} (or start_line={}) "
-                                "for the next chunk",
-                                remaining, a.offset + shown, a.offset + shown);
-        hint += "]";
+        std::string hint;
+        if (shown == 0) {
+            // offset landed past the end of the file — the old code rendered a
+            // nonsensical inverted range like "[showing lines 1000-999 of 1]".
+            // Tell the model plainly where the end is so it can re-request a
+            // valid range instead of guessing.
+            hint = std::format(
+                "\n[offset {} is past the end of the file, which has {} line{} "
+                "— nothing to show. Re-read with an offset ≤ {}.]",
+                a.offset, total_lines, total_lines == 1 ? "" : "s",
+                total_lines);
+        } else {
+            hint = std::format("\n[showing lines {}-{} of {}",
+                               a.offset, a.offset + shown - 1, total_lines);
+            int remaining = total_lines - (a.offset + shown - 1);
+            if (remaining > 0)
+                hint += std::format("; {} more — pass offset={} (or start_line={}) "
+                                    "for the next chunk",
+                                    remaining, a.offset + shown, a.offset + shown);
+            hint += "]";
+        }
         out += hint;
     }
     if (!a.display_description.empty())
@@ -647,7 +660,11 @@ std::expected<RemoveArgs, ToolError> parse_remove_args(const json& j) {
 ExecResult run_remove(const RemoveArgs& a) {
     std::error_code ec;
     if (!fs::exists(a.path, ec))
-        return std::unexpected(ToolError::not_found(a.path.string()));
+        return std::unexpected(ToolError::not_found(
+            "nothing to remove at " + a.path.string()
+            + " — it doesn't exist (already deleted, or a wrong path). If you "
+              "intended it gone, the desired state is already met; otherwise "
+              "`list_dir` the parent to check the name."));
     const bool directory = fs::is_directory(a.path, ec);
     if (directory && !a.recursive && !fs::is_empty(a.path, ec))
         return std::unexpected(ToolError::invalid_args(

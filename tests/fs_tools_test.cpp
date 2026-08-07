@@ -79,6 +79,20 @@ int main() {
         std::puts("read: stale-read sentinel ok");
     }
 
+    // ── read past EOF gives a clear message, not a broken range ──────────
+    {
+        auto args = obj(); args["path"] = wpath;
+        args["offset"] = 1000;   // file has 3 lines
+        auto rd = call(*provider, "read", args);
+        assert(!rd.is_error);
+        // The old code emitted a nonsensical inverted range like
+        // "[showing lines 1000-999 of 3]". Assert the actionable message and
+        // the ABSENCE of that inverted form.
+        assert(rd.text.find("past the end of the file") != std::string::npos);
+        assert(rd.text.find("1000-999") == std::string::npos);
+        std::puts("read: past-EOF offset gives a clear message");
+    }
+
     // ── edit applies a fuzzy splice and carries a FileChange ─────────────
     {
         auto e = obj();
