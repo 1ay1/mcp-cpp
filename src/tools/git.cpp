@@ -121,19 +121,10 @@ run_git(const std::vector<std::string>& argv, std::string_view op,
 // fall back to the workspace root itself when cwd is unusable or its repo
 // escapes the boundary.
 std::filesystem::path default_git_start() {
-    namespace fs = std::filesystem;
-    const fs::path& ws = util::workspace_root();
-    std::error_code ec;
-    fs::path cwd = fs::current_path(ec);
-    if (ec || cwd.empty()) return ws;
-
-    fs::path cwdc = fs::weakly_canonical(cwd, ec);
-    if (ec || cwdc.empty()) cwdc = cwd;
-    fs::path wsc = fs::weakly_canonical(ws, ec);
-    if (ec || wsc.empty()) wsc = ws;
-    // cwd must itself be inside the access boundary; if the user launched
-    // outside a wider `-w` scope (unusual) fall back to the boundary.
-    return path_under(cwdc, wsc) ? cwd : ws;
+    // The active project (process cwd clamped inside the access boundary) is
+    // the repo to run git in — shared with normalize_path and checkpoint.cpp
+    // so all three agree on "the project" vs "the access boundary".
+    return util::project_root();
 }
 
 // Resolve the repository directory to run git in. Given a raw path (a

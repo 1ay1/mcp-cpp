@@ -285,13 +285,20 @@ fs::path normalize_path(std::string_view s) {
     }
     fs::path p{s};
     if (!p.is_absolute()) {
-        // Resolve relative to the WORKSPACE ROOT, not the process cwd. The
-        // tool schemas promise "relative to the workspace root", and a tool
-        // thread's cwd may differ from the workspace (e.g. process_start with
-        // cwd=".", or a host that chdir'd elsewhere). fs::absolute() would
-        // anchor to current_path() and then fail the workspace-containment
-        // check for a path the model reasonably expected to be in-bounds.
-        p = workspace_root() / p;
+        // Resolve relative to the ACTIVE PROJECT (the process cwd clamped
+        // inside the access boundary), NOT the raw access boundary and NOT
+        // the tool thread's cwd. Three roots are in play:
+        //   * workspace_root() — the widenable ACCESS BOUNDARY (`-w /`).
+        //   * project_root()   — the cwd the user launched in (the project).
+        //   * a worker thread's cwd — may differ (process_start cwd=".").
+        // The tool schemas promise "relative to the workspace root", and by
+        // default project_root() == workspace_root() so nothing changes. But
+        // when the user widens the boundary (`--workspace /`), anchoring to
+        // the boundary would turn `read src/foo.cpp` into `/src/foo.cpp`;
+        // anchoring to project_root() keeps it in the launched project. The
+        // result is still containment-checked against the boundary by the
+        // caller, so this only ever narrows where a relative path lands.
+        p = project_root() / p;
     }
     return p.lexically_normal();
 }
@@ -320,6 +327,34 @@ void set_workspace_root(fs::path root) {
 
 const fs::path& workspace_root() {
     return mutable_workspace_root();
+}
+
+namespace {
+// Component-wise "child is at-or-under parent". Both sides must already be
+// canonical/normalised. Shared shape with is_within_workspace()'s prefix
+// walk and git.cpp's path_under.
+[[nodiscard]] bool path_at_or_under(const fs::path& child,
+                                    const fs::path& parent) noexcept {
+    auto pt = parent.begin();
+    auto ct = child.begin();
+    for (; pt != parent.end() && ct != child.end(); ++pt, ++ct)
+        if (*pt != *ct) return false;
+    return pt == parent.end();
+}
+} // namespace
+
+fs::path project_root() {
+    const fs::path& ws = mutable_workspace_root();   // already canonicalised
+    std::error_code ec;
+    fs::path cwd = fs::current_path(ec);
+    if (ec || cwd.empty()) return ws;
+    fs::path cwdc = fs::weakly_canonical(cwd, ec);
+    if (ec || cwdc.empty()) cwdc = cwd;
+    // The cwd is the active project ONLY if it sits inside the access
+    // boundary. If the user launched outside a wider `-w` scope (unusual),
+    // fall back to the boundary so we never resolve relative paths to a
+    // location the tools would then reject as out-of-workspace.
+    return path_at_or_under(cwdc, ws) ? cwdc : ws;
 }
 
 bool is_within_workspace(const fs::path& target) {

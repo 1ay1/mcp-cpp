@@ -76,6 +76,19 @@ void set_workspace_root(fs::path root);
 
 [[nodiscard]] const fs::path& workspace_root();
 
+// The ACTIVE PROJECT directory: the process cwd (the directory the user
+// launched agentty in), clamped to stay inside the access boundary. This
+// is distinct from workspace_root(), which is the widenable ACCESS
+// BOUNDARY (`--workspace /` opens the whole disk). Relative tool paths and
+// repo-scoped defaults resolve from HERE, not the boundary, so that
+// `read src/foo.cpp` under `--workspace /` still lands in the project the
+// user launched in rather than at `/src/foo.cpp`. Falls back to the
+// boundary only when the cwd is unusable or escapes it (an unusual launch
+// from outside a wider `-w` scope). Computed fresh each call (cheap: one
+// current_path() + canonicalise) since agentty never chdir's but tool
+// worker threads or embedders theoretically could.
+[[nodiscard]] fs::path project_root();
+
 // True if `target` is at-or-under the workspace root after canonicalising
 // both sides. Symlink escape is blocked: a link inside the workspace that
 // points to /etc would resolve to /etc and fail the prefix check. Uses
