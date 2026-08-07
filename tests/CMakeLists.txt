@@ -44,6 +44,10 @@ if(MCP_BUILD_TOOLS)
     target_link_libraries(mcp_search_tools_test PRIVATE mcp::tools)
     add_test(NAME mcp_search_tools_test COMMAND mcp_search_tools_test)
 
+    add_executable(mcp_repomap_test repomap_test.cpp)
+    target_link_libraries(mcp_repomap_test PRIVATE mcp::tools)
+    add_test(NAME mcp_repomap_test COMMAND mcp_repomap_test)
+
     add_executable(mcp_web_tools_test web_tools_test.cpp)
     target_link_libraries(mcp_web_tools_test PRIVATE mcp::tools)
     add_test(NAME mcp_web_tools_test COMMAND mcp_web_tools_test)

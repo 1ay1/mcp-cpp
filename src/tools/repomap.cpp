@@ -34,6 +34,7 @@
 #include <mcp/tools/util/fs_helpers.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -45,6 +46,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -310,10 +312,21 @@ const RepoGraph& build_graph(const fs::path& root) {
     // parses in tens of ms.
     const auto parse_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    for (auto& c : cands) {
-        if (std::chrono::steady_clock::now() > parse_deadline) break;
+
+    // Parse each candidate file into a (FileNode, body) pair. The read +
+    // per-line def regex scan is by FAR the dominant cost of build_graph
+    // (std::regex is slow; a ~900-file / 270k-line tree took ~4 s serially,
+    // right up against the 5 s deadline — a slightly larger repo would
+    // silently truncate the map). It is also embarrassingly parallel: every
+    // file is independent, and the def_patterns() regexes are shared-const
+    // (regex_search is re-entrant). Fan out across the hardware threads with a
+    // simple atomic work-stealing index, then merge. This turns the cold
+    // build into an O(files / cores) job and moves the deadline well out of
+    // reach on normal repos.
+    auto parse_one = [&](const Cand& c,
+                         FileNode& node_out, std::string& body_out) -> bool {
         std::ifstream in(c.abs, std::ios::binary);
-        if (!in) continue;
+        if (!in) return false;
         std::string body((std::istreambuf_iterator<char>(in)),
                           std::istreambuf_iterator<char>());
         // Binary/blob guard: a NUL byte in the first 512 bytes means this is
@@ -322,10 +335,10 @@ const RepoGraph& build_graph(const fs::path& root) {
         // slow and produces garbage "symbols".
         {
             const std::size_t probe = std::min<std::size_t>(body.size(), 512);
-            if (body.find('\0', 0) < probe) continue;
+            if (body.find('\0', 0) < probe) return false;
         }
         FileNode node;
-        node.rel = std::move(c.rel);
+        node.rel = c.rel;
         // Line scan for definitions.
         std::size_t pos = 0;
         int lineno = 0;
@@ -338,17 +351,10 @@ const RepoGraph& build_graph(const fs::path& root) {
             if (!line.empty() && line.size() < 500 && maybe_def_line(line)) {
                 std::cmatch m;
                 // Match on the string_view's underlying char range directly —
-                // no per-line std::string allocation. On a big repo the def
-                // scan visits hundreds of thousands of admitted lines; the
-                // copy this replaces was a heap alloc per line.
-                //
-                // Use data()/data()+size() (raw const char*) rather than
-                // begin()/end(): libstdc++ and libc++ make string_view's
-                // iterator a plain const char*, but MSVC's is a checked
-                // iterator class, which does not bind to the const char*
-                // overload std::cmatch (match_results<const char*>) requires
-                // — giving C2672 'no matching overloaded function'. Raw
-                // pointers are const char* everywhere.
+                // no per-line std::string allocation. Use data()/data()+size()
+                // (raw const char*) not begin()/end(): MSVC's string_view
+                // iterator is a checked class that won't bind to the
+                // const char* overload std::cmatch requires.
                 const char* const first = line.data();
                 const char* const last  = line.data() + line.size();
                 for (const auto& re : pats) {
@@ -368,8 +374,59 @@ const RepoGraph& build_graph(const fs::path& root) {
             if (eol == std::string::npos) break;
             pos = eol + 1;
         }
-        g.files.push_back(std::move(node));
-        bodies.push_back(std::move(body));
+        node_out = std::move(node);
+        body_out = std::move(body);
+        return true;
+    };
+
+    {
+        // Per-index result slots (parsed[i] valid iff ok[i]); preserves the
+        // `cands` order for a stable graph independent of thread scheduling.
+        std::vector<FileNode>    parsed(cands.size());
+        std::vector<std::string> parsed_bodies(cands.size());
+        std::vector<char>        ok(cands.size(), 0);
+        std::atomic<std::size_t> next_idx{0};
+        std::atomic<bool>        past_deadline{false};
+
+        unsigned nthreads = std::thread::hardware_concurrency();
+        if (nthreads == 0) nthreads = 2;
+        nthreads = std::min<unsigned>(nthreads, 16);
+        // Small trees don't benefit from the thread spin-up; run inline.
+        if (cands.size() < 32) nthreads = 1;
+
+        auto worker = [&] {
+            for (;;) {
+                std::size_t i = next_idx.fetch_add(1, std::memory_order_relaxed);
+                if (i >= cands.size()) break;
+                // Check the shared deadline every 64 files (cheap; a steady
+                // clock read per file would add up on a huge tree).
+                if ((i & 63) == 0
+                    && std::chrono::steady_clock::now() > parse_deadline) {
+                    past_deadline.store(true, std::memory_order_relaxed);
+                    break;
+                }
+                if (past_deadline.load(std::memory_order_relaxed)) break;
+                if (parse_one(cands[i], parsed[i], parsed_bodies[i]))
+                    ok[i] = 1;
+            }
+        };
+
+        if (nthreads <= 1) {
+            worker();
+        } else {
+            std::vector<std::thread> pool;
+            pool.reserve(nthreads);
+            for (unsigned t = 0; t < nthreads; ++t) pool.emplace_back(worker);
+            for (auto& th : pool) th.join();
+        }
+
+        // Merge in index order — deterministic regardless of which thread got
+        // which file.
+        for (std::size_t i = 0; i < cands.size(); ++i) {
+            if (!ok[i]) continue;
+            g.files.push_back(std::move(parsed[i]));
+            bodies.push_back(std::move(parsed_bodies[i]));
+        }
     }
 
     // Linking pass: symbol name → defining file(s), then per-file identifier
