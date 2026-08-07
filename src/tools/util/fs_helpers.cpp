@@ -484,6 +484,39 @@ bool should_skip_dir(std::string_view name) noexcept {
     return false;
 }
 
+const std::vector<std::string>& skip_dir_rg_globs() {
+    // Built once from the SAME skip set should_skip_dir() enforces, so the
+    // ripgrep-backed and built-in walkers prune identical directories. The
+    // "build*" / "cmake-build*" prefix families are matched with a trailing
+    // `*` glob to cover build-asan / cmake-build-debug / etc. Each entry is
+    // emitted as an argv PAIR ("-g", "!<name>") ready to splice into the rg
+    // command line. `!` makes it an exclude; a bare directory name in a glob
+    // matches that directory at any depth, which is exactly should_skip_dir's
+    // filename-only semantics.
+    static const std::vector<std::string> globs = [] {
+        static constexpr std::string_view names[] = {
+            ".git", "node_modules", "target", "__pycache__",
+            ".cache", "vendor", "dist", "out", ".next", ".venv",
+            ".idea", ".vscode", "_deps", "third_party", "thirdparty",
+            "3rdparty", "external", ".mypy_cache", ".pytest_cache", ".tox",
+            ".gradle", "Pods", "bazel-bin", "bazel-out", "DerivedData",
+            ".terraform",
+        };
+        std::vector<std::string> v;
+        v.reserve(std::size(names) * 2 + 4);
+        for (auto n : names) {
+            v.emplace_back("-g");
+            v.emplace_back("!" + std::string{n});
+        }
+        // Prefix families (build, build-*, cmake-build*): one glob each
+        // covers the bare name and every suffixed sibling.
+        v.emplace_back("-g"); v.emplace_back("!build*");
+        v.emplace_back("-g"); v.emplace_back("!cmake-build*");
+        return v;
+    }();
+    return globs;
+}
+
 bool is_binary_file(const fs::path& p) {
     std::ifstream ifs(p, std::ios::binary);
     // Can't open (permission denied, transient lock, race-deleted): NOT

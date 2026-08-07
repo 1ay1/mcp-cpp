@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <vector>
 #include <string_view>
 
 #include <mcp/tools/util/error.hpp>   // ToolError + factories
@@ -168,6 +169,16 @@ promote_to_workspace_path(NormalizedPath p, std::string_view tool_name);
 // list_dir) to skip by default. Keeps the skip list in one place so tools
 // stay in sync (e.g. adding `_deps` to every tool at once).
 [[nodiscard]] bool should_skip_dir(std::string_view name) noexcept;
+
+// The same skip set rendered as ripgrep exclude-glob arguments
+// (`-g`, `!node_modules`, `-g`, `!build*`, …). Appended to the `rg`
+// argv so the ripgrep-backed grep / find_definition PRUNE the same
+// directories the built-in walker prunes via should_skip_dir(), instead
+// of relying on ripgrep to stat + gitignore-check every build/vendor
+// file (a large cold-cache cost, and wrong entirely when there's no
+// .gitignore). Returned as flat argv pairs so the caller can splice them
+// straight into its argument vector.
+[[nodiscard]] const std::vector<std::string>& skip_dir_rg_globs();
 
 // Heuristic: scan the first 512 bytes for a NUL. Good enough to avoid
 // grep'ing PNGs / executables / model weights into the prompt.

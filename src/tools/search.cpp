@@ -230,6 +230,8 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
             "-t", "code", "-e", rg_pattern,
             wp->path().string(),
         };
+        // Prune build / vendor / _deps so rg doesn't crawl generated trees.
+        for (const auto& g : util::skip_dir_rg_globs()) argv.push_back(g);
         auto r = util::Subprocess::run(util::SubprocessOptions{
             .argv      = std::move(argv),
             .timeout   = std::chrono::seconds(30),
@@ -653,6 +655,12 @@ ExecResult run_ripgrep(const GrepArgs& a) {
     if (is_literal_pattern(a.pattern)) argv.push_back("-F");
     argv.push_back("-C");
     argv.push_back(std::to_string(kContext));
+    // Prune the build / vendor / _deps trees the built-in walker also skips.
+    // Without these, ripgrep still stat + gitignore-checks every generated
+    // file (tens of thousands in a repo with out-of-source build dirs) on a
+    // cold cache, and scans them outright when there's no .gitignore. Match
+    // should_skip_dir() exactly so grep behaves identically on both backends.
+    for (const auto& g : util::skip_dir_rg_globs()) argv.push_back(g);
     if (!a.file_glob.empty()) {
         argv.push_back("-g");
         argv.push_back(a.file_glob);
