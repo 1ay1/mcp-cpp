@@ -309,13 +309,26 @@ ExecResult run_start(const StartArgs& args) {
     return ToolOutput{std::move(text), std::nullopt};
 }
 
-struct PollArgs { std::string id; int max_chars = 30000; int wait_ms = 250; };
+struct PollArgs {
+    std::string id;
+    int max_chars = 30000;
+    int wait_ms = 250;
+    bool wait_for_exit = false;
+};
 std::expected<PollArgs, ToolError> parse_poll(const json& args) {
     util::ArgReader reader(args);
     auto id = reader.require_str("id");
     if (!id || id->empty()) return std::unexpected(ToolError::invalid_args("id is required"));
-    return PollArgs{*id, std::clamp(reader.integer("max_chars", 30000), 1000, 100000),
-                    std::clamp(reader.integer("wait_ms", 250), 0, 5000)};
+    const bool wait_for_exit = reader.boolean("wait_for_exit", false);
+    // In wait_for_exit mode the caller is parking on a long silent phase (a
+    // build link, a slow test) so allow a much longer block; otherwise keep
+    // the responsive 5s ceiling for incremental log tailing.
+    const int wait_cap = wait_for_exit ? 600000 : 5000;
+    const int wait_default = wait_for_exit ? 60000 : 250;
+    return PollArgs{*id,
+                    std::clamp(reader.integer("max_chars", 30000), 1000, 100000),
+                    std::clamp(reader.integer("wait_ms", wait_default), 0, wait_cap),
+                    wait_for_exit};
 }
 
 // Human-friendly list of live session ids for recovery hints. Caller must NOT
@@ -341,16 +354,21 @@ ExecResult run_poll(const PollArgs& args) {
     if (!session)
         return std::unexpected(ToolError::not_found(
             "unknown process session: " + args.id + live_session_hint()));
-    const auto deadline = std::chrono::steady_clock::now()
-        + std::chrono::milliseconds{args.wait_ms};
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::milliseconds{args.wait_ms};
     std::string output;
     std::size_t dropped = 0;
     bool running = false;
     do {
         running = session->running();
         output = session->take_new(static_cast<std::size_t>(args.max_chars), &dropped);
-        if (!output.empty() || !running || std::chrono::steady_clock::now() >= deadline) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        // Normal mode: return as soon as ANY output arrives. wait_for_exit
+        // mode: ignore incremental output and keep parking until the process
+        // actually exits (or the deadline hits) — one call to await a long
+        // silent phase instead of many empty polls.
+        const bool have_output_break = !output.empty() && !args.wait_for_exit;
+        if (have_output_break || !running || std::chrono::steady_clock::now() >= deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{args.wait_for_exit ? 100 : 10});
     } while (true);
     // Re-check liveness after draining: a process that printed its last line
     // and THEN exited during this same poll should report "exited (code)"
@@ -373,7 +391,18 @@ ExecResult run_poll(const PollArgs& args) {
     if (!output.empty()) {
         text += output;
     } else if (running) {
-        text += "(no new output yet — process still running; poll again)";
+        const auto waited = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (args.wait_for_exit) {
+            text += "(still running after waiting " + std::to_string(waited)
+                  + "s with no exit — poll again with wait_for_exit to keep "
+                    "parking, or process_stop to give up)";
+        } else {
+            text += "(no new output for " + std::to_string(waited)
+                  + "s; process still running. If you're waiting for it to "
+                    "FINISH, poll with wait_for_exit=true instead of repeating "
+                    "short polls)";
+        }
     } else {
         text += "(process has exited; no further output — call process_stop to reap it)";
     }
@@ -430,10 +459,13 @@ json poll_schema() {
         {"id", {{"type","string"}, {"description","Session id returned by process_start."}}},
         {"max_chars", {{"type","integer"}, {"minimum",1000}, {"maximum",100000}, {"default",30000},
                        {"description","Cap on bytes of new output returned this poll (most recent kept)."}}},
-        {"wait_ms", {{"type","integer"}, {"minimum",0}, {"maximum",5000}, {"default",250},
+        {"wait_for_exit", {{"type","boolean"}, {"default",false},
+            {"description", "Block until the process EXITS (or wait_ms elapses) instead of returning on the first output. Use this to await a long silent phase (a build link, a slow test) in ONE call rather than many empty polls. In this mode wait_ms defaults to 60000 and may go up to 600000."}}},
+        {"wait_ms", {{"type","integer"}, {"minimum",0}, {"maximum",600000}, {"default",250},
                      {"description","Block up to this long waiting for new output before returning "
                                     "(returns early as soon as any arrives). Raise it when waiting on "
-                                    "a slow-to-boot server."}}}
+                                    "a slow-to-boot server. Capped at 5000 normally; up to 600000 with "
+                                    "wait_for_exit=true."}}}
     }}};
 }
 json stop_schema() {
@@ -456,7 +488,10 @@ void register_process_tools(Shells& shells) {
     shells.add("process_poll",
         "Fetch output produced by a background session SINCE THE LAST POLL, plus "
         "its status (running + uptime, or exited + exit code). Blocks briefly for "
-        "new output. Reports if any output scrolled past the rolling buffer.",
+        "new output. Reports if any output scrolled past the rolling buffer. To "
+        "await a long silent phase (a build link, a slow test) in ONE call "
+        "instead of many empty polls, pass wait_for_exit=true - it blocks until "
+        "the process exits.",
         poll_schema(), EffectSet{Effect::Exec},
         body<PollArgs>(run_poll, parse_poll), 30000);
     shells.add("process_stop",
