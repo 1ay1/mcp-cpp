@@ -36,6 +36,7 @@ namespace {
 struct DiagnosticsArgs {
     std::string command;  // empty means auto-detect
     std::string display_description;
+    int timeout_seconds = 120;
 };
 
 enum class BuildSystem { None, CMake, Cargo, Go, Node, Make };
@@ -72,6 +73,7 @@ std::expected<DiagnosticsArgs, ToolError> parse_diagnostics_args(const json& j) 
     return DiagnosticsArgs{
         ar.str("command", ""),
         ar.str("display_description", ""),
+        std::clamp(ar.integer("timeout_seconds", 120), 1, 1800),
     };
 }
 
@@ -82,12 +84,11 @@ ExecResult run_diagnostics(const DiagnosticsArgs& a) {
         if (auto_argv.empty())
             return std::unexpected(ToolError::not_found("no build system detected; pass a command"));
     }
+    const auto timeout = std::chrono::seconds{a.timeout_seconds};
     auto sub = auto_argv.empty()
-        ? util::sandbox::run_shell_command(a.command, /*max_bytes*/100'000,
-                                           std::chrono::seconds{120})
-        : util::sandbox::run_argv(auto_argv, /*max_bytes*/100'000,
-                                  std::chrono::seconds{120});
-    auto output = util::legacy_format(sub, std::chrono::seconds{120});
+        ? util::sandbox::run_shell_command(a.command, /*max_bytes*/100'000, timeout)
+        : util::sandbox::run_argv(auto_argv, /*max_bytes*/100'000, timeout);
+    auto output = util::legacy_format(sub, timeout);
     if (output.empty()) return ToolOutput{"no diagnostics (clean build)", std::nullopt};
 
     int errors = 0, warnings = 0;
@@ -238,6 +239,8 @@ json diagnostics_schema() {
                 {"description","One-line summary shown in the UI. Optional."}}},
             {"command", {{"type","string"}, {"description",
                 "Custom build command. If omitted, auto-detects."}}},
+            {"timeout_seconds", {{"type","integer"}, {"minimum",1}, {"maximum",1800}, {"default",120},
+                {"description","Kill the build/lint after this many seconds (default 120). Raise it for a large project whose build exceeds 2 minutes."}}},
         }},
     };
 }
@@ -247,7 +250,9 @@ json diagnostics_schema() {
 void register_diagnostics_tool(Shells& sh) {
     sh.add("diagnostics",
         "Run the project's build or lint command and return errors/warnings. "
-        "Auto-detects build system (CMake, cargo, go, npm, make).",
+        "Auto-detects build system (CMake, cargo, go, npm, make). Runs to "
+        "completion in ONE call (blocks up to timeout_seconds); raise "
+        "timeout_seconds for a slow build instead of getting a spurious timeout.",
         diagnostics_schema(), EffectSet{Effect::Exec},
         body<DiagnosticsArgs>(run_diagnostics, parse_diagnostics_args), 30'000);
 }
@@ -255,6 +260,7 @@ void register_diagnostics_tool(Shells& sh) {
 void register_test_tool(Shells& sh) {
     sh.add("test",
         "Run focused project tests with structured pass/fail status, live output, filtering, repetition, and timeout. "
+        "Runs to completion in ONE call (blocks up to timeout_seconds, default 120, max 1800) — raise timeout_seconds for a long suite instead of getting a spurious timeout. "
         "Auto-detects CTest, Cargo, Go, npm, or Make; pass command for custom runners.",
         test_schema(), EffectSet{Effect::Exec},
         body<TestArgs>(run_tests, parse_test_args), 40'000);
