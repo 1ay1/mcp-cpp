@@ -46,6 +46,17 @@ struct Session {
     std::chrono::steady_clock::time_point started_at =
         std::chrono::steady_clock::now();
     bool stopped = false;
+    // Set by the reader thread when it consumes EOF on the output pipe.
+    // Distinguishes "child exited AND every byte is in the buffer" from
+    // "child exited but the pipe is still open" — either the reader hasn't
+    // drained the tail yet (scheduling), or a grandchild inherited the write
+    // end and keeps producing. Poll uses this to spend its wait budget on
+    // the tail instead of falsely reporting "no further output".
+    std::atomic<bool> reader_eof{false};
+
+    [[nodiscard]] bool reader_finished() const noexcept {
+        return reader_eof.load(std::memory_order_acquire);
+    }
 
     void append(std::string_view text) {
         std::lock_guard<std::mutex> lock(output_mu);
@@ -241,6 +252,7 @@ ExecResult run_start(const StartArgs& args) {
                 if (count > 0) raw->append(std::string_view{buffer, static_cast<std::size_t>(count)});
             }
         }
+        raw->reader_eof.store(true, std::memory_order_release);
     });
     {
         std::lock_guard<std::mutex> lock(manager.mu);
@@ -349,7 +361,14 @@ ExecResult run_poll(const PollArgs& args) {
     do {
         running = session->running();
         output = session->take_new(static_cast<std::size_t>(args.max_chars), &dropped);
-        if (!output.empty() || !running || std::chrono::steady_clock::now() >= deadline) break;
+        if (!output.empty()) break;
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        // Child exited AND the reader consumed EOF — every byte is in the
+        // buffer and it's empty: truly nothing more, stop waiting. Without
+        // the reader_finished() check we'd break the moment the child died,
+        // racing the reader thread and reporting a crashed server's FINAL
+        // LINES — the error the caller is polling for — as "no output".
+        if (!running && session->reader_finished()) break;
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
     } while (true);
     // Re-check liveness after draining: a process that printed its last line
@@ -374,6 +393,13 @@ ExecResult run_poll(const PollArgs& args) {
         text += output;
     } else if (running) {
         text += "(no new output yet — process still running; poll again)";
+    } else if (!session->reader_finished()) {
+        // Exited but the pipe never hit EOF within the wait budget: a
+        // backgrounded descendant inherited the write end. More output may
+        // still arrive from it.
+        text += "(process exited but its output pipe is still open — a "
+                "background child likely inherited it; poll again for more, "
+                "or process_stop to force-close and reap)";
     } else {
         text += "(process has exited; no further output — call process_stop to reap it)";
     }

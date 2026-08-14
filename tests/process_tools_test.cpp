@@ -171,7 +171,61 @@ int main() {
         std::puts("reap exited: ok");
     }
 
-    // ── 4. bad id gives a recovery hint, never a crash ───────────────────
+    // ── 4. dying breath: final line + exit land in ONE poll ─────────────
+    // A server that prints its fatal error and dies mid-poll must deliver
+    // that tail to the SAME poll (the reader-EOF drain), not report a bare
+    // "exited" with the error swallowed. Before the reader_finished() fix,
+    // poll broke the moment the child died — racing the reader thread.
+    {
+        mcp::Json a = mcp::Json::object();
+        // Quiet through the 300ms settle window, then one last line + death.
+        a["command"] = "sleep 0.6; echo FATAL-BIND-FAIL; exit 9";
+        auto r = call(*provider, "process_start", a);
+        CHECK(!r.is_error);
+        CHECK(contains(r.text, "running"));
+        auto id = extract_id(r.text);
+        CHECK(!id.empty());
+
+        mcp::Json p = mcp::Json::object();
+        p["id"] = id; p["wait_ms"] = 2000;   // spans the exit
+        auto pr = call(*provider, "process_poll", p);
+        CHECK(!pr.is_error);
+        // The single poll that observes death must carry the dying words.
+        CHECK(contains(pr.text, "FATAL-BIND-FAIL"));
+        CHECK(contains(pr.text, "exited"));
+        std::puts("dying-breath tail in one poll: ok");
+
+        mcp::Json s = mcp::Json::object(); s["id"] = id;
+        auto sr = call(*provider, "process_stop", s);
+        CHECK(!sr.is_error);
+    }
+
+    // ── 5. grandchild keeps the pipe open → poll says so ────────────────
+    // The shell exits but a backgrounded child inherits the write end: the
+    // pipe has no EOF, so "no further output" would be a lie. Poll must
+    // distinguish this from the fully-drained case.
+    {
+        mcp::Json a = mcp::Json::object();
+        a["command"] = "(sleep 3; echo late) & exit 0";
+        auto r = call(*provider, "process_start", a);
+        CHECK(!r.is_error);
+        auto id = extract_id(r.text);
+        // The shell may exit inside the settle window (session dropped, exit 0
+        // clean path) — only probe the open-pipe hint when a session survives.
+        if (contains(r.text, "running") && !id.empty()) {
+            mcp::Json p = mcp::Json::object();
+            p["id"] = id; p["wait_ms"] = 1200;   // < the 3s grandchild sleep
+            auto pr = call(*provider, "process_poll", p);
+            CHECK(!pr.is_error);
+            if (contains(pr.text, "exited") && !contains(pr.text, "late"))
+                CHECK(contains(pr.text, "pipe is still open"));
+            mcp::Json s = mcp::Json::object(); s["id"] = id;
+            (void)call(*provider, "process_stop", s);
+        }
+        std::puts("grandchild-held pipe: ok");
+    }
+
+    // ── 6. bad id gives a recovery hint, never a crash ───────────────────
     {
         mcp::Json p = mcp::Json::object(); p["id"] = "proc-does-not-exist";
         auto pr = call(*provider, "process_poll", p);
