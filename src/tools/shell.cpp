@@ -69,7 +69,11 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j) {
         int ms = ar.integer("timeout_ms", 0);
         if (ms > 0) timeout_int = (ms + 999) / 1000;
     }
-    if (timeout_int <= 0 || timeout_int > 300) timeout_int = 60;
+    // Out-of-range: clamp UP to the max rather than silently resetting a
+    // too-large request to the 60s default — a model asking for 600s wants
+    // MORE time, and 60 would time out the very command it was raised for.
+    if (timeout_int <= 0) timeout_int = 60;
+    else if (timeout_int > 300) timeout_int = 300;
 
     std::string cd = ar.str("cd", "");
     if (!cd.empty()) {
@@ -211,13 +215,22 @@ ExecResult run_bash(const BashArgs& a) {
 
     std::ostringstream out;
     if (r.timed_out) {
+        // Teach the recovery path: a bare "timed out" invites re-running the
+        // same command with the same deadline.
+        const char* next_step =
+            (a.timeout < 300)
+                ? "\n\nIf the command needs more time, retry with a larger "
+                  "`timeout` (max 300s); for servers/watchers that never "
+                  "exit, use process_start instead."
+                : "\n\nThis was already the maximum timeout (300s); for "
+                  "long builds or servers, use process_start and poll it.";
         if (r.output.empty()) {
             out << "Command \"" << a.command << "\" timed out after "
-                << a.timeout << "s. No output was captured.";
+                << a.timeout << "s. No output was captured." << next_step;
         } else {
             out << "Command \"" << a.command << "\" timed out after "
                 << a.timeout << "s. Output captured before timeout:\n\n"
-                << fence(r.output);
+                << fence(r.output) << next_step;
         }
     } else if (r.exit_code != 0) {
         if (r.output.empty()) {

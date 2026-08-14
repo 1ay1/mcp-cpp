@@ -74,10 +74,35 @@ ToolError classify_git_failure(const util::SubprocessResult& r,
         + r.output);
 }
 
+// Insert `-c core.editor=true` right after argv[0] ("git"). Shared by
+// run_git and the direct run_argv_s call sites whose subcommands can invoke
+// $EDITOR (rebase/cherry-pick --continue) — see the comment in run_git.
+[[nodiscard]] std::vector<std::string>
+hardened_git_argv(const std::vector<std::string>& argv) {
+    std::vector<std::string> hardened;
+    hardened.reserve(argv.size() + 2);
+    hardened.push_back(argv.empty() ? std::string{"git"} : argv.front());
+    hardened.push_back("-c");
+    hardened.push_back("core.editor=true");
+    hardened.insert(hardened.end(),
+                    argv.begin() + (argv.empty() ? 0 : 1), argv.end());
+    return hardened;
+}
+
 std::expected<std::string, ToolError>
 run_git(const std::vector<std::string>& argv, std::string_view op,
         std::size_t max_bytes = 30'000) {
-    auto r = util::run_argv_s(argv, max_bytes);
+    // Harden every git invocation for a non-interactive child (setsid, stdin
+    // /dev/null, stdout a pipe):
+    //   core.editor=true    — sequencer commands (rebase/cherry-pick
+    //     --continue, merge) invoke $EDITOR for the commit message; with no
+    //     tty the editor dies and git reports "problem with the editor"
+    //     instead of committing the ALREADY-PREPARED message. `true` (the
+    //     command) exits 0 immediately, accepting that message.
+    //   core.askPass=/GIT_TERMINAL_PROMPT — covered structurally: no tty
+    //     means prompts already fail fast rather than hang, so we leave
+    //     credential config alone (a helper may still work non-interactively).
+    auto r = util::run_argv_s(hardened_git_argv(argv), max_bytes);
     if (!r.started || r.timed_out || r.exit_code != 0)
         return std::unexpected(classify_git_failure(r, op));
     std::string out = std::move(r.output);
@@ -623,7 +648,7 @@ ExecResult run_git_commit(const GitCommitArgs& a) {
     }
 
     auto r = util::run_argv_s(
-        [&] {
+        hardened_git_argv([&] {
             std::vector<std::string> argv{"git", "-C", *git_dir, "commit"};
             if (a.amend) {
                 argv.push_back("--amend");
@@ -634,7 +659,7 @@ ExecResult run_git_commit(const GitCommitArgs& a) {
                 argv.push_back(a.message);
             }
             return argv;
-        }());
+        }()));
     if (!r.started || r.timed_out || r.exit_code != 0) {
         std::string_view out = r.output;
         if (out.find("nothing to commit") != std::string_view::npos
@@ -1077,7 +1102,7 @@ ExecResult run_git_rebase(const GitRebaseArgs& a) {
     } else {
         argv.push_back("--" + a.action);   // --continue / --abort / --skip
     }
-    auto r = util::run_argv_s(argv, 50'000);
+    auto r = util::run_argv_s(hardened_git_argv(argv), 50'000);
     if (!r.started || r.timed_out || r.exit_code != 0) {
         // continue with unresolved conflicts, or a fresh conflict during onto.
         std::string_view o = r.output;
@@ -1165,7 +1190,7 @@ ExecResult run_git_cherry_pick(const GitCherryPickArgs& a) {
     } else {
         argv.push_back("--" + a.action);
     }
-    auto r = util::run_argv_s(argv, 50'000);
+    auto r = util::run_argv_s(hardened_git_argv(argv), 50'000);
     if (!r.started || r.timed_out || r.exit_code != 0) {
         std::string_view o = r.output;
         if (o.find("no cherry-pick") != std::string_view::npos

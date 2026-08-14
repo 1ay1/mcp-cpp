@@ -591,6 +591,11 @@ ExecResult run_list_dir(const ListDirArgs& a) {
             return x.path().filename() < y.path().filename();
         });
         for (auto& e : entries) list_entry(e, 0);
+        // list_entry stops appending AND counting past the cap — signal
+        // truncation without claiming an exact remainder.
+        if (count > 1000)
+            out << "[>1000 entries, truncated — use glob with a narrower "
+                   "pattern]\n";
     }
     if (count == 0) return ToolOutput{"empty directory", std::nullopt};
     std::string body = out.str();
@@ -639,7 +644,25 @@ ExecResult run_move(const MoveArgs& a) {
     fs::create_directories(a.destination.parent_path(), ec);
     if (ec) return std::unexpected(ToolError::io(ec.message()));
     fs::rename(a.source, a.destination, ec);
-    if (ec) return std::unexpected(ToolError::io("move failed: " + ec.message()));
+    if (ec) {
+        // Cross-filesystem/device rename (EXDEV: different volume, tmpfs,
+        // bind mount) can't be a rename(2). Fall back to copy+delete — the
+        // semantics the caller asked for — instead of surfacing a cryptic
+        // "Invalid cross-device link".
+        std::error_code copy_ec;
+        fs::copy(a.source, a.destination,
+                 fs::copy_options::recursive | fs::copy_options::copy_symlinks,
+                 copy_ec);
+        if (copy_ec)
+            return std::unexpected(ToolError::io(
+                "move failed: " + ec.message()
+                + "; copy fallback also failed: " + copy_ec.message()));
+        fs::remove_all(a.source, copy_ec);
+        if (copy_ec)
+            return std::unexpected(ToolError::io(
+                "moved (copied) to " + a.destination.string()
+                + " but could not remove the source: " + copy_ec.message()));
+    }
     return ToolOutput{std::format("Moved {} -> {}", a.source.string(), a.destination.string()), std::nullopt};
 }
 

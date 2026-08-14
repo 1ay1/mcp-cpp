@@ -353,8 +353,14 @@ int main() {
         // hint the user would see a bare "no changes".
         {
             auto sm = obj(); sm["command"] =
-                // A bare upstream to add as a submodule.
-                "git init -q --bare " + (root / "up.git").string() + " && "
+                // A bare upstream to add as a submodule. Pin the initial
+                // branch: on git configured with init.defaultBranch=main
+                // (the modern default), a plain --bare repo's HEAD points at
+                // refs/heads/main while the seed below pushes HEAD:master —
+                // the submodule clone then checks out an unborn branch and
+                // `submodule add` fails before .gitmodules exists.
+                "git init -q --bare --initial-branch=master "
+                + (root / "up.git").string() + " && "
                 "git clone -q " + (root / "up.git").string() + " seedwt && "
                 "cd seedwt && git config user.email t@t.t && "
                 "git config user.name T && echo hi > f.txt && "
