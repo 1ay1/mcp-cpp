@@ -191,6 +191,13 @@ public:
     // failure returns the error text and sets `is_error`.
     [[nodiscard]] virtual std::string
         run(const SubagentRequest&, bool& is_error) = 0;
+    // Host-defined EXTRA agent types beyond the built-in five (user-authored
+    // .agentty/agents/*.md in agentty). Merged into the task tool's
+    // agent_type enum at registration so the model can discover them.
+    // Default: none.
+    [[nodiscard]] virtual std::vector<std::string> extra_agent_types() const {
+        return {};
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────

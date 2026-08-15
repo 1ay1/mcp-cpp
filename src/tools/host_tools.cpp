@@ -241,6 +241,18 @@ void register_search_code_tool(Shells& sh, const std::shared_ptr<DocRetriever>& 
 // ── task ─────────────────────────────────────────────────────────────────
 void register_task_tool(Shells& sh, const std::shared_ptr<SubagentRunner>& runner) {
     if (!runner) return;
+    // Built-in five + any host-defined types (user-authored agents). The
+    // enum makes them discoverable in the schema the model sees.
+    Json type_enum = Json::array({"explorer","reviewer","tester","coder","general"});
+    std::string type_desc = "Subagent specialisation (default general).";
+    if (auto extra = runner->extra_agent_types(); !extra.empty()) {
+        type_desc += " User-defined:";
+        for (auto& t : extra) {
+            type_enum.push_back(t);
+            type_desc += " " + t;
+        }
+        type_desc += ".";
+    }
     sh.add(
         "task",
         "Spawn an autonomous subagent to complete a self-contained task in "
@@ -252,8 +264,8 @@ void register_task_tool(Shells& sh, const std::shared_ptr<SubagentRunner>& runne
             {"properties", {
                 {"prompt", {{"type","string"}, {"description","Complete, self-contained task description."}}},
                 {"agent_type", {{"type","string"},
-                    {"enum", {"explorer","reviewer","tester","coder","general"}},
-                    {"description","Subagent specialisation (default general)."}}},
+                    {"enum", type_enum},
+                    {"description", type_desc}}},
                 {"display_description", {{"type","string"},
                     {"description","One-line summary shown in the UI. Optional."}}},
             }},
