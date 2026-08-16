@@ -9,3 +9,9 @@ if(NOT WIN32)
     add_executable(mcp_client_example client_example.cpp)
     target_link_libraries(mcp_client_example PRIVATE mcp::mcp)
 endif()
+
+# date-mcp — a complete, standalone MCP SERVER example (its own project so it
+# also builds when copied out of the tree via FetchContent). Ships two real
+# tools (current_date / days_between). wordcount-mcp alongside it is a
+# stdlib-only PYTHON server — no build, nothing to wire here.
+add_subdirectory(date-mcp)
