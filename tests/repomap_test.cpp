@@ -8,6 +8,8 @@
 //   2. CORRECTNESS — real definitions in the tree are surfaced with their file.
 // Drives the tool through the real make_provider() dispatch path.
 
+#include "agtest.hpp"
+
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/cap/capability.hpp>
@@ -22,18 +24,13 @@ namespace fs = std::filesystem;
 using namespace mcp;
 namespace mt = mcp::tools;
 
-static int g_fail = 0;
-static void check(bool ok, const char* what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++g_fail; }
-    else     { std::fprintf(stderr, "ok:   %s\n", what); }
-}
 
 static void write_file(const fs::path& p, const std::string& body) {
     fs::create_directories(p.parent_path());
     std::ofstream(p) << body;
 }
 
-int main() {
+TEST_CASE("repomap") {
     const fs::path root = fs::temp_directory_path()
         / ("repomap_test_" + std::to_string(std::random_device{}()));
     fs::remove_all(root);
@@ -78,8 +75,4 @@ int main() {
           "repo_map surfaces real symbols/files from the tree");
 
     fs::remove_all(root);
-
-    if (g_fail == 0) { std::puts("repomap_test: all checks passed"); return 0; }
-    std::fprintf(stderr, "repomap_test: %d check(s) failed\n", g_fail);
-    return 1;
 }

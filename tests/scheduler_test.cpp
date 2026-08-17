@@ -10,6 +10,8 @@
 //       wave actually runs CONCURRENTLY (wall-clock ≈ one sleep, not N) and
 //       returns results 1:1 with the input batch.
 //
+#include "agtest.hpp"
+
 #include <mcp/cap/cap.hpp>
 #include <mcp/cap/scheduler.hpp>
 
@@ -23,15 +25,6 @@
 using namespace mcp;
 using namespace mcp::cap;
 
-static int g_failures = 0;
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::cerr << "FAIL " << __FILE__ << ":" << __LINE__ << "  "      \
-                      << #cond << "\n";                                      \
-            ++g_failures;                                                    \
-        }                                                                    \
-    } while (0)
 
 namespace {
 
@@ -48,7 +41,9 @@ int wave_of(const Plan& p, std::size_t i) {
 }
 
 // ── (a) All pure reads → ONE wave (full parallelism). ──────────────────────
-void test_all_reads_one_wave() {
+} // namespace (helpers)
+
+TEST_CASE("all reads one wave") {
     std::vector<CallFacts> f = {
         cf(Effects{Eff::ReadFs}, {"a.c"}),
         cf(Effects{Eff::ReadFs}, {"b.c"}),
@@ -63,7 +58,7 @@ void test_all_reads_one_wave() {
 
 // ── (b) A write serialises against an overlapping read; disjoint reads still
 //        parallelise alongside. ─────────────────────────────────────────────
-void test_write_overlap_serialises() {
+TEST_CASE("write overlap serialises") {
     std::vector<CallFacts> f = {
         cf(Effects{Eff::ReadFs},  {"src/a.c"}),   // 0
         cf(Effects{Eff::ReadFs},  {"src/b.c"}),   // 1
@@ -77,7 +72,7 @@ void test_write_overlap_serialises() {
 }
 
 // ── (c) Disjoint writes parallelise. ───────────────────────────────────────
-void test_disjoint_writes_parallel() {
+TEST_CASE("disjoint writes parallel") {
     std::vector<CallFacts> f = {
         cf(Effects{Eff::WriteFs}, {"a.c"}),
         cf(Effects{Eff::WriteFs}, {"b.c"}),
@@ -88,7 +83,7 @@ void test_disjoint_writes_parallel() {
 
 // ── (d) Directory-prefix overlap: writing "src/" conflicts with reading
 //        "src/deep/x.c". ──────────────────────────────────────────────────
-void test_dir_prefix_overlap() {
+TEST_CASE("dir prefix overlap") {
     std::vector<CallFacts> f = {
         cf(Effects{Eff::WriteFs}, {"src"}),          // 0
         cf(Effects{Eff::ReadFs},  {"src/deep/x.c"}), // 1 — under src/
@@ -100,7 +95,7 @@ void test_dir_prefix_overlap() {
     CHECK(wave_of(p, 2) == 0);               // joins the first clash-free wave
 }
 
-void test_no_spurious_prefix() {
+TEST_CASE("no spurious prefix") {
     std::vector<CallFacts> f = {
         cf(Effects{Eff::WriteFs}, {"src"}),       // 0
         cf(Effects{Eff::WriteFs}, {"srcfoo"}),    // 1 — NOT under "src"
@@ -110,7 +105,7 @@ void test_no_spurious_prefix() {
 }
 
 // ── (e) Exec serialises against EVERYTHING. ────────────────────────────────
-void test_exec_serialises_all() {
+TEST_CASE("exec serialises all") {
     std::vector<CallFacts> f = {
         cf(Effects{Eff::ReadFs}, {"a.c"}),                       // 0
         cf(Effects{Eff::Exec, Eff::ReadFs, Eff::WriteFs}, {}),   // 1 — bash
@@ -127,7 +122,7 @@ void test_exec_serialises_all() {
 
 // ── (f) A blind writer (writes, no extractable path) serialises against all
 //        fs-touching peers, but a pure-Net peer still parallelises. ──────────
-void test_blind_writer() {
+TEST_CASE("blind writer") {
     std::vector<CallFacts> f = {
         cf(Effects{Eff::ReadFs},  {"a.c"}),   // 0 fs
         cf(Effects{Eff::WriteFs}, {}),        // 1 blind writer
@@ -140,7 +135,7 @@ void test_blind_writer() {
 
 // ── (g) Order preservation: a later-emitted conflicting call NEVER lands in
 //        an earlier wave than the call it conflicts with. ──────────────────
-void test_order_preserved() {
+TEST_CASE("order preserved") {
     std::vector<CallFacts> f = {
         cf(Effects{Eff::WriteFs}, {"x"}),   // 0
         cf(Effects{Eff::ReadFs},  {"x"}),   // 1 — must come AFTER 0
@@ -150,7 +145,7 @@ void test_order_preserved() {
 }
 
 // ── (h) Built-in path extraction pulls the right keys. ──────────────────────
-void test_extract_paths() {
+TEST_CASE("extract paths") {
     CHECK(extract_paths("read",  Json{{"path","foo.c"}})       == std::vector<std::string>{"foo.c"});
     CHECK(extract_paths("write", Json{{"file_path","bar.c"}})  == std::vector<std::string>{"bar.c"});
     CHECK(extract_paths("grep",  Json{{"dir","src"}})          == std::vector<std::string>{"src"});
@@ -159,7 +154,7 @@ void test_extract_paths() {
 
 // ── (i) Executor: a parallel wave runs concurrently (wall-clock proves it),
 //        and results come back 1:1 with the batch in original order. ─────────
-void test_concurrent_execution() {
+TEST_CASE("concurrent execution") {
     auto p = std::make_shared<LocalProvider>("slow");
     std::atomic<int> in_flight{0};
     std::atomic<int> max_in_flight{0};
@@ -207,7 +202,7 @@ void test_concurrent_execution() {
 
 // ── (j) Executor preserves correctness when forced serial (overlapping
 //        writes run one at a time, in order). ────────────────────────────────
-void test_serial_path_correct() {
+TEST_CASE("serial path correct") {
     auto p = std::make_shared<LocalProvider>("w");
     std::string log;
     p->add("edit", "edit", Json{{"type","object"}},
@@ -234,22 +229,4 @@ void test_serial_path_correct() {
     CHECK(log == "XYZ");   // strict submission order preserved
 }
 
-} // namespace
 
-int main() {
-    test_all_reads_one_wave();
-    test_write_overlap_serialises();
-    test_disjoint_writes_parallel();
-    test_dir_prefix_overlap();
-    test_no_spurious_prefix();
-    test_exec_serialises_all();
-    test_blind_writer();
-    test_order_preserved();
-    test_extract_paths();
-    test_concurrent_execution();
-    test_serial_path_correct();
-
-    if (g_failures == 0) std::cout << "scheduler_test: all checks passed\n";
-    else std::cerr << "scheduler_test: " << g_failures << " FAILURES\n";
-    return g_failures == 0 ? 0 : 1;
-}

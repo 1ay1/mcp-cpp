@@ -7,6 +7,10 @@
 //   3. MRTR (Multi Round-Trip Requests): a tool that needs input_required
 //      elicitation, fulfilled transparently by call_tool_interactive().
 //
+#include "agtest.hpp"
+
+static int g_failures = 0;
+
 #include <mcp/mcp.hpp>
 
 #include <iostream>
@@ -14,16 +18,8 @@
 
 using namespace mcp;
 
-static int g_failures = 0;
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::cerr << "FAIL " << __LINE__ << "  " << #cond << "\n";       \
-            ++g_failures;                                                    \
-        }                                                                    \
-    } while (0)
 
-int main() {
+TEST_CASE("stateless") {
     // Loopback: two raw engines that cross-feed. The "server" is hand-rolled
     // so we can inspect incoming _meta and craft input_required results the
     // SDK Server doesn't emit yet.
@@ -164,11 +160,5 @@ int main() {
         c.ping().get();
         CHECK(!last_meta.contains(std::string(meta_key::ProtocolVersion)));
     }
-
-    if (g_failures == 0) {
-        std::cout << "stateless_test: ALL PASS\n";
-        return 0;
-    }
-    std::cerr << "stateless_test: " << g_failures << " failure(s)\n";
-    return 1;
+    CHECK(g_failures == 0);
 }

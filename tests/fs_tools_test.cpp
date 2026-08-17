@@ -10,7 +10,7 @@
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/cap/local.hpp>
 
-#include <cassert>
+#include "agtest.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -34,7 +34,7 @@ static mcp::cap::Result call(mcp::cap::CapabilityProvider& p,
 
 static mcp::Json obj() { return mcp::Json::object(); }
 
-int main() {
+TEST_CASE("fs_tools") {
     auto root = fs::temp_directory_path() / ("mcp_fs_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
     util::set_workspace_root(root);
@@ -176,6 +176,4 @@ int main() {
     }
 
     fs::remove_all(root);
-    std::puts("ALL FS TOOL TESTS PASSED");
-    return 0;
 }

@@ -10,7 +10,7 @@
 #include <mcp/tools/meta.hpp>
 #include <mcp/cap/local.hpp>
 
-#include <cassert>
+#include "agtest.hpp"
 #include <cstdio>
 #include <string>
 
@@ -45,7 +45,7 @@ static HttpResponse html_resp(std::string body) {
     return r;
 }
 
-int main() {
+TEST_CASE("web_tools") {
     auto fake = std::make_shared<FakeHttp>();
 
     // web_fetch: a simple HTML page → cleaned text with the heading + link.
@@ -163,7 +163,4 @@ int main() {
         assert(r.is_error);
         std::puts("web tools: absent without HttpClient");
     }
-
-    std::puts("ALL WEB TOOL TESTS PASSED");
-    return 0;
 }

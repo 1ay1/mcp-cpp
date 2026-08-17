@@ -1,83 +1,55 @@
-add_executable(mcp_codec_test codec_test.cpp)
-target_link_libraries(mcp_codec_test PRIVATE mcp::mcp)
-add_test(NAME mcp_codec_test COMMAND mcp_codec_test)
-
-add_executable(mcp_loopback_test loopback_test.cpp)
-target_link_libraries(mcp_loopback_test PRIVATE mcp::mcp)
-add_test(NAME mcp_loopback_test COMMAND mcp_loopback_test)
-
-add_executable(mcp_stateless_test stateless_test.cpp)
-target_link_libraries(mcp_stateless_test PRIVATE mcp::mcp)
-add_test(NAME mcp_stateless_test COMMAND mcp_stateless_test)
-
-add_executable(mcp_server_stateless_test server_stateless_test.cpp)
-target_link_libraries(mcp_server_stateless_test PRIVATE mcp::mcp)
-add_test(NAME mcp_server_stateless_test COMMAND mcp_server_stateless_test)
-
-add_executable(mcp_auth_test auth_test.cpp)
-target_link_libraries(mcp_auth_test PRIVATE mcp::mcp)
-add_test(NAME mcp_auth_test COMMAND mcp_auth_test)
-
-add_executable(mcp_protocol_test protocol_test.cpp)
-target_link_libraries(mcp_protocol_test PRIVATE mcp::mcp)
-add_test(NAME mcp_protocol_test COMMAND mcp_protocol_test)
-
-add_executable(mcp_cap_test cap_test.cpp)
-target_link_libraries(mcp_cap_test PRIVATE mcp::mcp)
-add_test(NAME mcp_cap_test COMMAND mcp_cap_test)
-
-add_executable(mcp_scheduler_test scheduler_test.cpp)
+# Single mcp-cpp test binary. Every migrated test is a doctest TEST_CASE
+# auto-registered into mcp_tests, which links mcp::mcp + mcp::tools once
+# instead of ~18 separate executables. doctest_discover_tests keeps per-case
+# ctest entries (ctest -j parallelism + per-case reporting preserved).
 find_package(Threads REQUIRED)
-target_link_libraries(mcp_scheduler_test PRIVATE mcp::mcp Threads::Threads)
-add_test(NAME mcp_scheduler_test COMMAND mcp_scheduler_test)
 
-if(MCP_BUILD_TOOLS)
-    add_executable(mcp_toolset_test toolset_test.cpp)
-    target_link_libraries(mcp_toolset_test PRIVATE mcp::tools)
-    add_test(NAME mcp_toolset_test COMMAND mcp_toolset_test)
+include(FetchContent)
+FetchContent_Declare(
+    doctest
+    GIT_REPOSITORY https://github.com/doctest/doctest.git
+    GIT_TAG        v2.4.11
+    GIT_SHALLOW    TRUE
+)
+set(DOCTEST_WITH_TESTS OFF CACHE INTERNAL "")
+set(DOCTEST_NO_INSTALL ON CACHE INTERNAL "")
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE INTERNAL "")
+FetchContent_MakeAvailable(doctest)
+unset(CMAKE_POLICY_VERSION_MINIMUM CACHE)
 
-    add_executable(mcp_fs_tools_test fs_tools_test.cpp)
-    target_link_libraries(mcp_fs_tools_test PRIVATE mcp::tools)
-    add_test(NAME mcp_fs_tools_test COMMAND mcp_fs_tools_test)
+add_executable(mcp_tests
+    test_main.cpp
+    codec_test.cpp
+    loopback_test.cpp
+    stateless_test.cpp
+    server_stateless_test.cpp
+    auth_test.cpp
+    protocol_test.cpp
+    cap_test.cpp
+    scheduler_test.cpp
+    toolset_test.cpp
+    fs_tools_test.cpp
+    search_tools_test.cpp
+    repomap_test.cpp
+    web_tools_test.cpp
+    arg_reader_test.cpp
+    terminal_strip_test.cpp
+    bash_validate_test.cpp
+    fuzzy_match_test.cpp
+)
+target_link_libraries(mcp_tests PRIVATE mcp::mcp mcp::tools doctest::doctest Threads::Threads)
+include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
+doctest_discover_tests(mcp_tests)
 
-    add_executable(mcp_search_tools_test search_tools_test.cpp)
-    target_link_libraries(mcp_search_tools_test PRIVATE mcp::tools)
-    add_test(NAME mcp_search_tools_test COMMAND mcp_search_tools_test)
+# Kept standalone: subprocess_tty forks + drives a real PTY; process_tools
+# spawns `sh -c` children. Their process isolation is load-bearing, so they
+# must not share a binary with the in-process unit tests.
+if(NOT WIN32)
+    add_executable(mcp_subprocess_tty_test subprocess_tty_test.cpp)
+    target_link_libraries(mcp_subprocess_tty_test PRIVATE mcp::tools)
+    add_test(NAME mcp_subprocess_tty_test COMMAND mcp_subprocess_tty_test)
 
-    add_executable(mcp_repomap_test repomap_test.cpp)
-    target_link_libraries(mcp_repomap_test PRIVATE mcp::tools)
-    add_test(NAME mcp_repomap_test COMMAND mcp_repomap_test)
-
-    add_executable(mcp_web_tools_test web_tools_test.cpp)
-    target_link_libraries(mcp_web_tools_test PRIVATE mcp::tools)
-    add_test(NAME mcp_web_tools_test COMMAND mcp_web_tools_test)
-
-    add_executable(mcp_arg_reader_test arg_reader_test.cpp)
-    target_link_libraries(mcp_arg_reader_test PRIVATE mcp::tools)
-    add_test(NAME mcp_arg_reader_test COMMAND mcp_arg_reader_test)
-
-    add_executable(mcp_terminal_strip_test terminal_strip_test.cpp)
-    target_link_libraries(mcp_terminal_strip_test PRIVATE mcp::tools)
-    add_test(NAME mcp_terminal_strip_test COMMAND mcp_terminal_strip_test)
-
-    add_executable(mcp_bash_validate_test bash_validate_test.cpp)
-    target_link_libraries(mcp_bash_validate_test PRIVATE mcp::tools)
-    add_test(NAME mcp_bash_validate_test COMMAND mcp_bash_validate_test)
-
-    add_executable(mcp_fuzzy_match_test fuzzy_match_test.cpp)
-    target_link_libraries(mcp_fuzzy_match_test PRIVATE mcp::tools)
-    add_test(NAME mcp_fuzzy_match_test COMMAND mcp_fuzzy_match_test)
-
-    # /dev/tty detach check is POSIX-only (no /dev/tty on Windows).
-    if(NOT WIN32)
-        add_executable(mcp_subprocess_tty_test subprocess_tty_test.cpp)
-        target_link_libraries(mcp_subprocess_tty_test PRIVATE mcp::tools)
-        add_test(NAME mcp_subprocess_tty_test COMMAND mcp_subprocess_tty_test)
-
-        # process_start/poll/stop e2e uses sh -c + exit codes (POSIX shell).
-        add_executable(mcp_process_tools_test process_tools_test.cpp)
-        find_package(Threads REQUIRED)
-        target_link_libraries(mcp_process_tools_test PRIVATE mcp::tools Threads::Threads)
-        add_test(NAME mcp_process_tools_test COMMAND mcp_process_tools_test)
-    endif()
+    add_executable(mcp_process_tools_test process_tools_test.cpp)
+    target_link_libraries(mcp_process_tools_test PRIVATE mcp::tools Threads::Threads)
+    add_test(NAME mcp_process_tools_test COMMAND mcp_process_tools_test)
 endif()

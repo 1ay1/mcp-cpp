@@ -6,6 +6,8 @@
 // live path needs a real MCP server, so we cover the in-process surface that
 // every backed provider shares.
 //
+#include "agtest.hpp"
+
 #include <mcp/cap/cap.hpp>
 
 #include <iostream>
@@ -15,15 +17,6 @@
 using namespace mcp;
 using namespace mcp::cap;
 
-static int g_failures = 0;
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::cerr << "FAIL " << __FILE__ << ":" << __LINE__ << "  "      \
-                      << #cond << "\n";                                      \
-            ++g_failures;                                                    \
-        }                                                                    \
-    } while (0)
 
 namespace {
 
@@ -43,7 +36,9 @@ std::shared_ptr<LocalProvider> make_calc() {
 
 // (a) LocalProvider lists tools and dispatches handlers; thrown handler →
 //     Result::error, not a crash.
-void test_local_provider() {
+} // namespace (helpers)
+
+TEST_CASE("local provider") {
     auto calc = make_calc();
     CHECK(calc->origin() == "calc");
     CHECK(calc->list().size() == 2);
@@ -61,7 +56,7 @@ void test_local_provider() {
 }
 
 // (b) Single-provider Registry: bare names, dispatch routes to the provider.
-void test_registry_single() {
+TEST_CASE("registry single") {
     Registry reg;
     reg.add(make_calc());
     CHECK(reg.provider_count() == 1);
@@ -82,7 +77,7 @@ void test_registry_single() {
 
 // (c) Collision across providers → automatic "<origin>__<name>" namespacing,
 //     and dispatch resolves the namespaced form to the right provider.
-void test_registry_collision_namespacing() {
+TEST_CASE("registry collision namespacing") {
     auto a = std::make_shared<LocalProvider>("alpha");
     a->add("ping", "alpha ping", Json{{"type","object"}},
            [](const Json&) { return Result::ok("from-alpha"); });
@@ -111,7 +106,7 @@ void test_registry_collision_namespacing() {
 }
 
 // (d) always_namespace forces the prefix even without a collision.
-void test_registry_always_namespace() {
+TEST_CASE("registry always namespace") {
     Registry reg(/*always_namespace=*/true);
     reg.add(make_calc());
     auto tools = reg.tools();
@@ -122,7 +117,7 @@ void test_registry_always_namespace() {
 }
 
 // (e) content <-> Result helpers round-trip text + error + structured.
-void test_content_helpers() {
+TEST_CASE("content helpers") {
     Result r = Result::ok("hello world");
     r.structured = Json{{"k", 1}};
     CallToolResult ct = call_result_from(r);
@@ -140,16 +135,4 @@ void test_content_helpers() {
     CHECK(result_from_call(err).is_error);
 }
 
-} // namespace
 
-int main() {
-    test_local_provider();
-    test_registry_single();
-    test_registry_collision_namespacing();
-    test_registry_always_namespace();
-    test_content_helpers();
-
-    if (g_failures == 0) { std::cout << "cap_test: all checks passed\n"; return 0; }
-    std::cerr << "cap_test: " << g_failures << " failure(s)\n";
-    return 1;
-}

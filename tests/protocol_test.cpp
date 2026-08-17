@@ -3,22 +3,18 @@
 // protocol_test.cpp — exercise the JSON-RPC envelope algebra, the message-level
 // sums, the structured -32042 error, and the compile-time method dictionary.
 //
+#include "agtest.hpp"
+
+static int g_failures = 0;
+
 #include <mcp/mcp.hpp>
 
 #include <iostream>
 
 using namespace mcp;
 
-static int g_failures = 0;
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::cerr << "FAIL " << __LINE__ << "  " << #cond << "\n";       \
-            ++g_failures;                                                    \
-        }                                                                    \
-    } while (0)
 
-int main() {
+TEST_CASE("protocol") {
     // ── JsonRpcMessage round-trips for each envelope shape ───────────────
     {
         JsonRpcMessage req = JsonRpcMessage{JsonRpcRequest{
@@ -152,11 +148,5 @@ int main() {
         auto back = from_json<PrimitiveSchema>(pj);
         CHECK(std::holds_alternative<LegacyTitledEnum>(back));
     }
-
-    if (g_failures == 0) {
-        std::cout << "protocol_test: ALL PASS\n";
-        return 0;
-    }
-    std::cerr << "protocol_test: " << g_failures << " failure(s)\n";
-    return 1;
+    CHECK(g_failures == 0);
 }

@@ -12,6 +12,10 @@
 //
 // Run: build mcp_bash_validate_test, execute. Exit 0 = pass.
 
+#include "agtest.hpp"
+
+static int g_failures = 0;
+
 #include <mcp/tools/util/bash_validate.hpp>
 
 #include <cstdio>
@@ -20,7 +24,6 @@
 
 using mcp::tools::util::validate_bash_command;
 
-static int g_failures = 0;
 
 // A command is REFUSED when the validator returns a non-empty reason.
 static void expect_refused(std::string_view cmd) {
@@ -41,7 +44,7 @@ static void expect_allowed(std::string_view cmd) {
     }
 }
 
-int main() {
+TEST_CASE("bash_validate") {
     // ── root / home wipes: still refused ────────────────────────────────
     expect_refused("rm -rf /");
     expect_refused("rm -rf /*");
@@ -87,11 +90,5 @@ int main() {
     expect_allowed("grep -rn foo src/");
     expect_allowed("curl https://example.com -o out.txt");   // no |sh
     expect_allowed("git push origin main");                  // no --force
-
-    if (g_failures == 0) {
-        std::puts("bash_validate_test: all checks passed");
-        return 0;
-    }
-    std::fprintf(stderr, "bash_validate_test: %d failure(s)\n", g_failures);
-    return 1;
+    CHECK(g_failures == 0);
 }

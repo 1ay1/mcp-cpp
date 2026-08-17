@@ -11,7 +11,7 @@
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/cap/local.hpp>
 
-#include <cassert>
+#include "agtest.hpp"
 #include <cctype>
 #include <cstdio>
 #include <filesystem>
@@ -40,7 +40,7 @@ static void write_file(const fs::path& p, const std::string& s) {
     f.write(s.data(), static_cast<std::streamsize>(s.size()));
 }
 
-int main() {
+TEST_CASE("search_tools") {
     auto root = fs::temp_directory_path() / ("mcp_search_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
     util::set_workspace_root(root);
@@ -750,6 +750,4 @@ int main() {
     }
 
     fs::remove_all(root);
-    std::puts("ALL SEARCH/SHELL/DIAGNOSTICS TOOL TESTS PASSED");
-    return 0;
 }

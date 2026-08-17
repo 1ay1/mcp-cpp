@@ -7,21 +7,14 @@
 //
 #include <mcp/mcp.hpp>
 
-#include <cassert>
+#include "agtest.hpp"
+
+static int g_failures = 0;
 #include <iostream>
 #include <string>
 
 using namespace mcp;
 
-static int g_failures = 0;
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::cerr << "FAIL " << __FILE__ << ":" << __LINE__ << "  "      \
-                      << #cond << "\n";                                      \
-            ++g_failures;                                                    \
-        }                                                                    \
-    } while (0)
 
 template <class T>
 static void roundtrip(const T& v, const char* label) {
@@ -35,7 +28,7 @@ static void roundtrip(const T& v, const char* label) {
     }
 }
 
-int main() {
+TEST_CASE("codec") {
     // ── scalars / unions ────────────────────────────────────────────────
     {
         RequestId s{std::string{"req-7"}};
@@ -249,11 +242,5 @@ int main() {
         CHECK(to_json(cp)["requestId"] == 7);
         roundtrip(cp, "CancelledParams");
     }
-
-    if (g_failures == 0) {
-        std::cout << "codec_test: ALL PASS\n";
-        return 0;
-    }
-    std::cerr << "codec_test: " << g_failures << " failure(s)\n";
-    return 1;
+    CHECK(g_failures == 0);
 }

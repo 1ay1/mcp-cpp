@@ -17,6 +17,10 @@
 //
 // Run: build mcp_fuzzy_match_test, execute. Exit 0 = pass.
 
+#include "agtest.hpp"
+
+static int g_failures = 0;
+
 #include <mcp/tools/util/fuzzy_match.hpp>
 
 #include <cstdio>
@@ -27,21 +31,13 @@
 using mcp::tools::util::fuzzy_find;
 using mcp::tools::util::FuzzyMatch;
 
-static int g_failures = 0;
-#define CHECK(cond)                                                            \
-    do {                                                                       \
-        if (!(cond)) {                                                         \
-            std::fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); \
-            ++g_failures;                                                      \
-        }                                                                      \
-    } while (0)
 
 // Convenience: the substring of `file` that a match selected.
 static std::string_view matched(std::string_view file, const FuzzyMatch& m) {
     return file.substr(m.pos, m.len);
 }
 
-int main() {
+TEST_CASE("fuzzy_match") {
     // ── 1. exact unique match ────────────────────────────────────────────
     {
         std::string file = "line one\nline two\nline three\n";
@@ -226,11 +222,5 @@ int main() {
         CHECK(!m.ok);
         CHECK(m.count >= 2);
     }
-
-    if (g_failures == 0) {
-        std::puts("fuzzy_match_test: all checks passed");
-        return 0;
-    }
-    std::fprintf(stderr, "fuzzy_match_test: %d failure(s)\n", g_failures);
-    return 1;
+    CHECK(g_failures == 0);
 }

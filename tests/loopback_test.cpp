@@ -6,6 +6,10 @@
 // and a roots callback. No sockets, no threads in the transport — each side's
 // sink feeds the other's engine directly.
 //
+#include "agtest.hpp"
+
+static int g_failures = 0;
+
 #include <mcp/mcp.hpp>
 
 #include <iostream>
@@ -13,16 +17,8 @@
 
 using namespace mcp;
 
-static int g_failures = 0;
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::cerr << "FAIL " << __LINE__ << "  " << #cond << "\n";       \
-            ++g_failures;                                                    \
-        }                                                                    \
-    } while (0)
 
-int main() {
+TEST_CASE("loopback") {
     // Forward declarations so each sink can reference the other engine.
     RpcEngine* client_engine = nullptr;
     RpcEngine* server_engine = nullptr;
@@ -226,11 +222,5 @@ int main() {
         CHECK(r.content.has_value());
         CHECK(std::get<std::string>((*r.content)[0].second) == "Grace");
     }
-
-    if (g_failures == 0) {
-        std::cout << "loopback_test: ALL PASS\n";
-        return 0;
-    }
-    std::cerr << "loopback_test: " << g_failures << " failure(s)\n";
-    return 1;
+    CHECK(g_failures == 0);
 }

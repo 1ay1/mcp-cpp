@@ -12,6 +12,8 @@
 // ("\x1b[1;24r" → stray "r" cells) and were committed to native
 // scrollback. Every path out of the runners must now be escape-free.
 
+#include "agtest.hpp"
+
 #include <mcp/tools/util/subprocess.hpp>
 #include <mcp/tools/util/utf8.hpp>
 
@@ -21,18 +23,8 @@
 
 using namespace mcp::tools::util;
 
-static int g_failures = 0;
 static int g_checks   = 0;
 
-#define CHECK(cond, msg)                                                   \
-    do {                                                                   \
-        ++g_checks;                                                        \
-        if (!(cond)) {                                                     \
-            ++g_failures;                                                  \
-            std::fprintf(stderr, "  FAIL [%s:%d] %s\n",                    \
-                         __FILE__, __LINE__, (msg));                       \
-        }                                                                  \
-    } while (0)
 
 static bool has_controls(std::string_view s) {
     for (char ch : s) {
@@ -44,7 +36,7 @@ static bool has_controls(std::string_view s) {
     return false;
 }
 
-static void test_csi_and_osc_removed() {
+TEST_CASE("csi and osc removed") {
     CHECK(strip_terminal_controls("\x1b[1;31mred\x1b[0m plain") == "red plain",
           "SGR pair stripped");
     CHECK(strip_terminal_controls("\x1b[3;24r") == "",
@@ -59,7 +51,7 @@ static void test_csi_and_osc_removed() {
           "two-byte ESC pair stripped");
 }
 
-static void test_incomplete_sequences_dropped() {
+TEST_CASE("incomplete sequences dropped") {
     // The snapshot cadence can cut mid-CSI. The unfinished tail must be
     // DROPPED — passing "[1;24" through (or consuming only the ESC) is
     // exactly the stray-glyph bug.
@@ -71,7 +63,7 @@ static void test_incomplete_sequences_dropped() {
           "unterminated OSC dropped");
 }
 
-static void test_cr_overwrite_semantics() {
+TEST_CASE("cr overwrite semantics") {
     CHECK(strip_terminal_controls("12%\r34%\r100%\ndone") == "100%\ndone",
           "progress bar collapses to final state");
     CHECK(strip_terminal_controls("line\r\nnext") == "line\nnext",
@@ -80,7 +72,7 @@ static void test_cr_overwrite_semantics() {
           "trailing CR is a no-op (next snapshot may continue the line)");
 }
 
-static void test_backspace_and_c0() {
+TEST_CASE("backspace and c0") {
     CHECK(strip_terminal_controls("abcd\b\bXY") == "abXY",
           "backspace erases previous chars");
     CHECK(strip_terminal_controls("caf\xc3\xa9\bX") == "cafX",
@@ -92,7 +84,7 @@ static void test_backspace_and_c0() {
 }
 
 #ifndef _WIN32
-static void test_live_progress_path_is_clean() {
+TEST_CASE("live progress path is clean") {
     // A child that emits SGR + CR progress + a DECSTBM probe. Both the
     // live snapshots and the final output must be control-free.
     SubprocessOptions opts;
@@ -123,17 +115,3 @@ static void test_live_progress_path_is_clean() {
 }
 #endif
 
-int main() {
-    test_csi_and_osc_removed();
-    test_incomplete_sequences_dropped();
-    test_cr_overwrite_semantics();
-    test_backspace_and_c0();
-#ifndef _WIN32
-    test_live_progress_path_is_clean();
-#endif
-    if (g_failures == 0)
-        std::printf("PASS: %d checks\n", g_checks);
-    else
-        std::printf("FAILED: %d of %d checks\n", g_failures, g_checks);
-    return g_failures ? 1 : 0;
-}

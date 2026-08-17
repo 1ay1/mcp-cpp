@@ -14,6 +14,10 @@
 //      round — the server reconstructs its context purely from requestState.
 //   5. Cacheable tools/list carries ttlMs / cacheScope.
 //
+#include "agtest.hpp"
+
+static int g_failures = 0;
+
 #include <mcp/mcp.hpp>
 
 #include <iostream>
@@ -21,16 +25,8 @@
 
 using namespace mcp;
 
-static int g_failures = 0;
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::cerr << "FAIL " << __LINE__ << "  " << #cond << "\n";       \
-            ++g_failures;                                                    \
-        }                                                                    \
-    } while (0)
 
-int main() {
+TEST_CASE("server_stateless") {
     // ── 1. RequestStateCodec integrity ───────────────────────────────────
     {
         RequestStateCodec codec("test-secret");
@@ -253,11 +249,5 @@ int main() {
         auto rf = routing_from_body(body);
         CHECK(rf.method == "tools/call" && rf.name == "read");
     }
-
-    if (g_failures == 0) {
-        std::cout << "server_stateless_test: ALL PASS\n";
-        return 0;
-    }
-    std::cerr << "server_stateless_test: " << g_failures << " failure(s)\n";
-    return 1;
+    CHECK(g_failures == 0);
 }

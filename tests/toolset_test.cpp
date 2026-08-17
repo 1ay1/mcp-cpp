@@ -14,7 +14,7 @@
 #include <mcp/cap/local.hpp>
 
 #include <algorithm>
-#include <cassert>
+#include "agtest.hpp"
 #include <cstdio>
 #include <map>
 #include <string>
@@ -118,9 +118,6 @@ public:
 };
 
 int fails = 0;
-void check(bool c, const char* what) {
-    if (!c) { std::fprintf(stderr, "FAIL: %s\n", what); ++fails; }
-}
 
 mcp::cap::Result call(mcp::cap::CapabilityProvider& p, const std::string& tool, mcp::Json args) {
     return p.execute(mcp::cap::Request{tool, std::move(args)});
@@ -128,7 +125,7 @@ mcp::cap::Result call(mcp::cap::CapabilityProvider& p, const std::string& tool, 
 
 } // namespace
 
-int main() {
+TEST_CASE("toolset") {
     // ── backend absent → no memory tools registered ──────────────────────
     {
         HostServices empty;
@@ -291,6 +288,5 @@ int main() {
               "task reports exact unavailability reason");
     }
 
-    if (fails == 0) std::printf("mcp_toolset_test: all checks passed\n");
-    return fails == 0 ? 0 : 1;
+    (void)fails;
 }
