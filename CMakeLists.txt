@@ -5,7 +5,19 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(MCP_BUILD_TESTS    "Build mcp-cpp tests"    ON)
+# Build tests/examples by default ONLY when mcp-cpp is the top-level project
+# (built standalone). When embedded via add_subdirectory (e.g. by agentty),
+# they default OFF so the parent doesn't pull mcp-cpp's test binaries into its
+# own build/ctest — each repo runs its own tests. (PROJECT_IS_TOP_LEVEL is
+# CMake >=3.21; derive it for the 3.20 floor.)
+if(NOT DEFINED PROJECT_IS_TOP_LEVEL)
+    if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+        set(PROJECT_IS_TOP_LEVEL ON)
+    else()
+        set(PROJECT_IS_TOP_LEVEL OFF)
+    endif()
+endif()
+option(MCP_BUILD_TESTS    "Build mcp-cpp tests"    ${PROJECT_IS_TOP_LEVEL})
 option(MCP_BUILD_EXAMPLES "Build mcp-cpp examples" ON)
 
 include(FetchContent)
