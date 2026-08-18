@@ -8,6 +8,7 @@
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
+#include <mcp/tools/util/progress.hpp>   // cancellation::requested()
 #include <mcp/tools/util/sandbox.hpp>
 
 #include <algorithm>
@@ -326,8 +327,11 @@ std::expected<PollArgs, ToolError> parse_poll(const json& args) {
     util::ArgReader reader(args);
     auto id = reader.require_str("id");
     if (!id || id->empty()) return std::unexpected(ToolError::invalid_args("id is required"));
+    // wait_ms up to 300 s (matches the bash tool's max). A long block is safe:
+    // run_poll returns the instant output arrives OR the child exits, and the
+    // loop honours cancellation so the user can always interrupt it.
     return PollArgs{*id, std::clamp(reader.integer("max_chars", 30000), 1000, 100000),
-                    std::clamp(reader.integer("wait_ms", 250), 0, 5000)};
+                    std::clamp(reader.integer("wait_ms", 250), 0, 300000)};
 }
 
 // Human-friendly list of live session ids for recovery hints. Caller must NOT
@@ -353,15 +357,24 @@ ExecResult run_poll(const PollArgs& args) {
     if (!session)
         return std::unexpected(ToolError::not_found(
             "unknown process session: " + args.id + live_session_hint()));
-    const auto deadline = std::chrono::steady_clock::now()
-        + std::chrono::milliseconds{args.wait_ms};
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::milliseconds{args.wait_ms};
     std::string output;
     std::size_t dropped = 0;
     bool running = false;
+    // Adaptive backoff: poll at 10 ms while fresh (snappy first-byte + exit
+    // latency), then ramp toward 50 ms once the process has been quiet for a
+    // while, so a MULTI-MINUTE wait on a silent build/boot doesn't busy-spin.
+    // The 50 ms ceiling bounds how long we can miss a cancellation request or
+    // the first output byte.
+    long sleep_ms = 10;
     do {
         running = session->running();
         output = session->take_new(static_cast<std::size_t>(args.max_chars), &dropped);
         if (!output.empty()) break;
+        // Honour cooperative cancellation (user interrupt): a long wait_ms must
+        // never wedge the agent. Return what we have and let the caller re-poll.
+        if (util::cancellation::requested()) break;
         if (std::chrono::steady_clock::now() >= deadline) break;
         // Child exited AND the reader consumed EOF — every byte is in the
         // buffer and it's empty: truly nothing more, stop waiting. Without
@@ -369,7 +382,14 @@ ExecResult run_poll(const PollArgs& args) {
         // racing the reader thread and reporting a crashed server's FINAL
         // LINES — the error the caller is polling for — as "no output".
         if (!running && session->reader_finished()) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        // Don't overshoot the deadline with the last sleep.
+        const auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remain <= 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{std::min<long>(sleep_ms, remain)});
+        // Ramp the interval after the process has been quiet ~0.5 s.
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds{500} && sleep_ms < 50)
+            sleep_ms = 50;
     } while (true);
     // Re-check liveness after draining: a process that printed its last line
     // and THEN exited during this same poll should report "exited (code)"
@@ -456,10 +476,12 @@ json poll_schema() {
         {"id", {{"type","string"}, {"description","Session id returned by process_start."}}},
         {"max_chars", {{"type","integer"}, {"minimum",1000}, {"maximum",100000}, {"default",30000},
                        {"description","Cap on bytes of new output returned this poll (most recent kept)."}}},
-        {"wait_ms", {{"type","integer"}, {"minimum",0}, {"maximum",5000}, {"default",250},
-                     {"description","Block up to this long waiting for new output before returning "
-                                    "(returns early as soon as any arrives). Raise it when waiting on "
-                                    "a slow-to-boot server."}}}
+        {"wait_ms", {{"type","integer"}, {"minimum",0}, {"maximum",300000}, {"default",250},
+                     {"description","Block up to this long (ms, max 300000 = 5 min) waiting for "
+                                    "new output before returning — returns THE INSTANT output arrives "
+                                    "or the process exits, so a big value is free for a quiet process. "
+                                    "Raise it (e.g. 60000) to wait on a slow build/boot instead of "
+                                    "busy-polling; the wait stays interruptible."}}}
     }}};
 }
 json stop_schema() {

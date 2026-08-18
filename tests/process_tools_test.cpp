@@ -235,6 +235,32 @@ int main() {
         std::puts("bad-id hint: ok");
     }
 
+    // ── 7. a large wait_ms (past the OLD 5 s cap) is honoured and STILL
+    //       returns the instant output arrives — not after the full wait.
+    //       Regression: wait_ms used to clamp to 5000, so a poll meant to
+    //       block on a slow build returned early every time and the model
+    //       had to busy-spin.
+    {
+        mcp::Json a = mcp::Json::object();
+        a["command"] = "sleep 0.4; echo delayed-line";
+        auto r = call(*provider, "process_start", a);
+        CHECK(!r.is_error);
+        auto id = extract_id(r.text);
+        CHECK(!id.empty());
+
+        mcp::Json p = mcp::Json::object();
+        p["id"] = id;
+        p["wait_ms"] = 60000;   // 1 min: would be clamped to 5 s before the fix
+        const auto t0 = std::chrono::steady_clock::now();
+        auto pr = call(*provider, "process_poll", p);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        CHECK(!pr.is_error);
+        CHECK(contains(pr.text, "delayed-line"));   // got the output
+        CHECK(elapsed < 5000);                        // returned when it arrived, not at the deadline
+        std::puts("large wait_ms early-return: ok");
+    }
+
     fs::remove_all(root);
     if (g_failures == 0) std::puts("ALL PASS");
     else std::fprintf(stderr, "%d CHECK(s) FAILED\n", g_failures);
