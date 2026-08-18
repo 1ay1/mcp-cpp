@@ -1,5 +1,8 @@
-cmake_minimum_required(VERSION 3.20)
-project(mcp_cpp LANGUAGES CXX VERSION 0.1.0)
+cmake_minimum_required(VERSION 3.20...3.31)
+project(mcp_cpp
+    VERSION     0.1.0
+    DESCRIPTION "Model Context Protocol — modern C++ implementation + built-in tool set"
+    LANGUAGES   CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
