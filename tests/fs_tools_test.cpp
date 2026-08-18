@@ -18,6 +18,7 @@
 
 #ifdef _WIN32
 #  include <process.h>   // _getpid
+#  include <io.h>        // _chsize_s, _fileno
 #  define mcp_getpid _getpid
 #else
 #  include <unistd.h>    // getpid
