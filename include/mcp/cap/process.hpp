@@ -671,16 +671,31 @@ public:
         // hand-rolled close-ladder to drift out of sync with the open set.
         int in_pipe[2]  = {-1, -1};
         int out_pipe[2] = {-1, -1};
+        // Every pipe end is marked CLOEXEC the moment it exists. Providers
+        // spawn IN PARALLEL (the host connects servers concurrently), so a
+        // sibling's fork() between our pipe() and exec() inherits these FDs
+        // without it: that sibling's long-lived child then holds OUR child's
+        // stdout write end open, EOF never reaches our reader after our
+        // child dies, and teardown wedges forever in pthread_join (observed
+        // in the field as a quit-path hang, and as an exit-time hang in
+        // static destructors). dup2() onto 0/1 in our own child CLEARS the
+        // flag on the duplicate, so the exec'd server still gets its stdio.
+        auto cloexec = [](int fd) {
+            (void)::fcntl(fd, F_SETFD, ::fcntl(fd, F_GETFD) | FD_CLOEXEC);
+        };
         if (::pipe(in_pipe) != 0)
             throw std::runtime_error("mcp::cap: pipe() failed (stdin)");
+        cloexec(in_pipe[0]); cloexec(in_pipe[1]);
         FdGuard in_rd{in_pipe[0]}, in_wr{in_pipe[1]};
         if (::pipe(out_pipe) != 0)
             throw std::runtime_error("mcp::cap: pipe() failed (stdout)");
+        cloexec(out_pipe[0]); cloexec(out_pipe[1]);
         FdGuard out_rd{out_pipe[0]}, out_wr{out_pipe[1]};
 
         int ready_pipe[2] = {-1, -1};
         if (::pipe(ready_pipe) != 0)
             throw std::runtime_error("mcp::cap: pipe() failed (ready)");
+        cloexec(ready_pipe[0]); cloexec(ready_pipe[1]);
         FdGuard ready_rd{ready_pipe[0]}, ready_wr{ready_pipe[1]};
 
         pid_ = ::fork();

@@ -64,7 +64,18 @@ public:
         return ClientProvider::execute(req);
     }
 
-    ~StdioServerProvider() override { teardown_(); }
+    ~StdioServerProvider() override {
+        // Serialize with an in-flight execute()/reconnect. A tool-call worker
+        // may be inside start_() → connect() → initialize() (a seconds-long
+        // handshake) when the host drops its last pool reference at quit.
+        // Destroying the transport/engine under that thread's feet is a
+        // use-after-free (observed in the field: SIGSEGV in
+        // RpcEngine::request on thread A while ~StdioServerProvider ran on
+        // thread B). Taking reconnect_mu_ here parks the destructor until
+        // the reconnect either finishes or fails; only then is teardown safe.
+        std::lock_guard<std::mutex> lock(reconnect_mu_);
+        teardown_();
+    }
 
     StdioServerProvider(const StdioServerProvider&)            = delete;
     StdioServerProvider& operator=(const StdioServerProvider&) = delete;
@@ -79,8 +90,18 @@ protected:
         //   1. close_stdin() — EOF the child → it exits → stdout closes → the
         //      reader's getline returns EOF, so transport_.reset()'s join()
         //      won't block.
-        //   2. transport_.reset() — joins the reader thread.
-        if (proc_) proc_->close_stdin();
+        //   2. terminate() — makes step 3 BOUNDED. A misbehaving child that
+        //      ignores EOF and keeps its stdout open would otherwise wedge
+        //      the join forever (observed in the field: quit-path thread
+        //      parked in pthread_join inside on_teardown). SIGTERM→SIGKILL
+        //      guarantees the child dies, its stdout closes, and the reader
+        //      unblocks within ChildProcess's own deadline. A well-behaved
+        //      child has already exited on EOF, so this is a no-op for it.
+        //   3. transport_.reset() — joins the reader thread.
+        if (proc_) {
+            proc_->close_stdin();
+            proc_->terminate();
+        }
         transport_.reset();
     }
 
