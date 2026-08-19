@@ -632,26 +632,64 @@ std::vector<Hit> match_file(const std::vector<PNode>& pat,
 }
 
 // ── Enclosing-symbol heuristic (mirror of search.cpp's for consistency) ──
+// Indent-aware backward walk: only consider lines LESS indented than anything
+// seen so far (real ancestors); a definition-keyword line wins outright; a
+// keyword-less scope opener like `int main(…) {` is kept as fallback — and
+// because best_indent drops to its indent, an OUTER class can't steal the
+// attribution afterwards.
 std::string enclosing_symbol(const std::vector<std::string>& lines, int hit_line) {
     static const char* kw[] = {
-        "class ", "struct ", "def ", "fn ", "func ", "function ",
+        "class ", "struct ", "def ", "fn ", "func ", "function",
         "impl ", "trait ", "namespace ", "interface ", "module ",
+        "enum ", "template",
     };
-    for (int ln = hit_line - 1; ln >= 0 && ln > hit_line - 400; --ln) {
-        if (ln >= static_cast<int>(lines.size())) continue;
-        const std::string& s = lines[ln];
-        std::size_t indent = s.find_first_not_of(" \t");
-        if (indent == std::string::npos) continue;
-        for (auto* k : kw) {
-            auto pos = s.find(k);
-            if (pos != std::string::npos && pos <= indent + 8) {
-                std::string trimmed = s.substr(indent);
-                if (trimmed.size() > 90) trimmed.resize(90);
-                return trimmed;
+    static const char* ctrl[] = {
+        "for ", "for(", "while ", "while(", "if ", "if(", "else",
+        "switch ", "switch(", "do ", "do{", "try", "catch", "} else",
+        "} catch", "loop ", "loop{", "match ", "match(", "return ",
+    };
+    auto indent_of = [](const std::string& s) -> int {
+        int w = 0;
+        for (char c : s) {
+            if (c == ' ') ++w;
+            else if (c == '\t') w += 4;
+            else return w;
+        }
+        return -1;   // blank
+    };
+    if (hit_line < 2 || hit_line > static_cast<int>(lines.size()))
+        return {};
+    int best_indent = indent_of(lines[hit_line - 1]);
+    if (best_indent < 0) best_indent = 0;
+    std::string fallback;
+    for (int ln = hit_line - 1; ln >= 1 && ln > hit_line - 400; --ln) {
+        const std::string& raw = lines[ln - 1];
+        int ind = indent_of(raw);
+        if (ind < 0) continue;                       // blank
+        if (ind >= best_indent && ln != hit_line) continue;   // not an ancestor
+        std::size_t b = raw.find_first_not_of(" \t");
+        std::string s = raw.substr(b);
+        bool is_ctrl = false;
+        for (auto* c : ctrl) if (s.rfind(c, 0) == 0) { is_ctrl = true; break; }
+        if (!is_ctrl) {
+            for (auto* k : kw) {
+                auto pos = s.find(k);
+                if (pos != std::string::npos && pos <= 8) {
+                    if (s.size() > 90) s.resize(90);
+                    return s;
+                }
+            }
+            // Keyword-less scope opener (C: `int main(…) {`).
+            if (!s.empty() && (s.back() == '{' || s.back() == '(')
+                && fallback.empty()) {
+                fallback = s;
+                if (fallback.size() > 90) fallback.resize(90);
             }
         }
+        best_indent = ind;
+        if (ind == 0 && !fallback.empty()) break;    // reached a top-level opener
     }
-    return {};
+    return fallback;
 }
 
 std::vector<std::string> split_lines(std::string_view s) {
