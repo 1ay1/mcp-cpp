@@ -684,13 +684,13 @@ enum class Backend { Ripgrep, BuiltIn };
         int kind = classify(s);
         if (kind == 2) {
             std::string out{s};
-            if (out.size() > 100) { out.resize(99); out += "\xe2\x80\xa6"; }
+            if (out.size() > 100) { out.resize(util::safe_utf8_cut(out, 99)); out += "\xe2\x80\xa6"; }
             return out;
         }
         if (kind == 1) {
             if (fallback.empty()) {
                 fallback.assign(s);
-                if (fallback.size() > 100) { fallback.resize(99); fallback += "\xe2\x80\xa6"; }
+                if (fallback.size() > 100) { fallback.resize(util::safe_utf8_cut(fallback, 99)); fallback += "\xe2\x80\xa6"; }
             }
             best_indent = ind;
             continue;
@@ -1093,22 +1093,32 @@ ExecResult run_builtin(const GrepArgs& a) {
             if (i >= candidates.size()) return;
             const auto& path = candidates[i];
 
-            std::string content = util::read_file(path);
-            if (content.empty()) continue;
-            auto head = std::min<std::size_t>(content.size(), 4096);
-            if (std::memchr(content.data(), '\0', head)) continue;
+            // EXCEPTION WALL. std::regex throws error_complexity/error_stack
+            // AT MATCH TIME on catastrophic backtracking (e.g. `(a+)+b`
+            // against a large file) — and an exception escaping a jthread is
+            // std::terminate: one bad model-supplied pattern would kill the
+            // whole process. A file that blows the matcher is skipped, the
+            // rest of the scan completes.
+            try {
+                std::string content = util::read_file(path);
+                if (content.empty()) continue;
+                auto head = std::min<std::size_t>(content.size(), 4096);
+                if (std::memchr(content.data(), '\0', head)) continue;
 
-            std::vector<std::size_t> offsets;
-            if (literal) {
-                scan_literal(content, a.pattern, !a.case_sensitive,
-                             offsets, total_matches);
-            } else {
-                scan_regex(content, re, offsets, total_matches);
+                std::vector<std::size_t> offsets;
+                if (literal) {
+                    scan_literal(content, a.pattern, !a.case_sensitive,
+                                 offsets, total_matches);
+                } else {
+                    scan_regex(content, re, offsets, total_matches);
+                }
+                if (offsets.empty()) continue;
+                hits[i].path = path;
+                hits[i].content = std::move(content);
+                hits[i].match_offsets = std::move(offsets);
+            } catch (...) {
+                // regex blow-up or I/O race — skip this file, keep scanning.
             }
-            if (offsets.empty()) continue;
-            hits[i].path = path;
-            hits[i].content = std::move(content);
-            hits[i].match_offsets = std::move(offsets);
         }
     };
 

@@ -411,6 +411,10 @@ int apply_one(std::string& buf, const OneEdit& e,
             return 0;
         }
         // Count matches first (also powers the uniqueness + expected gates).
+        // The whole match+replace runs inside a try: std::regex can throw
+        // error_complexity/error_stack AT MATCH TIME on catastrophic
+        // backtracking — that must surface as a tool error, not a crash.
+        try {
         int n = 0;
         for (auto it = std::sregex_iterator(buf.begin(), buf.end(), re),
                   end = std::sregex_iterator(); it != end; ++it) {
@@ -427,6 +431,42 @@ int apply_one(std::string& buf, const OneEdit& e,
             }
         }
         if (n == 0) {
+            // CRLF fallback: on a \r\n file, `$` anchors before the \n but
+            // the \r is in the way, and multi-line literals in the pattern
+            // won't cross \r\n. Match+replace on an LF-normalized copy, then
+            // restore CRLF — same strategy the literal path uses.
+            if (buf.find('\r') != std::string::npos) {
+                std::string lf;
+                lf.reserve(buf.size());
+                for (char c : buf) if (c != '\r') lf.push_back(c);
+                int m = 0;
+                for (auto it = std::sregex_iterator(lf.begin(), lf.end(), re),
+                          end = std::sregex_iterator(); it != end; ++it) {
+                    if (it->length(0) == 0) { m = 0; break; }
+                    if (++m > 10000) break;
+                }
+                bool count_ok =
+                    m > 0
+                    && (e.expected_replacements > 0
+                            ? m == e.expected_replacements
+                            : (e.replace_all || m == 1));
+                if (count_ok) {
+                    std::string out2 = std::regex_replace(
+                        lf, re, e.new_text,
+                        (e.replace_all || m > 1)
+                            ? std::regex_constants::format_default
+                            : std::regex_constants::format_first_only);
+                    // Restore CRLF line endings.
+                    std::string crlf;
+                    crlf.reserve(out2.size() + out2.size() / 16);
+                    for (char c : out2) {
+                        if (c == '\n') crlf.push_back('\r');
+                        crlf.push_back(c);
+                    }
+                    if (crlf != buf) { buf = std::move(crlf); return m; }
+                    return kIdempotentNoOp;
+                }
+            }
             err = "regex matched nothing in " + path_str
                 + ". Test the pattern with `grep` first (same ECMAScript "
                   "syntax), or use a literal old_text.";
@@ -457,6 +497,13 @@ int apply_one(std::string& buf, const OneEdit& e,
         if (out == buf) return kIdempotentNoOp;
         buf = std::move(out);
         return n;
+        } catch (const std::regex_error& ex) {
+            err = std::format(
+                "regex blew the matcher's complexity budget on {} ({}) — "
+                "simplify the pattern (avoid nested quantifiers like (a+)+).",
+                path_str, ex.what());
+            return 0;
+        }
     }
 
     auto replace_exact = [&](std::string_view needle,

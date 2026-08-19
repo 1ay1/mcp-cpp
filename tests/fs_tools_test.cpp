@@ -368,5 +368,26 @@ TEST_CASE("fs_tools") {
         std::puts("edit: regex invalid/empty-match refused ok");
     }
 
+    // ── edit regex on a CRLF file: matches via LF-normalize, CRLF restored ─
+    {
+        (void)util::write_file(root / "win.c",
+            "int a = legacy(1);\r\nint b = keep(2);\r\n");
+        auto args = obj();
+        args["path"] = (root / "win.c").string();
+        mcp::Json ed = mcp::Json::array();
+        // `legacy\(1\);$` needs the $ anchor — on the raw CRLF buffer the \r
+        // blocks it; the LF-normalized fallback must kick in.
+        ed.push_back({{"old_text", "legacy\\((\\d)\\);$"},
+                      {"new_text", "modern($1);"},
+                      {"regex", true}});
+        args["edits"] = ed;
+        auto r = call(*provider, "edit", args);
+        assert(!r.is_error);
+        std::string disk = util::read_file(root / "win.c");
+        assert(disk.find("modern(1);") != std::string::npos);
+        assert(disk.find("keep(2);\r\n") != std::string::npos);  // CRLF intact
+        std::puts("edit: regex CRLF fallback ok");
+    }
+
     fs::remove_all(root);
 }

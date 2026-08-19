@@ -67,6 +67,7 @@
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/glob.hpp>
 #include <mcp/tools/util/error.hpp>
+#include <mcp/tools/util/utf8.hpp>
 #include <mcp/tools/host.hpp>
 
 #include "tool_shell.hpp"
@@ -427,8 +428,14 @@ bool is_close(const Token& t) {
 // Fold [begin,end) tokens into a sibling list of Nodes, recursing on brackets.
 // `i` advances by reference. Stops at a close bracket matching `expect_close`
 // (consuming it) or at end. Comments are dropped (layout-insensitive match).
+// `depth` caps the recursion: a pathological/generated file with tens of
+// thousands of nested brackets would otherwise blow the C++ stack — an
+// UNCATCHABLE crash. Past the cap, openers degrade to plain atoms (the match
+// still works textually inside the flattened region; only nesting precision
+// is lost, and only in a file no human wrote).
+constexpr int kMaxBracketDepth = 1500;
 std::vector<Node> build_nodes(const std::vector<Token>& toks, std::size_t& i,
-                              char expect_close) {
+                              char expect_close, int depth = 0) {
     std::vector<Node> out;
     while (i < toks.size()) {
         const Token& t = toks[i];
@@ -440,12 +447,12 @@ std::vector<Node> build_nodes(const std::vector<Token>& toks, std::size_t& i,
             if (expect_close) return out;
             ++i; continue;   // top-level stray close: skip it
         }
-        if (is_open(t)) {
+        if (is_open(t) && depth < kMaxBracketDepth) {
             Node g; g.kind = NodeKind::Group; g.tok = t; g.open = t.text[0];
             g.line = t.line;
             g.beg  = t.pos;
             ++i;
-            g.kids = build_nodes(toks, i, close_for(t.text[0]));
+            g.kids = build_nodes(toks, i, close_for(t.text[0]), depth + 1);
             // end_line: the close bracket sits at toks[i-1] when consumed;
             // otherwise fall back to the last child's end.
             const bool consumed_close = (i > 0 && is_close(toks[i-1]));
@@ -707,7 +714,7 @@ std::string enclosing_symbol(const std::vector<std::string>& lines, int hit_line
             for (auto* k : kw) {
                 auto pos = s.find(k);
                 if (pos != std::string::npos && pos <= 8) {
-                    if (s.size() > 90) s.resize(90);
+                    if (s.size() > 90) s.resize(util::safe_utf8_cut(s, 90));
                     return s;
                 }
             }
@@ -715,7 +722,7 @@ std::string enclosing_symbol(const std::vector<std::string>& lines, int hit_line
             if (!s.empty() && (s.back() == '{' || s.back() == '(')
                 && fallback.empty()) {
                 fallback = s;
-                if (fallback.size() > 90) fallback.resize(90);
+                if (fallback.size() > 90) fallback.resize(util::safe_utf8_cut(fallback, 90));
             }
         }
         best_indent = ind;
@@ -1021,7 +1028,7 @@ std::string semantic_leads(DocRetriever* sem, const StructArgs& a,
             auto b = ln.find_first_not_of(" \t");
             if (b == std::string::npos) continue;
             ln = ln.substr(b);
-            if (ln.size() > 88) ln.resize(88);
+            if (ln.size() > 88) ln.resize(util::safe_utf8_cut(ln, 88));
             out << "  — " << ln;
             break;
         }
@@ -1147,31 +1154,36 @@ ExecResult run_structural(const StructArgs& a, DocRetriever* sem) {
             if (total_hits.load(std::memory_order_relaxed) >= kMaxMatches) return;
             const fs::path& p = files[idx];
 
-            std::error_code ec;
-            auto sz = fs::file_size(p, ec);
-            if (ec || sz == 0 || sz > kMaxFileBytes) continue;
-            if (util::is_binary_file(p)) continue;
+            // Exception wall: an escape from a jthread is std::terminate.
+            // A file that trips anything (I/O race, allocation, matcher
+            // corner) is skipped; the scan completes.
+            try {
+                std::error_code ec;
+                auto sz = fs::file_size(p, ec);
+                if (ec || sz == 0 || sz > kMaxFileBytes) continue;
+                if (util::is_binary_file(p)) continue;
 
-            std::string bytes = util::read_file(p);
-            if (bytes.empty()) continue;
+                std::string bytes = util::read_file(p);
+                if (bytes.empty()) continue;
 
-            Lang lang = lang_of(p);
-            int key = static_cast<int>(lang);
-            const auto& gates = gates_by_lang[key];
-            if (!passes_prefilter(bytes, gates)) continue;
+                Lang lang = lang_of(p);
+                int key = static_cast<int>(lang);
+                const auto& gates = gates_by_lang[key];
+                if (!passes_prefilter(bytes, gates)) continue;
 
-            auto toks = tokenize(bytes, lang);
-            auto tree = build_tree(toks);
-            auto hits = match_file(pat_by_lang[key], tree);
-            if (hits.empty()) continue;
+                auto toks = tokenize(bytes, lang);
+                auto tree = build_tree(toks);
+                auto hits = match_file(pat_by_lang[key], tree);
+                if (hits.empty()) continue;
 
-            std::error_code rec;
-            auto rel = fs::relative(p, wp->path(), rec);
-            results[idx] = FileMatch{
-                rec ? p.string() : rel.generic_string(),
-                std::move(hits),
-            };
-            total_hits.fetch_add(results[idx].hits.size(), std::memory_order_relaxed);
+                std::error_code rec;
+                auto rel = fs::relative(p, wp->path(), rec);
+                results[idx] = FileMatch{
+                    rec ? p.string() : rel.generic_string(),
+                    std::move(hits),
+                };
+                total_hits.fetch_add(results[idx].hits.size(), std::memory_order_relaxed);
+            } catch (...) { /* skip this file */ }
         }
     };
 
@@ -1261,7 +1273,7 @@ ExecResult run_structural(const StructArgs& a, DocRetriever* sem) {
                 if (ln >= 1 && ln <= static_cast<int>(lines.size())) {
                     const std::string& src = lines[ln - 1];
                     out << (ln == h.line ? "  > " : "    ") << "L" << ln << ": "
-                        << (src.size() > 200 ? src.substr(0, 200) + "…" : src) << "\n";
+                        << (src.size() > 200 ? src.substr(0, util::safe_utf8_cut(src, 200)) + "…" : src) << "\n";
                 }
             }
             last_ctx_end = std::max(last_ctx_end, hi);
@@ -1501,7 +1513,7 @@ ExecResult run_rewrite(const RewriteArgs& a) {
             // clipped — enough to eyeball correctness without a full diff.
             auto clip = [](std::string s) {
                 for (auto& c : s) if (c == '\n') c = ' ';
-                if (s.size() > 120) { s.resize(119); s += "\xe2\x80\xa6"; }
+                if (s.size() > 120) { s.resize(util::safe_utf8_cut(s, 119)); s += "\xe2\x80\xa6"; }
                 return s;
             };
             out << "  L" << h->line << ": - "
