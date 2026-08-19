@@ -23,6 +23,7 @@
 #include <fstream>
 #include <limits>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -87,6 +88,8 @@ struct OneEdit {
     std::string old_text;
     std::string new_text;
     bool        replace_all = false;
+    bool        regex = false;   // old_text is ECMAScript regex; new_text may
+                                 // use $1-$9 / $& backrefs (sed s/…/…/ class)
     int         expected_replacements = 0;
     std::uint32_t line_hint = std::numeric_limits<std::uint32_t>::max();
 };
@@ -131,13 +134,14 @@ std::expected<EditArgs, ToolError> parse_edit_args(const json& j) {
             if (expected == 0) expected = sub.integer("count", 0);
             bool replace_all = sub.boolean("replace_all", false);
             if (expected >= 2) replace_all = true;
+            bool rx = sub.boolean("regex", false);
             std::uint32_t line_hint = std::numeric_limits<std::uint32_t>::max();
             int ln = sub.integer("line", 0);
             if (ln <= 0) ln = sub.integer("line_hint", 0);
             if (ln <= 0) ln = sub.integer("at_line", 0);
             if (ln > 0) line_hint = static_cast<std::uint32_t>(ln - 1);
             edits.push_back(OneEdit{std::move(*old_opt), std::move(new_text),
-                                    replace_all, expected, line_hint});
+                                    replace_all, rx, expected, line_hint});
         }
     } else {
         auto old_opt = ar.require_str("old_string");
@@ -153,13 +157,14 @@ std::expected<EditArgs, ToolError> parse_edit_args(const json& j) {
         if (expected == 0) expected = ar.integer("count", 0);
         bool replace_all = ar.boolean("replace_all", false);
         if (expected >= 2) replace_all = true;
+        bool rx = ar.boolean("regex", false);
         std::uint32_t line_hint = std::numeric_limits<std::uint32_t>::max();
         int ln = ar.integer("line", 0);
         if (ln <= 0) ln = ar.integer("line_hint", 0);
         if (ln <= 0) ln = ar.integer("at_line", 0);
         if (ln > 0) line_hint = static_cast<std::uint32_t>(ln - 1);
         edits.push_back(OneEdit{std::move(*old_opt), std::move(new_s),
-                                replace_all, expected, line_hint});
+                                replace_all, rx, expected, line_hint});
     }
 
     if (edits.empty())
@@ -389,6 +394,71 @@ constexpr int kIdempotentNoOp = -1;
 
 int apply_one(std::string& buf, const OneEdit& e,
               const std::string& path_str, std::string& err) {
+    // ── regex mode: sed s/pattern/replacement/[g] without the bash trip ──
+    // old_text is an ECMAScript regex matched against the WHOLE buffer
+    // (multiline: ^ $ anchor per line), new_text may use $1-$9 / $& backrefs.
+    // replace_all ⇒ every match; otherwise the match must be UNIQUE (same
+    // ambiguity contract as literal edits — a regex that hits twice without
+    // replace_all is an error, not a silent first-hit edit).
+    // expected_replacements still enforces an exact count.
+    if (e.regex) {
+        std::regex re;
+        try {
+            re.assign(e.old_text,
+                      std::regex::ECMAScript | std::regex::multiline);
+        } catch (const std::regex_error& ex) {
+            err = std::format("invalid regex in old_text: {}", ex.what());
+            return 0;
+        }
+        // Count matches first (also powers the uniqueness + expected gates).
+        int n = 0;
+        for (auto it = std::sregex_iterator(buf.begin(), buf.end(), re),
+                  end = std::sregex_iterator(); it != end; ++it) {
+            // Reject a pattern that matches empty (".*" class) — it would
+            // splice between every byte and is never what an edit means.
+            if (it->length(0) == 0) {
+                err = "regex matches the empty string — anchor it (a pattern "
+                      "like `x?` or `.*` alone would edit between every byte)";
+                return 0;
+            }
+            if (++n > 10000) {
+                err = "regex matched >10000 times — narrow the pattern";
+                return 0;
+            }
+        }
+        if (n == 0) {
+            err = "regex matched nothing in " + path_str
+                + ". Test the pattern with `grep` first (same ECMAScript "
+                  "syntax), or use a literal old_text.";
+            return 0;
+        }
+        if (e.expected_replacements > 0 && n != e.expected_replacements) {
+            err = std::format(
+                "regex matched {} time{} but expected_replacements={} — "
+                "refusing. Adjust the pattern or the expected count.",
+                n, n == 1 ? "" : "s", e.expected_replacements);
+            return 0;
+        }
+        if (!e.replace_all && e.expected_replacements == 0 && n > 1) {
+            err = std::format(
+                "regex matched {} times — pass replace_all:true to replace "
+                "every occurrence, or expected_replacements:{} to assert the "
+                "count, or anchor the pattern to a unique site.", n, n);
+            return 0;
+        }
+        std::string out;
+        if (e.replace_all || n > 1 || e.expected_replacements == n) {
+            out = std::regex_replace(buf, re, e.new_text);
+        } else {
+            // Single unique match: format_first_only.
+            out = std::regex_replace(buf, re, e.new_text,
+                                     std::regex_constants::format_first_only);
+        }
+        if (out == buf) return kIdempotentNoOp;
+        buf = std::move(out);
+        return n;
+    }
+
     auto replace_exact = [&](std::string_view needle,
                              std::string_view replacement) -> int {
         std::string out;
@@ -825,6 +895,22 @@ json edit_schema() {
                             {"default", false},
                             {"description","Replace every occurrence "
                                 "instead of exactly one."}}},
+                        {"regex",{{"type","boolean"},
+                            {"default", false},
+                            {"description","Treat old_text as an "
+                                "ECMAScript REGEX (multiline: ^ $ anchor "
+                                "per line) and new_text as its replacement "
+                                "template — $1-$9 insert capture groups, "
+                                "$& the whole match ('sed s/…/…/' without "
+                                "the shell trip, and it participates in the "
+                                "diff-review flow unlike bash). A multi-hit "
+                                "pattern still needs replace_all or "
+                                "expected_replacements — same ambiguity "
+                                "contract as literal edits. Empty-matching "
+                                "patterns are rejected. Example: pattern "
+                                "'log_(\\w+)\\(' → replacement "
+                                "'logger.$1(' renames every log_* call "
+                                "keeping the level."}}},
                         {"expected_replacements",{{"type","integer"},
                             {"description","If set, edit must match "
                                 "exactly this many times or it fails. "

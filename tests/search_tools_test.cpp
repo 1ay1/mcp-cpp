@@ -197,6 +197,48 @@ TEST_CASE("search_tools") {
         std::puts("grep: context=block python indent scope ok");
     }
 
+    // ── grep output:files — survey mode, no line bodies ──────────────
+    {
+        auto args = obj();
+        args["pattern"] = "NEEDLE_marker";
+        args["path"]    = root.string();
+        args["output"]  = "files";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("alpha.cpp") != std::string::npos);
+        assert(r.text.find("match)") != std::string::npos);     // count shown
+        assert(r.text.find("NEEDLE_marker") == std::string::npos); // no bodies
+        std::puts("grep: output=files survey mode ok");
+    }
+
+    // ── grep output:count — per-file counts only ───────────────────
+    {
+        auto args = obj();
+        args["pattern"] = "NEEDLE_marker";
+        args["path"]    = root.string();
+        args["output"]  = "count";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("alpha.cpp") != std::string::npos);
+        assert(r.text.find("NEEDLE_marker") == std::string::npos);
+        std::puts("grep: output=count ok");
+    }
+
+    // ── grep context:"0" — match lines only, no context rows ──────────
+    {
+        auto args = obj();
+        args["pattern"] = "NEEDLE_marker";
+        args["path"]    = root.string();
+        args["glob"]    = "alpha.cpp";
+        args["context"] = "0";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("NEEDLE_marker") != std::string::npos);
+        // alpha.cpp L5 is 2 lines above the needle — must NOT appear at ±0.
+        assert(r.text.find("L4:") == std::string::npos);
+        std::puts("grep: context=0 match-lines-only ok");
+    }
+
     // ── case-fold literal scanner: non-letter lead byte + mixed-case ─────
     // Guards the memchr-driven dual-scan (lowercase + uppercase first byte)
     // and the non-overlapping stride after a hit. "_zZz" leads with '_'

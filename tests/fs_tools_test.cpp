@@ -262,12 +262,110 @@ TEST_CASE("fs_tools") {
         std::puts("list_dir: ok");
     }
 
-    // ── workspace boundary refuses outside paths ─────────────────────────
+    // ── workspace boundary refuses outside paths ─────────────────
     {
         auto args = obj(); args["path"] = "/etc/hostname";
         auto esc = call(*provider, "read", args);
         assert(esc.is_error);
         std::puts("workspace boundary: outside path refused");
+    }
+
+    // ── read with NEGATIVE offset = tail -n semantics ─────────────────
+    {
+        std::string body;
+        for (int i = 1; i <= 100; ++i)
+            body += "line_" + std::to_string(i) + "\n";
+        (void)util::write_file(root / "tail.log", body);
+        auto args = obj();
+        args["path"]   = (root / "tail.log").string();
+        args["offset"] = -5;
+        auto r = call(*provider, "read", args);
+        assert(!r.is_error);
+        assert(r.text.find("line_96") != std::string::npos);   // first of last 5
+        assert(r.text.find("line_100") != std::string::npos);  // last line
+        assert(r.text.find("line_95\n") == std::string::npos); // bounded
+        // Tail bigger than the file clamps to the whole file.
+        args["offset"] = -5000;
+        auto r2 = call(*provider, "read", args);
+        assert(!r2.is_error);
+        assert(r2.text.find("line_1") != std::string::npos);
+        std::puts("read: negative offset tail ok");
+    }
+
+    // ── edit regex mode: capture-group rename across the file ─────────
+    {
+        (void)util::write_file(root / "log.c",
+            "void f() {\n"
+            "    log_info(\"a\");\n"
+            "    log_warn(\"b\");\n"
+            "    log_error(\"c\");\n"
+            "    not_log_stay(1);\n"
+            "}\n");
+        auto args = obj();
+        args["path"] = (root / "log.c").string();
+        mcp::Json ed = mcp::Json::array();
+        ed.push_back({{"old_text", "\\blog_(\\w+)\\("},
+                      {"new_text", "logger.$1("},
+                      {"regex", true},
+                      {"replace_all", true}});
+        args["edits"] = ed;
+        auto r = call(*provider, "edit", args);
+        assert(!r.is_error);
+        std::string disk = util::read_file(root / "log.c");
+        assert(disk.find("logger.info(\"a\")") != std::string::npos);
+        assert(disk.find("logger.warn(\"b\")") != std::string::npos);
+        assert(disk.find("logger.error(\"c\")") != std::string::npos);
+        assert(disk.find("not_log_stay(1)") != std::string::npos); // untouched
+        std::puts("edit: regex capture-group rename ok");
+    }
+
+    // ── edit regex: multi-hit without replace_all is refused ──────────
+    {
+        (void)util::write_file(root / "multi.c", "int a = old(1);\nint b = old(2);\n");
+        auto args = obj();
+        args["path"] = (root / "multi.c").string();
+        mcp::Json ed = mcp::Json::array();
+        ed.push_back({{"old_text", "old\\((\\d)\\)"},
+                      {"new_text", "fresh($1)"},
+                      {"regex", true}});
+        args["edits"] = ed;
+        auto r = call(*provider, "edit", args);
+        assert(r.is_error);   // ambiguous without replace_all
+        // With expected_replacements the exact count is enforced + applied.
+        mcp::Json ed2 = mcp::Json::array();
+        ed2.push_back({{"old_text", "old\\((\\d)\\)"},
+                       {"new_text", "fresh($1)"},
+                       {"regex", true},
+                       {"expected_replacements", 2}});
+        args["edits"] = ed2;
+        auto r2 = call(*provider, "edit", args);
+        assert(!r2.is_error);
+        std::string disk = util::read_file(root / "multi.c");
+        assert(disk.find("fresh(1)") != std::string::npos);
+        assert(disk.find("fresh(2)") != std::string::npos);
+        std::puts("edit: regex ambiguity + expected count ok");
+    }
+
+    // ── edit regex: invalid pattern and empty-match pattern are refused ─
+    {
+        auto args = obj();
+        args["path"] = (root / "multi.c").string();
+        mcp::Json ed = mcp::Json::array();
+        ed.push_back({{"old_text", "(unclosed"},
+                      {"new_text", "x"},
+                      {"regex", true}});
+        args["edits"] = ed;
+        auto r = call(*provider, "edit", args);
+        assert(r.is_error);
+        mcp::Json ed2 = mcp::Json::array();
+        ed2.push_back({{"old_text", "z*"},
+                       {"new_text", "x"},
+                       {"regex", true},
+                       {"replace_all", true}});
+        args["edits"] = ed2;
+        auto r2 = call(*provider, "edit", args);
+        assert(r2.is_error);   // empty-match rejected
+        std::puts("edit: regex invalid/empty-match refused ok");
     }
 
     fs::remove_all(root);

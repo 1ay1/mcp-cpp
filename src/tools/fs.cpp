@@ -333,7 +333,11 @@ std::expected<ReadArgs, ToolError> parse_read_args(const json& j) {
     auto wp = util::make_readable_path_checked(*path_opt, "read");
     if (!wp) return std::unexpected(std::move(wp.error()));
     int offset = ar.integer("offset", 1);
-    if (offset < 1) offset = 1;
+    // NEGATIVE offset = tail semantics: offset:-50 means "the last 50
+    // lines" (like `tail -n 50`) — the shape every log/build-output check
+    // wants, without a bash round-trip or knowing the file's length first.
+    // Resolved against the real line count in run_read.
+    if (offset == 0) offset = 1;
     int limit = ar.integer("limit", 2000);
     if (ar.has("end_line") && !ar.has("limit")) {
         int end_line = ar.integer("end_line", 0);
@@ -405,6 +409,18 @@ ExecResult run_read(const ReadArgs& a) {
     // that range — no `sed`, no line arithmetic. Overrides offset/limit.
     int eff_offset = a.offset;
     int eff_limit  = a.limit;
+    // Tail semantics: offset:-N = the last N lines (limit is ignored — the
+    // request IS the window). Count lines once, then convert to a normal
+    // forward range.
+    if (eff_offset < 0) {
+        int total = 0;
+        for (char c : content) if (c == '\n') ++total;
+        if (!content.empty() && content.back() != '\n') ++total;
+        int want = -eff_offset;
+        if (want > total) want = total;
+        eff_offset = total - want + 1;
+        eff_limit  = want;
+    }
     std::string symbol_header;
     if (!a.symbol.empty()) {
         auto rng = resolve_symbol_range(content, a.symbol);
@@ -930,7 +946,7 @@ json read_schema() {
                 {"description","One-line summary shown in the UI. Optional."}}},
             {"path",       {{"type","string"}, {"description","Absolute or relative path"}}},
             {"symbol",     {{"type","string"}, {"description","Read ONLY this symbol's definition + body (function/class/etc.), resolved to its enclosing block — no line numbers or `sed` needed. e.g. symbol=\"parse_args\"."}}},
-            {"offset",     {{"type","integer"}, {"description","Start line (1-based)"}}},
+            {"offset",     {{"type","integer"}, {"description","Start line (1-based). NEGATIVE = tail: offset:-50 returns the LAST 50 lines (like tail -n 50) — ideal for logs and build output, no need to know the file length."}}},
             {"limit",      {{"type","integer"}, {"description","Max lines"}}},
             {"start_line", {{"type","integer"}, {"description","Alias for offset (Zed-style)"}}},
             {"end_line",   {{"type","integer"}, {"description","Inclusive last line (Zed-style)"}}},

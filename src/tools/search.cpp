@@ -351,7 +351,15 @@ struct GrepArgs {
     bool        case_sensitive;
     bool        word;      // whole-word match (absorbs find_references)
     bool        block;     // return the whole enclosing function/block per hit
+    int         context_lines = kContext;  // ±N lines (context:"N")
     int         offset;    // ≥ 0
+    // Output mode: Content (default) renders matching lines w/ context;
+    // FilesOnly renders one path + match-count per line (rg -l — the survey
+    // shape: "which files touch X" without the line noise); Count renders
+    // ONLY the total + per-file counts (rg -c — the cheapest possible probe
+    // for "how widespread is X", perfect before a rewrite).
+    enum class Mode { Content, FilesOnly, Count };
+    Mode        mode = Mode::Content;
     std::string display_description;
 };
 
@@ -366,19 +374,42 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
             "pattern must not be blank (received only whitespace)"));
     int offset = ar.integer("offset", 0);
     if (offset < 0) offset = 0;
-    // `context: "block"` returns the enclosing scope; anything else is the
-    // default ±2-line window.
-    const bool block = ar.str("context", "") == "block";
-    return GrepArgs{
+    // `context`: "block" returns the enclosing scope; a NUMBER ("0".."10",
+    // or a bare integer) sets the ±N window; anything else is the default ±2.
+    bool block = false;
+    int  ctx_lines = kContext;
+    {
+        std::string ctx = ar.str("context", "");
+        if (ctx.empty() && ar.has("context")) {
+            // Model sent a bare integer (context: 5) — ArgReader.str returns
+            // "" for non-strings; read it as an integer instead.
+            ctx_lines = std::clamp(ar.integer("context", kContext), 0, 10);
+        } else if (ctx == "block") {
+            block = true;
+        } else if (!ctx.empty()
+                   && ctx.find_first_not_of("0123456789") == std::string::npos) {
+            ctx_lines = std::clamp(std::atoi(ctx.c_str()), 0, 10);
+        }
+    }
+    GrepArgs::Mode mode = GrepArgs::Mode::Content;
+    {
+        std::string o = ar.str("output", "");
+        if (o == "files") mode = GrepArgs::Mode::FilesOnly;
+        else if (o == "count") mode = GrepArgs::Mode::Count;
+    }
+    GrepArgs g{
         std::move(pat),
         ar.str("path", "."),
         ar.str("glob", ""),
         ar.boolean("case_sensitive", false),
         ar.boolean("word", false),
         block,
+        ctx_lines,
         offset,
+        mode,
         ar.str("display_description", ""),
     };
+    return g;
 }
 
 [[nodiscard]] bool is_literal_pattern(std::string_view p) noexcept {
@@ -808,7 +839,9 @@ ExecResult run_ripgrep(const GrepArgs& a) {
     if (a.word) argv.push_back("-w");           // whole-word match
     if (is_literal_pattern(a.pattern)) argv.push_back("-F");
     argv.push_back("-C");
-    argv.push_back(std::to_string(kContext));
+    // Summary modes never render lines — context bytes are pure waste.
+    argv.push_back(std::to_string(
+        a.mode == GrepArgs::Mode::Content ? a.context_lines : 0));
     // Prune the build / vendor / _deps trees the built-in walker also skips.
     // Without these, ripgrep still stat + gitignore-checks every generated
     // file (tens of thousands in a repo with out-of-source build dirs) on a
@@ -877,6 +910,32 @@ ExecResult run_ripgrep(const GrepArgs& a) {
 
     if (total_matches == 0)
         return ToolOutput{"No matches found.", std::nullopt};
+
+    // Summary modes: no line bodies at all — the cheapest useful answer.
+    if (a.mode != GrepArgs::Mode::Content) {
+        std::ostringstream out;
+        out << "Found " << total_matches << " match"
+            << (total_matches == 1 ? "" : "es")
+            << (total_matches >= kMaxScanned ? "+" : "")
+            << " across " << files.size()
+            << " file" << (files.size() == 1 ? "" : "s") << ".\n\n";
+        if (a.mode == GrepArgs::Mode::FilesOnly) {
+            std::size_t listed = 0;
+            for (const auto& f : files) {
+                out << f.path << "  (" << f.matches
+                    << (f.matches == 1 ? " match)" : " matches)") << "\n";
+                if (++listed >= 200) {
+                    out << "[" << (files.size() - listed)
+                        << " more files — narrow with `glob` or `path`]\n";
+                    break;
+                }
+            }
+        } else {   // Count — per-file counts, densest form
+            for (const auto& f : files)
+                out << f.matches << "\t" << f.path << "\n";
+        }
+        return ToolOutput{out.str(), std::nullopt};
+    }
 
     std::ostringstream out;
     out << "Found " << total_matches << " match"
@@ -1074,6 +1133,34 @@ ExecResult run_builtin(const GrepArgs& a) {
     std::size_t files_with_hits = 0;
     for (const auto& h : hits) if (!h.path.empty()) ++files_with_hits;
 
+    // Summary modes: path + count only, no line bodies.
+    if (a.mode != GrepArgs::Mode::Content) {
+        std::ostringstream out;
+        out << "Found " << total << " match" << (total == 1 ? "" : "es")
+            << (total >= kMaxScanned ? "+" : "")
+            << " across " << files_with_hits
+            << " file" << (files_with_hits == 1 ? "" : "s") << ".\n\n";
+        std::size_t listed = 0;
+        for (const auto& h : hits) {
+            if (h.path.empty()) continue;
+            std::error_code rec;
+            auto rel = fs::relative(h.path, a.root, rec);
+            std::string rp = (rec || rel.empty() ? h.path : rel).generic_string();
+            auto n = h.match_offsets.size();
+            if (a.mode == GrepArgs::Mode::FilesOnly) {
+                out << rp << "  (" << n << (n == 1 ? " match)" : " matches)") << "\n";
+                if (++listed >= 200) {
+                    out << "[" << (files_with_hits - listed)
+                        << " more files — narrow with `glob` or `path`]\n";
+                    break;
+                }
+            } else {
+                out << n << "\t" << rp << "\n";
+            }
+        }
+        return ToolOutput{out.str(), std::nullopt};
+    }
+
     std::ostringstream out;
     out << "Found " << total << " match" << (total == 1 ? "" : "es")
         << (total >= kMaxScanned ? "+" : "")
@@ -1118,8 +1205,8 @@ ExecResult run_builtin(const GrepArgs& a) {
                     : brace_block_range(file_lines, li.line_no);
                 start = lo - 1; end = hi - 1;
             } else {
-                start = std::max(0, row - kContext);
-                end   = row + kContext;
+                start = std::max(0, row - a.context_lines);
+                end   = row + a.context_lines;
             }
             if (!page_ranges.empty()
                 && start <= page_ranges.back().second + 1) {
@@ -1245,7 +1332,8 @@ json grep_schema() {
             {"glob",           {{"type","string"}, {"description","Filter files by glob. A bare pattern like `*.cpp` matches the filename anywhere; a slash pattern like `src/*.ts` or `**/test/*.py` matches the workspace-relative path."}}},
             {"case_sensitive", {{"type","boolean"}, {"description","Case-sensitive match (default: false)"}}},
             {"word",           {{"type","boolean"}, {"description","Whole-word match: `foo` won't match `foobar` or `do_foo`. Use for finding all USES of an identifier."}}},
-            {"context",        {{"type","string"}, {"enum", {"line","block"}}, {"description","`line` (default) = ±2 lines around each hit. `block` = the WHOLE enclosing function/block, so you rarely need a follow-up `read`."}}},
+            {"context",        {{"type","string"}, {"description","`line` (default) = ±2 lines around each hit. `block` = the WHOLE enclosing function/block, so you rarely need a follow-up `read`. A number `0`-`10` = ±N lines (use `0` for match lines only — densest content view)."}}},
+            {"output",         {{"type","string"}, {"enum", {"content","files","count"}}, {"description","`content` (default) = matching lines with context. `files` = one path + match-count per line, no line bodies (the survey view: WHICH files touch X). `count` = per-file match counts only (the cheapest probe: HOW WIDESPREAD is X — run this before a bulk rewrite)."}}},
             {"offset",         {{"type","integer"}, {"description","Skip this many matches (for pagination)"}}},
         }},
     };
