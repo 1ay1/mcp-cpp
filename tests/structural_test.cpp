@@ -67,10 +67,11 @@ TEST_CASE("search_structural") {
     HostServices svc;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
-    // ── 1. malloc($SIZE) matches every call — $SIZE captures a whole
-    //       EXPRESSION (one token, or `64 * sz`) — and NEVER the comment or
-    //       string literal that also contain "malloc(". This is the whole
-    //       point of structural over grep. ──────────────────────────────
+    // ── 1. malloc($SIZE) matches the single-NODE-arg calls (L2, L3), and
+    //       neither the comment nor the string that also contain "malloc(".
+    //       Per spacegrep/ast-grep semantics a single $X binds exactly ONE
+    //       node (one atom or one balanced group), so the multi-node arg on
+    //       L8 (64 * sz) is NOT a $SIZE match — use $$$ for that. ────────────
     {
         auto args = sobj();
         args["pattern"] = "malloc($SIZE)";
@@ -79,12 +80,12 @@ TEST_CASE("search_structural") {
         assert(!r.is_error);
         assert(r.text.find("> L2") != std::string::npos);   // malloc(n)
         assert(r.text.find("> L3") != std::string::npos);   // malloc(count)
-        assert(r.text.find("> L8") != std::string::npos);   // malloc(64 * sz)
+        assert(r.text.find("> L8") == std::string::npos);   // 64 * sz is 3 nodes
         // The comment (L4) and the string (L5) must never be MATCHED.
         assert(r.text.find("> L4") == std::string::npos);
         assert(r.text.find("> L5") == std::string::npos);
         assert(read_effects(r).has(Effect::ReadFs));
-        std::puts("structural: malloc($SIZE) skips comments+strings ok");
+        std::puts("structural: malloc($SIZE) binds one node, skips comments/strings ok");
     }
 
     // ── 1b. malloc($$$) matches ALL calls including the multi-token arg ────
@@ -161,6 +162,52 @@ TEST_CASE("search_structural") {
         // one-line body is returned; the match marker is still on L2.
         assert(r.text.find("> L2") != std::string::npos);
         std::puts("structural: expand returns enclosing block ok");
+    }
+
+    // ── 6b. Nested-document model: a metavar binds a whole GROUP, and the
+    //     matcher recurses into nested calls so an inner call still matches.
+    {
+        swrite(root / "nest.c",
+            "int p() { return outer(inner(x, y), z); }\n"   // L1: nested calls
+            "int q() { log(\"inner(a, b)\"); return 0; }\n"); // L2: call only in a string
+        // inner($$$) must find the nested inner(x,y) on L1 (recursion into the
+        // outer(...) group) and NOT the one inside the L2 string literal.
+        auto args = sobj();
+        args["pattern"] = "inner($$$)";
+        args["path"]    = root.string();
+        args["glob"]    = "nest.c";
+        auto r = scall(*provider, "search_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("> L1") != std::string::npos);   // nested call matched
+        assert(r.text.find("> L2") == std::string::npos);   // string literal ignored
+        std::puts("structural: nested-group recursion matches inner call ok");
+    }
+
+    // ── 6c. One-node vs multi-node metavar distinction (ast-grep semantics).
+    //     A single $C binds ONE node; a multi-node condition needs $$$C.
+    {
+        swrite(root / "cond.c",
+            "int a() { if (ready) return 1; return 0; }\n"     // L1: 1-node cond
+            "int b() { if (!ready) return 1; return 0; }\n");  // L2: 2-node cond
+        {
+            auto args = sobj();
+            args["pattern"] = "if ($C) return 1;";
+            args["path"] = root.string(); args["glob"] = "cond.c";
+            auto r = scall(*provider, "search_structural", args);
+            assert(!r.is_error);
+            assert(r.text.find("> L1") != std::string::npos);   // (ready) = 1 node
+            assert(r.text.find("> L2") == std::string::npos);   // (!ready) = 2 nodes
+        }
+        {
+            auto args = sobj();
+            args["pattern"] = "if ($$$C) return 1;";
+            args["path"] = root.string(); args["glob"] = "cond.c";
+            auto r = scall(*provider, "search_structural", args);
+            assert(!r.is_error);
+            assert(r.text.find("> L1") != std::string::npos);   // both match now
+            assert(r.text.find("> L2") != std::string::npos);
+        }
+        std::puts("structural: $C (one node) vs $$$C (many) distinction ok");
     }
 
     // ── 7. No structural match → clean not-found (not an error) ───────────

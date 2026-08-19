@@ -253,12 +253,6 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
 // ── Pattern compilation ─────────────────────────────────────────────────
 enum class MetaKind { None, One, Many };   // $X / $$$X
 
-struct PatTok {
-    Token    tok;
-    MetaKind meta = MetaKind::None;
-    std::string bind;    // metavariable name ("" = anonymous)
-};
-
 // Classify a pattern Ident token as a metavariable. Forms:
 //   $NAME      → One,  bind=NAME
 //   $$$NAME    → Many, bind=NAME
@@ -275,181 +269,252 @@ std::optional<std::pair<MetaKind, std::string>> meta_of(std::string_view t) {
     return std::make_pair(MetaKind::One, name == "_" ? std::string{} : name);
 }
 
-std::vector<PatTok> compile_pattern(std::string_view pattern, Lang lang) {
-    auto toks = tokenize(pattern, lang);
-    std::vector<PatTok> out;
-    out.reserve(toks.size());
-    for (auto& t : toks) {
-        if (t.kind == Tok::Comment) continue;   // comments in a pattern are ignored
-        PatTok p; p.tok = t;
-        if (t.kind == Tok::Ident) {
-            if (auto m = meta_of(t.text)) { p.meta = m->first; p.bind = m->second; }
-        }
-        out.push_back(std::move(p));
-    }
-    return out;
-}
-
-// Literal (non-meta) identifier/number/string tokens the pattern requires —
-// used as the O(bytes) substring pre-filter.
-std::vector<std::string> literal_gates(const std::vector<PatTok>& pat) {
-    std::vector<std::string> gates;
-    for (auto& p : pat) {
-        if (p.meta != MetaKind::None) continue;
-        if (p.tok.kind == Tok::Ident || p.tok.kind == Tok::Number) {
-            if (p.tok.text.size() >= 2) gates.push_back(p.tok.text);
-        }
-    }
-    return gates;
-}
-
 bool passes_prefilter(std::string_view bytes, const std::vector<std::string>& gates) {
     for (const auto& g : gates)
         if (bytes.find(g) == std::string_view::npos) return false;
     return true;
 }
 
-// ── Matcher ─────────────────────────────────────────────────────────────
-// Bracket depth delta for a punct token (for balanced metavariable spans).
-int bracket_delta(const Token& t) {
-    if (t.kind != Tok::Punct || t.text.size() != 1) return 0;
-    switch (t.text[0]) {
-        case '(': case '[': case '{': return +1;
-        case ')': case ']': case '}': return -1;
-        default: return 0;
-    }
+// ── Matcher: a spacegrep-style NESTED-DOCUMENT model ────────────────────
+// Rather than match a flat token list (which forces manual bracket-counting
+// and lets one stray brace corrupt the whole file), we fold tokens into a
+// tree of Nodes, exactly like Semgrep's generic/spacegrep engine:
+//   • Atom  — a single token (ident / number / string / punct).
+//   • Group — a bracket-delimited run: opener char + children + (maybe) close.
+// Brackets introduce "secondary nesting"; a mismatched close simply ends the
+// current group, so a broken brace only perturbs one local group, never the
+// rest of the document. Matching then recurses over sibling SEQUENCES, so:
+//   $X    binds exactly ONE node (an atom OR a whole balanced group) — the
+//         ast-grep "one node" intuition falls out for free, no counting.
+//   $$$X  matches a run of zero-or-more SIBLINGS within the current group.
+//   a literal group matches a same-bracket group and recurses into children.
+// Back-references ($X twice ⇒ same source text) hold across the tree.
+
+enum class NodeKind : std::uint8_t { Atom, Group };
+
+struct Node {
+    NodeKind          kind;
+    Token             tok;         // Atom: the token. Group: the '(' '[' '{' opener token.
+    char              open = 0;    // Group: opener char
+    std::vector<Node> kids;        // Group: children
+    int               line = 0;    // start line (for hit reporting)
+};
+
+constexpr char close_for(char o) {
+    return o == '(' ? ')' : o == '[' ? ']' : o == '{' ? '}' : 0;
+}
+bool is_open(const Token& t) {
+    return t.kind == Tok::Punct && t.text.size() == 1 &&
+           (t.text[0] == '(' || t.text[0] == '[' || t.text[0] == '{');
+}
+bool is_close(const Token& t) {
+    return t.kind == Tok::Punct && t.text.size() == 1 &&
+           (t.text[0] == ')' || t.text[0] == ']' || t.text[0] == '}');
 }
 
-bool tok_equal(const Token& a, const Token& b) {
+// Fold [begin,end) tokens into a sibling list of Nodes, recursing on brackets.
+// `i` advances by reference. Stops at a close bracket matching `expect_close`
+// (consuming it) or at end. Comments are dropped (layout-insensitive match).
+std::vector<Node> build_nodes(const std::vector<Token>& toks, std::size_t& i,
+                              char expect_close) {
+    std::vector<Node> out;
+    while (i < toks.size()) {
+        const Token& t = toks[i];
+        if (t.kind == Tok::Comment) { ++i; continue; }
+        if (is_close(t)) {
+            if (expect_close && t.text[0] == expect_close) { ++i; return out; }
+            // A close with no matching opener in scope: stop this group WITHOUT
+            // consuming it, so the stray bracket doesn't corrupt the parent.
+            if (expect_close) return out;
+            ++i; continue;   // top-level stray close: skip it
+        }
+        if (is_open(t)) {
+            Node g; g.kind = NodeKind::Group; g.tok = t; g.open = t.text[0];
+            g.line = t.line;
+            ++i;
+            g.kids = build_nodes(toks, i, close_for(t.text[0]));
+            out.push_back(std::move(g));
+            continue;
+        }
+        Node a; a.kind = NodeKind::Atom; a.tok = t; a.line = t.line;
+        out.push_back(std::move(a));
+        ++i;
+    }
+    return out;
+}
+
+std::vector<Node> build_tree(const std::vector<Token>& toks) {
+    std::size_t i = 0;
+    return build_nodes(toks, i, /*expect_close=*/0);
+}
+
+// Pattern node: same tree, but Atoms may be metavariables.
+struct PNode {
+    NodeKind           kind;
+    Token              tok;
+    char               open = 0;
+    MetaKind           meta = MetaKind::None;
+    std::string        bind;
+    std::vector<PNode> kids;
+};
+
+std::vector<PNode> build_pattern_nodes(const std::vector<Token>& toks,
+                                       std::size_t& i, char expect_close) {
+    std::vector<PNode> out;
+    while (i < toks.size()) {
+        const Token& t = toks[i];
+        if (t.kind == Tok::Comment) { ++i; continue; }
+        if (is_close(t)) {
+            if (expect_close && t.text[0] == expect_close) { ++i; return out; }
+            if (expect_close) return out;
+            ++i; continue;
+        }
+        if (is_open(t)) {
+            PNode g; g.kind = NodeKind::Group; g.tok = t; g.open = t.text[0];
+            ++i;
+            g.kids = build_pattern_nodes(toks, i, close_for(t.text[0]));
+            out.push_back(std::move(g));
+            continue;
+        }
+        PNode a; a.kind = NodeKind::Atom; a.tok = t;
+        if (t.kind == Tok::Ident)
+            if (auto m = meta_of(t.text)) { a.meta = m->first; a.bind = m->second; }
+        out.push_back(std::move(a));
+        ++i;
+    }
+    return out;
+}
+
+std::vector<PNode> compile_pattern_tree(std::string_view pattern, Lang lang) {
+    auto toks = tokenize(pattern, lang);
+    std::size_t i = 0;
+    return build_pattern_nodes(toks, i, 0);
+}
+
+// Serialize a matched node subtree back to source text (for back-ref compare).
+void node_text(const Node& n, std::string& out) {
+    if (n.kind == NodeKind::Atom) { out += n.tok.text; return; }
+    out += n.open;
+    for (auto& k : n.kids) node_text(k, out);
+    if (char c = close_for(n.open)) out += c;
+}
+std::string nodes_text(const std::vector<Node>& ns, std::size_t a, std::size_t b) {
+    std::string s;
+    for (std::size_t k = a; k < b; ++k) node_text(ns[k], s);
+    return s;
+}
+
+using Binds = std::unordered_map<std::string, std::string>;
+
+bool atoms_equal(const Token& a, const Token& b) {
     return a.kind == b.kind && a.text == b.text;
 }
 
-// Try to match pattern[pi..] against file tokens[fi..]. `binds` carries
-// metavariable captures for back-reference consistency. Returns the file
-// index just past the match on success (via out_end), or false.
-bool match_at(const std::vector<PatTok>& pat, std::size_t pi,
-              const std::vector<Token>& toks, std::size_t fi,
-              std::unordered_map<std::string, std::string>& binds,
-              std::size_t& out_end) {
-    while (pi < pat.size()) {
-        const PatTok& p = pat[pi];
+// Match pattern sibling-sequence pat[pi..] against doc siblings doc[di..].
+// On success returns true and sets di_end to the doc index just past the match.
+bool match_seq(const std::vector<PNode>& pat, std::size_t pi,
+               const std::vector<Node>& doc, std::size_t di,
+               Binds& binds, std::size_t& di_end);
 
-        // Skip comment tokens on the file side — layout-insensitive.
-        while (fi < toks.size() && toks[fi].kind == Tok::Comment) ++fi;
+// Does pattern node `p` match a single doc node `d` (one-to-one)?
+bool match_node(const PNode& p, const Node& d, Binds& binds) {
+    if (p.kind == NodeKind::Group) {
+        if (d.kind != NodeKind::Group || d.open != p.open) return false;
+        std::size_t end = 0;
+        Binds trial = binds;
+        if (!match_seq(p.kids, 0, d.kids, 0, trial, end)) return false;
+        if (end != d.kids.size()) return false;   // group children fully consumed
+        binds = std::move(trial);
+        return true;
+    }
+    // p is an Atom (literal, since metavars are handled in match_seq).
+    if (d.kind != NodeKind::Atom) return false;
+    return atoms_equal(p.tok, d.tok);
+}
+
+bool match_seq(const std::vector<PNode>& pat, std::size_t pi,
+               const std::vector<Node>& doc, std::size_t di,
+               Binds& binds, std::size_t& di_end) {
+    while (pi < pat.size()) {
+        const PNode& p = pat[pi];
 
         if (p.meta == MetaKind::One) {
-            if (fi >= toks.size()) return false;
-            // Capture ONE EXPRESSION: a maximal balanced run of tokens that
-            // stops before a top-level expression delimiter ( ) , ; { } ) so
-            // `$C` matches `x`, `!ifs`, `a && b`, `foo(1,2)`, `p->q[i]` — the
-            // ast-grep "one node" intuition — not just a single token. Greedy
-            // with backtracking: try the longest balanced span first, shrink
-            // until the REST of the pattern matches.
-            if (bracket_delta(toks[fi]) < 0) return false;  // lone close-bracket
-            std::vector<std::size_t> ends;   // candidate end offsets, longest-first built below
-            {
-                std::size_t k = fi; int depth = 0;
-                // Always allow the minimal 1-unit capture as a fallback.
-                while (k < toks.size()) {
-                    int d = bracket_delta(toks[k]);
-                    if (depth == 0) {
-                        // At top level, a bare delimiter ends the expression.
-                        const std::string& tx = toks[k].text;
-                        if (d < 0) break;                       // enclosing close
-                        if (toks[k].kind == Tok::Punct &&
-                            (tx == "," || tx == ";")) break;    // arg / stmt sep
-                    }
-                    depth += d; ++k;
-                    if (depth == 0) ends.push_back(k);          // balanced boundary
-                    if (depth < 0) break;
-                }
-                if (ends.empty()) ends.push_back(fi + 1);       // single token
+            if (di >= doc.size()) return false;
+            std::string cap; node_text(doc[di], cap);
+            if (!p.bind.empty()) {
+                auto it = binds.find(p.bind);
+                if (it != binds.end() && it->second != cap) return false;
+                binds[p.bind] = cap;
             }
-            // Longest-first.
-            for (auto eit = ends.rbegin(); eit != ends.rend(); ++eit) {
-                std::size_t end = *eit;
-                if (end <= fi) continue;
-                std::string captured;
-                for (std::size_t k = fi; k < end; ++k) captured += toks[k].text;
-                auto saved = binds;
-                bool ok = true;
-                if (!p.bind.empty()) {
-                    auto it = binds.find(p.bind);
-                    if (it != binds.end() && it->second != captured) ok = false;
-                    else binds[p.bind] = captured;
-                }
-                std::size_t sub_end = 0;
-                if (ok && match_at(pat, pi + 1, toks, end, binds, sub_end)) {
-                    out_end = sub_end;
-                    return true;
-                }
-                binds = saved;
-            }
-            return false;
+            ++pi; ++di;
+            continue;
         }
 
         if (p.meta == MetaKind::Many) {
-            // Greedy-with-backtrack: consume a balanced run of 0+ tokens, then
-            // require the REST of the pattern to match. Backtrack by shrinking.
-            // Determine the balanced maximal span from fi (stop when depth<0 or
-            // we'd cross the enclosing close bracket).
-            std::size_t k = fi; int depth = 0;
-            std::vector<std::size_t> stops;   // candidate end points (0-token first)
-            stops.push_back(fi);
-            while (k < toks.size()) {
-                int d = bracket_delta(toks[k]);
-                if (depth == 0 && d < 0) break;   // reached enclosing close
-                depth += d; ++k;
-                if (depth == 0) stops.push_back(k);   // balanced boundary
-            }
-            if (depth == 0) stops.push_back(k);
-            // Try longest-first for typical "rest of args" intent, but any works.
-            for (auto sit = stops.rbegin(); sit != stops.rend(); ++sit) {
-                std::size_t end = *sit;
-                auto saved = binds;
-                std::string captured;
-                for (std::size_t j = fi; j < end; ++j) captured += toks[j].text;
+            // Match a run of 0+ siblings, greedy with backtracking, so the rest
+            // of the pattern still lines up. Bounded by the current group's
+            // sibling count — never crosses a bracket boundary (that's why the
+            // nested model is O(n), not the flat model's cross-file scan).
+            for (std::size_t take = doc.size() - di + 1; take-- > 0;) {
+                std::size_t end = di + take;
+                Binds trial = binds;
                 bool ok = true;
                 if (!p.bind.empty()) {
-                    auto it = binds.find(p.bind);
-                    if (it != binds.end() && it->second != captured) ok = false;
-                    else binds[p.bind] = captured;
+                    std::string cap = nodes_text(doc, di, end);
+                    auto it = trial.find(p.bind);
+                    if (it != trial.end() && it->second != cap) ok = false;
+                    else trial[p.bind] = cap;
                 }
                 std::size_t sub_end = 0;
-                if (ok && match_at(pat, pi + 1, toks, end, binds, sub_end)) {
-                    out_end = sub_end;
+                if (ok && match_seq(pat, pi + 1, doc, end, trial, sub_end)) {
+                    binds = std::move(trial);
+                    di_end = sub_end;
                     return true;
                 }
-                binds = saved;
             }
             return false;
         }
 
-        // Literal token: exact match.
-        if (fi >= toks.size()) return false;
-        if (!tok_equal(p.tok, toks[fi])) return false;
-        ++pi; ++fi;
+        // Literal atom or group.
+        if (di >= doc.size()) return false;
+        if (!match_node(p, doc[di], binds)) return false;
+        ++pi; ++di;
     }
-    out_end = fi;
+    di_end = di;
     return true;
 }
 
 struct Hit { int line = 0; };
 
-std::vector<Hit> match_file(const std::vector<PatTok>& pat,
-                            const std::vector<Token>& toks) {
-    std::vector<Hit> hits;
-    if (pat.empty() || toks.empty()) return hits;
-    for (std::size_t i = 0; i < toks.size(); ++i) {
-        if (toks[i].kind == Tok::Comment) continue;
-        std::unordered_map<std::string, std::string> binds;
+// Try the pattern sequence starting at each sibling position, recursively into
+// groups, collecting hit start-lines. The pattern must match a CONTIGUOUS run
+// of siblings beginning at that position.
+void match_in_scope(const std::vector<PNode>& pat,
+                    const std::vector<Node>& doc,
+                    std::vector<Hit>& hits) {
+    for (std::size_t i = 0; i < doc.size(); ++i) {
+        Binds binds;
         std::size_t end = 0;
-        if (match_at(pat, 0, toks, i, binds, end)) {
-            hits.push_back({toks[i].line});
-            // Advance past this match to avoid overlapping duplicates.
-            if (end > i + 1) i = end - 1;
+        if (match_seq(pat, 0, doc, i, binds, end) && end > i) {
+            hits.push_back({doc[i].line});
         }
+        // Recurse into this node's group children so nested calls match too.
+        if (doc[i].kind == NodeKind::Group)
+            match_in_scope(pat, doc[i].kids, hits);
     }
+}
+
+std::vector<Hit> match_file(const std::vector<PNode>& pat,
+                            const std::vector<Node>& tree) {
+    std::vector<Hit> hits;
+    if (pat.empty() || tree.empty()) return hits;
+    match_in_scope(pat, tree, hits);
+    // De-dup by line (a nested recursion can re-report the same start line).
+    std::sort(hits.begin(), hits.end(),
+              [](const Hit& a, const Hit& b) { return a.line < b.line; });
+    hits.erase(std::unique(hits.begin(), hits.end(),
+              [](const Hit& a, const Hit& b) { return a.line == b.line; }),
+              hits.end());
     return hits;
 }
 
@@ -566,30 +631,47 @@ struct FileMatch {
     std::vector<Hit> hits;
 };
 
+// Literal (non-meta) identifier/number tokens the pattern requires, walked
+// recursively over the PNode tree — the O(bytes) substring pre-filter.
+void collect_gates(const std::vector<PNode>& pat, std::vector<std::string>& out) {
+    for (auto& p : pat) {
+        if (p.kind == NodeKind::Group) { collect_gates(p.kids, out); continue; }
+        if (p.meta != MetaKind::None) continue;
+        if ((p.tok.kind == Tok::Ident || p.tok.kind == Tok::Number)
+            && p.tok.text.size() >= 2)
+            out.push_back(p.tok.text);
+    }
+}
+std::vector<std::string> literal_gates(const std::vector<PNode>& pat) {
+    std::vector<std::string> g; collect_gates(pat, g); return g;
+}
+
+// A pattern needs at least one literal anchor (ident/number/string/punct/
+// bracket) — a pattern of only metavariables would match everything.
+bool has_literal_anchor(const std::vector<PNode>& pat) {
+    for (auto& p : pat) {
+        if (p.kind == NodeKind::Group) return true;     // a bracket is an anchor
+        if (p.meta == MetaKind::None) return true;      // any literal token
+    }
+    return false;
+}
+
 ExecResult run_structural(const StructArgs& a) {
     auto wp = util::make_workspace_path_checked(a.root, "search_structural");
     if (!wp) return std::unexpected(std::move(wp.error()));
 
     // A pattern's Lang is inferred from its own syntax weakly; we recompile it
     // per-file-family below, but need a default to validate it's non-trivial.
-    auto probe_pat = compile_pattern(a.pattern, Lang::CFamily);
+    auto probe_pat = compile_pattern_tree(a.pattern, Lang::CFamily);
     if (probe_pat.empty())
         return std::unexpected(ToolError::invalid_args(
             "pattern tokenized to nothing — provide a code shape like "
             "'foo($$$ARGS)' or 'if ($C) { $$$ }'"));
-    // Reject a pattern that is ALL metavariables (matches everything).
-    bool has_literal = false;
-    for (auto& pt : probe_pat)
-        if (pt.meta == MetaKind::None && pt.tok.kind != Tok::Punct) has_literal = true;
-    // A pattern of only punctuation+metavars (e.g. "$A == $B") is allowed IFF
-    // it has at least one literal punct anchor; pure "$A" is not.
-    bool has_punct = false;
-    for (auto& pt : probe_pat)
-        if (pt.meta == MetaKind::None && pt.tok.kind == Tok::Punct) has_punct = true;
-    if (!has_literal && !has_punct)
+    // Reject a pattern that is ALL metavariables (would match everything).
+    if (!has_literal_anchor(probe_pat))
         return std::unexpected(ToolError::invalid_args(
             "pattern is too broad (only metavariables) — anchor it with at "
-            "least one literal token or operator"));
+            "least one literal token, operator, or bracket"));
 
     // ── Collect candidate files (built-in walk; ripgrep shortlist optional) ──
     std::vector<fs::path> files;
@@ -620,13 +702,13 @@ ExecResult run_structural(const StructArgs& a) {
         return ToolOutput{"no source files under the search root.", std::nullopt};
 
     // Pre-compile a pattern per language family (comment/string rules differ).
-    std::unordered_map<int, std::vector<PatTok>> pat_by_lang;
+    std::unordered_map<int, std::vector<PNode>> pat_by_lang;
     std::unordered_map<int, std::vector<std::string>> gates_by_lang;
-    auto pat_for = [&](Lang l) -> const std::vector<PatTok>& {
+    auto pat_for = [&](Lang l) -> const std::vector<PNode>& {
         int key = static_cast<int>(l);
         auto it = pat_by_lang.find(key);
         if (it == pat_by_lang.end()) {
-            auto compiled = compile_pattern(a.pattern, l);
+            auto compiled = compile_pattern_tree(a.pattern, l);
             gates_by_lang[key] = literal_gates(compiled);
             it = pat_by_lang.emplace(key, std::move(compiled)).first;
         }
@@ -662,7 +744,8 @@ ExecResult run_structural(const StructArgs& a) {
             if (!passes_prefilter(bytes, gates)) continue;
 
             auto toks = tokenize(bytes, lang);
-            auto hits = match_file(pat_by_lang[key], toks);
+            auto tree = build_tree(toks);
+            auto hits = match_file(pat_by_lang[key], tree);
             if (hits.empty()) continue;
 
             std::error_code rec;
@@ -755,14 +838,20 @@ json structural_schema() {
             {"pattern", {
                 {"type", "string"},
                 {"description",
-                 "A code SHAPE to match, tokenized language-aware (never matches "
-                 "inside comments or string literals). Metavariables: $NAME "
-                 "matches one identifier/expression/balanced group and binds it "
-                 "(reuse $NAME to require the same text); $$$NAME matches zero or "
-                 "more tokens (e.g. an argument list); $_ / $$$ are anonymous. "
-                 "Examples: 'malloc($SIZE)' finds every malloc call; "
-                 "'if ($C) { $$$ }' finds if-blocks; '$X == $X' finds "
-                 "self-comparisons; 'catch ($$$) {}' finds empty catch blocks."}
+                 "A code SHAPE to match on a nested-document model (like "
+                 "Semgrep generic / ast-grep), tokenized language-aware so it "
+                 "NEVER matches inside comments or string literals. "
+                 "Metavariables: $NAME matches exactly ONE node — one "
+                 "identifier/literal OR one balanced (…)/[…]/{…} group — and "
+                 "binds it (reuse $NAME to require the same text); $$$NAME "
+                 "matches a run of ZERO OR MORE nodes (e.g. an argument list or "
+                 "a multi-token condition). $_ / $$$ are anonymous. So "
+                 "`malloc($N)` matches malloc(n) but NOT malloc(a*b) (2 nodes) "
+                 "— use `malloc($$$)` for that. Examples: 'foo($$$)' finds every "
+                 "foo call; 'if ($$$C) return $X;' finds guarded returns; "
+                 "'$X == $X' finds self-comparisons; 'catch ($$$) {}' finds "
+                 "empty catch blocks. Nested calls match too (the matcher "
+                 "recurses into groups)."}
             }},
             {"path", {{"type", "string"},
                       {"description", "Directory to search (default: workspace root)."}}},
