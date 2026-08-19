@@ -96,8 +96,13 @@ std::size_t worker_count() {
 
 // Language families we tokenize. The extension decides comment/string rules;
 // an unknown extension falls back to the C-family scanner (block + // + "…"),
-// which is a safe superset for most curly-brace languages.
-enum class Lang { CFamily, Python, Shell, Ruby, Lua, Unknown };
+// which is a safe superset for most curly-brace languages. The split matters:
+// in C/Go/Rust `'…'` is a bounded CHAR literal (and in Rust an unpaired `'`
+// is a lifetime), while in JS/Python/Shell/Ruby it's a full string; Go
+// backticks are raw (no escapes) while JS template literals escape; Rust has
+// r#"…"# raw strings and NESTED block comments. Conflating these corrupts
+// bracket balance for whole files.
+enum class Lang { CFamily, JsLike, Go, Rust, Python, Shell, Ruby, Lua, Unknown };
 
 Lang lang_of(const fs::path& p) {
     auto ext = p.extension().string();
@@ -106,11 +111,16 @@ Lang lang_of(const fs::path& p) {
     if (ext == ".sh" || ext == ".bash" || ext == ".zsh") return Lang::Shell;
     if (ext == ".rb") return Lang::Ruby;
     if (ext == ".lua") return Lang::Lua;
+    if (ext == ".rs") return Lang::Rust;
+    if (ext == ".go") return Lang::Go;
+    static const char* kJs[] = {
+        ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".dart", ".php",
+    };
+    for (auto* e : kJs) if (ext == e) return Lang::JsLike;
     static const char* kC[] = {
         ".cpp", ".hpp", ".c", ".h", ".cc", ".hh", ".cxx", ".hxx", ".ino",
-        ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
-        ".go", ".rs", ".java", ".kt", ".kts", ".swift", ".zig", ".cs",
-        ".scala", ".dart", ".php", ".m", ".mm", ".proto",
+        ".java", ".kt", ".kts", ".swift", ".zig", ".cs",
+        ".scala", ".m", ".mm", ".proto",
     };
     for (auto* e : kC) if (ext == e) return Lang::CFamily;
     return Lang::Unknown;
@@ -145,9 +155,16 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
     const std::size_t n = s.size();
     std::size_t i = 0;
 
-    const bool c_family   = (lang == Lang::CFamily || lang == Lang::Unknown);
+    const bool slash_cmt  = (lang == Lang::CFamily || lang == Lang::JsLike ||
+                              lang == Lang::Go || lang == Lang::Rust ||
+                              lang == Lang::Unknown);
     const bool hash_line  = (lang == Lang::Python || lang == Lang::Shell || lang == Lang::Ruby);
     const bool lua_cmt    = (lang == Lang::Lua);
+    const bool nested_cmt = (lang == Lang::Rust);            // /* /* */ */ nests
+    const bool cpp_raw    = (lang == Lang::CFamily || lang == Lang::Unknown);
+    const bool rust_lit   = (lang == Lang::Rust);            // r#"…"#, lifetimes
+    const bool raw_btick  = (lang == Lang::Go);              // `…` raw: \ is a byte
+    const bool raw_squote = (lang == Lang::Shell);           // '…' raw: \ is a byte
 
     auto count_newlines = [&](std::size_t from, std::size_t to) {
         for (std::size_t k = from; k < to; ++k) if (s[k] == '\n') ++line;
@@ -159,7 +176,7 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
         if (c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v') { ++i; continue; }
 
         // Line comments.
-        if (c_family && c == '/' && i + 1 < n && s[i+1] == '/') {
+        if (slash_cmt && c == '/' && i + 1 < n && s[i+1] == '/') {
             std::size_t b = i; while (i < n && s[i] != '\n') ++i;
             out.push_back({Tok::Comment, std::string{s.substr(b, i - b)}, line});
             continue;
@@ -183,19 +200,27 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
             out.push_back({Tok::Comment, std::string{s.substr(b, i - b)}, line});
             continue;
         }
-        // Block comments (C-family).
-        if (c_family && c == '/' && i + 1 < n && s[i+1] == '*') {
+        // Block comments (C-family; Rust block comments NEST).
+        if (slash_cmt && c == '/' && i + 1 < n && s[i+1] == '*') {
             std::size_t b = i; int start_line = line; i += 2;
             std::size_t body = i;
-            while (i + 1 < n && !(s[i] == '*' && s[i+1] == '/')) ++i;
+            int depth = 1;
+            while (i + 1 < n && depth > 0) {
+                if (s[i] == '*' && s[i+1] == '/') { --depth; i += 2; continue; }
+                if (nested_cmt && s[i] == '/' && s[i+1] == '*') { ++depth; i += 2; continue; }
+                ++i;
+            }
+            if (depth > 0) i = n;
             count_newlines(body, i);
-            if (i + 1 < n) i += 2; else i = n;
             out.push_back({Tok::Comment, std::string{s.substr(b, i - b)}, start_line});
             continue;
         }
 
         // Strings — triple-quoted first (Python), then single/double, then char.
-        auto scan_quoted = [&](char q) {
+        // `escapes=false` for RAW quoting styles (Go backticks, shell single
+        // quotes) where a backslash is an ordinary byte — treating it as an
+        // escape there would swallow the real closing quote.
+        auto scan_quoted = [&](char q, bool escapes) {
             int start_line = line;
             std::size_t b = i;
             // Triple quote?
@@ -210,7 +235,7 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
             } else {
                 ++i;
                 while (i < n && s[i] != q) {
-                    if (s[i] == '\\' && i + 1 < n) ++i;
+                    if (escapes && s[i] == '\\' && i + 1 < n) ++i;
                     if (s[i] == '\n') ++line;   // permit multiline (JS backtick, etc.)
                     ++i;
                 }
@@ -219,10 +244,24 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
             out.push_back({q == '\'' ? Tok::Char : Tok::String,
                            std::string{s.substr(b, i - b)}, start_line});
         };
-        if (c == '"' || c == '`') { scan_quoted(c); continue; }
+        if (c == '"') { scan_quoted(c, /*escapes=*/true); continue; }
+        if (c == '`')  { scan_quoted(c, /*escapes=*/!raw_btick); continue; }
         if (c == '\'') {
-            // In C-family, '\'' is a char literal; in Python/others treat as string.
-            scan_quoted('\'');
+            // Rust: `'a` / `'static` are LIFETIMES — an unpaired quote followed
+            // by an identifier. Treating one as a string-open would swallow
+            // arbitrary code (including brackets) until the next apostrophe.
+            // rustc's own rule: it's a char literal iff the next char is a
+            // backslash escape or the char after next is the closing quote;
+            // otherwise ident-start means lifetime.
+            if (rust_lit && i + 1 < n && is_ident_start((unsigned char)s[i+1])
+                && s[i+1] != '\\' && !(i + 2 < n && s[i+2] == '\'')) {
+                std::size_t b = i; ++i;                    // the quote
+                while (i < n && is_ident_cont((unsigned char)s[i])) ++i;
+                out.push_back({Tok::Ident, std::string{s.substr(b, i - b)}, line});
+                continue;
+            }
+            // In C/Go/Rust '…' is a char literal; in JS/Python/Ruby a string.
+            scan_quoted('\'', /*escapes=*/!raw_squote);
             continue;
         }
 
@@ -231,7 +270,7 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
         // a naive ".." scan mis-parses it. Detect an R directly before a " ,
         // optionally after an encoding prefix (u8/u/U/L). Must come BEFORE the
         // identifier scan since the prefix looks like an identifier.
-        if (c_family && (c == 'R' || c == 'u' || c == 'U' || c == 'L')) {
+        if (cpp_raw && (c == 'R' || c == 'u' || c == 'U' || c == 'L')) {
             // find the 'R"' anchor within a short prefix.
             std::size_t j = i;
             // allow u8R / uR / UR / LR / R
@@ -259,6 +298,36 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
                     continue;
                 }
                 // Not actually a raw string (no '(') — fall through to ident.
+            }
+        }
+
+        // Rust raw strings: r"…", r#"…"#, r##"…"##, and byte forms b"…",
+        // br#"…"#. The body is fully literal; the terminator is `"` followed
+        // by the same number of `#` as the opener. Must precede the ident scan
+        // (the r/b prefix lexes as an identifier otherwise).
+        if (rust_lit && (c == 'r' || c == 'b')) {
+            std::size_t j = i;
+            if (s[j] == 'b' && j + 1 < n && s[j+1] == 'r') j += 2;   // br
+            else if (s[j] == 'r' || s[j] == 'b') j += 1;             // r or b
+            std::size_t hashes = 0;
+            while (j + hashes < n && s[j + hashes] == '#' && hashes < 64) ++hashes;
+            bool is_raw = (s[i] != 'b' || (i + 1 < n && s[i+1] == 'r'));  // b"…" isn't raw but scan_quoted handles it
+            if (j + hashes < n && s[j + hashes] == '"' && (is_raw || hashes == 0)) {
+                // b"…" (no r): normal escaped string — let scan_quoted do it by
+                // skipping just the prefix byte.
+                if (s[i] == 'b' && (i + 1 >= n || s[i+1] != 'r')) {
+                    ++i; scan_quoted('"', /*escapes=*/true); continue;
+                }
+                int start_line = line;
+                std::size_t b = i;
+                std::size_t k = j + hashes + 1;         // past opening quote
+                const std::string term = "\"" + std::string(hashes, '#');
+                std::size_t found = std::string_view{s}.find(term, k);
+                std::size_t end = (found == std::string_view::npos) ? n : found + term.size();
+                count_newlines(k, end);
+                out.push_back({Tok::String, std::string{s.substr(b, end - b)}, start_line});
+                i = end;
+                continue;
             }
         }
 
@@ -617,7 +686,16 @@ std::pair<int,int> enclosing_block(const std::vector<std::string>& lines,
                 if (c == q) in_str = false;
                 continue;
             }
-            if (c == '"' || c == '\'' || c == '`') { in_str = true; q = c; continue; }
+            // Apostrophe: only a quote if it CLOSES on this line — an
+            // unpaired ' (Rust lifetime, contraction) must stay an ordinary
+            // byte or every brace after it on the line goes uncounted.
+            if (c == '\'') {
+                std::size_t k = i + 1;
+                while (k < s.size() && s[k] != '\'') { if (s[k] == '\\') ++k; ++k; }
+                if (k < s.size()) i = k;
+                continue;
+            }
+            if (c == '"' || c == '`') { in_str = true; q = c; continue; }
             if (c == '/' && i + 1 < s.size() && s[i+1] == '/') break;
             if (c == '#') break;
             if (c == '{') ++d;
@@ -788,7 +866,11 @@ ExecResult run_structural(const StructArgs& a) {
         return it->second;
     };
     // Warm the cache for all families up front (thread-safe reads afterwards).
-    for (Lang l : {Lang::CFamily, Lang::Python, Lang::Shell, Lang::Ruby, Lang::Lua})
+    // MUST list every Lang value: a worker touching a missing key would
+    // default-construct an empty pattern (silently zero matches) and mutate
+    // the map concurrently.
+    for (Lang l : {Lang::CFamily, Lang::JsLike, Lang::Go, Lang::Rust,
+                   Lang::Python, Lang::Shell, Lang::Ruby, Lang::Lua})
         (void)pat_for(l);
 
     // ── Parallel scan ────────────────────────────────────────────────────

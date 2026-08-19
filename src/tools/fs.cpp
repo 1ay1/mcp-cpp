@@ -272,7 +272,17 @@ resolve_symbol_range(std::string_view content, std::string_view symbol) {
                     }
                 }
             }
-            if (c == '"' || c == '\'' || c == '`') { in_str = true; q = c; continue; }
+            // Apostrophe: only a quote if it CLOSES on this line (char
+            // literal or short string). An unpaired ' is a Rust lifetime
+            // ('a) or an identifier apostrophe — treating it as an open
+            // would hide every brace after it on the line.
+            if (c == '\'') {
+                std::size_t k = i + 1;
+                while (k < s.size() && s[k] != '\'') { if (s[k] == '\\') ++k; ++k; }
+                if (k < s.size()) i = k;   // skip the closed literal wholesale
+                continue;                  // else: ordinary byte
+            }
+            if (c == '"' || c == '`') { in_str = true; q = c; continue; }
             if (c == '/' && i + 1 < s.size() && s[i+1] == '/') break;
             if (c == '#') break;
             if (c == '{') ++d; else if (c == '}') --d;

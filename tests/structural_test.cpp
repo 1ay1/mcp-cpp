@@ -251,7 +251,7 @@ TEST_CASE("search_structural") {
         std::puts("structural: $C (one node) vs $$$C (many) distinction ok");
     }
 
-    // ── 7. No structural match → clean not-found (not an error) ───────────
+    // ── 7. No structural match → clean not-found (not an error) ───────
     {
         auto args = sobj();
         args["pattern"] = "free($PTR)";   // no free() calls in the tree
@@ -260,6 +260,83 @@ TEST_CASE("search_structural") {
         assert(!r.is_error);
         assert(r.text.find("no structural match") != std::string::npos);
         std::puts("structural: no-match reported cleanly ok");
+    }
+
+    // ── 8. Rust semantics: lifetimes are NOT string-opens; r#"…"# raw strings
+    //      and nested block comments don't corrupt bracket balance ───────
+    {
+        swrite(root / "lib.rs",
+            "fn get<'a>(m: &'a Map) -> &'a str {\n"        // L1 lifetimes galore
+            "    let re = Regex::new(r#\"fn \\w+\\(\"#);\n" // L2 raw str w/ unbalanced (
+            "    /* outer /* nested */ still comment: target(1) */\n" // L3 nested cmt
+            "    target(seed)\n"                            // L4 <-- the real hit
+            "}\n");
+        auto args = sobj();
+        args["pattern"] = "target($X)";
+        args["path"]    = root.string();
+        args["glob"]    = "*.rs";
+        auto r = scall(*provider, "search_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("> L4") != std::string::npos);   // real call matched
+        assert(r.text.find("> L3") == std::string::npos);   // nested comment skipped
+        std::puts("structural: rust lifetimes + r#raw + nested comments ok");
+    }
+
+    // ── 8b. Rust: '\'' char literals still lex as chars, and a lifetime
+    //      before a brace doesn't swallow the block — expand still finds it ─
+    {
+        swrite(root / "ch.rs",
+            "fn f() -> char {\n"                            // L1
+            "    let c: char = '{';\n"                       // L2 brace-in-char
+            "    victim(c)\n"                                // L3 <-- hit
+            "}\n");                                         // L4
+        auto args = sobj();
+        args["pattern"] = "victim($X)";
+        args["path"]    = root.string();
+        args["glob"]    = "*.rs";
+        args["expand"]  = true;
+        auto r = scall(*provider, "search_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("> L3") != std::string::npos);
+        assert(r.text.find("fn f") != std::string::npos);   // expand got whole fn
+        std::puts("structural: rust char-literal brace + expand ok");
+    }
+
+    // ── 9. Go: backtick strings are RAW — a trailing backslash inside one
+    //      must not swallow the closing backtick (and braces inside are text) ─
+    {
+        swrite(root / "main.go",
+            "func f() string {\n"                             // L1
+            "    p := `C:\\dir\\` // raw: ends at 2nd backtick\n" // L2 trap
+            "    q := `has a } brace`\n"                       // L3 trap
+            "    return mark(p, q)\n"                          // L4 <-- hit
+            "}\n");
+        auto args = sobj();
+        args["pattern"] = "mark($$$)";
+        args["path"]    = root.string();
+        args["glob"]    = "*.go";
+        auto r = scall(*provider, "search_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("> L4") != std::string::npos);
+        std::puts("structural: go raw backtick strings ok");
+    }
+
+    // ── 10. JS: template literal with ${…} interpolation and an escaped
+    //      backtick — the string is one token; code around it still matches ─
+    {
+        swrite(root / "tpl.js",
+            "function t(x) {\n"                                     // L1
+            "    const s = `a ${x + 1} b \\` c { unbalanced`;\n"     // L2 trap
+            "    return probe(s);\n"                                 // L3 <-- hit
+            "}\n");
+        auto args = sobj();
+        args["pattern"] = "probe($X)";
+        args["path"]    = root.string();
+        args["glob"]    = "*.js";
+        auto r = scall(*provider, "search_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("> L3") != std::string::npos);
+        std::puts("structural: js template literal w/ escape + brace ok");
     }
 
     fs::current_path(prev_cwd);
