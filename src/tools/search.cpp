@@ -87,6 +87,7 @@ ExecResult run_glob(const GlobArgs& a) {
         bool is_dir;
         bool is_link;
         uintmax_t size;
+        std::int64_t mtime = 0;   // ns since epoch — recency ranking
     };
     std::vector<Entry> entries;
     entries.reserve(512);
@@ -122,11 +123,22 @@ ExecResult run_glob(const GlobArgs& a) {
         if (hit) {
             bool is_link = it->is_symlink(ec);
             uintmax_t sz = 0;
+            std::int64_t mt = 0;
             if (!is_dir_entry && !is_link) {
                 std::error_code sec;
                 sz = it->file_size(sec);
+                if (auto t = it->last_write_time(sec); !sec)
+                    mt = t.time_since_epoch().count();
             }
-            entries.push_back({it->path().string(), is_dir_entry, is_link, sz});
+            // Workspace-relative path: denser output, and the model feeds
+            // these straight back into read/edit which resolve relative
+            // paths against the project root anyway.
+            std::error_code rec2;
+            auto rel = fs::relative(it->path(), wp->path(), rec2);
+            entries.push_back({
+                (rec2 || rel.empty()) ? it->path().string()
+                                      : rel.generic_string(),
+                is_dir_entry, is_link, sz, mt});
             if (entries.size() > 500) break;
         }
     }
@@ -136,8 +148,14 @@ ExecResult run_glob(const GlobArgs& a) {
                           "on parent directories to see what exists.",
                           std::nullopt};
 
+    // Recency-first (Claude Code's Glob contract: sorted by modification
+    // time) — when a pattern hits 40 files, the recently-touched one is
+    // almost always the one the task is about. Directories keep a stable
+    // alphabetical block at the end (they carry no useful mtime signal).
     std::sort(entries.begin(), entries.end(), [](const Entry& x, const Entry& y) {
-        if (x.is_dir != y.is_dir) return x.is_dir > y.is_dir;
+        if (x.is_dir != y.is_dir) return x.is_dir < y.is_dir;   // files first
+        if (x.is_dir) return x.path < y.path;                    // dirs: alpha
+        if (x.mtime != y.mtime) return x.mtime > y.mtime;        // newest first
         return x.path < y.path;
     });
 
