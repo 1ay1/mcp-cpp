@@ -164,6 +164,28 @@ TEST_CASE("search_structural") {
         std::puts("structural: expand returns enclosing block ok");
     }
 
+    // ── 6a2. expand uses the TREE for the enclosing scope, so a `}` inside a
+    //      string literal can't mis-balance it — the whole function returns.
+    {
+        swrite(root / "hardexp.c",
+            "int f() {\n"                                 // L1
+            "    log(\"has a } brace in string\");\n"      // L2 fake close-brace
+            "    int x = compute(1);\n"                    // L3 <-- hit
+            "    return x;\n"                              // L4 must be included
+            "}\n");                                       // L5
+        auto args = sobj();
+        args["pattern"] = "compute($$$)";
+        args["path"]    = root.string();
+        args["glob"]    = "hardexp.c";
+        args["expand"]  = true;
+        auto r = scall(*provider, "search_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("> L3") != std::string::npos);        // the match
+        assert(r.text.find("int f() {") != std::string::npos);   // scope start
+        assert(r.text.find("return x;") != std::string::npos);   // full body, past the fake brace
+        std::puts("structural: tree-based expand ignores brace-in-string ok");
+    }
+
     // ── 6b. Nested-document model: a metavar binds a whole GROUP, and the
     //     matcher recurses into nested calls so an inner call still matches.
     {

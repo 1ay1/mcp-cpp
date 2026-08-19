@@ -52,6 +52,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <functional>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -298,6 +299,7 @@ struct Node {
     char              open = 0;    // Group: opener char
     std::vector<Node> kids;        // Group: children
     int               line = 0;    // start line (for hit reporting)
+    int               end_line = 0;// last line the node spans (== line for atoms)
 };
 
 constexpr char close_for(char o) {
@@ -333,10 +335,16 @@ std::vector<Node> build_nodes(const std::vector<Token>& toks, std::size_t& i,
             g.line = t.line;
             ++i;
             g.kids = build_nodes(toks, i, close_for(t.text[0]));
+            // end_line: the close bracket sits at toks[i-1] when consumed;
+            // otherwise fall back to the last child's end.
+            g.end_line = (i > 0 && is_close(toks[i-1])) ? toks[i-1].line
+                       : (!g.kids.empty() ? g.kids.back().end_line : g.line);
+            if (g.end_line < g.line) g.end_line = g.line;
             out.push_back(std::move(g));
             continue;
         }
         Node a; a.kind = NodeKind::Atom; a.tok = t; a.line = t.line;
+        a.end_line = t.line;
         out.push_back(std::move(a));
         ++i;
     }
@@ -601,6 +609,35 @@ std::pair<int,int> enclosing_block(const std::vector<std::string>& lines,
     return {lo, hi};
 }
 
+// SOTA enclosing scope: instead of re-scanning lines for braces (which the
+// flat approach did, and which one stray brace can derail), query the real
+// node TREE. Find the smallest brace `{…}` Group that spans the hit line over
+// multiple lines — that's the enclosing block/function, computed from actual
+// structure. Then extend UP to the declaration line that opens it (the lines
+// between the previous top-level boundary and the brace: the signature). Falls
+// back to the line-based enclosing_block when the tree has no covering brace
+// group (e.g. Python indent scope). Returns [lo,hi] 1-based inclusive.
+std::optional<std::pair<int,int>>
+scope_from_tree(const std::vector<Node>& nodes, int hit_line) {
+    const Node* best = nullptr;   // smallest covering multi-line '{' group
+    std::function<void(const std::vector<Node>&)> walk =
+        [&](const std::vector<Node>& ns) {
+            for (const auto& n : ns) {
+                if (n.kind != NodeKind::Group) continue;
+                if (n.line <= hit_line && hit_line <= n.end_line) {
+                    if (n.open == '{' && n.end_line > n.line) {
+                        if (!best || (n.end_line - n.line) < (best->end_line - best->line))
+                            best = &n;
+                    }
+                    walk(n.kids);   // descend for a tighter inner block
+                }
+            }
+        };
+    walk(nodes);
+    if (!best) return std::nullopt;
+    return std::make_pair(best->line, best->end_line);
+}
+
 // ── Tool args ───────────────────────────────────────────────────────────
 struct StructArgs {
     std::string pattern;
@@ -791,6 +828,12 @@ ExecResult run_structural(const StructArgs& a) {
         if (bytes.empty()) bytes = util::read_file(fs::path{fm.rel});
         auto lines = split_lines(bytes);
 
+        // For expand mode, rebuild the node tree once per matched file so each
+        // hit's enclosing block comes from REAL structure (precise group
+        // boundaries), not line-based brace re-scanning.
+        std::vector<Node> file_tree;
+        if (a.expand) file_tree = build_tree(tokenize(bytes, lang_of(fm.rel)));
+
         out << "\n" << fm.rel << ":\n";
         int last_ctx_end = -1;
         for (auto& h : fm.hits) {
@@ -805,8 +848,16 @@ ExecResult run_structural(const StructArgs& a) {
             // and never swallowed by a neighbour's already-printed context.
             int lo, hi;
             if (a.expand) {
-                auto blk = enclosing_block(lines, h.line, /*max_span=*/80);
-                lo = blk.first; hi = blk.second;
+                // Prefer the tree (exact group span); fall back to the line
+                // scan for indent-scoped langs with no covering brace group.
+                if (auto sc = scope_from_tree(file_tree, h.line)) {
+                    lo = sc->first; hi = sc->second;
+                } else {
+                    auto blk = enclosing_block(lines, h.line, /*max_span=*/80);
+                    lo = blk.first; hi = blk.second;
+                }
+                // Cap the span so a giant function can't blow the budget.
+                if (hi - lo > 120) hi = lo + 120;
             } else {
                 lo = std::max(1, h.line - kContext);
                 hi = std::min<int>(static_cast<int>(lines.size()), h.line + kContext);
