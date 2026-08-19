@@ -67,6 +67,7 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
         detail::register_process_tools(shells);
     }
     if (cfg.search)      detail::register_search_tools(shells);
+    if (cfg.search)      detail::register_structural_tools(shells);
     if (cfg.search)      detail::register_repo_map_tool(shells);
     if (cfg.diagnostics) {
         detail::register_diagnostics_tool(shells);
