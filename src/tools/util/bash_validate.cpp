@@ -152,4 +152,46 @@ std::string validate_bash_command(std::string_view cmd) {
     return {};
 }
 
+std::string bash_tool_suggestion(std::string_view cmd) {
+    // Stay SILENT when the shell is doing something a native tool can't: any
+    // pipe, redirect, command chaining, or substitution means bash is the
+    // right call. We only nudge on a single bare file-inspection command.
+    for (char c : cmd)
+        if (c == '|' || c == '>' || c == '<' || c == '`' || c == ';'
+            || c == '&' || c == '\n')
+            return {};
+    if (cmd.find("$(") != std::string_view::npos) return {};
+
+    const auto tok = first_token(cmd);
+    // read/read symbol= replaces cat/sed/head/tail; grep tool replaces grep;
+    // glob replaces find -name; list_dir replaces ls. Each nudge names the
+    // concrete win so the model actually switches next time.
+    if (tok == "cat")
+        return "tip: the `read` tool reads files with less output noise and "
+               "caches re-reads — prefer it over `cat` for file inspection.";
+    if (tok == "head" || tok == "tail")
+        return "tip: `read` takes offset/limit (and start_line/end_line) for a "
+               "line window — prefer it over `" + std::string{tok} + "` so you "
+               "don't re-shell for the next chunk.";
+    if (tok == "sed")
+        return "tip: to read a line range use `read` with offset+limit; to read "
+               "one function/type's body use `read` with symbol=\"name\" — no "
+               "line arithmetic. Prefer those over `sed` for inspection.";
+    if (tok == "grep" || tok == "rg" || tok == "egrep" || tok == "fgrep")
+        return "tip: the `grep` tool is ripgrep-backed, skips build/vendor "
+               "trees, groups hits by enclosing symbol, and supports "
+               "word=true / context:\"block\" — prefer it over shelling out.";
+    if (tok == "find")
+        return "tip: the `glob` tool finds files by pattern (e.g. '**/*.ts') "
+               "without crawling generated trees — prefer it over `find` for "
+               "name-based lookups.";
+    if (tok == "ls")
+        return "tip: the `list_dir` tool gives a structured listing (type, "
+               "size) — prefer it over `ls` for browsing the tree.";
+    if (tok == "wc")
+        return "tip: `read` reports total line count in its footer; for a match "
+               "count the `grep` tool's summary is cleaner than `wc -l`.";
+    return {};
+}
+
 } // namespace mcp::tools::util

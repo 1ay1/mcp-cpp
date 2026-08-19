@@ -90,5 +90,34 @@ TEST_CASE("bash_validate") {
     expect_allowed("grep -rn foo src/");
     expect_allowed("curl https://example.com -o out.txt");   // no |sh
     expect_allowed("git push origin main");                  // no --force
+
+    // ── out-of-the-box native-tool nudges (advisory, never blocks) ──────
+    using mcp::tools::util::bash_tool_suggestion;
+    auto nudges = [](std::string_view c) { return !bash_tool_suggestion(c).empty(); };
+    // Bare file-inspection shell-outs get a tip toward the native tool.
+    CHECK(nudges("cat src/main.cpp"));
+    CHECK(nudges("sed -n '10,40p' file"));
+    CHECK(nudges("head -50 log.txt"));
+    CHECK(nudges("tail -20 log.txt"));
+    CHECK(nudges("grep -rn foo src"));
+    CHECK(nudges("find . -name '*.ts'"));
+    CHECK(nudges("ls -la"));
+    CHECK(nudges("wc -l file"));
+    // The tip names the right replacement.
+    CHECK(bash_tool_suggestion("sed -n '1,5p' f").find("symbol=") != std::string::npos);
+    CHECK(bash_tool_suggestion("cat f").find("read") != std::string::npos);
+    CHECK(bash_tool_suggestion("find . -name x").find("glob") != std::string::npos);
+    // SILENT when the shell is doing real work: pipes, redirects, chaining,
+    // substitution — bash is the right call there, no nudge.
+    CHECK(!nudges("cat f | grep x"));
+    CHECK(!nudges("grep x f > out.txt"));
+    CHECK(!nudges("ls && echo done"));
+    CHECK(!nudges("cat $(ls)"));
+    CHECK(!nudges("wc -l < f"));
+    // Non-inspection commands never nudge.
+    CHECK(!nudges("python build.py"));
+    CHECK(!nudges("git status"));
+    CHECK(!nudges("make -j8"));
+
     CHECK(g_failures == 0);
 }

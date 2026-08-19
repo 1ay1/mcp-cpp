@@ -256,6 +256,13 @@ ExecResult run_bash(const BashArgs& a) {
             << "]";
 
     std::string body = out.str();
+    // Out-of-the-box nudge: if this was a bare file-inspection shell-out
+    // (cat/sed/head/grep/find/ls/wc) that a smart native tool does better,
+    // prepend a one-line tip. NEVER blocks — the command already ran; this
+    // just teaches the model to reach for `read`/`grep`/`glob`/`list_dir`
+    // next time. Silent for pipes/redirects, where bash is the right call.
+    if (auto tip = util::bash_tool_suggestion(a.command); !tip.empty())
+        body = tip + "\n\n" + body;
     if (!a.display_description.empty())
         body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
