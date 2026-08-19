@@ -114,6 +114,43 @@ TEST_CASE("search_tools") {
         std::puts("grep: case_sensitive=true ok");
     }
 
+    // ── grep word=true matches whole words only (absorbs find_references) ─
+    {
+        // "total" appears inside "compute_total" (L2) — a whole-word search
+        // must NOT match it as a substring.
+        write_file(root / "words.cpp",
+            "int total = 0;\n"           // L1 whole word
+            "int compute_total(int);\n"); // L2 substring only
+        auto args = obj();
+        args["pattern"] = "total";
+        args["word"]    = true;
+        args["path"]    = root.string();
+        args["glob"]    = "words.cpp";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("L1") != std::string::npos);   // `total`
+        assert(r.text.find("L2") == std::string::npos);   // `compute_total` excluded
+        std::puts("grep: word=true whole-word match ok");
+    }
+
+    // ── grep context:block returns the whole enclosing function ─────────
+    {
+        // alpha.cpp: compute_total spans L2..L7; a hit inside it with
+        // context:block should return the whole function, not just ±2 lines.
+        auto args = obj();
+        args["pattern"] = "NEEDLE_marker";   // on L6 of alpha.cpp
+        args["path"]    = root.string();
+        args["glob"]    = "alpha.cpp";
+        args["context"] = "block";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        // The whole function body is present: the opening signature (L2) and
+        // the closing brace region well outside a ±2 window around L6.
+        assert(r.text.find("compute_total") != std::string::npos);
+        assert(r.text.find("L2") != std::string::npos);   // function opener
+        std::puts("grep: context=block returns enclosing function ok");
+    }
+
     // ── case-fold literal scanner: non-letter lead byte + mixed-case ─────
     // Guards the memchr-driven dual-scan (lowercase + uppercase first byte)
     // and the non-overlapping stride after a hit. "_zZz" leads with '_'

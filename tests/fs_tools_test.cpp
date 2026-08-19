@@ -94,6 +94,49 @@ TEST_CASE("fs_tools") {
         std::puts("read: past-EOF offset gives a clear message");
     }
 
+    // ── read symbol= returns just the named function's body (sed-killer) ──
+    {
+        auto code = (root / "lib.cpp").string();
+        auto wargs = obj();
+        wargs["file_path"] = code;
+        wargs["content"] =
+            "#include <cstdio>\n"                       // L1
+            "int helper(int a) {\n"                     // L2
+            "    return a + 1;\n"                        // L3
+            "}\n"                                       // L4
+            "int compute(int x, int y) {\n"             // L5  <-- target
+            "    int t = helper(x);\n"                   // L6
+            "    return t * y;\n"                        // L7
+            "}\n"                                       // L8
+            "int main() { return compute(2, 3); }\n";   // L9
+        call(*provider, "write", wargs);
+
+        auto args = obj();
+        args["path"]   = code;
+        args["symbol"] = "compute";
+        auto rd = call(*provider, "read", args);
+        assert(!rd.is_error);
+        // Header names the location.
+        assert(rd.text.find("`compute` defined at") != std::string::npos);
+        // Body of compute is present…
+        assert(rd.text.find("int compute(int x, int y)") != std::string::npos);
+        assert(rd.text.find("return t * y;") != std::string::npos);
+        // …and the UNRELATED helper() body is NOT (we scoped to one symbol).
+        assert(rd.text.find("return a + 1;") == std::string::npos);
+        std::puts("read: symbol= returns just that function's body");
+    }
+
+    // ── read symbol= for a missing symbol errors clearly ───────────────
+    {
+        auto args = obj();
+        args["path"]   = (root / "lib.cpp").string();
+        args["symbol"] = "no_such_symbol";
+        auto rd = call(*provider, "read", args);
+        assert(rd.is_error);
+        assert(rd.text.find("no definition of") != std::string::npos);
+        std::puts("read: symbol= missing symbol errors cleanly");
+    }
+
     // ── edit applies a fuzzy splice and carries a FileChange ─────────────
     {
         auto e = obj();

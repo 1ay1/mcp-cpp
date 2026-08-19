@@ -134,10 +134,94 @@ constexpr std::size_t kAutoOutlineSize = 32 * 1024;
     return out;
 }
 
+// Resolve `symbol` to a [start,end] 1-based line range within `content`: find
+// the line that DEFINES it (via the outline def-pattern, whole-word) and return
+// its enclosing brace scope. Powers `read(path, symbol=)` — so the model can
+// pull exactly one function's body without line arithmetic or `sed`. Returns
+// nullopt when the symbol has no definition line here. Brace scan skips // and
+// # line comments and quoted strings.
+[[nodiscard]] std::optional<std::pair<int,int>>
+resolve_symbol_range(std::string_view content, std::string_view symbol) {
+    // Split into lines once.
+    std::vector<std::string_view> lines;
+    {
+        std::size_t start = 0;
+        for (std::size_t i = 0; i <= content.size(); ++i) {
+            if (i == content.size() || content[i] == '\n') {
+                auto ln = content.substr(start, i - start);
+                if (!ln.empty() && ln.back() == '\r') ln.remove_suffix(1);
+                lines.push_back(ln);
+                start = i + 1;
+            }
+        }
+    }
+    // Find the definition line: an outline-pattern line that mentions `symbol`
+    // as a whole word. Prefer the first such line.
+    const auto& re = outline_pattern();
+    int def_line = -1;
+    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
+        const auto& ln = lines[i];
+        if (ln.empty()) continue;
+        // whole-word containment check
+        auto pos = ln.find(symbol);
+        bool whole = false;
+        while (pos != std::string_view::npos) {
+            bool lok = pos == 0 || !(std::isalnum((unsigned char)ln[pos-1]) || ln[pos-1] == '_');
+            std::size_t after = pos + symbol.size();
+            bool rok = after >= ln.size() || !(std::isalnum((unsigned char)ln[after]) || ln[after] == '_');
+            if (lok && rok) { whole = true; break; }
+            pos = ln.find(symbol, pos + 1);
+        }
+        if (!whole) continue;
+        char c0 = ln.front();
+        if (c0 == '}' || c0 == ')' || c0 == ']' || c0 == ';' || c0 == '/') continue;
+        std::cmatch m;
+        if (std::regex_match(ln.data(), ln.data() + ln.size(), m, re)) { def_line = i + 1; break; }
+    }
+    if (def_line < 0) return std::nullopt;
+
+    // Enclosing brace scope from the def line downward.
+    auto delta = [](std::string_view s) {
+        int d = 0; bool in_str = false; char q = 0;
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (in_str) { if (c == '\\') { ++i; continue; } if (c == q) in_str = false; continue; }
+            if (c == '"' || c == '\'' || c == '`') { in_str = true; q = c; continue; }
+            if (c == '/' && i + 1 < s.size() && s[i+1] == '/') break;
+            if (c == '#') break;
+            if (c == '{') ++d; else if (c == '}') --d;
+        }
+        return d;
+    };
+    const int n = static_cast<int>(lines.size());
+    constexpr int kMaxSpan = 400;
+    int hi = def_line, fd = 0; bool started = false;
+    for (int ln = def_line; ln <= n && ln - def_line < kMaxSpan; ++ln) {
+        fd += delta(lines[ln - 1]); if (fd > 0) started = true; hi = ln;
+        if (started && fd <= 0) break;
+    }
+    // A brace-less definition (Python def, prototype ending in ';') — if we
+    // never opened a block, fall back to a small window from the def line.
+    if (!started) {
+        // Python-style: include the indented body until the indent returns.
+        std::size_t base_indent = lines[def_line-1].find_first_not_of(" \t");
+        hi = def_line;
+        for (int ln = def_line + 1; ln <= n && ln - def_line < kMaxSpan; ++ln) {
+            const auto& s = lines[ln-1];
+            std::size_t ind = s.find_first_not_of(" \t");
+            if (ind == std::string_view::npos) { hi = ln; continue; }   // blank
+            if (base_indent != std::string_view::npos && ind <= base_indent) break;
+            hi = ln;
+        }
+    }
+    return std::make_pair(def_line, hi);
+}
+
 struct ReadArgs {
     util::WorkspacePath path;
     int                 offset;
     int                 limit;
+    std::string         symbol;   // read just this symbol's definition + body
     std::string         display_description;
     bool                no_explicit_range = true;
 };
@@ -157,10 +241,14 @@ std::expected<ReadArgs, ToolError> parse_read_args(const json& j) {
         if (end_line >= offset) limit = end_line - offset + 1;
     }
     if (limit <= 0) limit = 2000;
+    const std::string symbol = ar.str("symbol", "");
+    // symbol= is itself an explicit selection, so it must NOT trigger the
+    // whole-file auto-outline path.
     bool explicit_range = ar.has("offset") || ar.has("limit")
-                       || ar.has("start_line") || ar.has("end_line");
+                       || ar.has("start_line") || ar.has("end_line")
+                       || !symbol.empty();
     return ReadArgs{
-        std::move(*wp), offset, limit,
+        std::move(*wp), offset, limit, symbol,
         ar.str("display_description", ""),
         /*no_explicit_range=*/ !explicit_range,
     };
@@ -179,7 +267,7 @@ ExecResult run_read(const ReadArgs& a) {
     {
         std::error_code mtime_ec;
         current_mtime = fs::last_write_time(p, mtime_ec);
-        if (!mtime_ec) {
+        if (!mtime_ec && a.symbol.empty()) {
             std::error_code canon_ec;
             auto canon = fs::weakly_canonical(p, canon_ec);
             if (!canon_ec) {
@@ -213,6 +301,26 @@ ExecResult run_read(const ReadArgs& a) {
             a.path.string(), static_cast<uintmax_t>(ec ? 0 : sz))));
     }
     auto content = util::read_file(a.path);
+
+    // symbol=: resolve to the defining line + enclosing block, then read just
+    // that range — no `sed`, no line arithmetic. Overrides offset/limit.
+    int eff_offset = a.offset;
+    int eff_limit  = a.limit;
+    std::string symbol_header;
+    if (!a.symbol.empty()) {
+        auto rng = resolve_symbol_range(content, a.symbol);
+        if (!rng) {
+            return std::unexpected(ToolError::not_found(std::format(
+                "no definition of `{}` found in {}. Use `grep` (or "
+                "`find_definition`) to locate it, or drop `symbol` to read "
+                "the whole file.", a.symbol, a.path.string())));
+        }
+        eff_offset = rng->first;
+        eff_limit  = rng->second - rng->first + 1;
+        symbol_header = std::format(
+            "SUCCESS: `{}` defined at {}:{} (lines {}\xe2\x80\x93{}).\n\n",
+            a.symbol, a.path.string(), rng->first, rng->first, rng->second);
+    }
 
     if (a.no_explicit_range && content.size() > kAutoOutlineSize) {
         std::size_t kib = content.size() / 1024;
@@ -292,7 +400,7 @@ ExecResult run_read(const ReadArgs& a) {
         if (c == '\n') {
             ++total_lines;
             int n = total_lines;
-            if (n >= a.offset && shown < a.limit) {
+            if (n >= eff_offset && shown < eff_limit) {
                 size_t end = i;
                 if (end > line_start && content[end - 1] == '\r') --end;
                 out.append(content.data() + line_start, end - line_start);
@@ -305,7 +413,7 @@ ExecResult run_read(const ReadArgs& a) {
     if (line_start < N) {
         ++total_lines;
         int n = total_lines;
-        if (n >= a.offset && shown < a.limit) {
+        if (n >= eff_offset && shown < eff_limit) {
             size_t end = N;
             if (end > line_start && content[end - 1] == '\r') --end;
             out.append(content.data() + line_start, end - line_start);
@@ -313,37 +421,34 @@ ExecResult run_read(const ReadArgs& a) {
             ++shown;
         }
     }
-    if (a.offset > 1 || shown < total_lines) {
+    if (eff_offset > 1 || shown < total_lines) {
         std::string hint;
         if (shown == 0) {
-            // offset landed past the end of the file — the old code rendered a
-            // nonsensical inverted range like "[showing lines 1000-999 of 1]".
-            // Tell the model plainly where the end is so it can re-request a
-            // valid range instead of guessing.
             hint = std::format(
                 "\n[offset {} is past the end of the file, which has {} line{} "
                 "— nothing to show. Re-read with an offset ≤ {}.]",
-                a.offset, total_lines, total_lines == 1 ? "" : "s",
+                eff_offset, total_lines, total_lines == 1 ? "" : "s",
                 total_lines);
         } else {
             hint = std::format("\n[showing lines {}-{} of {}",
-                               a.offset, a.offset + shown - 1, total_lines);
-            int remaining = total_lines - (a.offset + shown - 1);
-            if (remaining > 0)
+                               eff_offset, eff_offset + shown - 1, total_lines);
+            int remaining = total_lines - (eff_offset + shown - 1);
+            if (remaining > 0 && a.symbol.empty())
                 hint += std::format("; {} more — pass offset={} (or start_line={}) "
                                     "for the next chunk",
-                                    remaining, a.offset + shown, a.offset + shown);
+                                    remaining, eff_offset + shown, eff_offset + shown);
             hint += "]";
         }
         out += hint;
     }
+    if (!symbol_header.empty()) out = symbol_header + out;
     if (!a.display_description.empty())
         out = a.display_description + "\n" + out;
     if (current_mtime.time_since_epoch().count() != 0) {
         std::error_code canon_ec;
         auto canon = fs::weakly_canonical(p, canon_ec);
         if (!canon_ec) {
-            ReadCacheKey key{canon.string(), a.offset, a.limit};
+            ReadCacheKey key{canon.string(), eff_offset, eff_limit};
             std::lock_guard lk{read_cache().mu};
             read_cache().seen[std::move(key)] = current_mtime;
         }
@@ -725,6 +830,7 @@ json read_schema() {
             {"display_description", {{"type","string"},
                 {"description","One-line summary shown in the UI. Optional."}}},
             {"path",       {{"type","string"}, {"description","Absolute or relative path"}}},
+            {"symbol",     {{"type","string"}, {"description","Read ONLY this symbol's definition + body (function/class/etc.), resolved to its enclosing block — no line numbers or `sed` needed. e.g. symbol=\"parse_args\"."}}},
             {"offset",     {{"type","integer"}, {"description","Start line (1-based)"}}},
             {"limit",      {{"type","integer"}, {"description","Max lines"}}},
             {"start_line", {{"type","integer"}, {"description","Alias for offset (Zed-style)"}}},
@@ -772,8 +878,11 @@ void register_fs_tools(Shells& sh) {
         "structure, its first 1 KiB \xe2\x80\x94 instead of the "
         "full content; use start_line + end_line (or offset + "
         "limit) on a follow-up read to fetch the specific section "
-        "you want. Include a brief `display_description` so the "
-        "user sees why you're reading.",
+        "you want. Best of all, pass `symbol` to read exactly one "
+        "function/class/type's definition and body (resolved to its "
+        "enclosing block) with no line arithmetic — use that instead "
+        "of computing ranges or shelling out to sed/head/tail. Include "
+        "a brief `display_description` so the user sees why you're reading.",
         read_schema(), EffectSet{Effect::ReadFs},
         body<ReadArgs>(run_read, parse_read_args), 80'000);
 

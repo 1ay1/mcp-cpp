@@ -349,6 +349,8 @@ struct GrepArgs {
     std::string root;
     std::string file_glob;
     bool        case_sensitive;
+    bool        word;      // whole-word match (absorbs find_references)
+    bool        block;     // return the whole enclosing function/block per hit
     int         offset;    // ≥ 0
     std::string display_description;
 };
@@ -364,11 +366,16 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
             "pattern must not be blank (received only whitespace)"));
     int offset = ar.integer("offset", 0);
     if (offset < 0) offset = 0;
+    // `context: "block"` returns the enclosing scope; anything else is the
+    // default ±2-line window.
+    const bool block = ar.str("context", "") == "block";
     return GrepArgs{
         std::move(pat),
         ar.str("path", "."),
         ar.str("glob", ""),
         ar.boolean("case_sensitive", false),
+        ar.boolean("word", false),
+        block,
         offset,
         ar.str("display_description", ""),
     };
@@ -377,6 +384,19 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
 [[nodiscard]] bool is_literal_pattern(std::string_view p) noexcept {
     constexpr std::string_view meta{".^$*+?()[]{}|\\"};
     return p.find_first_of(meta) == std::string_view::npos;
+}
+
+// Escape ECMAScript regex metacharacters so a literal string can be embedded
+// in a regex (used by grep's word-boundary path). One backslash per meta char.
+[[nodiscard]] std::string regex_escape(std::string_view text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (char c : text) {
+        if (std::string_view{".^$|()[]{}*+?\\"}.find(c) != std::string_view::npos)
+            out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
 }
 
 // Match a glob against a file, choosing filename-vs-path semantics from the
@@ -649,9 +669,61 @@ enum class Backend { Ripgrep, BuiltIn };
     return fallback;
 }
 
+// Split content into lines (LF, tolerant of CRLF) — used by block-context mode.
+[[nodiscard]] std::vector<std::string> split_content_lines(std::string_view s) {
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\n') {
+            std::size_t end = i;
+            if (end > start && s[end-1] == '\r') --end;
+            out.emplace_back(s.substr(start, end - start));
+            start = i + 1;
+        }
+    }
+    if (start < s.size()) out.emplace_back(s.substr(start));
+    return out;
+}
+
+// Find the enclosing brace scope [lo,hi] (1-based, inclusive) of `line` for
+// grep's context:"block" mode — so a hit returns the whole function/block it
+// lives in and the model needs no follow-up `read`. Lightweight per-line brace
+// counting that skips // and # line comments and quoted strings. Clamped to
+// `max_span` so a giant function can't blow the budget.
+[[nodiscard]] std::pair<int,int> brace_block_range(
+    const std::vector<std::string>& lines, int line, int max_span = 120) {
+    auto delta = [](const std::string& s) {
+        int d = 0; bool in_str = false; char q = 0;
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (in_str) { if (c == '\\') { ++i; continue; } if (c == q) in_str = false; continue; }
+            if (c == '"' || c == '\'' || c == '`') { in_str = true; q = c; continue; }
+            if (c == '/' && i + 1 < s.size() && s[i+1] == '/') break;
+            if (c == '#') break;
+            if (c == '{') ++d; else if (c == '}') --d;
+        }
+        return d;
+    };
+    const int n = static_cast<int>(lines.size());
+    if (line < 1 || line > n) return {line, line};
+    int lo = line, depth = 0;
+    for (int ln = line; ln >= 1 && line - ln < max_span; --ln) {
+        depth += delta(lines[ln - 1]); lo = ln;
+        if (depth > 0) break;                 // opened our enclosing block
+    }
+    int hi = line, fd = 0; bool started = false;
+    for (int ln = lo; ln <= n && ln - lo < max_span; ++ln) {
+        fd += delta(lines[ln - 1]); if (fd > 0) started = true; hi = ln;
+        if (started && fd <= 0) break;         // matching close brace
+    }
+    if (hi < line) hi = line;
+    return {lo, hi};
+}
+
 ExecResult run_ripgrep(const GrepArgs& a) {
     std::vector<std::string> argv = {"rg", "--json", "--no-config"};
     if (!a.case_sensitive) argv.push_back("-i");
+    if (a.word) argv.push_back("-w");           // whole-word match
     if (is_literal_pattern(a.pattern)) argv.push_back("-F");
     argv.push_back("-C");
     argv.push_back(std::to_string(kContext));
@@ -813,12 +885,22 @@ ExecResult run_ripgrep(const GrepArgs& a) {
 }
 
 ExecResult run_builtin(const GrepArgs& a) {
-    const bool literal = is_literal_pattern(a.pattern);
+    // word=true forces whole-word matching. We compile a regex with \b anchors
+    // around the (escaped-if-literal) pattern, so the fast literal path is
+    // bypassed — correctness (no `foo` inside `foobar`) beats the micro-opt.
+    const bool literal = !a.word && is_literal_pattern(a.pattern);
     std::regex re;
     if (!literal) {
         auto flags = std::regex::ECMAScript | std::regex::optimize;
         if (!a.case_sensitive) flags = flags | std::regex::icase;
-        try { re = std::regex(a.pattern, flags); }
+        std::string src = a.pattern;
+        if (a.word) {
+            // Escape when the pattern is a plain literal so a word search for
+            // e.g. "a.b" is treated literally; otherwise honour the user regex.
+            if (is_literal_pattern(a.pattern)) src = regex_escape(a.pattern);
+            src = "\\b(?:" + src + ")\\b";
+        }
+        try { re = std::regex(src, flags); }
         catch (const std::regex_error& e) {
             return std::unexpected(ToolError::invalid_regex(
                 std::string{"invalid regex '"} + a.pattern + "': " + e.what()));
@@ -928,13 +1010,24 @@ ExecResult run_builtin(const GrepArgs& a) {
 
         auto lines = offsets_to_lines(h.content, h.match_offsets);
 
+        // In block mode, precompute the file's line vector once so each hit's
+        // range can be expanded to its enclosing brace scope.
+        std::vector<std::string> file_lines;
+        if (a.block) file_lines = split_content_lines(h.content);
+
         std::vector<std::pair<int,int>> page_ranges;
         for (const auto& li : lines) {
             if (skipped < a.offset) { ++skipped; continue; }
             if (shown >= kPerPage) break;
             int row = li.line_no - 1;
-            int start = std::max(0, row - kContext);
-            int end   = row + kContext;
+            int start, end;
+            if (a.block) {
+                auto [lo, hi] = brace_block_range(file_lines, li.line_no);
+                start = lo - 1; end = hi - 1;
+            } else {
+                start = std::max(0, row - kContext);
+                end   = row + kContext;
+            }
             if (!page_ranges.empty()
                 && start <= page_ranges.back().second + 1) {
                 page_ranges.back().second =
@@ -1010,56 +1103,13 @@ ExecResult run_grep(const GrepArgs& a) {
     GrepArgs gated = a;
     gated.root = wp->string();
 
-    auto r = (detect_backend() == Backend::Ripgrep) ? run_ripgrep(gated)
-                                                    : run_builtin(gated);
+    // Block mode (context:"block") needs the file content in hand to expand a
+    // hit to its enclosing brace scope — the builtin scanner always has it, so
+    // force that path (ripgrep's --json gives only ±C fixed context).
+    const bool use_builtin = a.block || detect_backend() != Backend::Ripgrep;
+    auto r = use_builtin ? run_builtin(gated) : run_ripgrep(gated);
     if (r.has_value()) r->text = util::to_valid_utf8(std::move(r->text));
     return r;
-}
-
-struct FindReferencesArgs {
-    std::string symbol;
-    std::string path;
-    std::string glob;
-    int offset = 0;
-};
-
-std::expected<FindReferencesArgs, ToolError> parse_find_references_args(const json& j) {
-    util::ArgReader ar(j);
-    auto symbol = ar.require_str("symbol");
-    if (!symbol || symbol->empty())
-        return std::unexpected(ToolError::invalid_args("symbol is required"));
-    return FindReferencesArgs{*symbol, ar.str("path", "."), ar.str("glob", ""),
-                              std::max(0, ar.integer("offset", 0))};
-}
-
-std::string regex_escape(std::string_view text) {
-    std::string out;
-    out.reserve(text.size() * 2);
-    constexpr std::string_view special = R"(\.^$|()[]{}*+?)";
-    for (char c : text) {
-        if (special.find(c) != std::string_view::npos) out.push_back('\\');
-        out.push_back(c);
-    }
-    return out;
-}
-
-ExecResult run_find_references(const FindReferencesArgs& a) {
-    const std::string escaped = regex_escape(a.symbol);
-    GrepArgs grep{
-        "(^|[^A-Za-z0-9_])" + escaped + "([^A-Za-z0-9_]|$)",
-        a.path, a.glob, true, a.offset,
-        "References to " + a.symbol,
-    };
-    return run_grep(grep);
-}
-
-json find_references_schema() {
-    return json{{"type","object"}, {"required", {"symbol"}}, {"properties", {
-        {"symbol", {{"type","string"}, {"description","Exact identifier to find."}}},
-        {"path", {{"type","string"}, {"description","Directory to search (default workspace)."}}},
-        {"glob", {{"type","string"}, {"description","Optional file glob."}}},
-        {"offset", {{"type","integer"}, {"minimum",0}, {"description","Pagination offset."}}}
-    }}};
 }
 
 // ── Schemas ──────────────────────────────────────────────────────────────
@@ -1101,6 +1151,8 @@ json grep_schema() {
             {"path",           {{"type","string"}, {"description","Directory to search (default: cwd)"}}},
             {"glob",           {{"type","string"}, {"description","Filter files by glob. A bare pattern like `*.cpp` matches the filename anywhere; a slash pattern like `src/*.ts` or `**/test/*.py` matches the workspace-relative path."}}},
             {"case_sensitive", {{"type","boolean"}, {"description","Case-sensitive match (default: false)"}}},
+            {"word",           {{"type","boolean"}, {"description","Whole-word match: `foo` won't match `foobar` or `do_foo`. Use for finding all USES of an identifier."}}},
+            {"context",        {{"type","string"}, {"enum", {"line","block"}}, {"description","`line` (default) = ±2 lines around each hit. `block` = the WHOLE enclosing function/block, so you rarely need a follow-up `read`."}}},
             {"offset",         {{"type","integer"}, {"description","Skip this many matches (for pagination)"}}},
         }},
     };
@@ -1127,25 +1179,13 @@ void register_search_tools(Shells& sh) {
         glob_schema(), EffectSet{Effect::ReadFs},
         body<GlobArgs>(run_glob, parse_glob_args), 25'000);
 
-    sh.add("find_references",
-        "Find every use of an EXACT identifier (whole-word, case-sensitive) "
-        "with file, line, enclosing symbol, context, glob filtering, and "
-        "pagination. Convenience wrapper over `grep` that auto-escapes the "
-        "symbol and adds word boundaries so `foo` doesn't match `foobar` or "
-        "`do_foo`. Use it for a quick 'who touches this name'. NOTE: like grep "
-        "it is TEXT-based, so it also matches the name in comments and "
-        "strings — if that noise matters, use `search_structural` (e.g. "
-        "`foo($$$)` for calls only) which ignores comments and string "
-        "literals.",
-        find_references_schema(), EffectSet{Effect::ReadFs},
-        body<FindReferencesArgs>(run_find_references, parse_find_references_args), 30'000);
-
     sh.add("find_definition",
         "Jump to where a symbol is DEFINED (function, class, struct, enum, "
         "type) across the codebase, using curated per-language definition "
         "patterns for C/C++, Python, JavaScript/TypeScript, Go, and Rust — so "
-        "it returns the declaration, not every mention (that's "
-        "`find_references`) and not a ranked overview (that's `repo_map`).",
+        "it returns the declaration, not a ranked overview (that's `repo_map`). "
+        "To find USES of a symbol, use `grep` with word=true; for calls with a "
+        "specific shape use `search_structural`.",
         find_definition_schema(), EffectSet{Effect::ReadFs},
         body<FindDefinitionArgs>(run_find_definition, parse_find_definition_args), 25'000);
 }
