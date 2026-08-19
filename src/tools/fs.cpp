@@ -219,7 +219,31 @@ resolve_symbol_range(std::string_view content, std::string_view symbol) {
         def_line = start;
     }
 
-    // Enclosing brace scope from the def line downward.
+    const int n = static_cast<int>(lines.size());
+    constexpr int kMaxSpan = 400;
+
+    // Decide brace-scope vs indent-scope. A def is INDENT-scoped (Python /
+    // Ruby / YAML-ish) when its signature line(s) open the block with `:`
+    // rather than `{` — brace-counting there is wrong because the body's
+    // dicts/sets `{...}` would close the "block" early. Scan the def line and
+    // its immediate continuations for the first block-opener.
+    auto trailing = [](std::string_view s) -> char {
+        std::size_t e = s.find_last_not_of(" \t");
+        // ignore a trailing line comment
+        if (auto h = s.find('#'); h != std::string_view::npos) {
+            std::size_t e2 = s.find_last_not_of(" \t", h ? h - 1 : 0);
+            if (e2 != std::string_view::npos && e2 < h) e = e2;
+        }
+        return e == std::string_view::npos ? '\0' : s[e];
+    };
+    bool indent_scoped = false;
+    for (int ln = def_line; ln <= n && ln - def_line < 6; ++ln) {
+        const auto& s = lines[ln - 1];
+        if (s.find('{') != std::string_view::npos) { indent_scoped = false; break; }
+        if (trailing(s) == ':') { indent_scoped = true; break; }
+    }
+
+    // Enclosing brace scope from the def line downward (brace-language path).
     auto delta = [](std::string_view s) {
         int d = 0; bool in_str = false; char q = 0;
         for (std::size_t i = 0; i < s.size(); ++i) {
@@ -232,17 +256,17 @@ resolve_symbol_range(std::string_view content, std::string_view symbol) {
         }
         return d;
     };
-    const int n = static_cast<int>(lines.size());
-    constexpr int kMaxSpan = 400;
     int hi = def_line, fd = 0; bool started = false;
-    for (int ln = def_line; ln <= n && ln - def_line < kMaxSpan; ++ln) {
-        fd += delta(lines[ln - 1]); if (fd > 0) started = true; hi = ln;
-        if (started && fd <= 0) break;
+    if (!indent_scoped) {
+        for (int ln = def_line; ln <= n && ln - def_line < kMaxSpan; ++ln) {
+            fd += delta(lines[ln - 1]); if (fd > 0) started = true; hi = ln;
+            if (started && fd <= 0) break;
+        }
     }
-    // A brace-less definition (Python def, prototype ending in ';') — if we
-    // never opened a block, fall back to a small window from the def line.
-    if (!started) {
-        // Python-style: include the indented body until the indent returns.
+    // Indent-scoped def, OR a brace-less prototype (never opened a block):
+    // include the indented body until the indentation returns to the def's
+    // level or shallower.
+    if (indent_scoped || !started) {
         std::size_t base_indent = lines[def_line-1].find_first_not_of(" \t");
         hi = def_line;
         for (int ln = def_line + 1; ln <= n && ln - def_line < kMaxSpan; ++ln) {
@@ -252,6 +276,9 @@ resolve_symbol_range(std::string_view content, std::string_view symbol) {
             if (base_indent != std::string_view::npos && ind <= base_indent) break;
             hi = ln;
         }
+        // Trim trailing blank lines that the indent walk swallowed.
+        while (hi > def_line && lines[hi-1].find_first_not_of(" \t")
+                                    == std::string_view::npos) --hi;
     }
     return std::make_pair(def_line, hi);
 }

@@ -137,6 +137,33 @@ TEST_CASE("fs_tools") {
         std::puts("read: symbol= missing symbol errors cleanly");
     }
 
+    // ── read symbol= is INDENT-scoped for Python (braces in the body, e.g.
+    //    a dict, must NOT close the block early) ─────────────────────────
+    {
+        auto py = (root / "mod.py").string();
+        auto wargs = obj();
+        wargs["file_path"] = py;
+        wargs["content"] =
+            "def build():\n"            // L1  <-- target
+            "    config = {\n"          // L2  multi-line dict opens a brace
+            "        'a': 1,\n"         // L3
+            "    }\n"                    // L4  dict close — must NOT end the def
+            "    return config\n"        // L5  <-- must be included
+            "def sibling():\n"          // L6  <-- must NOT be included
+            "    return 0\n";           // L7
+        call(*provider, "write", wargs);
+
+        auto args = obj();
+        args["path"]   = py;
+        args["symbol"] = "build";
+        auto rd = call(*provider, "read", args);
+        assert(!rd.is_error);
+        assert(rd.text.find("def build():") != std::string::npos);
+        assert(rd.text.find("return config") != std::string::npos);  // full body
+        assert(rd.text.find("def sibling") == std::string::npos);    // stops at next def
+        std::puts("read: symbol= indent-scoped for Python (dict braces ignored)");
+    }
+
     // ── edit applies a fuzzy splice and carries a FileChange ─────────────
     {
         auto e = obj();
