@@ -372,3 +372,136 @@ TEST_CASE("search_structural") {
     std::error_code ec;
     fs::remove_all(root, ec);
 }
+
+// ── Semantic bridge: RAG proposes, structure disposes ────────────────
+// A fake DocRetriever locks the composition contract: zero structural hits
+// yield VERIFIED leads (stale index entries silently dropped); an over-cap
+// result set is reordered by semantic proximity without changing the hit
+// set; and a null retriever leaves behaviour untouched (locked above).
+namespace {
+struct FakeRetriever final : mcp::tools::DocRetriever {
+    std::vector<mcp::tools::DocPassage> canned;
+    int calls = 0;
+    std::string last_query;
+    std::vector<mcp::tools::DocPassage>
+    retrieve(const mcp::tools::DocQuery& q, std::string& mode,
+             std::string& err) override {
+        ++calls;
+        last_query = q.query;
+        mode = "fake";
+        err.clear();
+        return canned;
+    }
+};
+} // namespace
+
+TEST_CASE("search_structural semantic bridge") {
+    auto root = fs::temp_directory_path() /
+                ("mcp_structsem_test_" + std::to_string(mcp_getpid()));
+    fs::create_directories(root);
+    util::set_workspace_root(root);
+    auto prev_cwd = fs::current_path();
+    fs::current_path(root);
+
+    swrite(root / "pool.c",
+        "void* grab(int n) { return pool_take(n); }\n"   // L1: the lead target
+        "void put(void* p) { pool_give(p); }\n");        // L2
+
+    auto fake = std::make_shared<FakeRetriever>();
+    HostServices svc;
+    svc.code_retriever = fake;
+    auto provider = make_provider(svc, ToolsetConfig{}, "local");
+
+    // ── 1. Zero hits → verified leads appended; stale lead dropped ─────
+    {
+        mcp::tools::DocPassage good;
+        good.source = "code"; good.path = "pool.c";
+        good.line_start = 1; good.line_end = 2; good.score = 0.9;
+        good.text = "void* grab(int n) { return pool_take(n); }";
+        mcp::tools::DocPassage stale;                     // file doesn't exist
+        stale.source = "code"; stale.path = "deleted_module.c";
+        stale.line_start = 10; stale.line_end = 20; stale.score = 0.95;
+        stale.text = "void gone() {}";
+        fake->canned = {stale, good};
+
+        auto args = sobj();
+        args["pattern"] = "malloc($$$)";                  // no malloc here
+        args["path"]    = root.string();
+        auto r = scall(*provider, "search_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("no structural match") != std::string::npos);
+        assert(r.text.find("Semantically nearest") != std::string::npos);
+        assert(r.text.find("pool.c:1-2") != std::string::npos);   // verified lead
+        assert(r.text.find("deleted_module") == std::string::npos); // stale dropped
+        assert(fake->calls == 1);
+        // Query synthesized from the pattern's literal tokens.
+        assert(fake->last_query.find("malloc") != std::string::npos);
+        std::puts("structural+rag: zero hits -> verified leads, stale dropped ok");
+    }
+
+    // ── 2. Lead range clipped when the file SHRANK since indexing ───────
+    {
+        mcp::tools::DocPassage shrunk;
+        shrunk.source = "code"; shrunk.path = "pool.c";
+        shrunk.line_start = 1; shrunk.line_end = 500;     // file has 2 lines
+        shrunk.score = 0.9; shrunk.text = "void* grab";
+        fake->canned = {shrunk};
+        auto args = sobj();
+        args["pattern"] = "calloc($$$)";
+        args["path"]    = root.string();
+        auto r = scall(*provider, "search_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("pool.c:1-") != std::string::npos);
+        assert(r.text.find("1-500") == std::string::npos);  // clipped to disk truth
+        std::puts("structural+rag: shrunk lead range clipped ok");
+    }
+
+    // ── 3. Over-cap: semantic score reorders FILES, hit set unchanged ───
+    {
+        // 30 files, one hit each (> the 20-file soft cap so ordering kicks
+        // in). The retriever scores zz_last.c highest — it must render first
+        // even though the walk finds it last.
+        for (int i = 0; i < 29; ++i) {
+            char name[32];
+            std::snprintf(name, sizeof name, "m_%02d.c", i);
+            swrite(root / name, "void f() { widget(1); }\n");
+        }
+        swrite(root / "zz_last.c", "void g() { widget(2); }\n");
+        mcp::tools::DocPassage top;
+        top.source = "code"; top.path = "zz_last.c";
+        top.line_start = 1; top.line_end = 1; top.score = 0.99;
+        top.text = "void g() { widget(2); }";
+        fake->canned = {top};
+        fake->calls = 0;
+
+        auto args = sobj();
+        args["pattern"] = "widget($X)";
+        args["path"]    = root.string();
+        auto r = scall(*provider, "search_structural", args);
+        assert(!r.is_error);
+        assert(fake->calls == 1);                          // ordering consulted
+        auto zz = r.text.find("zz_last.c");
+        auto m0 = r.text.find("m_00.c");
+        assert(zz != std::string::npos);
+        assert(m0 == std::string::npos || zz < m0);        // semantic-first
+        assert(r.text.find("30 structural match") != std::string::npos); // set intact
+        std::puts("structural+rag: over-cap semantic ordering ok");
+    }
+
+    // ── 4. Few hits → retriever NOT consulted (no per-query tax) ───────
+    {
+        fake->calls = 0;
+        auto args = sobj();
+        args["pattern"] = "pool_take($N)";                 // exactly 1 hit
+        args["path"]    = root.string();
+        auto r = scall(*provider, "search_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("pool.c") != std::string::npos);
+        assert(fake->calls == 0);                          // sound path untouched
+        std::puts("structural+rag: small result set skips retriever ok");
+    }
+
+    fs::current_path(prev_cwd);
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}

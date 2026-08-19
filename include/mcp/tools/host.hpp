@@ -168,6 +168,15 @@ public:
     // ("hybrid" / "BM25-only") for the result header; `err` empty ⇒ success.
     [[nodiscard]] virtual std::vector<DocPassage>
         retrieve(const DocQuery&, std::string& mode, std::string& err) = 0;
+
+    // Whether the retriever can answer an OPPORTUNISTIC query — one issued
+    // as a side-effect of another tool (e.g. search_structural's zero-hit
+    // leads / over-budget ordering) rather than an explicit search — without
+    // paying a heavy cold start (index build, embedder round-trips). Hosts
+    // with a lazily-built index should return true only once it's warm.
+    // Explicit tools (search_code / search_docs) ignore this and always call
+    // retrieve(). Default: always ready.
+    [[nodiscard]] virtual bool warm() const { return true; }
 };
 
 // ─────────────────────────────────────────────────────────────────────────

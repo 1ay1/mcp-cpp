@@ -67,6 +67,7 @@
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/glob.hpp>
 #include <mcp/tools/util/error.hpp>
+#include <mcp/tools/host.hpp>
 
 #include "tool_shell.hpp"
 #include "tool_body.hpp"
@@ -902,7 +903,142 @@ bool has_literal_anchor(const std::vector<PNode>& pat) {
     return false;
 }
 
-ExecResult run_structural(const StructArgs& a) {
+// ── Semantic bridge (RAG proposes, structure disposes) ─────────────────
+// The structural matcher is a sound decision procedure; the injected
+// DocRetriever (agentty's search_code RAG engine) is an approximate
+// suggestion engine. They compose at exactly two seams, neither of which
+// weakens soundness:
+//   1. ZERO HITS → leads. A dead end becomes a lead list: the retriever's
+//      nearest passages, each VERIFIED against the live file before being
+//      shown (a stale index can never lie into the result).
+//   2. OVER-CAP → ordering. When more files match than the output budget
+//      renders, semantic proximity decides which files render FIRST. The
+//      hit set is untouched — only the order of presentation.
+
+// Build a natural-language-ish query from the pattern's literal tokens — the
+// metavariables carry no meaning ('$X == $X' → 'x == x' would mislead the
+// embedder). display_description, when the model provided one, is prepended:
+// it IS the natural-language intent.
+std::string semantic_query(const StructArgs& a,
+                           const std::vector<PNode>& pat) {
+    std::string q;
+    if (!a.display_description.empty()) {
+        q = a.display_description;
+        q += ' ';
+    }
+    std::function<void(const std::vector<PNode>&)> walk =
+        [&](const std::vector<PNode>& ns) {
+            for (auto& p : ns) {
+                if (p.kind == NodeKind::Group) { walk(p.kids); continue; }
+                if (p.meta != MetaKind::None) continue;
+                if (p.tok.kind == Tok::Ident || p.tok.kind == Tok::Number) {
+                    q += p.tok.text; q += ' ';
+                }
+            }
+        };
+    walk(pat);
+    // Trim the trailing space.
+    while (!q.empty() && q.back() == ' ') q.pop_back();
+    return q;
+}
+
+// A retrieved passage is only shown if the file it names still exists inside
+// the workspace and still spans the claimed lines — ground-truth gate against
+// index staleness. Returns the (possibly clipped) verified line count, or 0
+// to drop the lead.
+int verify_lead(const fs::path& ws_root, DocPassage& p) {
+    if (p.path.empty()) return 0;
+    fs::path f = fs::path{p.path}.is_absolute() ? fs::path{p.path}
+                                                : ws_root / p.path;
+    std::error_code ec;
+    if (!fs::exists(f, ec) || ec) return 0;
+    std::string bytes = util::read_file(f);
+    if (bytes.empty()) return 0;
+    int nlines = 1;
+    for (char c : bytes) if (c == '\n') ++nlines;
+    if (p.line_start < 1) p.line_start = 1;
+    if (p.line_start > nlines) return 0;          // range vanished: stale
+    if (p.line_end > nlines) p.line_end = nlines; // clip a shrunk file
+    if (p.line_end < p.line_start) p.line_end = p.line_start;
+    return nlines;
+}
+
+// Zero structural hits: turn the dead end into verified leads. Clearly
+// labeled approximate — the model knows these are neighbours, not matches.
+std::string semantic_leads(DocRetriever* sem, const StructArgs& a,
+                           const std::vector<PNode>& pat,
+                           const fs::path& ws_root) {
+    if (!sem || !sem->warm()) return {};
+    std::string q = semantic_query(a, pat);
+    if (q.empty()) return {};
+    DocQuery dq; dq.query = q; dq.k = 3;
+    std::string mode, err;
+    auto passages = sem->retrieve(dq, mode, err);
+    if (!err.empty() || passages.empty()) return {};
+    std::ostringstream out;
+    std::size_t shown = 0;
+    for (auto& p : passages) {
+        if (!verify_lead(ws_root, p)) continue;   // stale → silently dropped
+        if (shown == 0)
+            out << "\n\nSemantically nearest code (approximate leads from the "
+                   "code index, verified against disk — NOT structural "
+                   "matches):\n";
+        out << "  " << p.path << ":" << p.line_start << "-" << p.line_end;
+        // One-line teaser: first non-blank line of the passage body.
+        std::istringstream body(p.text);
+        for (std::string ln; std::getline(body, ln);) {
+            auto b = ln.find_first_not_of(" \t");
+            if (b == std::string::npos) continue;
+            ln = ln.substr(b);
+            if (ln.size() > 88) ln.resize(88);
+            out << "  — " << ln;
+            break;
+        }
+        out << "\n";
+        if (++shown == 3) break;
+    }
+    return out.str();
+}
+
+// Over-cap: order matched FILES by semantic proximity to the query so the
+// rendered subset is the relevant subset. Score by best passage per file;
+// unscored files keep their relative walk order after the scored ones.
+void semantic_order(DocRetriever* sem, const StructArgs& a,
+                    const std::vector<PNode>& pat,
+                    std::vector<FileMatch>& results) {
+    if (!sem || !sem->warm()) return;
+    std::string q = semantic_query(a, pat);
+    if (q.empty()) return;
+    DocQuery dq; dq.query = q; dq.k = 20;
+    std::string mode, err;
+    auto passages = sem->retrieve(dq, mode, err);
+    if (!err.empty() || passages.empty()) return;
+    std::unordered_map<std::string, double> score;
+    for (auto& p : passages) {
+        // Normalize to generic separators for matching against rel paths.
+        std::string key = fs::path{p.path}.generic_string();
+        auto& s = score[key];
+        s = std::max(s, p.score);
+    }
+    if (score.empty()) return;
+    auto file_score = [&](const FileMatch& fm) -> double {
+        if (fm.rel.empty()) return -1.0;
+        // Exact rel match, or the index used absolute/differently-rooted
+        // paths — fall back to suffix containment.
+        if (auto it = score.find(fm.rel); it != score.end()) return it->second;
+        for (auto& [k, v] : score)
+            if (k.size() > fm.rel.size()
+                    ? k.ends_with(fm.rel) : fm.rel.ends_with(k))
+                return v;
+        return 0.0;
+    };
+    std::stable_sort(results.begin(), results.end(),
+                     [&](const FileMatch& x, const FileMatch& y) {
+                         return file_score(x) > file_score(y);
+                     });
+}
+
+ExecResult run_structural(const StructArgs& a, DocRetriever* sem) {
     auto wp = util::make_workspace_path_checked(a.root, "search_structural");
     if (!wp) return std::unexpected(std::move(wp.error()));
 
@@ -1020,12 +1156,21 @@ ExecResult run_structural(const StructArgs& a) {
     std::size_t match_count = 0, file_count = 0;
     for (auto& fm : results) if (!fm.rel.empty()) { ++file_count; match_count += fm.hits.size(); }
 
-    if (match_count == 0)
-        return ToolOutput{
+    if (match_count == 0) {
+        std::string msg =
             "no structural matches. The pattern must match the code SHAPE "
             "token-for-token (metavariables $X / $$$X match one / many). If you "
-            "wanted a text match, use `grep` instead.",
-            std::nullopt};
+            "wanted a text match, use `grep` instead.";
+        // RAG proposes: append verified semantic neighbours as leads.
+        msg += semantic_leads(sem, a, probe_pat, wp->path());
+        return ToolOutput{std::move(msg), std::nullopt};
+    }
+
+    // More matches than the output budget renders → semantic proximity picks
+    // WHICH files render first. The hit set itself is untouched (soundness);
+    // only presentation order changes, and only when truncation is possible.
+    if (match_count > 20 || total_hits.load(std::memory_order_relaxed) >= kMaxMatches)
+        semantic_order(sem, a, probe_pat, results);
 
     std::ostringstream out;
     if (!a.display_description.empty()) out << a.display_description << "\n";
@@ -1141,7 +1286,8 @@ json structural_schema() {
 
 } // namespace
 
-void register_structural_tools(Shells& sh) {
+void register_structural_tools(Shells& sh,
+                               const std::shared_ptr<DocRetriever>& sem) {
     sh.add("search_structural",
            "Structural (AST-shape) code search — the layer between `grep` "
            "(text) and `search_code` (meaning). Matches a code SHAPE with "
@@ -1153,10 +1299,16 @@ void register_structural_tools(Shells& sh) {
            "flow shape (`if ($C) return $X;`), empty catch blocks "
            "(`catch ($$$) {}`), self-assignments (`$X = $X`). For an exact "
            "string/identifier use `grep`; for a concept you can't name use "
-           "`search_code`.",
+           "`search_code`. When the code index is available, zero hits come "
+           "back with semantically-nearest leads (verified against disk), and "
+           "over-budget result sets render the most task-relevant files first.",
            structural_schema(),
            EffectSet{Effect::ReadFs},
-           body<StructArgs>(run_structural, parse_args),
+           [sem](const Json& j) -> mcp::cap::Result {
+               auto parsed = parse_args(j);
+               if (!parsed) return mcp::cap::Result::error(parsed.error().render());
+               return lower(run_structural(*parsed, sem.get()));
+           },
            /*token_budget=*/30'000);
 }
 

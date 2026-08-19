@@ -76,7 +76,10 @@ void register_fs_tools(Shells&);       // read, write, edit, list_dir
 void register_shell_tools(Shells&);    // bash
 void register_process_tools(Shells&);  // process_start/poll/stop
 void register_search_tools(Shells&);   // grep, glob, find_definition
-void register_structural_tools(Shells&); // search_structural (AST-shape search)
+void register_structural_tools(Shells&,
+    const std::shared_ptr<DocRetriever>& = nullptr); // search_structural
+    // (AST-shape search; optional retriever adds verified semantic leads on
+    // zero hits and semantic file ordering when results exceed the budget)
 void register_repo_map_tool(Shells&);  // repo_map (PageRank codebase skeleton)
 void register_diagnostics_tool(Shells&);
 void register_test_tool(Shells&);
