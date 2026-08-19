@@ -226,6 +226,42 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
             continue;
         }
 
+        // C++ raw string literal: (prefix)R"delim( ... )delim" — the body is
+        // fully literal (no escapes, embedded quotes/braces are just bytes), so
+        // a naive ".." scan mis-parses it. Detect an R directly before a " ,
+        // optionally after an encoding prefix (u8/u/U/L). Must come BEFORE the
+        // identifier scan since the prefix looks like an identifier.
+        if (c_family && (c == 'R' || c == 'u' || c == 'U' || c == 'L')) {
+            // find the 'R"' anchor within a short prefix.
+            std::size_t j = i;
+            // allow u8R / uR / UR / LR / R
+            if (s[j] == 'u' && j + 1 < n && s[j+1] == '8') j += 2;
+            else if (s[j] == 'u' || s[j] == 'U' || s[j] == 'L') j += 1;
+            if (j < n && s[j] == 'R' && j + 1 < n && s[j+1] == '"') {
+                int start_line = line;
+                std::size_t b = i;
+                std::size_t k = j + 2;                 // just past R"
+                std::string delim;                     // up to 16 chars, no '(' ' '
+                while (k < n && s[k] != '(' && s[k] != '\n' && delim.size() < 16
+                       && s[k] != ' ' && s[k] != ')' && s[k] != '\\')
+                    delim.push_back(s[k++]);
+                if (k < n && s[k] == '(') {
+                    const std::string term = ")" + delim + "\"";
+                    k += 1;                            // past '('
+                    std::size_t body = k;
+                    // find the terminating )delim"
+                    std::size_t found = std::string_view{s}.find(term, k);
+                    std::size_t end = (found == std::string_view::npos)
+                                          ? n : found + term.size();
+                    count_newlines(body, end);
+                    out.push_back({Tok::String, std::string{s.substr(b, end - b)}, start_line});
+                    i = end;
+                    continue;
+                }
+                // Not actually a raw string (no '(') — fall through to ident.
+            }
+        }
+
         // Numbers.
         if (std::isdigit((unsigned char)c)
             || (c == '.' && i + 1 < n && std::isdigit((unsigned char)s[i+1]))) {

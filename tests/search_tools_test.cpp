@@ -151,6 +151,29 @@ TEST_CASE("search_tools") {
         std::puts("grep: context=block returns enclosing function ok");
     }
 
+    // ── grep context:block handles C++ raw strings (quote/brace inside
+    //    R"(…)" must not mis-balance the scope scan) ───────────────────
+    {
+        write_file(root / "rawblk.cpp",
+            "int f() {\n"                                  // L1
+            "    auto re = R\"(a \" and } here)\";\n"       // L2 trap
+            "    int found = 7;\n"                          // L3 hit
+            "    return found;\n"                           // L4
+            "}\n"                                          // L5
+            "int g() { return 0; }\n");                     // L6 must NOT leak in
+        auto args = obj();
+        args["pattern"] = "found = 7";
+        args["path"]    = root.string();
+        args["glob"]    = "rawblk.cpp";
+        args["context"] = "block";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("int f()") != std::string::npos);   // scope start
+        assert(r.text.find("return found;") != std::string::npos);
+        assert(r.text.find("int g()") == std::string::npos);   // no over-capture
+        std::puts("grep: context=block handles raw strings ok");
+    }
+
     // ── case-fold literal scanner: non-letter lead byte + mixed-case ─────
     // Guards the memchr-driven dual-scan (lowercase + uppercase first byte)
     // and the non-overlapping stride after a hit. "_zZz" leads with '_'

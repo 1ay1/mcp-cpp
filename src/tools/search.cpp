@@ -697,6 +697,26 @@ enum class Backend { Ripgrep, BuiltIn };
         for (std::size_t i = 0; i < s.size(); ++i) {
             char c = s[i];
             if (in_str) { if (c == '\\') { ++i; continue; } if (c == q) in_str = false; continue; }
+            // C++ raw string R"delim( ... )delim" (incl. u8R/uR/UR/LR): body is
+            // literal, so skip it whole — embedded quotes/braces are just bytes.
+            if (c == 'R' || c == 'u' || c == 'U' || c == 'L') {
+                std::size_t j = i;
+                if (c == 'u' && j + 1 < s.size() && s[j+1] == '8') j += 2;
+                else if (c == 'u' || c == 'U' || c == 'L') j += 1;
+                if (j + 1 < s.size() && s[j] == 'R' && s[j+1] == '"') {
+                    std::size_t k = j + 2; std::string delim;
+                    while (k < s.size() && s[k] != '(' && delim.size() < 16
+                           && s[k] != ' ' && s[k] != ')' && s[k] != '\\')
+                        delim.push_back(s[k++]);
+                    if (k < s.size() && s[k] == '(') {
+                        std::string term = ")" + delim + "\"";
+                        std::size_t close = s.find(term, k + 1);
+                        i = (close == std::string::npos) ? s.size() - 1
+                                                         : close + term.size() - 1;
+                        continue;
+                    }
+                }
+            }
             if (c == '"' || c == '\'' || c == '`') { in_str = true; q = c; continue; }
             if (c == '/' && i + 1 < s.size() && s[i+1] == '/') break;
             if (c == '#') break;

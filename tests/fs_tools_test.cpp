@@ -164,6 +164,30 @@ TEST_CASE("fs_tools") {
         std::puts("read: symbol= indent-scoped for Python (dict braces ignored)");
     }
 
+    // ── read symbol= handles C++ raw strings (a `"` or `}` inside R"(…)" must
+    //    not mis-balance the brace scan) ───────────────────────────────
+    {
+        auto cc = (root / "raw.cpp").string();
+        auto wargs = obj();
+        wargs["file_path"] = cc;
+        wargs["content"] =
+            "int f() {\n"                                    // L1
+            "    auto re = R\"(a \" quote and } brace)\";\n"  // L2 traps: quote+brace in raw string
+            "    return 1;\n"                                // L3 must be included
+            "}\n"                                            // L4
+            "int g() { return 2; }\n";                       // L5 must NOT be included
+        call(*provider, "write", wargs);
+
+        auto args = obj();
+        args["path"]   = cc;
+        args["symbol"] = "f";
+        auto rd = call(*provider, "read", args);
+        assert(!rd.is_error);
+        assert(rd.text.find("return 1;") != std::string::npos);   // full body
+        assert(rd.text.find("int g()") == std::string::npos);     // didn't over-capture
+        std::puts("read: symbol= handles C++ raw strings ok");
+    }
+
     // ── edit applies a fuzzy splice and carries a FileChange ─────────────
     {
         auto e = obj();

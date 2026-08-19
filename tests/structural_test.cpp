@@ -186,6 +186,25 @@ TEST_CASE("search_structural") {
         std::puts("structural: tree-based expand ignores brace-in-string ok");
     }
 
+    // ── 6a3. The tokenizer understands C++ raw strings R"(…)", so a quote or
+    //      brace inside one can't corrupt tokenization or the tree. ───────
+    {
+        swrite(root / "rawtok.cpp",
+            "int f() {\n"                                 // L1
+            "    auto re = R\"(a \" and } trap)\";\n"      // L2 quote+brace in raw string
+            "    int found = 9;\n"                         // L3 <-- hit
+            "    return found;\n"                          // L4
+            "}\n");                                       // L5
+        auto args = sobj();
+        args["pattern"] = "found = $X";
+        args["path"]    = root.string();
+        args["glob"]    = "rawtok.cpp";
+        auto r = scall(*provider, "search_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("> L3") != std::string::npos);   // matched past the raw-string trap
+        std::puts("structural: tokenizer parses C++ raw strings ok");
+    }
+
     // ── 6b. Nested-document model: a metavar binds a whole GROUP, and the
     //     matcher recurses into nested calls so an inner call still matches.
     {
