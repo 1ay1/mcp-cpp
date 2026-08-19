@@ -79,6 +79,7 @@ namespace fs = std::filesystem;
 using util::ExecResult;
 using util::ToolError;
 using util::ToolOutput;
+using mcp::tools::FileChange;
 
 namespace {
 
@@ -136,6 +137,7 @@ struct Token {
     Tok         kind;
     std::string text;   // exact bytes (for Ident/Number/Punct); literals keep quotes
     int         line;   // 1-based line where the token STARTS
+    std::size_t pos = 0; // byte offset of the token's first byte in the file
 };
 
 bool is_ident_start(unsigned char c) { return std::isalpha(c) || c == '_' || c == '$'; }
@@ -179,7 +181,7 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
         // Line comments.
         if (slash_cmt && c == '/' && i + 1 < n && s[i+1] == '/') {
             std::size_t b = i; while (i < n && s[i] != '\n') ++i;
-            out.push_back({Tok::Comment, std::string{s.substr(b, i - b)}, line});
+            out.push_back({Tok::Comment, std::string{s.substr(b, i - b)}, line, b});
             continue;
         }
         if (lua_cmt && c == '-' && i + 1 < n && s[i+1] == '-') {
@@ -193,12 +195,12 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
             } else {
                 while (i < n && s[i] != '\n') ++i;
             }
-            out.push_back({Tok::Comment, std::string{s.substr(b, i - b)}, line});
+            out.push_back({Tok::Comment, std::string{s.substr(b, i - b)}, line, b});
             continue;
         }
         if (hash_line && c == '#') {
             std::size_t b = i; while (i < n && s[i] != '\n') ++i;
-            out.push_back({Tok::Comment, std::string{s.substr(b, i - b)}, line});
+            out.push_back({Tok::Comment, std::string{s.substr(b, i - b)}, line, b});
             continue;
         }
         // Block comments (C-family; Rust block comments NEST).
@@ -213,7 +215,7 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
             }
             if (depth > 0) i = n;
             count_newlines(body, i);
-            out.push_back({Tok::Comment, std::string{s.substr(b, i - b)}, start_line});
+            out.push_back({Tok::Comment, std::string{s.substr(b, i - b)}, start_line, b});
             continue;
         }
 
@@ -243,7 +245,7 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
                 if (i < n) ++i;   // closing quote
             }
             out.push_back({q == '\'' ? Tok::Char : Tok::String,
-                           std::string{s.substr(b, i - b)}, start_line});
+                           std::string{s.substr(b, i - b)}, start_line, b});
         };
         if (c == '"') { scan_quoted(c, /*escapes=*/true); continue; }
         if (c == '`')  { scan_quoted(c, /*escapes=*/!raw_btick); continue; }
@@ -258,7 +260,7 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
                 && s[i+1] != '\\' && !(i + 2 < n && s[i+2] == '\'')) {
                 std::size_t b = i; ++i;                    // the quote
                 while (i < n && is_ident_cont((unsigned char)s[i])) ++i;
-                out.push_back({Tok::Ident, std::string{s.substr(b, i - b)}, line});
+                out.push_back({Tok::Ident, std::string{s.substr(b, i - b)}, line, b});
                 continue;
             }
             // In C/Go/Rust '…' is a char literal; in JS/Python/Ruby a string.
@@ -294,7 +296,7 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
                     std::size_t end = (found == std::string_view::npos)
                                           ? n : found + term.size();
                     count_newlines(body, end);
-                    out.push_back({Tok::String, std::string{s.substr(b, end - b)}, start_line});
+                    out.push_back({Tok::String, std::string{s.substr(b, end - b)}, start_line, b});
                     i = end;
                     continue;
                 }
@@ -326,7 +328,7 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
                 std::size_t found = std::string_view{s}.find(term, k);
                 std::size_t end = (found == std::string_view::npos) ? n : found + term.size();
                 count_newlines(k, end);
-                out.push_back({Tok::String, std::string{s.substr(b, end - b)}, start_line});
+                out.push_back({Tok::String, std::string{s.substr(b, end - b)}, start_line, b});
                 i = end;
                 continue;
             }
@@ -338,7 +340,7 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
             std::size_t b = i;
             while (i < n && (std::isalnum((unsigned char)s[i]) || s[i] == '.'
                              || s[i] == '_' || s[i] == 'x' || s[i] == 'X')) ++i;
-            out.push_back({Tok::Number, std::string{s.substr(b, i - b)}, line});
+            out.push_back({Tok::Number, std::string{s.substr(b, i - b)}, line, b});
             continue;
         }
 
@@ -346,12 +348,12 @@ std::vector<Token> tokenize(std::string_view s, Lang lang) {
         if (is_ident_start((unsigned char)c)) {
             std::size_t b = i;
             while (i < n && is_ident_cont((unsigned char)s[i])) ++i;
-            out.push_back({Tok::Ident, std::string{s.substr(b, i - b)}, line});
+            out.push_back({Tok::Ident, std::string{s.substr(b, i - b)}, line, b});
             continue;
         }
 
         // Punctuation — one char per token (keeps bracket balancing simple).
-        out.push_back({Tok::Punct, std::string(1, c), line});
+        out.push_back({Tok::Punct, std::string(1, c), line, i});
         ++i;
     }
     return out;
@@ -406,6 +408,8 @@ struct Node {
     std::vector<Node> kids;        // Group: children
     int               line = 0;    // start line (for hit reporting)
     int               end_line = 0;// last line the node spans (== line for atoms)
+    std::size_t       beg = 0;     // byte span [beg,end) in the source file —
+    std::size_t       end = 0;     // exact splice coordinates for rewrite
 };
 
 constexpr char close_for(char o) {
@@ -439,18 +443,25 @@ std::vector<Node> build_nodes(const std::vector<Token>& toks, std::size_t& i,
         if (is_open(t)) {
             Node g; g.kind = NodeKind::Group; g.tok = t; g.open = t.text[0];
             g.line = t.line;
+            g.beg  = t.pos;
             ++i;
             g.kids = build_nodes(toks, i, close_for(t.text[0]));
             // end_line: the close bracket sits at toks[i-1] when consumed;
             // otherwise fall back to the last child's end.
-            g.end_line = (i > 0 && is_close(toks[i-1])) ? toks[i-1].line
+            const bool consumed_close = (i > 0 && is_close(toks[i-1]));
+            g.end_line = consumed_close ? toks[i-1].line
                        : (!g.kids.empty() ? g.kids.back().end_line : g.line);
             if (g.end_line < g.line) g.end_line = g.line;
+            g.end = consumed_close ? toks[i-1].pos + toks[i-1].text.size()
+                  : (!g.kids.empty() ? g.kids.back().end
+                                     : g.beg + t.text.size());
+            if (g.end < g.beg) g.end = g.beg;
             out.push_back(std::move(g));
             continue;
         }
         Node a; a.kind = NodeKind::Atom; a.tok = t; a.line = t.line;
         a.end_line = t.line;
+        a.beg = t.pos; a.end = t.pos + t.text.size();
         out.push_back(std::move(a));
         ++i;
     }
@@ -518,7 +529,15 @@ std::string nodes_text(const std::vector<Node>& ns, std::size_t a, std::size_t b
     return s;
 }
 
-using Binds = std::unordered_map<std::string, std::string>;
+// A metavariable binding: `norm` is the whitespace-normalized token render
+// (used for $X == $X back-reference COMPARISON — '64 * sz' and '64*sz' are
+// the same capture); [beg,end) is the VERBATIM byte span in the source file
+// (used by rewrite to splice the original bytes, preserving spacing).
+struct Bound {
+    std::string norm;
+    std::size_t beg = 0, end = 0;   // beg==end ⇒ empty capture ($$$→nothing)
+};
+using Binds = std::unordered_map<std::string, Bound>;
 
 bool atoms_equal(const Token& a, const Token& b) {
     return a.kind == b.kind && a.text == b.text;
@@ -557,8 +576,8 @@ bool match_seq(const std::vector<PNode>& pat, std::size_t pi,
             std::string cap; node_text(doc[di], cap);
             if (!p.bind.empty()) {
                 auto it = binds.find(p.bind);
-                if (it != binds.end() && it->second != cap) return false;
-                binds[p.bind] = cap;
+                if (it != binds.end() && it->second.norm != cap) return false;
+                binds[p.bind] = Bound{std::move(cap), doc[di].beg, doc[di].end};
             }
             ++pi; ++di;
             continue;
@@ -576,8 +595,13 @@ bool match_seq(const std::vector<PNode>& pat, std::size_t pi,
                 if (!p.bind.empty()) {
                     std::string cap = nodes_text(doc, di, end);
                     auto it = trial.find(p.bind);
-                    if (it != trial.end() && it->second != cap) ok = false;
-                    else trial[p.bind] = cap;
+                    if (it != trial.end() && it->second.norm != cap) ok = false;
+                    else {
+                        Bound b;
+                        b.norm = std::move(cap);
+                        if (end > di) { b.beg = doc[di].beg; b.end = doc[end-1].end; }
+                        trial[p.bind] = std::move(b);
+                    }
                 }
                 std::size_t sub_end = 0;
                 if (ok && match_seq(pat, pi + 1, doc, end, trial, sub_end)) {
@@ -598,7 +622,11 @@ bool match_seq(const std::vector<PNode>& pat, std::size_t pi,
     return true;
 }
 
-struct Hit { int line = 0; };
+struct Hit {
+    int         line = 0;
+    std::size_t beg  = 0, end = 0;   // byte span of the whole match
+    Binds       binds;               // metavariable captures (for rewrite)
+};
 
 // Try the pattern sequence starting at each sibling position, recursively into
 // groups, collecting hit start-lines. The pattern must match a CONTIGUOUS run
@@ -610,7 +638,8 @@ void match_in_scope(const std::vector<PNode>& pat,
         Binds binds;
         std::size_t end = 0;
         if (match_seq(pat, 0, doc, i, binds, end) && end > i) {
-            hits.push_back({doc[i].line});
+            hits.push_back({doc[i].line, doc[i].beg, doc[end-1].end,
+                            std::move(binds)});
         }
         // Recurse into this node's group children so nested calls match too.
         if (doc[i].kind == NodeKind::Group)
@@ -623,11 +652,13 @@ std::vector<Hit> match_file(const std::vector<PNode>& pat,
     std::vector<Hit> hits;
     if (pat.empty() || tree.empty()) return hits;
     match_in_scope(pat, tree, hits);
-    // De-dup by line (a nested recursion can re-report the same start line).
+    // De-dup by span start (a nested recursion can re-report the same match).
     std::sort(hits.begin(), hits.end(),
-              [](const Hit& a, const Hit& b) { return a.line < b.line; });
+              [](const Hit& a, const Hit& b) {
+                  return a.beg != b.beg ? a.beg < b.beg : a.end > b.end;
+              });
     hits.erase(std::unique(hits.begin(), hits.end(),
-              [](const Hit& a, const Hit& b) { return a.line == b.line; }),
+              [](const Hit& a, const Hit& b) { return a.beg == b.beg; }),
               hits.end());
     return hits;
 }
@@ -1245,6 +1276,289 @@ ExecResult run_structural(const StructArgs& a, DocRetriever* sem) {
     return ToolOutput{out.str(), std::nullopt};
 }
 
+// ── rewrite_structural — the sound matcher as a REFACTORING engine ─────
+// Same pattern language, plus a `rewrite` template: every match's byte span
+// is replaced by the template with $X / $$$Y substituted by the VERBATIM
+// source bytes each metavariable captured (original spacing preserved — the
+// normalized form is only for back-ref comparison). Because matches carry
+// exact [beg,end) spans from the node tree, splices are token-precise:
+// comments and strings can never be edited, and overlapping matches are
+// resolved deterministically (outermost-first, inner dropped).
+//
+// dry_run=true (the default) renders a preview — per-file before/after line
+// pairs — without touching disk. apply=true performs the splices and writes
+// each file atomically, returning per-file replace counts.
+
+struct RewriteArgs {
+    std::string pattern;
+    std::string rewrite;
+    std::string root;
+    std::string glob;
+    bool        apply = false;      // false ⇒ dry-run preview
+    std::string display_description;
+};
+
+// Parse the rewrite template ONCE into literal runs + metavariable refs.
+struct TplPiece {
+    std::string lit;    // literal bytes (may be empty)
+    std::string var;    // metavariable name to splice (empty ⇒ none)
+};
+std::vector<TplPiece> parse_template(std::string_view tpl) {
+    std::vector<TplPiece> out;
+    std::string lit;
+    std::size_t i = 0;
+    while (i < tpl.size()) {
+        if (tpl[i] == '$') {
+            std::size_t sig = (tpl.compare(i, 3, "$$$") == 0) ? 3 : 1;
+            std::size_t j = i + sig;
+            std::size_t b = j;
+            while (j < tpl.size() && (std::isalnum((unsigned char)tpl[j]) || tpl[j] == '_'))
+                ++j;
+            if (j > b) {
+                out.push_back({std::move(lit), std::string{tpl.substr(b, j - b)}});
+                lit.clear();
+                i = j;
+                continue;
+            }
+        }
+        lit += tpl[i++];
+    }
+    if (!lit.empty()) out.push_back({std::move(lit), ""});
+    return out;
+}
+
+// Render the template for one hit. Returns nullopt if the template names a
+// metavariable the pattern never bound (caught per-hit, reported once).
+std::optional<std::string> render_template(const std::vector<TplPiece>& tpl,
+                                           const Binds& binds,
+                                           const std::string& file_bytes) {
+    std::string out;
+    for (const auto& p : tpl) {
+        out += p.lit;
+        if (p.var.empty()) continue;
+        auto it = binds.find(p.var);
+        if (it == binds.end()) return std::nullopt;
+        const Bound& b = it->second;
+        if (b.end > b.beg && b.end <= file_bytes.size())
+            out.append(file_bytes, b.beg, b.end - b.beg);   // verbatim bytes
+        // empty capture ($$$ matched nothing) splices nothing — correct.
+    }
+    return out;
+}
+
+// Metavariable names the template references (to validate against pattern).
+std::vector<std::string> template_vars(const std::vector<TplPiece>& tpl) {
+    std::vector<std::string> v;
+    for (auto& p : tpl) if (!p.var.empty()) v.push_back(p.var);
+    return v;
+}
+
+// Metavariable names the PATTERN binds.
+void pattern_vars(const std::vector<PNode>& pat, std::vector<std::string>& out) {
+    for (auto& p : pat) {
+        if (p.kind == NodeKind::Group) { pattern_vars(p.kids, out); continue; }
+        if (p.meta != MetaKind::None && !p.bind.empty()) out.push_back(p.bind);
+    }
+}
+
+std::expected<RewriteArgs, ToolError> parse_rewrite_args(const json& j) {
+    util::ArgReader ar(j);
+    auto pat = ar.require_str("pattern");
+    if (!pat) return std::unexpected(ToolError::invalid_args("pattern required"));
+    auto rw = ar.require_str("rewrite");
+    if (!rw) return std::unexpected(ToolError::invalid_args("rewrite required"));
+    std::string p = *std::move(pat);
+    if (p.find_first_not_of(" \t\r\n") == std::string::npos)
+        return std::unexpected(ToolError::invalid_args("pattern must not be blank"));
+    return RewriteArgs{
+        std::move(p),
+        *std::move(rw),
+        ar.str("path", "."),
+        ar.str("glob", ""),
+        ar.boolean("apply", false),
+        ar.str("display_description", ""),
+    };
+}
+
+ExecResult run_rewrite(const RewriteArgs& a) {
+    auto wp = util::make_workspace_path_checked(a.root, "rewrite_structural");
+    if (!wp) return std::unexpected(std::move(wp.error()));
+
+    auto probe_pat = compile_pattern_tree(a.pattern, Lang::CFamily);
+    if (probe_pat.empty())
+        return std::unexpected(ToolError::invalid_args(
+            "pattern tokenized to nothing — provide a code shape like "
+            "'foo($$$ARGS)'"));
+    if (!has_literal_anchor(probe_pat))
+        return std::unexpected(ToolError::invalid_args(
+            "pattern is too broad (only metavariables) — anchor it with at "
+            "least one literal token, operator, or bracket"));
+
+    auto tpl = parse_template(a.rewrite);
+    // Validate: every template var must be bound by the pattern.
+    {
+        std::vector<std::string> pv;
+        pattern_vars(probe_pat, pv);
+        for (auto& v : template_vars(tpl)) {
+            if (std::find(pv.begin(), pv.end(), v) == pv.end())
+                return std::unexpected(ToolError::invalid_args(
+                    "rewrite template references $" + v +
+                    " which the pattern never binds"));
+        }
+    }
+
+    // Collect candidate files (same walk as search).
+    std::vector<fs::path> files;
+    {
+        std::error_code ec;
+        for (auto it = fs::recursive_directory_iterator(
+                 wp->path(), fs::directory_options::skip_permission_denied, ec);
+             it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            std::error_code lec;
+            bool is_dir = it->is_directory(lec);
+            if (it->is_symlink(lec)) { if (is_dir) it.disable_recursion_pending(); continue; }
+            if (is_dir) {
+                if (util::should_skip_dir(it->path().filename().string()))
+                    it.disable_recursion_pending();
+                continue;
+            }
+            const fs::path& p = it->path();
+            if (!is_source_ext(p)) continue;
+            if (!a.glob.empty() && !util::glob_match(a.glob, p.filename().string()))
+                continue;
+            files.push_back(p);
+            if (files.size() >= kMaxScanned) break;
+        }
+    }
+    if (files.empty())
+        return ToolOutput{"no source files under the search root.", std::nullopt};
+
+    std::unordered_map<int, std::vector<PNode>> pat_by_lang;
+    std::unordered_map<int, std::vector<std::string>> gates_by_lang;
+    for (Lang l : {Lang::CFamily, Lang::JsLike, Lang::Go, Lang::Rust,
+                   Lang::Python, Lang::Shell, Lang::Ruby, Lang::Lua}) {
+        int key = static_cast<int>(l);
+        auto compiled = compile_pattern_tree(a.pattern, l);
+        gates_by_lang[key] = literal_gates(compiled);
+        pat_by_lang[key] = std::move(compiled);
+    }
+
+    std::ostringstream out;
+    if (!a.display_description.empty()) out << a.display_description << "\n";
+    std::size_t total_repl = 0, files_changed = 0;
+    bool truncated = false;
+    std::optional<FileChange> change;   // carried for single-file applies
+
+    for (const auto& p : files) {
+        if (total_repl >= kMaxMatches) { truncated = true; break; }
+        std::error_code ec;
+        auto sz = fs::file_size(p, ec);
+        if (ec || sz == 0 || sz > kMaxFileBytes) continue;
+        if (util::is_binary_file(p)) continue;
+        std::string bytes = util::read_file(p);
+        if (bytes.empty()) continue;
+
+        Lang lang = lang_of(p);
+        int key = static_cast<int>(lang);
+        if (!passes_prefilter(bytes, gates_by_lang[key])) continue;
+
+        auto toks = tokenize(bytes, lang);
+        auto tree = build_tree(toks);
+        auto hits = match_file(pat_by_lang[key], tree);
+        if (hits.empty()) continue;
+
+        // Drop overlapping matches: hits are sorted by beg (outermost kept
+        // first at equal beg). Keep a hit only if it starts at/after the
+        // previous kept hit's end — splicing nested matches would corrupt.
+        std::vector<const Hit*> kept;
+        std::size_t last_end = 0;
+        for (const auto& h : hits) {
+            if (h.beg < last_end) continue;
+            if (h.end > bytes.size() || h.beg >= h.end) continue;   // paranoia
+            kept.push_back(&h);
+            last_end = h.end;
+        }
+        if (kept.empty()) continue;
+
+        // Render replacements; a template var unbound for THIS hit (possible
+        // when '?'-optional semantics arrive; today pattern_vars guarantees
+        // it) drops the hit rather than corrupting.
+        std::string rebuilt;
+        rebuilt.reserve(bytes.size());
+        std::size_t cursor = 0;
+        std::size_t applied_here = 0;
+        std::error_code rec;
+        auto rel = fs::relative(p, wp->path(), rec);
+        std::string relname = rec ? p.string() : rel.generic_string();
+
+        for (const Hit* h : kept) {
+            auto rendered = render_template(tpl, h->binds, bytes);
+            if (!rendered) continue;
+            if (total_repl >= kMaxMatches) { truncated = true; break; }
+            if (applied_here == 0) out << "\n" << relname << ":\n";
+            // Preview: the before/after of the spliced region, single-line
+            // clipped — enough to eyeball correctness without a full diff.
+            auto clip = [](std::string s) {
+                for (auto& c : s) if (c == '\n') c = ' ';
+                if (s.size() > 120) { s.resize(119); s += "\xe2\x80\xa6"; }
+                return s;
+            };
+            out << "  L" << h->line << ": - "
+                << clip(bytes.substr(h->beg, h->end - h->beg)) << "\n"
+                << "  L" << h->line << ": + " << clip(*rendered) << "\n";
+            rebuilt.append(bytes, cursor, h->beg - cursor);
+            rebuilt += *rendered;
+            cursor = h->end;
+            ++applied_here;
+            ++total_repl;
+        }
+        if (applied_here == 0) continue;
+        rebuilt.append(bytes, cursor, bytes.size() - cursor);
+        ++files_changed;
+
+        if (a.apply) {
+            if (auto err = util::write_file(p, rebuilt); !err.empty())
+                return std::unexpected(ToolError::io(
+                    "rewrite_structural: " + err));
+            // Surface the LAST file's change for the host diff-review UI
+            // (single-file rewrites — the common case — get a full diff).
+            int added = 0, removed = 0;
+            {
+                std::istringstream ib(bytes), ir(rebuilt);
+                std::size_t nb = 0, nr = 0;
+                for (std::string l; std::getline(ib, l);) ++nb;
+                for (std::string l; std::getline(ir, l);) ++nr;
+                added   = static_cast<int>(nr > nb ? nr - nb : 0);
+                removed = static_cast<int>(nb > nr ? nb - nr : 0);
+            }
+            change = FileChange{relname, added, removed, bytes, rebuilt};
+        }
+        if (out.tellp() > static_cast<std::streamoff>(kMaxOutBytes)) {
+            truncated = true;
+            break;
+        }
+    }
+
+    if (total_repl == 0)
+        return ToolOutput{
+            "no structural matches — nothing to rewrite. Run "
+            "search_structural with the same pattern to inspect.",
+            std::nullopt};
+
+    std::ostringstream head;
+    head << (a.apply ? "Rewrote " : "DRY RUN — would rewrite ")
+         << total_repl << " occurrence" << (total_repl == 1 ? "" : "s")
+         << " across " << files_changed << " file"
+         << (files_changed == 1 ? "" : "s") << "."
+         << (a.apply ? "" : " Re-run with apply:true to write.") << "\n";
+    if (truncated)
+        head << "[truncated at " << kMaxMatches << " occurrences — narrow "
+                "the pattern or path and repeat]\n";
+    return ToolOutput{head.str() + out.str(),
+                      files_changed == 1 ? std::move(change) : std::nullopt};
+}
+
 json structural_schema() {
     return json{
         {"type", "object"},
@@ -1284,6 +1598,44 @@ json structural_schema() {
     };
 }
 
+json rewrite_schema() {
+    return json{
+        {"type", "object"},
+        {"properties", {
+            {"pattern", {
+                {"type", "string"},
+                {"description",
+                 "The code SHAPE to find — same language as search_structural "
+                 "($NAME binds one node, $$$NAME binds a run, back-refs must "
+                 "match). Every match's exact byte span is replaced."}
+            }},
+            {"rewrite", {
+                {"type", "string"},
+                {"description",
+                 "Replacement template. $NAME / $$$NAME splice the VERBATIM "
+                 "source bytes that metavariable captured (original spacing "
+                 "kept). Example: pattern 'assertEquals($A, $B)' rewrite "
+                 "'assertEqual($B, $A)' swaps the arguments at every call "
+                 "site. Every $NAME in the template must be bound by the "
+                 "pattern."}
+            }},
+            {"path", {{"type", "string"},
+                      {"description", "Directory to rewrite under (default: workspace root)."}}},
+            {"glob", {{"type", "string"},
+                      {"description", "Optional filename glob filter, e.g. '*.py'."}}},
+            {"apply", {{"type", "boolean"},
+                      {"description",
+                       "false (default) = DRY RUN: show every before/after "
+                       "pair without touching disk. true = write the files "
+                       "(atomic per file). ALWAYS dry-run first and read the "
+                       "preview before applying."}}},
+            {"display_description", {{"type", "string"},
+                      {"description", "One-line summary shown in the UI. Optional."}}},
+        }},
+        {"required", json::array({"pattern", "rewrite"})},
+    };
+}
+
 } // namespace
 
 void register_structural_tools(Shells& sh,
@@ -1309,6 +1661,24 @@ void register_structural_tools(Shells& sh,
                if (!parsed) return mcp::cap::Result::error(parsed.error().render());
                return lower(run_structural(*parsed, sem.get()));
            },
+           /*token_budget=*/30'000);
+
+    sh.add("rewrite_structural",
+           "Structural find-and-replace — the search_structural pattern "
+           "language as a REFACTORING engine. Matches a code shape and "
+           "replaces every occurrence with a template, splicing each "
+           "metavariable's VERBATIM captured source back in: pattern "
+           "'assertEquals($A, $B)' + rewrite 'assertEqual($B, $A)' swaps "
+           "arguments at every call site in one call. Token-precise byte "
+           "spans mean comments and string literals are never touched — "
+           "unlike sed/regex replace. Back-references constrain matches "
+           "('$X = $X' finds only self-assignments). Defaults to a DRY-RUN "
+           "preview of every before/after pair; re-run with apply:true to "
+           "write. Use `edit` for one-off changes; use THIS for the same "
+           "shape change across many sites.",
+           rewrite_schema(),
+           EffectSet{Effect::ReadFs, Effect::WriteFs},
+           body<RewriteArgs>(run_rewrite, parse_rewrite_args),
            /*token_budget=*/30'000);
 }
 

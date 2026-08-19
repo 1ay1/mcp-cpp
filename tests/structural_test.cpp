@@ -505,3 +505,136 @@ TEST_CASE("search_structural semantic bridge") {
     std::error_code ec;
     fs::remove_all(root, ec);
 }
+
+// ── rewrite_structural: the sound matcher as a refactoring engine ─────
+TEST_CASE("rewrite_structural") {
+    auto root = fs::temp_directory_path() /
+                ("mcp_rewrite_test_" + std::to_string(mcp_getpid()));
+    fs::create_directories(root);
+    util::set_workspace_root(root);
+    auto prev_cwd = fs::current_path();
+    fs::current_path(root);
+
+    HostServices svc;
+    auto provider = make_provider(svc, ToolsetConfig{}, "local");
+
+    swrite(root / "t.c",
+        "int a() { return assertEquals(x, 42); }\n"           // L1
+        "// assertEquals(ignore, me) — comment, must survive\n" // L2
+        "const char* s = \"assertEquals(nor, me)\";\n"        // L3
+        "int b() { return assertEquals(compute(1,2), y); }\n"); // L4 nested args
+
+    // ── 1. DRY RUN: preview shows swaps, disk untouched. NOTE: $$$A because
+    //      `compute(1,2)` is TWO sibling nodes (ident + group) — $A alone
+    //      would (correctly) skip that call site. ───────────────────
+    {
+        auto args = sobj();
+        args["pattern"] = "assertEquals($$$A, $B)";
+        args["rewrite"] = "assertEqual($B, $$$A)";
+        args["path"]    = root.string();
+        auto r = scall(*provider, "rewrite_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("DRY RUN") != std::string::npos);
+        assert(r.text.find("2 occurrences") != std::string::npos);
+        assert(r.text.find("assertEqual(42, x)") != std::string::npos);
+        // Nested group captured as ONE node and spliced verbatim:
+        assert(r.text.find("assertEqual(y, compute(1,2))") != std::string::npos);
+        // Disk untouched:
+        std::ifstream in(root / "t.c");
+        std::string disk((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        assert(disk.find("assertEquals(x, 42)") != std::string::npos);
+        std::puts("rewrite: dry-run preview, disk untouched ok");
+    }
+
+    // ── 2. APPLY: swaps written; comment + string occurrences survive ───
+    {
+        auto args = sobj();
+        args["pattern"] = "assertEquals($$$A, $B)";
+        args["rewrite"] = "assertEqual($B, $$$A)";
+        args["path"]    = root.string();
+        args["apply"]   = true;
+        auto r = scall(*provider, "rewrite_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("Rewrote 2 occurrences") != std::string::npos);
+        std::ifstream in(root / "t.c");
+        std::string disk((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        assert(disk.find("assertEqual(42, x)") != std::string::npos);
+        assert(disk.find("assertEqual(y, compute(1,2))") != std::string::npos);
+        // The comment and the string literal are byte-for-byte intact:
+        assert(disk.find("// assertEquals(ignore, me)") != std::string::npos);
+        assert(disk.find("\"assertEquals(nor, me)\"") != std::string::npos);
+        std::puts("rewrite: apply writes swaps, comments/strings immune ok");
+    }
+
+    // ── 3. $$$ splice: wrap every call's whole arg list ───────────────
+    {
+        swrite(root / "w.c",
+            "int f() { return old_log(a, b, fmt(x));\n"
+            "          return old_log(); }\n");           // zero args too
+        auto args = sobj();
+        args["pattern"] = "old_log($$$ARGS)";
+        args["rewrite"] = "new_log(ctx, $$$ARGS)";
+        args["path"]    = root.string();
+        args["glob"]    = "w.c";
+        args["apply"]   = true;
+        auto r = scall(*provider, "rewrite_structural", args);
+        assert(!r.is_error);
+        std::ifstream in(root / "w.c");
+        std::string disk((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        assert(disk.find("new_log(ctx, a, b, fmt(x))") != std::string::npos);
+        assert(disk.find("new_log(ctx, )") != std::string::npos); // empty splice
+        std::puts("rewrite: $$$ARGS splice incl. empty capture ok");
+    }
+
+    // ── 4. Unbound template var → invalid-args error, nothing written ───
+    {
+        auto args = sobj();
+        args["pattern"] = "foo($A)";
+        args["rewrite"] = "bar($NOPE)";
+        args["path"]    = root.string();
+        auto r = scall(*provider, "rewrite_structural", args);
+        assert(r.is_error);
+        assert(r.text.find("NOPE") != std::string::npos);
+        std::puts("rewrite: unbound template var rejected ok");
+    }
+
+    // ── 5. Back-reference constrains the rewrite set ─────────────────
+    {
+        swrite(root / "sa.c",
+            "void f() { x = x; y = z; a = a; }\n");
+        auto args = sobj();
+        args["pattern"] = "$V = $V;";
+        args["rewrite"] = "/* self-assign removed: $V */;";
+        args["path"]    = root.string();
+        args["glob"]    = "sa.c";
+        args["apply"]   = true;
+        auto r = scall(*provider, "rewrite_structural", args);
+        assert(!r.is_error);
+        std::ifstream in(root / "sa.c");
+        std::string disk((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        assert(disk.find("self-assign removed: x") != std::string::npos);
+        assert(disk.find("self-assign removed: a") != std::string::npos);
+        assert(disk.find("y = z;") != std::string::npos);   // untouched
+        std::puts("rewrite: back-reference constrained rewrite ok");
+    }
+
+    // ── 6. No matches → clean no-op message ────────────────────────
+    {
+        auto args = sobj();
+        args["pattern"] = "nonexistent_fn($$$)";
+        args["rewrite"] = "other_fn($$$)";
+        args["path"]    = root.string();
+        auto r = scall(*provider, "rewrite_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("nothing to rewrite") != std::string::npos);
+        std::puts("rewrite: zero matches clean no-op ok");
+    }
+
+    fs::current_path(prev_cwd);
+    std::error_code ec2;
+    fs::remove_all(root, ec2);
+}
