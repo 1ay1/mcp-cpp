@@ -180,6 +180,45 @@ resolve_symbol_range(std::string_view content, std::string_view symbol) {
     }
     if (def_line < 0) return std::nullopt;
 
+    // Multi-line signatures: the outline regex matches the line with the NAME,
+    // but the return type / attributes / template head may sit on the lines
+    // ABOVE (e.g. `[[nodiscard]] std::optional<Foo>` \n `bar(...) {`). Back up
+    // over those continuation lines so the returned range starts at the real
+    // declaration. A line is a continuation of the def below it when it is
+    // non-empty, not itself a statement/block end, and reads as a type head:
+    // ends in one of  , < & * :  or is a bare template/attribute/qualifier.
+    {
+        auto is_sig_head = [](std::string_view s) {
+            // trim trailing spaces
+            std::size_t e = s.find_last_not_of(" \t");
+            if (e == std::string_view::npos) return false;   // blank
+            s = s.substr(0, e + 1);
+            char last = s.back();
+            if (last == ';' || last == '{' || last == '}' || last == ':')
+                return false;   // statement / block / label end
+            std::size_t b = s.find_first_not_of(" \t");
+            std::string_view t = s.substr(b);
+            // Attribute or template head, or a return-type/qualifier line that
+            // flows into the signature (ends in a type-continuation char).
+            if (t.rfind("[[", 0) == 0) return true;
+            if (t.rfind("template", 0) == 0) return true;
+            if (last == ',' || last == '<' || last == '&' || last == '*'
+                || last == '>' ) return true;
+            static constexpr std::string_view kQual[] = {
+                "static", "inline", "constexpr", "const", "virtual",
+                "explicit", "friend", "[[nodiscard]]", "pub", "async",
+                "public", "private", "protected", "export",
+            };
+            for (auto q : kQual)
+                if (t.rfind(q, 0) == 0 && t.find('(') == std::string_view::npos)
+                    return true;
+            return false;
+        };
+        int start = def_line;
+        while (start > 1 && is_sig_head(lines[start - 2])) --start;
+        def_line = start;
+    }
+
     // Enclosing brace scope from the def line downward.
     auto delta = [](std::string_view s) {
         int d = 0; bool in_str = false; char q = 0;
