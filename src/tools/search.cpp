@@ -1128,14 +1128,24 @@ void register_search_tools(Shells& sh) {
         body<GlobArgs>(run_glob, parse_glob_args), 25'000);
 
     sh.add("find_references",
-        "Find exact identifier references across the workspace with file, line, enclosing symbol, context, glob filtering, and pagination.",
+        "Find every use of an EXACT identifier (whole-word, case-sensitive) "
+        "with file, line, enclosing symbol, context, glob filtering, and "
+        "pagination. Convenience wrapper over `grep` that auto-escapes the "
+        "symbol and adds word boundaries so `foo` doesn't match `foobar` or "
+        "`do_foo`. Use it for a quick 'who touches this name'. NOTE: like grep "
+        "it is TEXT-based, so it also matches the name in comments and "
+        "strings — if that noise matters, use `search_structural` (e.g. "
+        "`foo($$$)` for calls only) which ignores comments and string "
+        "literals.",
         find_references_schema(), EffectSet{Effect::ReadFs},
         body<FindReferencesArgs>(run_find_references, parse_find_references_args), 30'000);
 
     sh.add("find_definition",
-        "Find the definition of a symbol (function, class, struct, enum, type) "
-        "across the codebase. Searches for common definition patterns in C/C++, "
-        "Python, JavaScript/TypeScript, Go, and Rust.",
+        "Jump to where a symbol is DEFINED (function, class, struct, enum, "
+        "type) across the codebase, using curated per-language definition "
+        "patterns for C/C++, Python, JavaScript/TypeScript, Go, and Rust — so "
+        "it returns the declaration, not every mention (that's "
+        "`find_references`) and not a ranked overview (that's `repo_map`).",
         find_definition_schema(), EffectSet{Effect::ReadFs},
         body<FindDefinitionArgs>(run_find_definition, parse_find_definition_args), 25'000);
 }
