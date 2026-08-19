@@ -174,6 +174,29 @@ TEST_CASE("search_tools") {
         std::puts("grep: context=block handles raw strings ok");
     }
 
+    // ── grep context:block on PYTHON uses indent scope, not braces ──────
+    {
+        write_file(root / "blk.py",
+            "def handler(req):\n"                    // L1 header
+            "    opts = {'a': 1}\n"                  // L2 dict literal trap
+            "    NEEDLE_py = req\n"                  // L3 hit
+            "    return NEEDLE_py\n"                 // L4 tail must show
+            "\n"
+            "def other():\n"                          // L6 must NOT leak in
+            "    pass\n");
+        auto args = obj();
+        args["pattern"] = "NEEDLE_py =";
+        args["path"]    = root.string();
+        args["glob"]    = "blk.py";
+        args["context"] = "block";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("def handler") != std::string::npos);   // header
+        assert(r.text.find("return NEEDLE_py") != std::string::npos); // tail
+        assert(r.text.find("def other") == std::string::npos);     // bounded
+        std::puts("grep: context=block python indent scope ok");
+    }
+
     // ── case-fold literal scanner: non-letter lead byte + mixed-case ─────
     // Guards the memchr-driven dual-scan (lowercase + uppercase first byte)
     // and the non-overlapping stride after a hit. "_zZz" leads with '_'

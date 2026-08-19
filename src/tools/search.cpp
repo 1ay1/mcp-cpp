@@ -749,6 +749,59 @@ enum class Backend { Ripgrep, BuiltIn };
     return {lo, hi};
 }
 
+// context:"block" for INDENT-scoped languages (Python/Ruby), where braces
+// don't delimit scope. Walk backward from the hit to the nearest header at
+// strictly smaller indent (Python: line ends with ':'; Ruby: def/class/
+// module), then forward while lines are blank or indented deeper than the
+// header. Mirrors structural.cpp's indent_scope. 1-based inclusive.
+[[nodiscard]] std::pair<int,int> indent_block_range(
+    const std::vector<std::string>& lines, int line, bool ruby,
+    int max_span = 120) {
+    auto indent_of = [](const std::string& s) -> int {
+        int w = 0;
+        for (char c : s) {
+            if (c == ' ') ++w;
+            else if (c == '\t') w += 8;
+            else return w;
+        }
+        return -1;                                 // blank line
+    };
+    auto is_header = [&](const std::string& s) {
+        if (ruby) {
+            std::size_t b = s.find_first_not_of(" \t");
+            if (b == std::string::npos) return false;
+            std::string_view v{s.data() + b, s.size() - b};
+            return v.starts_with("def ") || v.starts_with("class ")
+                || v.starts_with("module ");
+        }
+        std::size_t e = s.find_last_not_of(" \t\r");
+        return e != std::string::npos && s[e] == ':';
+    };
+    const int n = static_cast<int>(lines.size());
+    if (line < 1 || line > n) return {line, line};
+
+    int hit_ind = indent_of(lines[line - 1]);
+    if (hit_ind < 0) hit_ind = 0;
+
+    int lo = line, hdr_ind = -1;
+    for (int ln = line; ln >= 1 && line - ln <= max_span; --ln) {
+        int ind = indent_of(lines[ln - 1]);
+        if (ind < 0) continue;
+        if (ind < hit_ind && is_header(lines[ln - 1])) { lo = ln; hdr_ind = ind; break; }
+        if (ind == 0 && ln < line) break;          // top-level non-header: stop
+    }
+    if (hdr_ind < 0) return {line, line};          // module-level hit: bare
+
+    int hi = line;
+    for (int ln = line; ln <= n && ln - lo <= max_span; ++ln) {
+        int ind = indent_of(lines[ln - 1]);
+        if (ind < 0) continue;                     // blank: tentative
+        if (ind <= hdr_ind && ln > lo) break;
+        hi = ln;
+    }
+    return {lo, hi};
+}
+
 ExecResult run_ripgrep(const GrepArgs& a) {
     std::vector<std::string> argv = {"rg", "--json", "--no-config"};
     if (!a.case_sensitive) argv.push_back("-i");
@@ -1040,9 +1093,18 @@ ExecResult run_builtin(const GrepArgs& a) {
         auto lines = offsets_to_lines(h.content, h.match_offsets);
 
         // In block mode, precompute the file's line vector once so each hit's
-        // range can be expanded to its enclosing brace scope.
+        // range can be expanded to its enclosing brace scope. Indent-scoped
+        // languages (Python/Ruby) have no brace scope — walk indentation.
         std::vector<std::string> file_lines;
-        if (a.block) file_lines = split_content_lines(h.content);
+        bool indent_scoped = false;
+        bool ruby = false;
+        if (a.block) {
+            file_lines = split_content_lines(h.content);
+            auto ext = h.path.extension().string();
+            for (auto& ch : ext) ch = static_cast<char>(std::tolower((unsigned char)ch));
+            indent_scoped = (ext == ".py" || ext == ".pyi" || ext == ".rb");
+            ruby = (ext == ".rb");
+        }
 
         std::vector<std::pair<int,int>> page_ranges;
         for (const auto& li : lines) {
@@ -1051,7 +1113,9 @@ ExecResult run_builtin(const GrepArgs& a) {
             int row = li.line_no - 1;
             int start, end;
             if (a.block) {
-                auto [lo, hi] = brace_block_range(file_lines, li.line_no);
+                auto [lo, hi] = indent_scoped
+                    ? indent_block_range(file_lines, li.line_no, ruby)
+                    : brace_block_range(file_lines, li.line_no);
                 start = lo - 1; end = hi - 1;
             } else {
                 start = std::max(0, row - kContext);
