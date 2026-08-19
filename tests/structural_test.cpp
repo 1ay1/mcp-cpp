@@ -339,6 +339,35 @@ TEST_CASE("search_structural") {
         std::puts("structural: js template literal w/ escape + brace ok");
     }
 
+    // ── 11. Python expand: indent scope returns the whole def — including
+    //      lines AFTER the hit — and is not fooled by a dict literal ─────
+    {
+        swrite(root / "svc.py",
+            "CONF = {\n"                                  // L1 module-level dict
+            "    'k': 1,\n"                               // L2
+            "}\n"                                          // L3
+            "def handler(req):\n"                          // L4 header
+            "    opts = {'a': 1,\n"                        // L5 multi-line dict
+            "            'b': 2}\n"                        // L6
+            "    fire(req)\n"                              // L7 <-- hit
+            "    return opts\n"                            // L8 must be included
+            "\n"
+            "def other():\n"                               // L10 must NOT leak in
+            "    pass\n");
+        auto args = sobj();
+        args["pattern"] = "fire($X)";
+        args["path"]    = root.string();
+        args["glob"]    = "*.py";
+        args["expand"]  = true;
+        auto r = scall(*provider, "search_structural", args);
+        assert(!r.is_error);
+        assert(r.text.find("> L7") != std::string::npos);
+        assert(r.text.find("def handler") != std::string::npos); // header shown
+        assert(r.text.find("return opts") != std::string::npos); // tail shown
+        assert(r.text.find("def other") == std::string::npos);   // next def excluded
+        std::puts("structural: python expand = indent scope ok");
+    }
+
     fs::current_path(prev_cwd);
     std::error_code ec;
     fs::remove_all(root, ec);

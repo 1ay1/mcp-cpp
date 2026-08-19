@@ -752,6 +752,63 @@ scope_from_tree(const std::vector<Node>& nodes, int hit_line) {
     return std::make_pair(best->line, best->end_line);
 }
 
+// Indent-based enclosing scope for Python/indent-scoped languages, where the
+// brace-group walk finds nothing. Walk BACKWARD from the hit to the nearest
+// header line at strictly smaller indent (Python: ends with ':'; Ruby: starts
+// with def/class/module), then FORWARD while lines are blank or indented
+// deeper than the header. Returns [lo,hi] 1-based inclusive.
+std::pair<int,int> indent_scope(const std::vector<std::string>& lines,
+                                int hit_line, int max_span, Lang lang) {
+    auto indent_of = [](const std::string& s) -> int {
+        int w = 0;
+        for (char c : s) {
+            if (c == ' ') ++w;
+            else if (c == '\t') w += 8;
+            else return w;
+        }
+        return -1;   // blank line: no indent information
+    };
+    auto is_header = [&](const std::string& s) {
+        if (lang == Lang::Ruby) {
+            std::size_t b = s.find_first_not_of(" \t");
+            if (b == std::string::npos) return false;
+            std::string_view v{s.data() + b, s.size() - b};
+            return v.starts_with("def ") || v.starts_with("class ")
+                || v.starts_with("module ");
+        }
+        std::size_t e = s.find_last_not_of(" \t\r");
+        if (e == std::string::npos) return false;
+        return s[e] == ':';
+    };
+    const int n = static_cast<int>(lines.size());
+    if (hit_line < 1 || hit_line > n) return {hit_line, hit_line};
+
+    int hit_ind = indent_of(lines[hit_line - 1]);
+    if (hit_ind < 0) hit_ind = 0;
+
+    // Backward: nearest header at smaller indent.
+    int lo = hit_line, hdr_ind = -1;
+    for (int ln = hit_line; ln >= 1 && hit_line - ln <= max_span; --ln) {
+        int ind = indent_of(lines[ln - 1]);
+        if (ind < 0) continue;                    // blank
+        if (ind < hit_ind && is_header(lines[ln - 1])) {
+            lo = ln; hdr_ind = ind; break;
+        }
+        if (ind == 0 && ln < hit_line) break;      // hit top-level code, stop
+    }
+    if (hdr_ind < 0) return {hit_line, hit_line};  // no header found
+
+    // Forward: body extends while blank or indented deeper than the header.
+    int hi = hit_line;
+    for (int ln = hit_line; ln <= n && ln - lo <= max_span; ++ln) {
+        int ind = indent_of(lines[ln - 1]);
+        if (ind < 0) continue;                    // blank: tentative
+        if (ind <= hdr_ind && ln > lo) break;
+        hi = ln;
+    }
+    return {lo, hi};
+}
+
 // ── Tool args ───────────────────────────────────────────────────────────
 struct StructArgs {
     std::string pattern;
@@ -966,9 +1023,14 @@ ExecResult run_structural(const StructArgs& a) {
             // and never swallowed by a neighbour's already-printed context.
             int lo, hi;
             if (a.expand) {
-                // Prefer the tree (exact group span); fall back to the line
-                // scan for indent-scoped langs with no covering brace group.
-                if (auto sc = scope_from_tree(file_tree, h.line)) {
+                // Indent-scoped langs FIRST (a multi-line dict literal is a
+                // brace group that would win otherwise); then the tree (exact
+                // group span); brace line-scan as final fallback.
+                Lang flang = lang_of(fm.rel);
+                if (flang == Lang::Python || flang == Lang::Ruby) {
+                    auto blk = indent_scope(lines, h.line, /*max_span=*/120, flang);
+                    lo = blk.first; hi = blk.second;
+                } else if (auto sc = scope_from_tree(file_tree, h.line)) {
                     lo = sc->first; hi = sc->second;
                 } else {
                     auto blk = enclosing_block(lines, h.line, /*max_span=*/80);
