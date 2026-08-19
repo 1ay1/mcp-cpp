@@ -13,6 +13,15 @@
 //   throws std::runtime_error if the server can't be spawned or doesn't
 //   complete the handshake, so a host can catch-and-skip a bad server.
 //
+//   CONCURRENCY BY CONSTRUCTION. The mutable connection state (child process
+//   + transport) lives inside Guarded<Conn>: the ONLY way to reach it is
+//   Guarded::use(), which runs under the connection lock, and ~Guarded parks
+//   until every in-flight use() drains. That makes the field crash class
+//   "destructor tears the transport down while another thread is mid-
+//   handshake inside execute()'s reconnect" UNREPRESENTABLE — there is no
+//   unlocked path to the state for a destructor to race, and no lock a
+//   future edit can forget to take.
+//
 //   POSIX-only (needs ChildProcess). Guarded by MCP_CAP_HAVE_PROCESS.
 //
 #pragma once
@@ -22,11 +31,11 @@
 
 #if MCP_CAP_HAVE_PROCESS
 
+#include <mcp/cap/guarded.hpp>
 #include <mcp/stdio.hpp>
 
 #include <chrono>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -45,86 +54,110 @@ public:
     };
 
     explicit StdioServerProvider(Config cfg) : cfg_(std::move(cfg)) {
-        start_();
+        conn_.use([&](Conn& c) { start_(c); });
     }
 
     [[nodiscard]] Result execute(const Request& req) override {
-        std::lock_guard<std::mutex> lock(reconnect_mu_);
-        if (!alive() || connection_poisoned()) {
-            try {
-                teardown_();
-                reset_client();
-                proc_.reset();
-                start_();
-                if (on_list_changed_) on_list_changed_();
-            } catch (const std::exception& error) {
-                return Result::error(std::string{"mcp reconnect failed: "} + error.what());
-            }
-        }
+        // The reconnect (spawn + seconds-long handshake) runs entirely under
+        // the connection lock via use(). A concurrent destructor cannot free
+        // the transport/engine mid-handshake: ~Guarded blocks until this
+        // use() returns. (Field SIGSEGV, crash report 2026-08-16.)
+        if (auto err = conn_.use([&](Conn& c) -> std::string {
+                if (alive_(c) && !connection_poisoned()) return {};   // healthy
+                try {
+                    teardown_(c);
+                    start_(c);
+                    if (on_list_changed_) on_list_changed_();
+                } catch (const std::exception& error) {
+                    return std::string{"mcp reconnect failed: "} + error.what();
+                }
+                return {};
+            });
+            !err.empty())
+            return Result::error(std::move(err));
         return ClientProvider::execute(req);
     }
 
+    // NOTE: no hand-written destructor. ~Guarded<Conn> parks until in-flight
+    // use() calls drain, then Conn's members tear down in declaration order
+    // (transport joins its reader first — see Conn) — the safe order is the
+    // DECLARATION order, not a comment.
     ~StdioServerProvider() override {
-        // Serialize with an in-flight execute()/reconnect. A tool-call worker
-        // may be inside start_() → connect() → initialize() (a seconds-long
-        // handshake) when the host drops its last pool reference at quit.
-        // Destroying the transport/engine under that thread's feet is a
-        // use-after-free (observed in the field: SIGSEGV in
-        // RpcEngine::request on thread A while ~StdioServerProvider ran on
-        // thread B). Taking reconnect_mu_ here parks the destructor until
-        // the reconnect either finishes or fails; only then is teardown safe.
-        std::lock_guard<std::mutex> lock(reconnect_mu_);
-        teardown_();
+        // The base's client_ (engine) must outlive the transport reader.
+        // Stop the reader while the engine is still alive; ~Guarded makes
+        // this wait for any concurrent execute()/reconnect first.
+        conn_.use([&](Conn& c) { teardown_(c); });
     }
 
     StdioServerProvider(const StdioServerProvider&)            = delete;
     StdioServerProvider& operator=(const StdioServerProvider&) = delete;
 
-    [[nodiscard]] bool alive() const noexcept override { return proc_ && proc_->alive(); }
+    [[nodiscard]] bool alive() const noexcept override {
+        try {
+            return conn_.use([&](const Conn& c) { return alive_(c); });
+        } catch (...) { return false; }
+    }
 
 protected:
     void on_teardown() noexcept override {
-        // Order is load-bearing: the transport's reader thread calls into the
-        // engine on every inbound frame, so STOP the reader before the client
-        // is destroyed.
-        //   1. close_stdin() — EOF the child → it exits → stdout closes → the
-        //      reader's getline returns EOF, so transport_.reset()'s join()
-        //      won't block.
-        //   2. terminate() — makes step 3 BOUNDED. A misbehaving child that
-        //      ignores EOF and keeps its stdout open would otherwise wedge
-        //      the join forever (observed in the field: quit-path thread
-        //      parked in pthread_join inside on_teardown). SIGTERM→SIGKILL
-        //      guarantees the child dies, its stdout closes, and the reader
-        //      unblocks within ChildProcess's own deadline. A well-behaved
-        //      child has already exited on EOF, so this is a no-op for it.
-        //   3. transport_.reset() — joins the reader thread.
-        if (proc_) {
-            proc_->close_stdin();
-            proc_->terminate();
-        }
-        transport_.reset();
+        // Reached from the base's connect() failure path — which only ever
+        // runs INSIDE one of our use() calls (construction / reconnect), so
+        // the recursive lock re-enters instead of deadlocking.
+        try {
+            conn_.use([&](Conn& c) { stop_reader_(c); });
+        } catch (...) {}
     }
 
 private:
-    void start_() {
-        proc_      = std::make_unique<ChildProcess>(cfg_.spawn);
-        transport_ = std::make_unique<StdioTransport>(proc_->out(), proc_->in());
-        auto client = std::make_unique<Client>(transport_->sink());
-        transport_->start(client->engine());
+    // The connection state. Declaration order is the teardown contract:
+    // members destroy bottom-up, so `transport` (whose dtor joins the reader
+    // thread) dies BEFORE `proc` (whose dtor reaps the child) — and both die
+    // after ~StdioServerProvider already stopped the reader against the
+    // still-alive engine.
+    struct Conn {
+        std::unique_ptr<ChildProcess>   proc;
+        std::unique_ptr<StdioTransport> transport;
+    };
+
+    [[nodiscard]] static bool alive_(const Conn& c) noexcept {
+        return c.proc && c.proc->alive();
+    }
+
+    void start_(Conn& c) {
+        c.proc      = std::make_unique<ChildProcess>(cfg_.spawn);
+        c.transport = std::make_unique<StdioTransport>(c.proc->out(), c.proc->in());
+        auto client = std::make_unique<Client>(c.transport->sink());
+        c.transport->start(client->engine());
         connect(cfg_.name, std::move(client), cfg_.client_info,
                 cfg_.handshake_timeout, cfg_.call_timeout, cfg_.integration);
     }
 
-    void teardown_() noexcept {
-        on_teardown();      // stop reader (steps 1+2)
-        reset_client();     // 3. now no thread touches the engine
-        proc_.reset();      // 4. reap the child + close the read FD
+    // Stop the transport's reader thread while the engine still exists.
+    // Order is load-bearing:
+    //   1. close_stdin() — EOF the child → it exits → its stdout closes →
+    //      the reader's getline returns EOF, so the join won't block.
+    //   2. terminate() — makes the join BOUNDED. A misbehaving child that
+    //      ignores EOF would otherwise wedge the join forever (observed in
+    //      the field as a quit-path hang). SIGTERM→SIGKILL guarantees the
+    //      child dies and the reader unblocks; a well-behaved child already
+    //      exited on EOF, so this is a no-op for it.
+    //   3. transport.reset() — joins the reader thread.
+    static void stop_reader_(Conn& c) noexcept {
+        if (c.proc) {
+            c.proc->close_stdin();
+            c.proc->terminate();
+        }
+        c.transport.reset();
     }
 
-    Config                           cfg_;
-    std::mutex                       reconnect_mu_;
-    std::unique_ptr<ChildProcess>   proc_;
-    std::unique_ptr<StdioTransport> transport_;
+    void teardown_(Conn& c) noexcept {
+        stop_reader_(c);    // 1–3: reader stopped against the live engine
+        reset_client();     // 4. now no thread touches the engine
+        c.proc.reset();     // 5. reap the child + close the read FD
+    }
+
+    Config        cfg_;
+    Guarded<Conn> conn_;
 };
 
 } // namespace mcp::cap

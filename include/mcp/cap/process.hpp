@@ -651,6 +651,39 @@ private:
     int fd_ = -1;
 };
 
+// A pipe whose two ends are CLOEXEC FROM BIRTH — the property is part of the
+// TYPE, not a call site's discipline. Why it must be structural: providers
+// spawn in parallel, so a sibling's fork() between a bare ::pipe() and our
+// exec would inherit the ends; that sibling's long-lived child then holds our
+// child's stdout write end open, EOF never reaches our reader, and teardown
+// wedges forever in pthread_join (a real field hang). With CloexecPipe there
+// is no window in which an inheritable end exists, and no future edit can
+// forget the fcntl — the only way to get a pipe here is the safe way.
+// (pipe2(O_CLOEXEC) is atomic where the platform has it; the fcntl fallback
+// still closes the race down to our own two instructions, and every OTHER
+// concurrently-spawned child sees CLOEXEC set.) dup2() onto 0/1 in our own
+// child CLEARS the flag on the duplicate, so the exec'd server keeps stdio.
+struct CloexecPipe {
+    FdGuard rd, wr;
+    // Named constructor: the throwing path never yields a partially-armed pipe.
+    static CloexecPipe make(const char* what) {
+        int fds[2] = {-1, -1};
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        if (::pipe2(fds, O_CLOEXEC) != 0)
+            throw std::runtime_error(std::string{"mcp::cap: pipe2() failed ("} + what + ")");
+#else
+        if (::pipe(fds) != 0)
+            throw std::runtime_error(std::string{"mcp::cap: pipe() failed ("} + what + ")");
+        (void)::fcntl(fds[0], F_SETFD, ::fcntl(fds[0], F_GETFD) | FD_CLOEXEC);
+        (void)::fcntl(fds[1], F_SETFD, ::fcntl(fds[1], F_GETFD) | FD_CLOEXEC);
+#endif
+        CloexecPipe p;
+        p.rd = FdGuard{fds[0]};
+        p.wr = FdGuard{fds[1]};
+        return p;
+    }
+};
+
 // A spawned child process whose stdin/stdout are wired to iostreams. stderr is
 // left attached to the parent's (MCP servers log there; the spec keeps stderr
 // free for logging). Construction throws std::runtime_error on spawn failure.
@@ -665,38 +698,20 @@ public:
     };
 
     explicit ChildProcess(const Spawn& s) {
-        // parent[1] → child stdin[0]; child stdout[1] → parent[0]. Each end is
-        // owned by an FdGuard the moment ::pipe() hands it back, so any throw
-        // before the commit point unwinds every open FD automatically — no
-        // hand-rolled close-ladder to drift out of sync with the open set.
-        int in_pipe[2]  = {-1, -1};
-        int out_pipe[2] = {-1, -1};
-        // Every pipe end is marked CLOEXEC the moment it exists. Providers
-        // spawn IN PARALLEL (the host connects servers concurrently), so a
-        // sibling's fork() between our pipe() and exec() inherits these FDs
-        // without it: that sibling's long-lived child then holds OUR child's
-        // stdout write end open, EOF never reaches our reader after our
-        // child dies, and teardown wedges forever in pthread_join (observed
-        // in the field as a quit-path hang, and as an exit-time hang in
-        // static destructors). dup2() onto 0/1 in our own child CLEARS the
-        // flag on the duplicate, so the exec'd server still gets its stdio.
-        auto cloexec = [](int fd) {
-            (void)::fcntl(fd, F_SETFD, ::fcntl(fd, F_GETFD) | FD_CLOEXEC);
-        };
-        if (::pipe(in_pipe) != 0)
-            throw std::runtime_error("mcp::cap: pipe() failed (stdin)");
-        cloexec(in_pipe[0]); cloexec(in_pipe[1]);
-        FdGuard in_rd{in_pipe[0]}, in_wr{in_pipe[1]};
-        if (::pipe(out_pipe) != 0)
-            throw std::runtime_error("mcp::cap: pipe() failed (stdout)");
-        cloexec(out_pipe[0]); cloexec(out_pipe[1]);
-        FdGuard out_rd{out_pipe[0]}, out_wr{out_pipe[1]};
-
-        int ready_pipe[2] = {-1, -1};
-        if (::pipe(ready_pipe) != 0)
-            throw std::runtime_error("mcp::cap: pipe() failed (ready)");
-        cloexec(ready_pipe[0]); cloexec(ready_pipe[1]);
-        FdGuard ready_rd{ready_pipe[0]}, ready_wr{ready_pipe[1]};
+        // parent.wr → child stdin; child stdout → parent.rd. Every end is
+        // CLOEXEC-from-birth by TYPE (see CloexecPipe) and owned by an
+        // FdGuard, so any throw before the commit point unwinds every open
+        // FD automatically — no hand-rolled close-ladder, no inheritable
+        // window for a concurrently-forking sibling.
+        CloexecPipe in_p    = CloexecPipe::make("stdin");
+        CloexecPipe out_p   = CloexecPipe::make("stdout");
+        CloexecPipe ready_p = CloexecPipe::make("ready");
+        FdGuard& in_rd = in_p.rd;       FdGuard& in_wr = in_p.wr;
+        FdGuard& out_rd = out_p.rd;     FdGuard& out_wr = out_p.wr;
+        FdGuard& ready_rd = ready_p.rd; FdGuard& ready_wr = ready_p.wr;
+        int in_pipe[2]    = {in_p.rd.get(), in_p.wr.get()};
+        int out_pipe[2]   = {out_p.rd.get(), out_p.wr.get()};
+        int ready_pipe[2] = {ready_p.rd.get(), ready_p.wr.get()};
 
         pid_ = ::fork();
         if (pid_ < 0)
