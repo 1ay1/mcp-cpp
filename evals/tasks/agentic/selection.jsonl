@@ -1,0 +1,5 @@
+// Tier-2 AGENTIC evals — assert on WHICH tool the model picks. Needs a live
+// model + AGENTTY_BIN; NOT wired into CI. Run: python3 evals/run_agentic.py
+{"name": "count TODO owners → aggregate, not grep", "prompt": "In the Python files here, how many TODOs does each author have? Answer with the counts. Use the single most direct tool.", "expect_tools": ["aggregate"], "reject_tools": [], "answer_contains": ["alice", "bob"]}
+{"name": "query package.json scripts → json_query, not read", "prompt": "What script names are defined in package.json? List them.", "expect_tools": ["json_query"], "reject_tools": [], "answer_contains": ["build", "test", "lint"]}
+{"name": "understand app.py shape → outline before read", "prompt": "What functions and classes does app.py define? Don't read the whole file if you can avoid it.", "expect_tools": ["outline"], "reject_tools": [], "answer_contains": ["Widget", "render"]}

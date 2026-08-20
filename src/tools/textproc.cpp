@@ -980,13 +980,15 @@ void register_textproc_tools(Shells& sh) {
         body<ExtractArgs>(run_extract, parse_extract_args), 25'000);
 
     sh.add("aggregate",
-        "Group a pattern's matches and reduce them in one pass — the "
-        "`sort | uniq -c` / GROUP BY for a codebase. `by:file` answers WHICH "
-        "files touch X and how often (heat map before a refactor); `by:match` "
-        "tallies the distinct matched strings; `by:capture` groups on a regex "
-        "group. `op` is count (default), list (count + sample lines), or sum "
-        "(total the matched numbers). Sorted by magnitude, so the dominant "
-        "group is first.",
+        "USE WHEN the question is \"how many X per Y\" or \"which Y has the most "
+        "X\" — count/group/sum a pattern's matches in ONE pass instead of grep "
+        "then tallying by hand. The `sort | uniq -c` / GROUP BY for a codebase. "
+        "`by:capture` groups on a regex group (e.g. TODO owner, count per "
+        "author); `by:file` answers which files touch X and how often (heat map "
+        "a refactor); `by:match` tallies the distinct matched strings. `op` is "
+        "count (default), list (count + sample lines), or sum (total the matched "
+        "numbers). Sorted by magnitude — dominant group first. Reach for this "
+        "over grep whenever you'd otherwise count matches yourself.",
         aggregate_schema(), EffectSet{Effect::ReadFs},
         body<AggregateArgs>(run_aggregate, parse_aggregate_args), 25'000);
 

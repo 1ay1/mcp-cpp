@@ -51,11 +51,20 @@ Exit non-zero on any failure — wire it into CI next to the unit tests.
 ```
 
 This is the tier Anthropic emphasises (tool *selection*, not just tool
-*correctness*). It needs a live model and a way to observe tool calls. The
-observation hook is the **remaining wiring**: `agentty run` currently prints only
-the final answer, so a `--trace-tools` flag (or parsing `AGENTTY_DEBUG_API`
-events) is required before `run_agentic.py` can assert on `expect_tools`. Until
-then this tier is a documented design + fixtures, not yet executable.
+*correctness*). It needs a live model + credentials, so it is NOT wired into
+CI. Tool calls are observed via `AGENTTY_TRACE_TOOLS=1`, which makes the
+headless agent loop emit one `TOOL <name> <ok|error>` line per executed tool
+to stderr (the stdout answer stays clean). Run it deliberately:
+
+```bash
+AGENTTY_BIN=/path/to/agentty python3 evals/run_agentic.py
+```
+
+This loop already earned its keep: on the seed tasks it caught the model
+reaching for `grep` instead of `aggregate` on a "count per author" task —
+front-loading aggregate's "how many X per Y" use case in its description
+flipped the selection (measure → fix → re-measure, exactly the workflow
+Anthropic prescribes). All three seed tasks now pass.
 
 ## Why this shape
 
