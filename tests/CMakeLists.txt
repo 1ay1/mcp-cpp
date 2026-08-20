@@ -57,3 +57,20 @@ if(NOT WIN32)
     target_link_libraries(mcp_process_tools_test PRIVATE mcp::tools Threads::Threads)
     add_test(NAME mcp_process_tools_test COMMAND mcp_process_tools_test)
 endif()
+
+# ── Tier-1 tool evals (evals/run.py) ────────────────────────────────────────
+# A self-contained stdio server exposing the full toolset, driven by the
+# Python harness over the same JSON-RPC surface the model uses. Registered
+# as a CTest only when python3 is present (build-time dep is fine); skipped,
+# not failed, otherwise.
+add_executable(mcp_eval_server eval_server.cpp)
+target_link_libraries(mcp_eval_server PRIVATE mcp::tools Threads::Threads)
+
+find_program(PYTHON3_EXECUTABLE NAMES python3 python)
+if(PYTHON3_EXECUTABLE)
+    add_test(NAME tool_evals
+        COMMAND ${PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../evals/run.py)
+    set_tests_properties(tool_evals PROPERTIES
+        ENVIRONMENT "AGENTTY_EVAL_SERVER=$<TARGET_FILE:mcp_eval_server>")
+endif()

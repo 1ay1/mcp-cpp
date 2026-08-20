@@ -21,19 +21,21 @@ ROOT = HERE.parent
 
 
 def find_binary():
+    # The CTest integration builds a self-contained stdio server exposing the
+    # full toolset and points us at it. This is the CI path.
+    if srv := os.environ.get("AGENTTY_EVAL_SERVER"):
+        return [srv]
+    # Manual runs can point at a full agentty binary instead.
     if env := os.environ.get("AGENTTY_BIN"):
         return [env, "mcp-serve"]
-    # Prefer an agentty superproject binary if present (full toolset), else a
-    # mcp-cpp example server. Fall back to a built mcp-serve-capable target.
     for cand in [
         ROOT.parent / "build" / "agentty",
-        ROOT / "build-tests" / "examples" / "mcp_server_example",
-        ROOT / "build" / "examples" / "mcp_server_example",
+        ROOT / "build-tests" / "tests" / "mcp_eval_server",
+        ROOT / "build" / "tests" / "mcp_eval_server",
     ]:
         if cand.exists():
-            # agentty needs the `mcp-serve` subcommand; the example server does not.
             return [str(cand), "mcp-serve"] if cand.name == "agentty" else [str(cand)]
-    sys.exit("no server binary found; set AGENTTY_BIN=/path/to/agentty")
+    sys.exit("no server binary found; set AGENTTY_EVAL_SERVER or AGENTTY_BIN")
 
 
 def rpc(binary, workspace, calls):
@@ -48,7 +50,11 @@ def rpc(binary, workspace, calls):
             "params": {"name": tool, "arguments": args}}))
     cmd = list(binary)
     if binary[-1] == "mcp-serve":
+        # agentty: -w <dir> mcp-serve
         cmd = binary[:-1] + ["-w", str(workspace), "mcp-serve"]
+    else:
+        # eval_server: -w <dir>
+        cmd = binary + ["-w", str(workspace)]
     p = subprocess.run(cmd, input="\n".join(lines) + "\n",
                        capture_output=True, text=True, timeout=60)
     out = {}
