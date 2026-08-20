@@ -30,6 +30,7 @@ add_executable(mcp_tests
     toolset_test.cpp
     fs_tools_test.cpp
     search_tools_test.cpp
+    textproc_test.cpp
     structural_test.cpp
     repomap_test.cpp
     web_tools_test.cpp

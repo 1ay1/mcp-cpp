@@ -81,6 +81,7 @@ void register_structural_tools(Shells&,
     // (AST-shape search; optional retriever adds verified semantic leads on
     // zero hits and semantic file ordering when results exceed the budget)
 void register_repo_map_tool(Shells&);  // repo_map (PageRank codebase skeleton)
+void register_textproc_tools(Shells&); // extract / aggregate / replace / read_filter
 void register_diagnostics_tool(Shells&);
 void register_test_tool(Shells&);
 void register_git_tools(Shells&);
