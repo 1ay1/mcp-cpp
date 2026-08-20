@@ -26,6 +26,7 @@ EffectSet effects_for_builtin(const std::string& name) {
         {"extract",         EffectSet{E::ReadFs}},
         {"aggregate",       EffectSet{E::ReadFs}},
         {"read_filter",     EffectSet{E::ReadFs}},
+        {"json_query",      EffectSet{E::ReadFs}},
         {"replace",         EffectSet{E::ReadFs, E::WriteFs}},
         {"write",           EffectSet{E::WriteFs}},
         {"edit",            EffectSet{E::WriteFs}},
