@@ -29,14 +29,38 @@ model uses, then checks the response against `expect` verifiers:
 - `is_error` — the call must fail (bad-input tasks)
 - `regex` — the output must match
 
+### Golden-output tasks (formatting / ranking regressions)
+
+A `contains` check can't catch a REORDERED aggregate table, a changed count
+header, or a shifted outline indent — the output still "contains" the right
+substrings. A golden task pins the tool's **entire output** against a stored
+file so any format/ranking drift fails loudly:
+
+```json
+{"name": "golden: aggregate ranked table", "tool": "aggregate",
+ "args": {"pattern": "TODO\\((\\w+)\\)", "by": "capture", "group": 1, "glob": "*.py"},
+ "golden": "aggregate_todos.txt"}
+```
+
+The `golden` field names a file under `evals/golden/`. The workspace temp path
+is normalised to `<WS>` so goldens are stable across runs. On drift the runner
+prints the first differing line. After an INTENTIONAL output change, regenerate
+and review the diff before committing:
+
+```bash
+AGENTTY_EVAL_SERVER=… python3 evals/run.py --update   # rewrites the goldens
+git diff evals/golden/                                 # review, then commit
+```
+
 Run:
 
 ```bash
-python3 evals/run.py                    # against a built ./build*/… mcp-serve
+python3 evals/run.py                    # against the mcp_eval_server / a built mcp-serve
 AGENTTY_BIN=/path/to/agentty python3 evals/run.py   # via agentty mcp-serve
 ```
 
-Exit non-zero on any failure — wire it into CI next to the unit tests.
+Exit non-zero on any failure. Already wired into CTest as `tool_evals` (runs
+whenever python3 is present) — the golden + substring tasks run together.
 
 ## Tier 2 — agentic (opt-in; needs a model + key)
 

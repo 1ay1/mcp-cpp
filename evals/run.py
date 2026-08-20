@@ -68,6 +68,13 @@ def rpc(binary, workspace, calls):
     return out
 
 
+def response_text(resp):
+    if resp.get("error") or resp.get("result", {}).get("isError"):
+        return None
+    return "".join(c.get("text", "")
+                   for c in resp.get("result", {}).get("content", []))
+
+
 def check(resp, expect):
     """Return (ok, reason)."""
     is_err = bool(resp.get("error")) or bool(resp.get("result", {}).get("isError"))
@@ -75,9 +82,7 @@ def check(resp, expect):
         return (is_err, "expected an error, got success" if not is_err else "")
     if is_err:
         return (False, f"unexpected error: {json.dumps(resp)[:200]}")
-    text = ""
-    for c in resp.get("result", {}).get("content", []):
-        text += c.get("text", "")
+    text = response_text(resp) or ""
     for sub in expect.get("contains", []):
         if sub not in text:
             return (False, f"missing {sub!r} in output")
@@ -91,7 +96,41 @@ def check(resp, expect):
     return (True, "")
 
 
+# Volatile bits of tool output that would make a golden flaky: absolute temp
+# paths (the workspace lives in a fresh mktemp dir each run) and match counts
+# that depend on scan order. Normalise the workspace path to <WS>.
+def normalise_golden(text, workspace):
+    return text.replace(str(workspace), "<WS>")
+
+
+def check_golden(resp, golden_path, workspace, update):
+    """Compare the tool's FULL output to a stored golden file. Returns
+    (ok, reason). With `update`, (re)writes the golden and always passes."""
+    text = response_text(resp)
+    if text is None:
+        return (False, f"tool errored: {json.dumps(resp)[:200]}")
+    norm = normalise_golden(text, workspace)
+    if update:
+        golden_path.parent.mkdir(parents=True, exist_ok=True)
+        golden_path.write_text(norm)
+        return (True, "(updated)")
+    if not golden_path.exists():
+        return (False, f"no golden at {golden_path.name} — run with --update to create")
+    want = golden_path.read_text()
+    if norm == want:
+        return (True, "")
+    # Show a compact first-difference so a formatting drift is obvious.
+    wl, gl = norm.splitlines(), want.splitlines()
+    for i in range(max(len(wl), len(gl))):
+        a = wl[i] if i < len(wl) else "<eof>"
+        b = gl[i] if i < len(gl) else "<eof>"
+        if a != b:
+            return (False, f"golden drift at line {i+1}:\n      got:  {a!r}\n      want: {b!r}")
+    return (False, "golden differs")
+
+
 def main():
+    update = "--update" in sys.argv
     binary = find_binary()
     tasks = []
     for f in sorted((HERE / "tasks").glob("*.jsonl")):
@@ -110,10 +149,14 @@ def main():
                 shutil.copytree(fixtures, ws, dirs_exist_ok=True)
             args = dict(t.get("args", {}))
             resp = rpc(binary, ws, [(t["tool"], args)]).get(2, {})
-            ok, why = check(resp, t.get("expect", {}))
+            if "golden" in t:
+                ok, why = check_golden(resp, HERE / "golden" / t["golden"],
+                                       ws, update)
+            else:
+                ok, why = check(resp, t.get("expect", {}))
             if ok:
                 passed += 1
-                print(f"  ok   {t['name']}")
+                print(f"  ok   {t['name']}{(' ' + why) if why else ''}")
             else:
                 failed += 1
                 print(f"  FAIL {t['name']}: {why}")

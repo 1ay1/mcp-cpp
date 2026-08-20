@@ -1,0 +1,5 @@
+Extracted 3 values → 3 distinct.
+
+1	__init__
+1	build
+1	render

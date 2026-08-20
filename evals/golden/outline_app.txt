@@ -1,0 +1,7 @@
+<WS>/app.py — 5 definitions across 18 lines:
+
+L8: class Widget:
+  L9: def __init__(self, name):
+  L12: def render(self):
+L16: def build():
+  L17: return Widget("root")
