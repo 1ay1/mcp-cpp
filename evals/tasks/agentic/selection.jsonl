@@ -1,5 +1,37 @@
-// Tier-2 AGENTIC evals — assert on WHICH tool the model picks. Needs a live
-// model + AGENTTY_BIN; NOT wired into CI. Run: python3 evals/run_agentic.py
-{"name": "count TODO owners → aggregate, not grep", "prompt": "In the Python files here, how many TODOs does each author have? Answer with the counts. Use the single most direct tool.", "expect_tools": ["aggregate"], "reject_tools": [], "answer_contains": ["alice", "bob"]}
-{"name": "query package.json scripts → json_query, not read", "prompt": "What script names are defined in package.json? List them.", "expect_tools": ["json_query"], "reject_tools": [], "answer_contains": ["build", "test", "lint"]}
-{"name": "understand app.py shape → outline before read", "prompt": "What functions and classes does app.py define? Don't read the whole file if you can avoid it.", "expect_tools": ["outline"], "reject_tools": [], "answer_contains": ["Widget", "render"]}
+// Tier-2 AGENTIC evals — assert on WHICH tool the model picks from a NATURAL
+// prompt (no "use tool X" coaching). expect_tools = must appear; reject_tools =
+// the tempting-but-wrong alternative that must NOT. Needs a live model +
+// AGENTTY_BIN; NOT in CI. Run: python3 evals/run_agentic.py
+//
+// The suite deliberately probes the DISCRIMINATION BOUNDARIES where tool
+// selection breaks: count-per-group vs find vs list-values; shape vs text;
+// one-file read vs whole-file shape; structured query vs regex.
+
+// ── aggregate: "how many X per Y" (NOT grep-then-count) ─────────────────────
+{"name": "count TODOs per author", "prompt": "Which author has the most TODOs across all the files here?", "expect_tools": ["aggregate"], "reject_tools": [], "answer_contains": ["alice"]}
+{"name": "which files import Cache", "prompt": "Count how many times each TypeScript file here imports something — group the totals by file.", "expect_tools": ["aggregate"], "reject_tools": [], "answer_contains": ["routes.ts", "service.ts"]}
+
+// ── extract: pull a VALUE from every match (NOT grep, NOT aggregate) ─────────
+{"name": "list every import target", "prompt": "List every distinct module imported across the .ts files here.", "expect_tools": ["extract"], "reject_tools": [], "answer_contains": ["Router", "Store", "Cache"]}
+
+// ── json_query: query structured data by path (NOT read, NOT grep) ──────────
+// NOTE: for a TINY config, `read` is a defensible alternative, so we only
+// assert json_query on a SPECIFIC DEEP-PATH lookup (dependency version) where
+// querying clearly beats eyeballing. "service ports" accepts either.
+{"name": "dependency version", "prompt": "What version of react does package.json pin?", "expect_tools": ["json_query"], "reject_tools": ["grep"], "answer_contains": ["18"]}
+{"name": "service ports", "prompt": "What ports do the services in package.json listen on?", "expect_tools": [], "reject_tools": ["grep"], "answer_contains": ["8080", "3000"]}
+
+// ── outline: file SHAPE cheaply (NOT read the whole file) ───────────────────
+{"name": "shape of a file", "prompt": "Give me a quick map of what routes.ts defines — just the functions, not the bodies.", "expect_tools": ["outline"], "reject_tools": [], "answer_contains": ["registerRoutes", "handleLogin"]}
+
+// ── read_filter: one concern out of a file (NOT read the whole thing) ────────
+{"name": "just the TODO lines", "prompt": "Show me only the TODO comments in routes.ts, nothing else.", "expect_tools": ["read_filter"], "reject_tools": [], "answer_contains": ["alice", "carol"]}
+
+// ── search_structural: a code SHAPE, not text (NOT grep) ────────────────────
+{"name": "all unwrap call sites", "prompt": "Find everywhere the unwrap function is CALLED (not defined) in the .ts files.", "expect_tools": ["search_structural", "grep"], "reject_tools": [], "answer_contains": ["routes.ts"]}
+
+// ── grep: plain text find (the baseline — must NOT over-reach to a fancy tool)
+{"name": "find a literal string", "prompt": "Which file contains the string \"rate-limit\"?", "expect_tools": ["grep"], "reject_tools": ["aggregate", "extract"], "answer_contains": ["routes.ts"]}
+
+// ── replace: project-wide rename, dry-run first (NOT many edits) ────────────
+{"name": "rename across files (preview)", "prompt": "Across the .ts files, I want to change every log level string \"warn\" to \"warning\" — show me a preview of what would change first, don't apply it.", "expect_tools": ["replace"], "reject_tools": ["edit"], "answer_contains": []}

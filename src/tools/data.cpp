@@ -313,15 +313,16 @@ json json_query_schema() {
 
 void register_data_tools(Shells& sh) {
     sh.add("json_query",
-        "Query a JSON document by PATH instead of regex \u2014 a jq-lite for "
-        "structured data. Point it at a `.json` file (or inline `json`) and a "
-        "jq-style `query`: `.scripts | keys`, `.dependencies.react`, "
-        "`.services[].name`, `.compilerOptions.paths`, `[0].id`. Supports "
-        "`.key`, `[i]` (negative from end), `[lo:hi]` slices, `[]` iteration, "
-        "and `| keys | values | length | type | has(k)`. Each result prints as "
-        "one compact JSON line (`raw:true` unquotes strings). Structure-aware "
-        "where grep/extract are blind \u2014 reach for it on package.json, "
-        "tsconfig, compile_commands.json, API fixtures, MCP configs. JSON only.",
+        "USE WHEN you need a value OUT of a .json file (package.json, tsconfig, "
+        "compile_commands.json, an API fixture, an MCP config) — query it by "
+        "PATH instead of `read`-ing the whole file and eyeballing it, or "
+        "grep-ing blind to structure. A jq-lite: point it at a `.json` file (or "
+        "inline `json`) and a jq-style `query` — `.dependencies.react`, "
+        "`.services[].port`, `.scripts | keys`, `.compilerOptions.paths`, "
+        "`[0].id`. Supports `.key`, `[i]` (negative from end), `[lo:hi]` slices, "
+        "`[]` iteration, and `| keys | values | length | type | has(k)`. Each "
+        "result prints as one compact JSON line (`raw:true` unquotes strings). "
+        "JSON only.",
         json_query_schema(), EffectSet{Effect::ReadFs},
         body<QueryArgs>(run_json_query, parse_query_args), 25'000);
 }
