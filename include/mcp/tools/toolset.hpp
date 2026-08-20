@@ -79,6 +79,12 @@ struct ToolsetConfig {
     bool filesystem   = true;   // read, write, edit, list_dir
     bool shell        = true;   // bash
     bool search       = true;   // grep, glob, find_definition
+    // The transform / aggregate / structured-data family: extract, aggregate,
+    // replace, read_filter, json_query, outline. Split from `search` so a
+    // minimal or latency-sensitive profile can shed ~5 KB of schema (these
+    // 7 tools) without losing grep/read. Registered only when BOTH this and
+    // the family's base capability (search or filesystem) are on.
+    bool transforms   = true;
     bool diagnostics  = true;   // diagnostics
     bool git          = true;   // git_status/diff/log/commit
     bool web          = true;   // web_fetch, web_search
