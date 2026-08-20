@@ -195,6 +195,18 @@ TEST_CASE("textproc") {
               "apply rewrites Foo→Qux on disk");
         check(has(rd(root / "src" / "b.ts"), "Qux"),
               "apply hits every matching file");
+        // Multi-file diff-review feed: one FileChange per written file, each
+        // with before/after (so the host can rebuild hunks + queue for review).
+        auto changes = mcp::tools::read_changes(r);
+        check(changes.size() == 2, "apply emits one change per written file");
+        bool ca=false, cb=false;
+        for (auto& ch : changes) {
+            if (ch.path.find("a.ts") != std::string::npos) ca = true;
+            if (ch.path.find("b.ts") != std::string::npos) cb = true;
+            check(has(ch.after, "Qux") && has(ch.before, "Foo"),
+                  "each change carries before/after");
+        }
+        check(ca && cb, "both edited files are in the change set");
     }
 
     // ── read_filter: only TODO lines + context, gaps collapsed ───────────

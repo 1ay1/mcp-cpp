@@ -69,6 +69,9 @@ struct ToolError {
 struct ToolOutput {
     std::string                            text;
     std::optional<mcp::tools::FileChange>  change;
+    // Multi-file tools (replace) emit ONE FileChange per written file here;
+    // single-file tools use `change` above. Both flow to the host diff-review.
+    std::vector<mcp::tools::FileChange>    changes;
 };
 
 using ExecResult = std::expected<ToolOutput, ToolError>;

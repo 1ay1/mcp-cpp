@@ -30,18 +30,25 @@ inline constexpr const char* kMetaKey = "_mcp_tools";
 // Attach effects (+ optional FileChange) onto a Result's structured payload.
 // Preserves any structured content the tool already produced.
 inline void attach_meta(mcp::cap::Result& r, EffectSet fx,
-                        const std::optional<FileChange>& change = std::nullopt) {
+                        const std::optional<FileChange>& change = std::nullopt,
+                        const std::vector<FileChange>& changes = {}) {
     if (!r.structured.is_object()) r.structured = mcp::Json::object();
     mcp::Json m = mcp::Json::object();
     m["effects"] = fx.bits();
-    if (change) {
-        m["change"] = mcp::Json{
-            {"path",    change->path},
-            {"added",   change->added},
-            {"removed", change->removed},
-            {"before",  change->before},
-            {"after",   change->after},
+    auto encode = [](const FileChange& c) {
+        return mcp::Json{
+            {"path",    c.path},
+            {"added",   c.added},
+            {"removed", c.removed},
+            {"before",  c.before},
+            {"after",   c.after},
         };
+    };
+    if (change) m["change"] = encode(*change);
+    if (!changes.empty()) {
+        mcp::Json arr = mcp::Json::array();
+        for (const auto& c : changes) arr.push_back(encode(c));
+        m["changes"] = std::move(arr);
     }
     r.structured[kMetaKey] = std::move(m);
 }
@@ -70,6 +77,30 @@ inline void attach_meta(mcp::cap::Result& r, EffectSet fx,
     fc.before  = c->value("before", std::string{});
     fc.after   = c->value("after", std::string{});
     return fc;
+}
+
+// Read all FileChanges a tool produced: the single `change` (edit/write/
+// apply_patch) plus any `changes` array (multi-file tools like replace),
+// deduped by path (change wins). Empty if the tool touched no files.
+[[nodiscard]] inline std::vector<FileChange> read_changes(const mcp::cap::Result& r) {
+    std::vector<FileChange> out;
+    if (!r.structured.is_object()) return out;
+    auto it = r.structured.find(kMetaKey);
+    if (it == r.structured.end() || !it->is_object()) return out;
+    auto decode = [](const mcp::Json& c) {
+        FileChange fc;
+        fc.path    = c.value("path", std::string{});
+        fc.added   = c.value("added", 0);
+        fc.removed = c.value("removed", 0);
+        fc.before  = c.value("before", std::string{});
+        fc.after   = c.value("after", std::string{});
+        return fc;
+    };
+    if (auto c = it->find("change"); c != it->end() && c->is_object())
+        out.push_back(decode(*c));
+    if (auto cs = it->find("changes"); cs != it->end() && cs->is_array())
+        for (const auto& c : *cs) if (c.is_object()) out.push_back(decode(c));
+    return out;
 }
 
 // Strip the carry key so it doesn't leak to a plain MCP client that would

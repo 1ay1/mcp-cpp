@@ -32,16 +32,24 @@ inline mcp::cap::Result lower(util::ExecResult r) {
         return mcp::cap::Result::error(r.error().render());
     }
     mcp::cap::Result out = mcp::cap::Result::ok(std::move(r->text));
-    if (r->change) {
+    if (r->change || !r->changes.empty()) {
         out.structured = Json::object();
         Json m = Json::object();
-        m["change"] = Json{
-            {"path",    r->change->path},
-            {"added",   r->change->added},
-            {"removed", r->change->removed},
-            {"before",  r->change->before},
-            {"after",   r->change->after},
+        auto encode = [](const mcp::tools::FileChange& c) {
+            return Json{
+                {"path",    c.path},
+                {"added",   c.added},
+                {"removed", c.removed},
+                {"before",  c.before},
+                {"after",   c.after},
+            };
         };
+        if (r->change) m["change"] = encode(*r->change);
+        if (!r->changes.empty()) {
+            Json arr = Json::array();
+            for (const auto& c : r->changes) arr.push_back(encode(c));
+            m["changes"] = std::move(arr);
+        }
         out.structured[kMetaKey] = std::move(m);
     }
     return out;

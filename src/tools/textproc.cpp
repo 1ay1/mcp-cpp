@@ -687,9 +687,11 @@ ExecResult run_replace(const ReplaceArgs& a) {
 
     struct Change { std::string path; int hits; std::string before_line, after_line; int line; };
     std::vector<Change> changes;
+    std::vector<mcp::tools::FileChange> file_changes;  // for diff-review (apply only)
     long long total_hits = 0;
     int files_changed = 0;
     std::vector<std::pair<fs::path,std::string>> writes;  // path → new content
+    std::vector<std::string> originals;                   // parallel to writes
 
     for (const auto& f : files) {
         std::string content;
@@ -730,6 +732,7 @@ ExecResult run_replace(const ReplaceArgs& a) {
             ? std::regex_replace(before, *re, a.replacement)
             : literal_replace(before, a.find, a.replacement).first;
         changes.push_back({rel_path(f, root), hits, before, after, ln});
+        originals.push_back(content);
         writes.emplace_back(f, std::move(updated));
     }
 
@@ -757,9 +760,14 @@ ExecResult run_replace(const ReplaceArgs& a) {
 
     if (a.apply) {
         int written = 0;
-        for (auto& [p, content] : writes) {
+        for (std::size_t i = 0; i < writes.size(); ++i) {
+            auto& [p, content] = writes[i];
             auto err = util::write_file(p, content);
-            if (err.empty()) ++written;
+            if (!err.empty()) continue;
+            ++written;
+            // Queue this file for diff-review: original → written content.
+            file_changes.push_back(
+                make_change(rel_path(p, root), originals[i], content));
         }
         out << "\nWrote " << written << " file" << (written==1?"":"s") << ".";
     } else {
@@ -767,7 +775,9 @@ ExecResult run_replace(const ReplaceArgs& a) {
     }
     std::string body = out.str();
     if (!a.display_description.empty()) body = a.display_description + "\n" + body;
-    return ToolOutput{util::to_valid_utf8(std::move(body)), std::nullopt};
+    ToolOutput tout{util::to_valid_utf8(std::move(body)), std::nullopt};
+    tout.changes = std::move(file_changes);
+    return tout;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

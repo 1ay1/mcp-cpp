@@ -94,11 +94,17 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
                 -> mcp::cap::Result {
                 mcp::cap::Result r = handler(args);
                 if (!r.is_error) r.text = apply_budget(std::move(r.text), budget);
-                // Attach effects + (if the tool put one in structured) the
-                // file-change is already there; just stamp effects so the host
-                // permission policy + scheduler can read them back.
-                auto existing_change = read_change(r);
-                attach_meta(r, fx, existing_change);
+                // The tool body (via lower()) may have put file change(s) in
+                // structured already; re-stamp effects WITHOUT dropping them.
+                // read_changes() returns the single `change` (edit/write/
+                // apply_patch) AND the `changes` array (multi-file replace);
+                // preserve both.
+                auto all = read_changes(r);
+                std::optional<FileChange> single;
+                std::vector<FileChange>   multi;
+                if (all.size() == 1) single = std::move(all.front());
+                else if (all.size() > 1) multi = std::move(all);
+                attach_meta(r, fx, single, multi);
                 return r;
             });
     }
