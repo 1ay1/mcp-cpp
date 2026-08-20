@@ -243,6 +243,10 @@ std::expected<ExtractArgs, ToolError> parse_extract_args(const json& j) {
     a.count          = r.boolean("count", false);
     a.sort           = r.boolean("sort", false);
     a.with_location  = r.boolean("with_location", false);
+    // Anthropic's response_format token-economy pattern: `concise` (default)
+    // emits just the values; `detailed` adds file:line provenance. An
+    // explicit with_location still wins so the fine-grained flag isn't lost.
+    if (r.str("response_format") == "detailed") a.with_location = true;
     a.limit          = std::clamp(r.integer("limit", 500), 1, 5000);
     a.display_description = r.str("display_description");
     if (a.group < 0)
@@ -911,7 +915,8 @@ json extract_schema() {
         {"unique",{{"type","boolean"},{"description","Dedup values (first-seen order)."}}},
         {"count",{{"type","boolean"},{"description","Emit `value → occurrences` sorted desc (like sort|uniq -c)."}}},
         {"sort",{{"type","boolean"},{"description","Sort values lexically."}}},
-        {"with_location",{{"type","boolean"},{"description","Prefix each value with file:line."}}},
+        {"with_location",{{"type","boolean"},{"description","Prefix each value with file:line (same as response_format=detailed)."}}},
+        {"response_format",{{"type","string"},{"enum",{"concise","detailed"}},{"description","concise (default) = values only; detailed = each value tagged with file:line. Ask for concise unless you need provenance — it's cheaper."}}},
         {"limit",{{"type","integer"},{"description","Max rows emitted (default 500)."}}},
     }}};
 }
@@ -962,12 +967,14 @@ json read_filter_schema() {
 
 void register_textproc_tools(Shells& sh) {
     sh.add("extract",
-        "Project every match of a pattern to a VALUE and return the set — the "
-        "`rg -o -r` / awk `$N` niche. Give a regex and a `group` to pull each "
-        "capture (every import target, every route path, every TODO owner), or "
-        "a `delimiter`+`column` to slice a field out of each matching line. "
-        "`unique` dedups, `count` gives value\xe2\x86\x92" "frequency (sort|uniq -c), "
-        "`sort` orders them, `with_location` tags file:line. One call replaces "
+        "RULES: `pattern` is an ECMAScript regex — escape regex metachars in a "
+        "literal; put the part you want to pull in a group and pass its number "
+        "as `group` (1 = first group), OR use `delimiter`+`column` for awk-style "
+        "field slicing (not both). — Project every match of a pattern to a "
+        "VALUE and return the set (the `rg -o -r` / awk `$N` niche): every "
+        "import target, route path, TODO owner. `unique` dedups, `count` gives "
+        "value\xe2\x86\x92" "frequency (sort|uniq -c), `sort` orders them, "
+        "response_format=detailed tags each with file:line. One call replaces "
         "grep\xe2\x86\x92read\xe2\x86\x92hand-aggregate.",
         extract_schema(), EffectSet{Effect::ReadFs},
         body<ExtractArgs>(run_extract, parse_extract_args), 25'000);
@@ -984,13 +991,14 @@ void register_textproc_tools(Shells& sh) {
         body<AggregateArgs>(run_aggregate, parse_aggregate_args), 25'000);
 
     sh.add("replace",
-        "Literal or regex find-and-replace across every file under a glob — the "
-        "plain-text sibling of rewrite_structural, for renames/string swaps that "
-        "aren't an AST shape. DRY-RUN by default: returns a per-file before/after "
-        "preview and the total hit count WITHOUT touching disk; re-run with "
-        "apply:true to write. Always pass a `glob` to bound the blast radius. "
-        "For code-shape changes (call sites, control flow) prefer "
-        "rewrite_structural; for a single file prefer edit.",
+        "RULES: DRY-RUN by default — returns a per-file before/after preview + "
+        "total hit count WITHOUT touching disk; re-run with apply:true to write. "
+        "ALWAYS pass a `glob` to bound the blast radius. `find` is literal unless "
+        "regex:true (then $1-$9/$& in `replacement` insert capture groups). — "
+        "Literal or regex find-and-replace across every file under the glob: the "
+        "plain-text sibling of rewrite_structural, for renames / string swaps "
+        "that aren't an AST shape. For code-shape changes (call sites, control "
+        "flow) prefer rewrite_structural; for a single file prefer edit.",
         replace_schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
         body<ReplaceArgs>(run_replace, parse_replace_args), 25'000);
 

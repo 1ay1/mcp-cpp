@@ -110,6 +110,24 @@ TEST_CASE("textproc") {
               "field mode emits column 2 of each matching line");
     }
 
+    // ── extract response_format: detailed tags file:line, concise doesn't ──
+    {
+        auto a = obj();
+        a["pattern"] = "import \\{ (\\w+) \\}";
+        a["group"] = 1; a["response_format"] = "detailed";
+        a["path"] = root.string(); a["glob"] = "*.ts";
+        auto r = call(*provider, "extract", a);
+        check(!r.is_error, "extract detailed runs");
+        check(has(r.text, "a.ts:") || has(r.text, "src/a.ts:"),
+              "response_format=detailed tags each value with file:line");
+        // concise (default) omits the path.
+        auto b = obj();
+        b["pattern"] = "import \\{ (\\w+) \\}"; b["group"] = 1;
+        b["path"] = root.string(); b["glob"] = "*.ts";
+        auto r2 = call(*provider, "extract", b);
+        check(!has(r2.text, ".ts:"), "concise (default) omits file:line");
+    }
+
     // ── aggregate by=capture on the TODO owner ───────────────────────────
     {
         auto a = obj();
