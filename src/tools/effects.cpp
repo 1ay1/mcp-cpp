@@ -28,6 +28,7 @@ EffectSet effects_for_builtin(const std::string& name) {
         {"replace",         EffectSet{E::ReadFs, E::WriteFs}},
         {"write",           EffectSet{E::WriteFs}},
         {"edit",            EffectSet{E::WriteFs}},
+        {"apply_patch",     EffectSet{E::ReadFs, E::WriteFs}},
         {"move",            EffectSet{E::ReadFs, E::WriteFs}},
         {"remove",          EffectSet{E::ReadFs, E::WriteFs}},
         {"bash",            EffectSet{E::Exec, E::ReadFs, E::WriteFs, E::Net}},

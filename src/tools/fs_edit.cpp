@@ -997,12 +997,246 @@ constexpr const char* kEditDescription =
     "`display_description` (e.g. 'Fix null-deref in auth.cpp') — it "
     "shows in the card while edits stream.";
 
+} // namespace (edit)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  apply_patch — apply a unified-diff patch to ONE file, fuzzy-located.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Models are fluent in unified diff; this is the multi-hunk editing idiom
+// `edit` can't express as a single call. Each hunk's context+`-` lines become
+// a fuzzy `needle` and its context+`+` lines the replacement, then we reuse
+// the EXACT fuzzy_find machinery `edit` uses — so a hunk still lands after the
+// file has drifted from the line numbers in its `@@` header (the header line
+// numbers become hints, not hard requirements). All hunks apply atomically:
+// if ANY hunk can't be located unambiguously, nothing is written.
+
+namespace {
+
+struct Hunk {
+    std::string before;   // context + removed lines (the match target)
+    std::string after;    // context + added lines (the replacement)
+    long        old_start = 0;  // from @@ -old_start,.. (1-based line hint)
+    int         index = 0;      // 1-based hunk number for diagnostics
+};
+
+struct ApplyPatchArgs {
+    util::WorkspacePath path;
+    std::string         patch;
+    std::string         display_description;
+};
+
+// A unified-diff body line: strip the leading marker, keep the text. Handles
+// the "\ No newline at end of file" sentinel by ignoring it.
+[[nodiscard]] std::vector<Hunk> parse_hunks(std::string_view patch,
+                                            std::string& err) {
+    std::vector<Hunk> hunks;
+    std::vector<std::string> lines;
+    { std::size_t s = 0, n;
+      while ((n = patch.find('\n', s)) != std::string_view::npos) {
+          lines.emplace_back(patch.substr(s, n - s)); s = n + 1; }
+      if (s < patch.size()) lines.emplace_back(patch.substr(s)); }
+
+    int hunk_no = 0;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const std::string& ln = lines[i];
+        // Skip file headers (---, +++, diff, index) — single-file tool.
+        if (ln.rfind("@@", 0) != 0) continue;
+        // Parse `@@ -a,b +c,d @@` for the old_start hint.
+        Hunk h; h.index = ++hunk_no;
+        { auto minus = ln.find('-');
+          if (minus != std::string::npos)
+              h.old_start = std::strtol(ln.c_str() + minus + 1, nullptr, 10); }
+        // Consume body lines until the next @@ or EOF.
+        for (++i; i < lines.size(); ++i) {
+            const std::string& b = lines[i];
+            if (b.rfind("@@", 0) == 0) { --i; break; }
+            if (b.rfind("\\ No newline", 0) == 0) continue;   // sentinel
+            if (b.empty()) { h.before += "\n"; h.after += "\n"; continue; }
+            char mk = b[0];
+            std::string body = b.substr(1);
+            if      (mk == ' ') { h.before += body; h.before += "\n";
+                                  h.after  += body; h.after  += "\n"; }
+            else if (mk == '-') { h.before += body; h.before += "\n"; }
+            else if (mk == '+') { h.after  += body; h.after  += "\n"; }
+            else {
+                // A line with no marker inside a hunk is malformed unified
+                // diff; treat as context to be forgiving (some tools emit
+                // bare lines for blank context).
+                h.before += b; h.before += "\n";
+                h.after  += b; h.after  += "\n";
+            }
+        }
+        if (h.before.empty() && h.after.empty()) continue;   // empty hunk
+        hunks.push_back(std::move(h));
+    }
+    if (hunks.empty())
+        err = "no @@ hunks found in the patch. Provide a unified diff "
+              "(hunks starting with `@@ -a,b +c,d @@`); file headers "
+              "(--- / +++) are optional and ignored — this tool patches the "
+              "single file given by `path`.";
+    return hunks;
+}
+
+ExecResult run_apply_patch(const ApplyPatchArgs& a) {
+    const auto& p = a.path.path();
+    std::error_code ec;
+    if (!fs::exists(p, ec))
+        return std::unexpected(ToolError::not_found(
+            "file not found: " + a.path.string()
+            + ". apply_patch modifies an existing file; use `write` to create "
+              "a new one."));
+    if (!fs::is_regular_file(p, ec))
+        return std::unexpected(ToolError::not_a_file(
+            "not a regular file: " + a.path.string()));
+    constexpr std::uintmax_t kMaxBytes = 1024u * 1024u;
+    const std::uintmax_t size = fs::file_size(p, ec);
+    if (!ec && size > kMaxBytes)
+        return std::unexpected(ToolError::too_large(std::format(
+            "file is {} KiB (> 1 MiB apply_patch cap).", size / 1024)));
+    if (util::is_binary_file(p))
+        return std::unexpected(ToolError::binary(
+            "refusing to patch binary file: " + a.path.string()));
+
+    std::string err;
+    auto hunks = parse_hunks(a.patch, err);
+    if (hunks.empty())
+        return std::unexpected(ToolError::invalid_args(std::move(err)));
+
+    std::string original;
+    try { original = util::read_file(a.path); }
+    catch (...) { return std::unexpected(ToolError::io(
+        "cannot read " + a.path.string())); }
+    if (original.find('\0') != std::string::npos)
+        return std::unexpected(ToolError::binary(
+            "refusing to patch binary file: " + a.path.string()));
+
+    std::string staleness;
+    if (util::staleness_of(p) == util::StaleVerdict::Stale)
+        staleness =
+            "\xe2\x9a\xa0  The file changed on disk since a tool last observed "
+            "it this session. The patch was applied to the CURRENT bytes; "
+            "re-read if the result looks wrong.\n\n";
+
+    // Locate every hunk against the ORIGINAL buffer (so hunk N's search isn't
+    // perturbed by hunk N-1's splice), collect spans, then splice bottom-up.
+    struct Span { std::size_t pos, len; std::string replacement; int hunk; };
+    std::vector<Span> spans;
+    spans.reserve(hunks.size());
+    for (const auto& h : hunks) {
+        // A pure-insertion hunk (no `before`) has nothing to fuzzy-match;
+        // reject rather than guess a location.
+        if (h.before.empty())
+            return std::unexpected(ToolError::invalid_args(std::format(
+                "hunk #{} is a pure insertion with no context lines \u2014 "
+                "apply_patch can't place it unambiguously. Add a few context "
+                "lines around the insertion, or use `edit`.", h.index)));
+        auto fm = util::fuzzy_find(original, h.before, h.after,
+                                   static_cast<std::uint32_t>(
+                                       h.old_start > 0 ? h.old_start : 0));
+        if (!fm.ok) {
+            if (fm.count > 1)
+                return std::unexpected(ToolError::ambiguous(std::format(
+                    "hunk #{} matched {} locations \u2014 its context isn't "
+                    "unique. Widen the context lines in that hunk.",
+                    h.index, fm.count)));
+            return std::unexpected(ToolError::no_match(std::format(
+                "hunk #{} did not match the file (context/removed lines not "
+                "found, even fuzzily). The file may have moved on from the "
+                "patch's base \u2014 re-read {} and regenerate the diff.",
+                h.index, a.path.string())));
+        }
+        std::string repl = fm.adjusted_new_text.empty() ? h.after
+                                                         : fm.adjusted_new_text;
+        spans.push_back({fm.pos, fm.len, std::move(repl), h.index});
+    }
+
+    // Reject overlapping hunks (two hunks that located to the same region).
+    std::sort(spans.begin(), spans.end(),
+              [](const Span& x, const Span& y){ return x.pos < y.pos; });
+    for (std::size_t i = 1; i < spans.size(); ++i)
+        if (spans[i].pos < spans[i-1].pos + spans[i-1].len)
+            return std::unexpected(ToolError::ambiguous(std::format(
+                "hunks #{} and #{} located to overlapping regions \u2014 the "
+                "patch is inconsistent with the file. Regenerate it from the "
+                "current contents.", spans[i-1].hunk, spans[i].hunk)));
+
+    // Splice bottom-up so earlier offsets stay valid.
+    std::string updated = original;
+    for (auto it = spans.rbegin(); it != spans.rend(); ++it)
+        updated.replace(it->pos, it->len, it->replacement);
+
+    if (updated == original)
+        return ToolOutput{staleness + "Patch produced no change \u2014 the file "
+            "already matches the patched state.", std::nullopt};
+
+    auto d = diff::compute(a.path.string(), original, updated);
+    if (auto werr = util::write_file(a.path, updated); !werr.empty())
+        return std::unexpected(ToolError::io(werr));
+    { std::error_code mt; auto nm = fs::last_write_time(p, mt);
+      if (!mt) util::record_file_seen(p, nm,
+                   static_cast<std::uintmax_t>(updated.size()),
+                   util::content_fnv1a(updated)); }
+
+    std::string unified = diff::render_unified(d);
+    std::ostringstream msg;
+    if (!staleness.empty()) msg << staleness;
+    if (!a.display_description.empty()) msg << a.display_description << "\n\n";
+    msg << "Patched " << a.path.string() << " (" << d.added << "+ "
+        << d.removed << "-, " << hunks.size() << " hunk"
+        << (hunks.size()==1?"":"s") << "):\n\n```diff\n" << unified;
+    if (unified.empty() || unified.back() != '\n') msg << "\n";
+    msg << "```";
+
+    FileChange change = make_change(a.path.string(), original, updated);
+    return ToolOutput{msg.str(), std::move(change)};
+}
+
+std::expected<ApplyPatchArgs, ToolError> parse_apply_patch_args(const json& j) {
+    util::ArgReader r(j);
+    if (!r.is_object())
+        return std::unexpected(ToolError::invalid_args("expected a JSON object"));
+    auto path = r.require_str("path");
+    if (!path || path->empty())
+        return std::unexpected(ToolError::invalid_args("`path` is required"));
+    auto patch = r.require_str("patch");
+    if (!patch || patch->empty())
+        return std::unexpected(ToolError::invalid_args("`patch` is required"));
+    auto wp = util::make_workspace_path_checked(*path, "apply_patch");
+    if (!wp) return std::unexpected(std::move(wp.error()));
+    ApplyPatchArgs a{std::move(*wp), std::move(*patch),
+                     r.str("display_description")};
+    return a;
+}
+
+json apply_patch_schema() {
+    return json{{"type","object"},{"required",{"path","patch"}},{"properties",{
+        {"path",{{"type","string"},{"description","Existing file to patch. Stream FIRST."}}},
+        {"display_description",{{"type","string"},{"description","One-line summary shown in the card. Stream second."}}},
+        {"patch",{{"type","string"},{"description","A unified diff for THIS file: one or more hunks starting with `@@ -a,b +c,d @@`, body lines prefixed ` ` (context), `-` (remove), `+` (add). File headers (--- / +++) are optional and ignored. Hunks are fuzzy-located (the @@ line numbers are hints), so a patch still applies after the file drifts; every hunk needs \u22651 context line and all hunks apply atomically (any miss \u2192 nothing written)."}}},
+    }}};
+}
+
 } // namespace
 
 void register_edit_tool(Shells& sh) {
     sh.add("edit", kEditDescription, edit_schema(),
            EffectSet{Effect::ReadFs, Effect::WriteFs},
            body<EditArgs>(run_edit, parse_edit_args), 40'000);
+
+    sh.add("apply_patch",
+        "Apply a unified-diff PATCH to one existing file \u2014 the multi-hunk "
+        "editing idiom `edit` can't express in a single call. Give a `patch` "
+        "whose hunks start with `@@ \u2026 @@` and whose body lines are ` `/"
+        "`-`/`+`; each hunk is FUZZY-located by its context + removed lines "
+        "(reusing edit's matcher), so the diff still applies after the file "
+        "has drifted from the line numbers in its headers. All hunks apply "
+        "atomically: if any can't be placed unambiguously, nothing is "
+        "written. Produces a reviewable diff card like `edit`. Use `edit` for "
+        "a one-off substitution, `apply_patch` when you already have a diff.",
+        apply_patch_schema(),
+        EffectSet{Effect::ReadFs, Effect::WriteFs},
+        body<ApplyPatchArgs>(run_apply_patch, parse_apply_patch_args), 40'000);
 }
 
 } // namespace mcp::tools::detail
