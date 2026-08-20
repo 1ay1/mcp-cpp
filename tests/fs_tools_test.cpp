@@ -389,5 +389,47 @@ TEST_CASE("fs_tools") {
         std::puts("edit: regex CRLF fallback ok");
     }
 
+    // ── outline: nested symbol tree with line numbers, no bodies ─────────
+    {
+        (void)util::write_file(root / "shape.py",
+            "import os\n"
+            "\n"
+            "class Widget:\n"
+            "    def __init__(self):\n"
+            "        self.x = 1\n"
+            "    def render(self):\n"
+            "        return self.x\n"
+            "\n"
+            "def top_level():\n"
+            "    return Widget()\n");
+        auto args = obj(); args["path"] = (root / "shape.py").string();
+        auto r = call(*provider, "outline", args);
+        assert(!r.is_error);
+        assert(r.text.find("class Widget") != std::string::npos);
+        assert(r.text.find("def __init__") != std::string::npos);
+        assert(r.text.find("def render") != std::string::npos);
+        assert(r.text.find("def top_level") != std::string::npos);
+        // Bodies excluded — the assignment inside __init__ must NOT appear.
+        assert(r.text.find("self.x = 1") == std::string::npos);
+        // Nesting: the method line is indented deeper than the class line.
+        auto cls = r.text.find("class Widget");
+        auto ren = r.text.find("def render");
+        assert(cls != std::string::npos && ren != std::string::npos && cls < ren);
+        auto lstart = [&](std::size_t p){ auto n = r.text.rfind('\n', p);
+                                          return n == std::string::npos ? 0 : n + 1; };
+        assert((ren - lstart(ren)) > (cls - lstart(cls)));  // render nested under Widget
+        std::puts("outline: nested tree, bodies excluded");
+    }
+
+    // ── outline: file with no defs degrades gracefully ──────────────────
+    {
+        (void)util::write_file(root / "plain.txt", "just\nsome\nprose\n");
+        auto args = obj(); args["path"] = (root / "plain.txt").string();
+        auto r = call(*provider, "outline", args);
+        assert(!r.is_error);
+        assert(r.text.find("no top-level definitions") != std::string::npos);
+        std::puts("outline: no-defs file handled");
+    }
+
     fs::remove_all(root);
 }

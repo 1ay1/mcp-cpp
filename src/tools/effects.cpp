@@ -17,6 +17,7 @@ EffectSet effects_for_builtin(const std::string& name) {
     static const std::unordered_map<std::string, EffectSet> table = {
         // Tier-1 (self-contained)
         {"read",            EffectSet{E::ReadFs}},
+        {"outline",         EffectSet{E::ReadFs}},
         {"list_dir",        EffectSet{E::ReadFs}},
         {"grep",            EffectSet{E::ReadFs}},
         {"glob",            EffectSet{E::ReadFs}},

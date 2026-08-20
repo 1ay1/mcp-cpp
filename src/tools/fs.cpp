@@ -10,6 +10,7 @@
 
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
+#include <mcp/tools/util/utf8.hpp>
 #include <mcp/tools/util/error.hpp>
 
 #include <algorithm>
@@ -983,6 +984,137 @@ json list_dir_schema() {
 
 } // namespace
 
+// ─────────────────────────────────────────────────────────────────────────
+//  outline — a nested symbol tree for ONE file (no bodies).
+// ─────────────────────────────────────────────────────────────────────────
+// `read` emits a FLAT outline as a side effect for files >32 KiB; this is the
+// first-class, intentional "show me this file's SHAPE" tool: works at any
+// size, and NESTS entries by leading-indent depth so a class's methods sit
+// under it. Reuses the same def/heading pattern read's outline uses, so what
+// you see here is exactly what read would surface — just structured, with a
+// line number you can jump to via read(symbol=) or read(offset=).
+
+struct OutlineArgs {
+    util::WorkspacePath path;
+    int  max_entries = 400;
+    std::string display_description;
+};
+
+[[nodiscard]] std::string render_outline_nested(std::string_view content,
+                                                std::size_t max_entries,
+                                                int& total_defs) {
+    const auto& re = outline_pattern();
+    // Collect (indent_cols, line_no, signature) for each matching line.
+    struct Row { int cols; int line; std::string sig; };
+    std::vector<Row> rows;
+    int line_no = 0;
+    std::size_t start = 0;
+    total_defs = 0;
+    while (start <= content.size()) {
+        std::size_t nl = content.find('\n', start);
+        std::string_view line = content.substr(
+            start, (nl == std::string_view::npos ? content.size() : nl) - start);
+        ++line_no;
+        std::string s{line};
+        if (std::regex_search(s, re)) {
+            // indent width in columns (tab = 4) for depth bucketing
+            int cols = 0;
+            for (char c : line) {
+                if (c == ' ') ++cols;
+                else if (c == '\t') cols += 4;
+                else break;
+            }
+            std::size_t l = 0;
+            while (l < line.size() && (line[l] == ' ' || line[l] == '\t')) ++l;
+            auto trimmed = line.substr(l);
+            while (!trimmed.empty() && (trimmed.back() == ' '
+                       || trimmed.back() == '\t' || trimmed.back() == '\r'))
+                trimmed.remove_suffix(1);
+            if (!trimmed.empty()) {
+                ++total_defs;
+                if (rows.size() < max_entries)
+                    rows.push_back({cols, line_no, std::string{trimmed}});
+            }
+        }
+        if (nl == std::string_view::npos) break;
+        start = nl + 1;
+    }
+
+    // Map distinct indent-column values → tree depth (0,1,2,…) so mixed
+    // 2-space / 4-space files still nest sanely: depth = rank of this row's
+    // indent among the indents of its enclosing (smaller-indent) ancestors.
+    std::string out;
+    std::vector<int> stack;   // indent cols of open ancestors
+    for (auto& r : rows) {
+        while (!stack.empty() && stack.back() >= r.cols) stack.pop_back();
+        int depth = static_cast<int>(stack.size());
+        stack.push_back(r.cols);
+        for (int i = 0; i < depth; ++i) out += "  ";
+        std::format_to(std::back_inserter(out), "L{}: {}\n", r.line, r.sig);
+    }
+    return out;
+}
+
+ExecResult run_outline(const OutlineArgs& a) {
+    const auto& p = a.path.path();
+    std::error_code ec;
+    if (!fs::exists(p, ec))
+        return std::unexpected(ToolError::not_found(a.path.string()));
+    if (!fs::is_regular_file(p, ec))
+        return std::unexpected(ToolError::not_a_file(a.path.string()));
+    constexpr std::uintmax_t kMaxBytes = 8u * 1024u * 1024u;
+    if (auto sz = fs::file_size(p, ec); !ec && sz > kMaxBytes)
+        return std::unexpected(ToolError::too_large(std::format(
+            "file is {} KiB (> 8 MiB outline cap).", sz / 1024)));
+
+    std::string content;
+    try { content = util::read_file(a.path); }
+    catch (...) { return std::unexpected(ToolError::io("cannot read " + a.path.string())); }
+    if (content.find('\0') != std::string::npos)
+        return std::unexpected(ToolError::binary(a.path.string()));
+
+    int total = 0;
+    std::string tree = render_outline_nested(
+        content, static_cast<std::size_t>(a.max_entries), total);
+
+    int lines = static_cast<int>(std::count(content.begin(), content.end(), '\n')) + 1;
+    std::ostringstream out;
+    if (!a.display_description.empty()) out << a.display_description << "\n";
+    if (total == 0)
+        return ToolOutput{a.path.string() + " (" + std::to_string(lines)
+            + " lines): no top-level definitions or headings detected — "
+            "read it directly.", std::nullopt};
+    out << a.path.string() << " — " << total << " definition"
+        << (total==1?"":"s") << " across " << lines << " lines:\n\n" << tree;
+    if (total > a.max_entries)
+        out << "\n[" << (total - a.max_entries)
+            << " more — raise max_entries]";
+    return ToolOutput{util::to_valid_utf8(out.str()), std::nullopt};
+}
+
+std::expected<OutlineArgs, ToolError> parse_outline_args(const json& j) {
+    util::ArgReader r(j);
+    if (!r.is_object())
+        return std::unexpected(ToolError::invalid_args("expected a JSON object"));
+    auto path = r.require_str("path");
+    if (!path || path->empty())
+        return std::unexpected(ToolError::invalid_args("`path` is required"));
+    auto wp = util::make_readable_path_checked(*path, "outline");
+    if (!wp) return std::unexpected(std::move(wp.error()));
+    OutlineArgs a{std::move(*wp),
+                  std::clamp(r.integer("max_entries", 400), 1, 2000),
+                  r.str("display_description")};
+    return a;
+}
+
+json outline_schema() {
+    return json{{"type","object"},{"required",{"path"}},{"properties",{
+        {"path",{{"type","string"},{"description","File to outline."}}},
+        {"display_description",{{"type","string"},{"description","One-line summary shown in the UI. Optional."}}},
+        {"max_entries",{{"type","integer"},{"description","Max symbols shown (default 400)."}}},
+    }}};
+}
+
 void register_fs_tools(Shells& sh) {
     sh.add("read",
         "Read a file from the filesystem. Returns up to 2000 lines "
@@ -1019,6 +1151,17 @@ void register_fs_tools(Shells& sh) {
         "Use this to explore project structure before reading files.",
         list_dir_schema(), EffectSet{Effect::ReadFs},
         body<ListDirArgs>(run_list_dir, parse_list_dir_args), 25'000);
+
+    sh.add("outline",
+        "Show a file's SHAPE \xe2\x80\x94 a nested tree of its definitions "
+        "(functions / classes / structs / headings) with line numbers, and "
+        "NO bodies. The cheap \"what's in this file\" probe before reading: "
+        "one call maps a 2000-line source at a fraction of the context cost, "
+        "then jump to a symbol with read(symbol=) or read(offset=). Unlike "
+        "read's size-triggered outline, this works at any size and nests "
+        "methods under their class by indent depth.",
+        outline_schema(), EffectSet{Effect::ReadFs},
+        body<OutlineArgs>(run_outline, parse_outline_args), 25'000);
 
     sh.add("move",
         "Move or rename a file or directory within the workspace without invoking a shell. "
