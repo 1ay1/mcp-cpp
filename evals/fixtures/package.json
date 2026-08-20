@@ -1,0 +1,10 @@
+{
+  "name": "demo",
+  "version": "2.4.0",
+  "scripts": { "build": "tsc", "test": "vitest", "lint": "eslint ." },
+  "dependencies": { "react": "^18.2.0", "zod": "^3.22.0" },
+  "services": [
+    { "name": "api", "port": 8080 },
+    { "name": "web", "port": 3000 }
+  ]
+}
