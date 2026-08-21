@@ -277,7 +277,13 @@ fs::path normalize_path(std::string_view s) {
     // getpwnam_r for that and the model's never seen it work.)
     std::string expanded;
     if (!s.empty() && s.front() == '~' && (s.size() == 1 || s[1] == '/')) {
-        if (const char* home = std::getenv("HOME"); home && *home) {
+        // Home root: $HOME (POSIX / MSYS2 / Cygwin) with a $USERPROFILE
+        // fallback for native Windows, where $HOME is usually unset. Without
+        // the fallback a `~/...` path argument silently failed to expand on
+        // Windows and was passed through verbatim.
+        const char* home = std::getenv("HOME");
+        if (!home || !*home) home = std::getenv("USERPROFILE");
+        if (home && *home) {
             expanded = home;
             expanded.append(s.data() + 1, s.size() - 1);
             s = expanded;
