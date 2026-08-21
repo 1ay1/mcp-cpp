@@ -33,8 +33,11 @@ class StdioTransport {
 public:
     // The streams must outlive the transport. `in` is the agent's stdin (when
     // wrapping an agent) or the spawned child's stdout (when wrapping a client).
+    // out_ptr_ mirrors out_ as an atomic pointer so sink() can detect
+    // invalidation (invalidate_output() sets it to nullptr) without
+    // dereferencing a dangling reference.
     StdioTransport(std::istream& in, std::ostream& out)
-        : in_(in), out_(out) {}
+        : in_(in), out_(out), out_ptr_(&out) {}
 
     StdioTransport(const StdioTransport&)            = delete;
     StdioTransport& operator=(const StdioTransport&) = delete;
@@ -45,12 +48,22 @@ public:
     Transport sink() {
         return [this](std::string_view line) {
             std::lock_guard lk(write_mu_);
-            // Append framing newline atomically with the payload so a concurrent
-            // write can't interleave between body and terminator.
-            out_.write(line.data(), static_cast<std::streamsize>(line.size()));
-            out_.put('\n');
-            out_.flush();
+            // Use the atomic pointer, not the reference: if close_stdin()
+            // or teardown has nulled out_ptr_, we silently drop the write
+            // instead of dereferencing a dangling ostream&.
+            auto* out = out_ptr_.load(std::memory_order_acquire);
+            if (!out || !out->good()) return;
+            out->write(line.data(), static_cast<std::streamsize>(line.size()));
+            out->put('\n');
+            out->flush();
+            if (!out->good()) out->clear(std::ios::badbit);
         };
+    }
+
+    // Called by the host before destroying the ostream (e.g. in
+    // close_stdin/terminate). After this, sink() silently drops writes.
+    void invalidate_output() noexcept {
+        out_ptr_.store(nullptr, std::memory_order_release);
     }
 
     // Run the read pump on a dedicated thread. The pump terminates on EOF or
@@ -93,6 +106,7 @@ public:
 private:
     std::istream& in_;
     std::ostream& out_;
+    std::atomic<std::ostream*> out_ptr_;
     std::mutex    write_mu_;
     std::thread   reader_;
     std::atomic<bool> running_{false};

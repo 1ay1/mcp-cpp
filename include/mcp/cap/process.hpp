@@ -311,9 +311,9 @@ public:
     // begins exiting, which closes its stdout and unblocks a reader parked in
     // ReadFile. Does NOT touch the read stream or reap the process.
     void close_stdin() noexcept {
-        if (out_stream_) out_stream_->flush();
-        out_stream_.reset();
-        out_buf_.reset();   // closes child's stdin HANDLE
+        // Do NOT flush out_stream_ here — races the reader thread's sink().
+        // See POSIX close_stdin() for the full rationale.
+        if (out_buf_) out_buf_->close();   // closes child's stdin HANDLE
     }
 
     void interrupt_output() noexcept {
@@ -327,9 +327,9 @@ public:
     // Stop/reap the process but keep the read stream object alive so a
     // concurrent output reader can observe EOF and join safely.
     void terminate() noexcept {
-        if (out_stream_) out_stream_->flush();
-        out_stream_.reset();
-        out_buf_.reset();
+        // Do NOT flush out_stream_ here — races the reader thread's sink().
+        // See POSIX terminate() for the full rationale.
+        if (out_buf_) out_buf_->close();
         if (proc_) {
             if (::WaitForSingleObject(proc_, 500) == WAIT_TIMEOUT) {
                 // Kill the whole tree, not just the launcher. The child is
@@ -814,9 +814,22 @@ public:
     // reader thread parked in getline on our read end. Does NOT reap or touch
     // the read stream, so a reader can drain remaining output + the EOF
     // cleanly. Safe to call before joining the reader, then shutdown() after.
+    // Close the child's stdin FD WITHOUT destroying out_stream_ OR out_buf_.
+    // The StdioTransport holds an std::ostream& into out_stream_, and
+    // out_stream_'s rdbuf() points into out_buf_. Destroying out_buf_
+    // here leaves a dangling rdbuf: if the reader thread processes a
+    // notification and writes a reply between this call and
+    // transport.reset() (which joins the reader), the ostream dereferences
+    // freed memory → SIGSEGV. Calling close() shuts the FD (writes fail
+    // with EBADF/EPIPE, which the streambuf surfaces as badbit) but keeps
+    // the object alive until ~ChildProcess().
     void close_stdin() noexcept {
-        out_stream_.reset();
-        out_buf_.reset();   // closes child's stdin FD
+        // Do NOT call out_stream_->flush() here: the reader thread's sink()
+        // lambda writes to out_stream_ under StdioTransport::write_mu_, and
+        // an unsynchronized flush() races it (ostream internals are not
+        // thread-safe). Any pending data in the put area is lost, which is
+        // acceptable during teardown.
+        if (out_buf_) out_buf_->close();   // closes FD; objects stay alive
     }
 
     void interrupt_output() noexcept {
@@ -826,9 +839,16 @@ public:
     // Stop/reap the entire process group with bounded waits. SIGTERM gives
     // cooperative children two seconds; SIGKILL guarantees TERM-resistant
     // children and descendants cannot retain stdout indefinitely.
+    // Like close_stdin(), this does NOT reset out_stream_ or out_buf_ — the
+    // reader thread may still be mid-notification holding a reference to
+    // them via StdioTransport::out_. close() shuts the FD safely; the
+    // objects are destroyed when ChildProcess itself is destructed
+    // (proc.reset() in teardown_, after the reader is joined).
     void terminate() noexcept {
-        out_stream_.reset();
-        out_buf_.reset();
+        // Do NOT call out_stream_->flush() here — same race as close_stdin():
+        // the reader thread may be writing via sink() and an unsynchronized
+        // flush() on the same ostream is a data race.
+        if (out_buf_) out_buf_->close();
         if (pid_ <= 0) return;
 
         const pid_t leader = pid_;

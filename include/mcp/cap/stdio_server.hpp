@@ -143,6 +143,12 @@ private:
     //      exited on EOF, so this is a no-op for it.
     //   3. transport.reset() — joins the reader thread.
     static void stop_reader_(Conn& c) noexcept {
+        // Invalidate the transport's output pointer FIRST: once this is
+        // null, sink() silently drops any write the reader thread makes
+        // while we're shutting down (e.g. a notification handler that
+        // tries to send a reply). Without this, the reader could dereference
+        // a dangling ostream& after close_stdin/terminate closes the FD.
+        if (c.transport) c.transport->invalidate_output();
         if (c.proc) {
             c.proc->close_stdin();
             c.proc->terminate();
