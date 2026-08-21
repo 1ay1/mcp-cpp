@@ -342,12 +342,46 @@ std::expected<ReadArgs, ToolError> parse_read_args(const json& j) {
     // wants, without a bash round-trip or knowing the file's length first.
     // Resolved against the real line count in run_read.
     if (offset == 0) offset = 1;
-    int limit = ar.integer("limit", 2000);
-    if (ar.has("end_line") && !ar.has("limit")) {
-        int end_line = ar.integer("end_line", 0);
+    // Did the caller pin a START but leave the END open? Paging with only an
+    // `offset`/`start_line` and no `limit`/`end_line` is the common case, and
+    // defaulting `limit` to 2000 there dumps the ENTIRE rest of the file into
+    // context — the "why is every read huge" footgun. A start-anchored read
+    // wants a FOCUSED window, so default it to kPageWindow lines. A read with
+    // NO position at all (`read(path)`) keeps the whole-file default (2000,
+    // or the >32 KiB auto-outline) — that's the deliberate "show me the file"
+    // request. An explicit `limit`/`end_line` always wins.
+    constexpr int kPageWindow = 250;
+    // has() is alias-aware (raw() consults the synonym tables), so has("offset")
+    // already covers start_line/start/from_line and has("limit") covers
+    // end_line/num_lines/max_lines/count — no need to spell the aliases out.
+    const bool anchored_start = ar.has("offset");
+    // `end_line` is an END POSITION, not a line count. It's aliased to `limit`
+    // in the arg tables (so has("limit") sees it), but its VALUE must be
+    // converted (end_line − offset + 1), not used raw — otherwise
+    // end_line=180 with offset=120 reads 180 lines (120..299) instead of the
+    // 60-line window 120..180 the outline tells the model to ask for. Detect
+    // a raw, literal `end_line`/`to_line` key and honour it as a position.
+    const bool has_end_line =
+        j.contains("end_line") || j.contains("to_line") || j.contains("endLine");
+    const bool explicit_end = ar.has("limit");
+    const int default_limit = (anchored_start && !explicit_end)
+                                  ? kPageWindow : 2000;
+    int limit = ar.integer("limit", default_limit);
+    // A literal end_line= wins and is interpreted as a position: window is
+    // [offset, end_line] inclusive. (A raw `limit`/`num_lines`/`count` stays a
+    // count and is already in `limit` above — we only remap the true end key.)
+    if (has_end_line) {
+        int end_line = 0;
+        for (const char* k : {"end_line", "to_line", "endLine"}) {
+            auto it = j.find(k);
+            if (it != j.end() && it->is_number()) {
+                end_line = it->get<int>();
+                break;
+            }
+        }
         if (end_line >= offset) limit = end_line - offset + 1;
     }
-    if (limit <= 0) limit = 2000;
+    if (limit <= 0) limit = default_limit;
     const std::string symbol = ar.str("symbol", "");
     // symbol= is itself an explicit selection, so it must NOT trigger the
     // whole-file auto-outline path.
@@ -1120,8 +1154,12 @@ json outline_schema() {
 
 void register_fs_tools(Shells& sh) {
     sh.add("read",
-        "Read a file from the filesystem. Returns up to 2000 lines "
-        "starting at an optional offset. For files over 32 KiB, "
+        "Read a file from the filesystem. A plain read (no line range) "
+        "returns up to 2000 lines from the top; but when you pass a START "
+        "position (offset / start_line) WITHOUT an end, it returns a "
+        "FOCUSED ~250-line window (not the whole rest of the file) and the "
+        "footer tells you how many lines remain + the exact offset to page "
+        "\xe2\x80\x94 so paging stays cheap. For files over 32 KiB, "
         "reading without an explicit line range returns a SYMBOL "
         "OUTLINE (function / class / heading names with line "
         "numbers) \xe2\x80\x94 or, if the file has no code "

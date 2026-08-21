@@ -333,6 +333,52 @@ TEST_CASE("fs_tools") {
         std::puts("read: negative offset tail ok");
     }
 
+    // ── read paging: offset WITHOUT a limit returns a FOCUSED window, not
+    //    the whole rest of the file (the "why is every read huge" fix). ──
+    {
+        std::string body;
+        for (int i = 1; i <= 1000; ++i)
+            body += "L" + std::to_string(i) + "\n";
+        (void)util::write_file(root / "big.txt", body);
+        const auto bp = (root / "big.txt").string();
+
+        // offset only, no limit → ~250-line window (not 1000).
+        auto a1 = obj(); a1["path"] = bp; a1["offset"] = 100;
+        auto r1 = call(*provider, "read", a1);
+        assert(!r1.is_error);
+        assert(r1.text.find("L100\n") != std::string::npos);   // window start
+        assert(r1.text.find("L349\n") != std::string::npos);   // 250th line in
+        assert(r1.text.find("L350\n") == std::string::npos);   // window ENDS
+        assert(r1.text.find("651 more") != std::string::npos); // pages onward
+        assert(r1.text.find("offset=350") != std::string::npos);
+
+        // start_line (alias) behaves identically. Use a DIFFERENT start so the
+        // (path,offset,limit) read-cache key doesn't collide with a1 above and
+        // return the "unchanged" sentinel instead of content.
+        auto a1b = obj(); a1b["path"] = bp; a1b["start_line"] = 200;
+        auto r1b = call(*provider, "read", a1b);
+        assert(!r1b.is_error);
+        assert(r1b.text.find("L449\n") != std::string::npos);   // 250th from 200
+        assert(r1b.text.find("L450\n") == std::string::npos);
+
+        // end_line is an END POSITION, not a line count: [120,180] = 61 lines.
+        auto a2 = obj(); a2["path"] = bp; a2["start_line"] = 120; a2["end_line"] = 180;
+        auto r2 = call(*provider, "read", a2);
+        assert(!r2.is_error);
+        assert(r2.text.find("L120\n") != std::string::npos);
+        assert(r2.text.find("L180\n") != std::string::npos);   // inclusive end
+        assert(r2.text.find("L181\n") == std::string::npos);   // stops AT end_line
+        assert(r2.text.find("L119\n") == std::string::npos);
+
+        // An explicit limit still wins verbatim (a real count).
+        auto a3 = obj(); a3["path"] = bp; a3["offset"] = 100; a3["limit"] = 10;
+        auto r3 = call(*provider, "read", a3);
+        assert(!r3.is_error);
+        assert(r3.text.find("L109\n") != std::string::npos);
+        assert(r3.text.find("L110\n") == std::string::npos);
+        std::puts("read: offset-only pages a focused window; end_line is a position");
+    }
+
     // ── edit regex mode: capture-group rename across the file ─────────
     {
         (void)util::write_file(root / "log.c",
