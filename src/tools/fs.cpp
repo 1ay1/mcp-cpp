@@ -82,7 +82,10 @@ constexpr std::size_t kAutoOutlineSize = 32 * 1024;
         R"(function|module|component|service|directive)\b[^=]*)|)"
         R"((?:const|let|var)\s+\w+\s*(?:=|:)|)"
         R"(\w+\s*=\s*(?:async\s+)?(?:function|\([^)]*\)\s*=>)|)"
-        R"((?:[\w:~<>\[\]&*\s,]+\s+)?\w+\s*\([^)]*\)\s*(?:const\s*)?\{?\s*$))",
+        R"((?:[\w:~<>\[\]&*\s,]+\s+)?\w+\s*\([^)]*\))"
+        R"((?:\s*(?:const|noexcept(?:\s*\([^)]*\))?|override|final|mutable|)"
+        R"(=\s*(?:default|delete|0)|->\s*[\w:~<>\[\]&*\s,]+))*)"
+        R"(\s*\{?\s*$))",
         std::regex::ECMAScript | std::regex::optimize);
     return re;
 }

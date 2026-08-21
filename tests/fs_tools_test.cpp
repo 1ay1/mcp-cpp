@@ -188,6 +188,47 @@ TEST_CASE("fs_tools") {
         std::puts("read: symbol= handles C++ raw strings ok");
     }
 
+    // ── read symbol= resolves signatures with TRAILING specifiers ───────
+    //    (noexcept / const / override / trailing return type). The outline
+    //    def-pattern used to require `)` be followed only by an optional
+    //    `const` then `{`, so `int f() noexcept {` — and every function in
+    //    catalog.hpp — failed to resolve ("no definition of ... found").
+    {
+        auto sp = (root / "specifiers.cpp").string();
+        auto wargs = obj();
+        wargs["file_path"] = sp;
+        wargs["content"] =
+            "#include <string_view>\n"                                   // L1
+            "inline int max_output_tokens_for(std::string_view m) noexcept {\n" // L2 target
+            "    return m.empty() ? 0 : 64000;\n"                        // L3
+            "}\n"                                                        // L4
+            "struct S {\n"                                               // L5
+            "    int value() const noexcept { return v_; }\n"            // L6
+            "    void step() override final {\n"                         // L7 target
+            "        ++v_;\n"                                            // L8
+            "    }\n"                                                    // L9
+            "    int v_ = 0;\n"                                          // L10
+            "};\n"                                                       // L11
+            "auto trailing() -> int {\n"                                 // L12 target
+            "    return 7;\n"                                            // L13
+            "}\n";                                                       // L14
+        call(*provider, "write", wargs);
+
+        auto want = [&](const char* sym, const char* needle) {
+            auto args = obj();
+            args["path"]   = sp;
+            args["symbol"] = sym;
+            auto rd = call(*provider, "read", args);
+            assert(!rd.is_error);
+            assert(rd.text.find("defined at") != std::string::npos);
+            assert(rd.text.find(needle) != std::string::npos);
+        };
+        want("max_output_tokens_for", "return m.empty()");  // noexcept
+        want("step", "++v_;");                              // override final
+        want("trailing", "return 7;");                      // -> trailing return
+        std::puts("read: symbol= resolves noexcept/override/trailing-return sigs");
+    }
+
     // ── edit applies a fuzzy splice and carries a FileChange ─────────────
     {
         auto e = obj();
