@@ -177,6 +177,45 @@ std::expected<ParsedUrl, std::string> parse_url(std::string_view url) {
         || h.starts_with("fe9") || h.starts_with("fea")
         || h.starts_with("feb")) return true;
 
+    // IPv4-mapped / -compatible IPv6 (::ffff:127.0.0.1, ::ffff:a9fe:a9fe,
+    // ::127.0.0.1) resolve to the embedded IPv4 and are a classic SSRF filter
+    // bypass: the prefix checks above miss them and the dotted-quad folding
+    // below rejects them (they contain ':'). Extract the trailing IPv4 (dotted,
+    // or the last two hex groups of a ::ffff: mapping) and fold it to dotted
+    // form so the private-range check catches it. Genuine public IPv6 has no
+    // embedded v4 and is left to pass — we don't blanket-block v6.
+    if (h.find(':') != std::string::npos
+        && (h.starts_with("::ffff:") || h.starts_with("::"))) {
+        auto last_colon = h.rfind(':');
+        std::string tail = h.substr(last_colon + 1);
+        if (tail.find('.') != std::string::npos) {
+            h = tail;   // ::ffff:127.0.0.1 -> "127.0.0.1"
+        } else if (h.starts_with("::ffff:")) {
+            auto prev_colon = (last_colon == 0) ? std::string::npos
+                                                : h.rfind(':', last_colon - 1);
+            std::string g_hi = (prev_colon != std::string::npos)
+                                   ? h.substr(prev_colon + 1, last_colon - prev_colon - 1)
+                                   : std::string{};
+            auto hex4 = [](const std::string& g, unsigned& v) -> bool {
+                if (g.empty() || g.size() > 4) return false;
+                v = 0;
+                for (char ch : g) {
+                    unsigned d;
+                    if (ch >= '0' && ch <= '9') d = static_cast<unsigned>(ch - '0');
+                    else if (ch >= 'a' && ch <= 'f') d = static_cast<unsigned>(ch - 'a' + 10);
+                    else return false;
+                    v = v * 16 + d;
+                }
+                return true;
+            };
+            unsigned hi, lo;
+            if (!g_hi.empty() && hex4(g_hi, hi) && hex4(tail, lo)) {
+                h = std::to_string((hi >> 8) & 0xff) + "." + std::to_string(hi & 0xff)
+                  + "." + std::to_string((lo >> 8) & 0xff) + "." + std::to_string(lo & 0xff);
+            }
+        }
+    }
+
     // Canonicalize the many legal IPv4 spellings into dotted-quad octets
     // BEFORE the private-range checks. A dotted-quad-only guard is trivially
     // bypassed by the integer, hex, octal, and short forms that libc's
