@@ -27,6 +27,7 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+#include <algorithm>
 
 #include <nlohmann/json.hpp>
 
@@ -92,6 +93,58 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j) {
     };
 }
 
+// Pull the lines that look like compiler/test/runtime errors out of captured
+// output, so a failing command doesn't force the model to eyeball the whole
+// dump. Same signal set the spill path uses; capped so we never balloon the
+// message. Deduped preserves order.
+std::vector<std::string> extract_error_lines(std::string_view output,
+                                             std::size_t max_lines = 12) {
+    static constexpr std::string_view kMarkers[] = {
+        "error:", "Error:", "ERROR:", "error[", "FAILED", "FAIL:",
+        "panicked", "Traceback", "Exception", "fatal:", "fatal error",
+        "undefined reference", "assertion failed", "SIGSEGV", "cannot find",
+        "No such file", "Permission denied", "command not found",
+    };
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    while (pos < output.size() && out.size() < max_lines) {
+        std::size_t eol = output.find('\n', pos);
+        if (eol == std::string_view::npos) eol = output.size();
+        std::string_view line{output.data() + pos, eol - pos};
+        for (auto m : kMarkers) {
+            if (line.find(m) != std::string_view::npos) {
+                // Trim to keep the digest tight; skip if we already have it.
+                std::string_view t = line;
+                while (!t.empty() && (t.front() == ' ' || t.front() == '\t'))
+                    t.remove_prefix(1);
+                if (!t.empty()
+                    && std::find(out.begin(), out.end(), std::string{t}) == out.end())
+                    out.emplace_back(t);
+                break;
+            }
+        }
+        pos = eol + 1;
+    }
+    return out;
+}
+
+// Decode the exit codes a model most often misreads. Shells encode a
+// signal-terminated child as 128+signum, and 126/127 have fixed meanings.
+// Returns "" when the code carries no extra meaning worth a hint.
+std::string explain_exit_code(int code) {
+    switch (code) {
+        case 124: return "(124: timed out — the coreutils `timeout` wrapper killed it)";
+        case 126: return "(126: found but not executable — check the file's +x bit or that it's a script)";
+        case 127: return "(127: command not found — check the name, PATH, or that the tool is installed)";
+        case 128: return "(128: invalid exit argument)";
+        case 130: return "(130: interrupted, SIGINT / Ctrl-C)";
+        case 137: return "(137: killed, SIGKILL — usually the OOM killer; the process ran out of memory)";
+        case 139: return "(139: segfault, SIGSEGV)";
+        case 143: return "(143: terminated, SIGTERM)";
+        default:  return {};
+    }
+}
+
 ExecResult run_bash(const BashArgs& a) {
     auto t0 = std::chrono::steady_clock::now();
     const std::string& cmd_str = a.command;
@@ -150,27 +203,7 @@ ExecResult run_bash(const BashArgs& a) {
             tail = r.output.substr(r.output.size() - kSpillPreviewTail);
         }
 
-        std::vector<std::string> error_lines;
-        {
-            std::size_t pos = 0;
-            while (pos < r.output.size() && error_lines.size() < 10) {
-                std::size_t eol = r.output.find('\n', pos);
-                if (eol == std::string::npos) eol = r.output.size();
-                std::string_view line{r.output.data() + pos, eol - pos};
-                bool is_error = (line.find("error:") != std::string_view::npos ||
-                                 line.find("Error:") != std::string_view::npos ||
-                                 line.find("ERROR:") != std::string_view::npos ||
-                                 line.find("FAILED") != std::string_view::npos ||
-                                 line.find("error[") != std::string_view::npos ||
-                                 line.find("panicked") != std::string_view::npos ||
-                                 line.find("Traceback") != std::string_view::npos ||
-                                 line.find("Exception") != std::string_view::npos);
-                if (is_error) {
-                    error_lines.emplace_back(line);
-                }
-                pos = eol + 1;
-            }
-        }
+        std::vector<std::string> error_lines = extract_error_lines(r.output, 10);
 
         std::ostringstream env;
         env << "<persisted-output>\n";
@@ -233,12 +266,27 @@ ExecResult run_bash(const BashArgs& a) {
                 << fence(r.output) << next_step;
         }
     } else if (r.exit_code != 0) {
-        if (r.output.empty()) {
-            out << "Command \"" << a.command << "\" failed with exit code "
-                << r.exit_code << ".";
+        const std::string code_hint = explain_exit_code(r.exit_code);
+        out << "Command \"" << a.command << "\" failed with exit code "
+            << r.exit_code << ".";
+        if (!code_hint.empty()) out << " " << code_hint;
+        if (!r.output.empty()) {
+            // Lead with a digest of the error-looking lines so the model sees
+            // the failure cause first, then the full output for context. On a
+            // 300-line build log this is the difference between a targeted fix
+            // and re-scanning everything.
+            auto errs = extract_error_lines(r.output, 12);
+            if (!errs.empty()) {
+                out << "\n\n\xe2\x9d\x8c Key error line"
+                    << (errs.size() == 1 ? "" : "s") << ":\n";
+                for (const auto& e : errs) out << "  " << e << "\n";
+            }
+            out << "\n" << fence(r.output);
         } else {
-            out << "Command \"" << a.command << "\" failed with exit code "
-                << r.exit_code << ".\n\n" << fence(r.output);
+            out << " No output was captured"
+                << (code_hint.empty()
+                        ? " — the command signals only via its exit status."
+                        : ".");
         }
     } else if (r.output.empty()) {
         out << "Command executed successfully.";
