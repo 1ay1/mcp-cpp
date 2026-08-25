@@ -180,6 +180,40 @@ std::vector<std::string> test_argv_for(BuildSystem bs, const TestArgs& a) {
     return argv;
 }
 
+// On a failing test run, pull the lines that name a failing test so the model
+// sees WHICH test broke before the full log. Covers the common runners:
+// CTest ("***Failed" / "(Failed)"), Cargo/rustc ("test x ... FAILED"),
+// Go ("--- FAIL:"), GoogleTest ("[  FAILED  ]"), and jest/mocha ("✕"/"✗").
+// Deduped, order-preserving, capped.
+std::vector<std::string> failing_test_lines(std::string_view output,
+                                            std::size_t max_lines = 15) {
+    static constexpr std::string_view kMarkers[] = {
+        "--- FAIL", "[  FAILED  ]", "***Failed", "***Not Run", "(Failed)",
+        "assertion failed", "panicked at", "\xe2\x9c\x95", "\xe2\x9c\x97",
+        "AssertionError", "... FAILED", "not ok ",
+    };
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    while (pos < output.size() && out.size() < max_lines) {
+        std::size_t eol = output.find('\n', pos);
+        if (eol == std::string_view::npos) eol = output.size();
+        std::string_view line{output.data() + pos, eol - pos};
+        for (auto m : kMarkers) {
+            if (line.find(m) != std::string_view::npos) {
+                std::string_view t = line;
+                while (!t.empty() && (t.front() == ' ' || t.front() == '\t'))
+                    t.remove_prefix(1);
+                if (!t.empty()
+                    && std::find(out.begin(), out.end(), std::string{t}) == out.end())
+                    out.emplace_back(t);
+                break;
+            }
+        }
+        pos = eol + 1;
+    }
+    return out;
+}
+
 ExecResult run_tests(const TestArgs& a) {
     const auto bs = a.command.empty() ? detect_build_system() : BuildSystem::None;
     auto argv = a.command.empty() ? test_argv_for(bs, a)
@@ -216,6 +250,17 @@ ExecResult run_tests(const TestArgs& a) {
         summary << " (run " << runs_done << "/" << loops
                 << (sub.exit_code == 0 && !sub.timed_out ? " all passed" : " — stopped on failure") << ")";
     summary << '\n';
+    // On failure, lead with a digest of the failing-test lines so the model
+    // sees WHICH tests broke without scanning the whole runner log.
+    if ((sub.exit_code != 0 || sub.timed_out) && !output.empty()) {
+        auto fails = failing_test_lines(output);
+        if (!fails.empty()) {
+            summary << "\xe2\x9d\x8c Failing test"
+                    << (fails.size() == 1 ? "" : "s") << ":\n";
+            for (const auto& f : fails) summary << "  " << f << "\n";
+            summary << '\n';
+        }
+    }
     if (!output.empty()) summary << output;
     return ToolOutput{summary.str(), std::nullopt};
 }
