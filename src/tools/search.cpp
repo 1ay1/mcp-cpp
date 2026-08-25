@@ -851,6 +851,34 @@ enum class Backend { Ripgrep, BuiltIn };
     return {lo, hi};
 }
 
+// A dead-end "No matches found." costs the model a turn guessing why. Build a
+// short, PRIORITISED hint from the actual args: the causes that most often
+// turn a real hit into zero, in the order worth trying.
+std::string grep_no_match_hint(const GrepArgs& a) {
+    std::string h = "No matches for '" + a.pattern + "'";
+    if (!a.file_glob.empty()) h += " in files matching '" + a.file_glob + "'";
+    h += ".";
+    std::vector<std::string> tips;
+    if (a.case_sensitive)
+        tips.emplace_back("drop case_sensitive (search is case-insensitive by "
+                          "default) if the casing might differ");
+    if (!a.file_glob.empty())
+        tips.emplace_back("widen or remove `glob` — it may be filtering out the "
+                          "files that contain it");
+    if (a.word)
+        tips.emplace_back("drop `word` if the term appears as part of a larger "
+                          "identifier");
+    // Always-useful escalation paths.
+    tips.emplace_back("loosen the regex (fewer anchors / a substring)");
+    tips.emplace_back("use `search_code` for a meaning-based search when you "
+                      "don't know the exact spelling");
+    h += " Try: ";
+    for (std::size_t i = 0; i < tips.size(); ++i)
+        h += (i ? "; " : "") + tips[i];
+    h += ".";
+    return h;
+}
+
 ExecResult run_ripgrep(const GrepArgs& a) {
     std::vector<std::string> argv = {"rg", "--json", "--no-config"};
     if (!a.case_sensitive) argv.push_back("-i");
@@ -883,7 +911,7 @@ ExecResult run_ripgrep(const GrepArgs& a) {
         return std::unexpected(ToolError::spawn(
             "rg failed to start: " + r.start_error));
     if (r.exit_code == 1)
-        return ToolOutput{"No matches found.", std::nullopt};
+        return ToolOutput{grep_no_match_hint(a), std::nullopt};
     if (r.exit_code != 0)
         return std::unexpected(ToolError::subprocess(
             "rg exited " + std::to_string(r.exit_code) + ":\n"
@@ -927,7 +955,7 @@ ExecResult run_ripgrep(const GrepArgs& a) {
     std::erase_if(files, [](const FileRows& f){ return f.matches == 0; });
 
     if (total_matches == 0)
-        return ToolOutput{"No matches found.", std::nullopt};
+        return ToolOutput{grep_no_match_hint(a), std::nullopt};
 
     // Summary modes: no line bodies at all — the cheapest useful answer.
     if (a.mode != GrepArgs::Mode::Content) {

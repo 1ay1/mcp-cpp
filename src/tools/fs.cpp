@@ -594,6 +594,27 @@ ExecResult run_read(const ReadArgs& a) {
         }
         out += hint;
     }
+    // Heads-up prefixes for files a model can otherwise misread as "read
+    // failed" or waste turns paging line-by-line through.
+    std::string heads_up;
+    if (N == 0) {
+        heads_up = "(file is empty — 0 bytes)\n";
+    } else if (a.symbol.empty()) {
+        // Minified / single-huge-line files (bundled JS, one-line JSON/SVG):
+        // line-based paging is nearly useless, so say so once and point at a
+        // better strategy. Trigger on a very high average line length across a
+        // non-trivial file.
+        const std::size_t avg_line = N / static_cast<std::size_t>(
+            total_lines > 0 ? total_lines : 1);
+        if (N > 4096 && avg_line > 800) {
+            heads_up = std::format(
+                "(heads-up: this file averages ~{} chars/line over {} line(s) "
+                "— it looks minified or machine-generated, so line paging is "
+                "coarse. `grep` for a token, or read a byte range, to target a "
+                "spot.)\n", avg_line, total_lines);
+        }
+    }
+    if (!heads_up.empty()) out = heads_up + out;
     if (!symbol_header.empty()) out = symbol_header + out;
     if (!a.display_description.empty())
         out = a.display_description + "\n" + out;
