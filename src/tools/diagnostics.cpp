@@ -114,7 +114,15 @@ ExecResult run_diagnostics(const DiagnosticsArgs& a) {
 
     std::ostringstream result;
     if (errors > 0 || warnings > 0) {
-        result << "\xe2\x9d\x8c " << errors << " error(s), " << warnings << " warning(s)\n\n";
+        // Status glyph reflects severity: warnings alone don't mean the build
+        // failed, so don't cry ❌ for a clean-but-noisy compile.
+        const char* glyph = errors > 0 ? "\xe2\x9d\x8c"          // ❌
+                                       : "\xe2\x9a\xa0\xef\xb8\x8f"; // ⚠️
+        result << glyph << " " << errors << " error(s), "
+               << warnings << " warning(s)";
+        if (errors == 0)
+            result << " — built OK, warnings only";
+        result << "\n\n";
         if (!error_lines.empty()) {
             result << "First errors:\n";
             for (const auto& el : error_lines) {
