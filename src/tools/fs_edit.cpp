@@ -867,12 +867,47 @@ ExecResult run_edit(const EditArgs& a) {
     }
 
     std::string unified = diff::render_unified(d);
+    // Live line locator: point at the FIRST CHANGED line of each hunk, not the
+    // hunk's context start. new_start is where the hunk (incl. leading context)
+    // begins; walk past the leading ' ' context lines in the patch body to the
+    // first '+'/'-' so the number names the actual edit. Computed from
+    // original-on-disk vs the fully-applied buffer, so it stays live across
+    // multiple edits that shift lines.
+    auto first_changed_line = [](const auto& h) -> int {
+        int ln = h.new_start;
+        std::size_t pos = 0;
+        const std::string& body = h.patch;
+        while (pos < body.size()) {
+            std::size_t eol = body.find('\n', pos);
+            if (eol == std::string::npos) eol = body.size();
+            char c = body[pos];
+            if (c == '+' || c == '-') break;      // first change
+            if (c == ' ') ++ln;                    // context line advances new-side
+            pos = eol + 1;
+        }
+        return ln;
+    };
+    std::string where;
+    {
+        std::vector<int> starts;
+        for (const auto& h : d.hunks) starts.push_back(first_changed_line(h));
+        if (starts.size() == 1) {
+            where = std::format(" at line {}", starts[0]);
+        } else if (!starts.empty()) {
+            where = std::format(" at lines ");
+            const std::size_t show = std::min<std::size_t>(starts.size(), 6);
+            for (std::size_t i = 0; i < show; ++i)
+                where += (i ? ", " : "") + std::to_string(starts[i]);
+            if (starts.size() > show)
+                where += std::format(", +{} more", starts.size() - show);
+        }
+    }
     std::ostringstream msg;
     if (!staleness_warning.empty()) msg << staleness_warning;
     if (!a.display_description.empty())
         msg << a.display_description << "\n\n";
     msg << "Edited " << a.path.string() << " (" << d.added << "+ "
-        << d.removed << "-";
+        << d.removed << "-" << where;
     if (a.edits.size() > 1) {
         msg << ", " << applied << "/" << a.edits.size() << " edits applied";
         if (idempotent > 0)   msg << ", " << idempotent   << " already present";
@@ -1179,12 +1214,42 @@ ExecResult run_apply_patch(const ApplyPatchArgs& a) {
                    util::content_fnv1a(updated)); }
 
     std::string unified = diff::render_unified(d);
+    // Live line locator: first changed line of each hunk (skip leading context).
+    auto first_changed_line = [](const auto& h) -> int {
+        int ln = h.new_start;
+        std::size_t pos = 0;
+        const std::string& body = h.patch;
+        while (pos < body.size()) {
+            std::size_t eol = body.find('\n', pos);
+            if (eol == std::string::npos) eol = body.size();
+            char c = body[pos];
+            if (c == '+' || c == '-') break;
+            if (c == ' ') ++ln;
+            pos = eol + 1;
+        }
+        return ln;
+    };
+    std::string where;
+    {
+        std::vector<int> starts;
+        for (const auto& h : d.hunks) starts.push_back(first_changed_line(h));
+        if (starts.size() == 1) {
+            where = std::format(" at line {}", starts[0]);
+        } else if (!starts.empty()) {
+            where = " at lines ";
+            const std::size_t show = std::min<std::size_t>(starts.size(), 6);
+            for (std::size_t i = 0; i < show; ++i)
+                where += (i ? ", " : "") + std::to_string(starts[i]);
+            if (starts.size() > show)
+                where += std::format(", +{} more", starts.size() - show);
+        }
+    }
     std::ostringstream msg;
     if (!staleness.empty()) msg << staleness;
     if (!a.display_description.empty()) msg << a.display_description << "\n\n";
     msg << "Patched " << a.path.string() << " (" << d.added << "+ "
         << d.removed << "-, " << hunks.size() << " hunk"
-        << (hunks.size()==1?"":"s") << "):\n\n```diff\n" << unified;
+        << (hunks.size()==1?"":"s") << where << "):\n\n```diff\n" << unified;
     if (unified.empty() || unified.back() != '\n') msg << "\n";
     msg << "```";
 
