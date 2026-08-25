@@ -465,6 +465,17 @@ ExecResult run_git_diff(const GitDiffArgs& a) {
     }
     if (!a.display_description.empty())
         output = a.display_description + "\n" + output;
+    // run_git appends a bare "[output truncated]" when the patch overruns the
+    // 50 KB cap. For a diff that's a trap: an incomplete patch can end
+    // mid-hunk, so the model must NOT feed it to apply_patch. Upgrade the
+    // generic marker to a diff-specific, actionable one.
+    if (auto tp = output.rfind("\n[output truncated]");
+        tp != std::string::npos && tp + 19 >= output.size()) {
+        output.replace(tp, std::string::npos,
+            "\n\n[patch truncated at 50 KB — this diff is INCOMPLETE and may end "
+            "mid-hunk; don't apply_patch it. Narrow with stat_only:true for the "
+            "file list, a `path` to one file, or a smaller `ref` range.]");
+    }
     return ToolOutput{std::move(output), std::nullopt};
 }
 
