@@ -754,6 +754,29 @@ ExecResult run_write(const WriteArgs& a) {
                            prefix, exists ? "Overwrote" : "Created",
                            a.path.string(), change.added, change.removed,
                            a.coercion_note);
+    // Teaching nudge (never blocks — the write already succeeded): when a
+    // model OVERWRITES a substantial existing file but only changed a small
+    // fraction of its lines, `edit` would have been the better call — it
+    // ships only the changed snippet instead of the whole body, can't clobber
+    // an unseen concurrent change, and renders a tighter diff. Mirrors
+    // bash_tool_suggestion's philosophy. Silent for new files, whole-file
+    // rewrites, and small files where write is genuinely the right tool.
+    if (exists && !original.empty()) {
+        const std::size_t orig_lines =
+            static_cast<std::size_t>(
+                std::count(original.begin(), original.end(), '\n')) + 1;
+        const int churn = change.added + change.removed;
+        if (orig_lines >= 40 && churn > 0
+            && static_cast<std::size_t>(churn) * 5 < orig_lines) {
+            msg += std::format(
+                "\n\ntip: this overwrote a {}-line file but only changed ~{} "
+                "line(s). For a targeted change like this, `edit` (or "
+                "`apply_patch`) ships just the snippet instead of the whole "
+                "file, won't clobber unseen concurrent edits, and produces a "
+                "cleaner diff — prefer it over `write` when the file already "
+                "exists and you're changing part of it.", orig_lines, churn);
+        }
+    }
     return ToolOutput{std::move(msg), std::move(change)};
 }
 
