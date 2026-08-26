@@ -1180,10 +1180,14 @@ ExecResult run_builtin(const GrepArgs& a) {
 
     int total = total_matches.load();
     if (total == 0)
+        // Same actionable hint the ripgrep backend emits (names the pattern +
+        // prioritised next steps incl. `search_code`) so grep's zero-match
+        // output is identical whichever backend served it. Append the builtin-
+        // specific ECMAScript-vs-PCRE note, which only applies to this path.
         return ToolOutput{
-            "No matches found. Check the pattern syntax (this is ECMAScript "
-            "regex, not PCRE — no look-behind, no named groups), try a "
-            "broader pattern, or use `glob` first to narrow the file set.",
+            grep_no_match_hint(a)
+            + " (Builtin backend: pattern is ECMAScript regex, not PCRE — no "
+              "look-behind or named groups.)",
             std::nullopt};
 
     std::size_t files_with_hits = 0;
