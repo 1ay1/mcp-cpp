@@ -24,6 +24,7 @@
 #include "tool_shell.hpp"
 
 #include <mcp/tools/util/error.hpp>
+#include <mcp/tools/util/regex_guard.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/utf8.hpp>
@@ -160,6 +161,11 @@ collect_files(const fs::path& root, std::string_view file_glob) {
     return out;
 }
 
+// Conservative ReDoS guard: reject nested unbounded quantifiers up front.
+// The detector lives in a shared header so grep's builtin backend uses the
+// same one — see util/regex_guard.hpp for the full rationale.
+using util::has_nested_quantifier;
+
 // Compile a search regex from a pattern; honours literal/word/case. On a
 // literal pattern with word=false, returns nullopt so callers can use the
 // faster substring path.
@@ -167,6 +173,12 @@ collect_files(const fs::path& root, std::string_view file_glob) {
 compile_pattern(const std::string& pattern, bool case_sensitive, bool word) {
     const bool literal = !word && is_literal_pattern(pattern);
     if (literal) return std::optional<std::regex>{std::nullopt};
+    if (has_nested_quantifier(pattern))
+        return std::unexpected(ToolError::invalid_regex(
+            "regex '" + pattern + "' has a nested unbounded quantifier (e.g. "
+            "(a+)+) that can cause catastrophic backtracking — rewrite it "
+            "without the nested +/* (e.g. use a single quantifier or a "
+            "possessive/atomic form), or search for a plain substring."));
     auto flags = std::regex::ECMAScript | std::regex::optimize;
     if (!case_sensitive) flags |= std::regex::icase;
     std::string src = word

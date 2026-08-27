@@ -4,6 +4,7 @@
 // replace / read_filter) driven end-to-end through make_provider(), proving
 // each tool's core contract and that the workspace boundary + effects flow.
 
+#include <chrono>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
@@ -245,6 +246,36 @@ TEST_CASE("textproc") {
         b["pattern"] = "["; b["path"] = root.string();  // bad regex
         auto r2 = call(*provider, "extract", b);
         check(r2.is_error, "extract with a broken regex is an error");
+    }
+
+    // ── ReDoS GUARD: a nested unbounded quantifier is rejected at compile
+    //    time. std::regex is a backtracking engine with no step limit or
+    //    interrupt, so `(a+)+$` vs a run of 'a' backtracks EXPONENTIALLY
+    //    (~30 s at 28 chars) and the tool's catch(...) never fires — it hangs.
+    //    compile_pattern must refuse the pattern up front, FAST, for extract,
+    //    aggregate, and regex replace. We seed a file of 'a' to make the
+    //    catastrophic case reachable if the guard ever regresses.
+    {
+        wr(root / "aaa.txt", std::string(40, 'a'));
+        for (const char* danger : {"(a+)+$", "(a*)*", "(.+)*x", "(\\d+)+"}) {
+            for (const char* tool : {"extract", "aggregate"}) {
+                auto a = obj();
+                a["pattern"] = danger;
+                a["path"] = root.string(); a["glob"] = "aaa.txt";
+                if (std::string(tool) == "aggregate") a["by"] = "match";
+                const auto t0 = std::chrono::steady_clock::now();
+                auto r = call(*provider, tool, a);
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+                check(r.is_error, std::string(tool) + ": nested-quantifier regex rejected");
+                check(ms < 500, std::string(tool) + ": rejected fast (no backtracking)");
+            }
+        }
+        // A legitimate quantified group must STILL work.
+        auto ok = obj();
+        ok["pattern"] = "(a)+"; ok["path"] = root.string(); ok["glob"] = "aaa.txt";
+        auto r = call(*provider, "extract", ok);
+        check(!r.is_error, "a safe quantified group (a)+ still compiles + runs");
     }
 
     fs::current_path(prev_cwd);

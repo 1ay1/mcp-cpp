@@ -14,6 +14,7 @@
 #include <mcp/tools/util/subprocess.hpp>
 #include <mcp/tools/util/utf8.hpp>
 #include <mcp/tools/util/error.hpp>
+#include <mcp/tools/util/regex_guard.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -1078,6 +1079,19 @@ ExecResult run_builtin(const GrepArgs& a) {
     const bool literal = !a.word && is_literal_pattern(a.pattern);
     std::regex re;
     if (!literal) {
+        // std::regex is an uninterruptible backtracker; a nested unbounded
+        // quantifier (e.g. `(a+)+`) against a long non-matching line hangs for
+        // seconds–minutes, and the per-file jthread exception wall below does
+        // NOT catch it (catastrophic backtracking hangs, it doesn't throw).
+        // Refuse the structural cause up front — same guard as textproc /
+        // extract — so this backend (used when ripgrep is absent) can't be
+        // wedged by one model-supplied pattern.
+        if (util::has_nested_quantifier(a.pattern))
+            return std::unexpected(ToolError::invalid_regex(
+                "regex '" + a.pattern + "' has a nested unbounded quantifier "
+                "(e.g. (a+)+) that can cause catastrophic backtracking — "
+                "rewrite it without the nested +/*, or search a plain "
+                "substring."));
         auto flags = std::regex::ECMAScript | std::regex::optimize;
         if (!a.case_sensitive) flags = flags | std::regex::icase;
         std::string src = a.pattern;
