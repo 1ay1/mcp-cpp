@@ -88,3 +88,10 @@ endif()
 if(MCP_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
+
+# libFuzzer harnesses (Clang only). Off by default; opt in with
+#   CC=clang CXX=clang++ cmake -B fuzzbuild -DMCP_BUILD_FUZZERS=ON
+option(MCP_BUILD_FUZZERS "Build libFuzzer harnesses (Clang only)" OFF)
+if(MCP_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
+endif()

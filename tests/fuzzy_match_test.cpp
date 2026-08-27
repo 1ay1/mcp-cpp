@@ -25,6 +25,7 @@ static int g_failures = 0;
 
 #include <cstdio>
 #include <limits>
+#include <chrono>
 #include <string>
 #include <string_view>
 
@@ -221,6 +222,32 @@ TEST_CASE("fuzzy_match") {
         auto m = fuzzy_find(file, block);
         CHECK(!m.ok);
         CHECK(m.count >= 2);
+    }
+
+    // ── 11. DoS BOUND (algorithmic-complexity guard). A large multi-line
+    //     needle against a big, highly-repetitive file used to spend SECONDS
+    //     in the banded DP (each cell runs an O(L²) levenshtein via fuzzy_eq),
+    //     reachable from a single edit/apply_patch call. MAX_DP_CELLS now caps
+    //     the total work: such an input must bail to "no match" quickly rather
+    //     than wedge the tool. We assert BOTH the verdict and a generous wall-
+    //     clock ceiling so a future cap regression trips this test.
+    {
+        std::string file;
+        for (int i = 0; i < 2'000; ++i)
+            file += "  func item_" + std::to_string(i % 37) + "(a, b) { return a; }\n";
+        std::string needle;                       // ~400-line fuzzy needle
+        for (int i = 0; i < 400; ++i)
+            needle += "  func item_" + std::to_string(i % 37) + "(a,b){ return b; }\n";
+
+        const auto t0 = std::chrono::steady_clock::now();
+        auto m = fuzzy_find(file, needle);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        CHECK(!m.ok);                             // over-cap input bails cleanly
+        // 1 s is ~50× the post-fix time and far under the pre-fix seconds; it
+        // catches a cap regression without flaking on a slow/loaded CI box.
+        CHECK(elapsed < 1'000);
     }
     CHECK(g_failures == 0);
 }

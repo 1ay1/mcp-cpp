@@ -35,11 +35,18 @@ constexpr std::uint32_t DELETION_COST    = 10;
 constexpr double        FUZZY_EQ_THRESHOLD = 0.8;   // line-level
 constexpr double        MATCH_RATIO        = 0.8;   // accepted match
 constexpr std::uint32_t LINE_HINT_TOLERANCE = 200;  // lines
-// Beyond this, the O(n*m) DP gets expensive. The exact-match fast path
-// handles every case below the cap; above it we conservatively bail to
-// "no match" rather than burn the watchdog. Real files vs. real needles
-// are well under this in practice.
-constexpr std::size_t   MAX_DP_CELLS = 2'000'000;   // ~16 MiB of state
+// Beyond this many DP cells we bail to "no match" rather than burn the
+// watchdog. This is NOT free per cell: each cell runs fuzzy_eq(), whose inner
+// term is an O(L²) levenshtein on the two line texts (L ≈ tens of chars). So
+// the real work is ~MAX_DP_CELLS × L². A multi-hundred-line needle against a
+// large repetitive file used to sit just under the old 2M-cell cap and spend
+// SECONDS in fuzzy_eq — an algorithmic-complexity DoS reachable from one edit/
+// apply_patch call. 200k cells keeps worst-case work ~100 ms while still
+// covering every realistic needle/file (a real fuzzy needle is a handful of
+// lines; anything past this is a pathological or adversarial input where
+// bailing to "no match" is the correct, safe answer — the exact-match fast
+// path already handled the common case).
+constexpr std::size_t   MAX_DP_CELLS = 100'000;
 
 enum class Dir : std::uint8_t { Up, Left, Diag };
 
@@ -58,8 +65,27 @@ std::size_t levenshtein(std::string_view a, std::string_view b) noexcept {
     if (a.size() < b.size()) std::swap(a, b);
     if (b.empty()) return a.size();
 
-    std::vector<std::size_t> prev(b.size() + 1);
-    std::vector<std::size_t> curr(b.size() + 1);
+    // The inner row is (len(b)+1) wide. Source lines are short in the common
+    // case, so keep the two DP rows on the STACK to avoid two heap allocations
+    // per call — this function is the hot inner term of fuzzy_eq, which
+    // run_line_dp calls once per DP cell, so per-call allocation dominated the
+    // fuzzy locator's time on large repetitive files. Fall back to heap only
+    // for pathologically long lines.
+    constexpr std::size_t kStack = 256;
+    std::size_t  stack_prev[kStack];
+    std::size_t  stack_curr[kStack];
+    std::vector<std::size_t> heap_prev, heap_curr;
+    std::size_t* prev;
+    std::size_t* curr;
+    if (b.size() + 1 <= kStack) {
+        prev = stack_prev;
+        curr = stack_curr;
+    } else {
+        heap_prev.resize(b.size() + 1);
+        heap_curr.resize(b.size() + 1);
+        prev = heap_prev.data();
+        curr = heap_curr.data();
+    }
     for (std::size_t j = 0; j <= b.size(); ++j) prev[j] = j;
 
     for (std::size_t i = 1; i <= a.size(); ++i) {
@@ -533,7 +559,19 @@ std::vector<DPMatch> run_banded_dp(std::string_view file, std::string_view needl
                                    const std::vector<Line>& nl) {
     auto bands = candidate_bands(file, needle, fl, nl);
     std::vector<DPMatch> all;
+    // Global work budget across ALL bands. candidate_bands can emit many
+    // windows when the anchor line fuzzy-matches lots of rows (a file full of
+    // similar/duplicated lines); MAX_DP_CELLS bounds a SINGLE band but the SUM
+    // was unbounded, so such an input drove fuzzy_find into tens of seconds of
+    // DP — an algorithmic-complexity DoS reachable from one `edit` call.
+    // Charge each band its cell cost and stop once the cumulative budget is
+    // spent: total work is now O(MAX_DP_CELLS) no matter how the bands split.
+    const std::size_t Qrows = nl.size() + 1;
+    std::size_t budget = MAX_DP_CELLS;
     for (const auto& b : bands) {
+        const std::size_t cells = (b.hi - b.lo + 1) * Qrows;
+        if (cells > budget) break;   // spending this band would blow the budget
+        budget -= cells;
         auto part = run_line_dp(file, needle, fl, nl, b.lo, b.hi);
         for (auto& m : part) all.push_back(m);
     }
