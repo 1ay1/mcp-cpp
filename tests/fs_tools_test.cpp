@@ -8,11 +8,13 @@
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
+#include "../src/tools/diff.hpp"
 #include <mcp/cap/local.hpp>
 
 #include "agtest.hpp"
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <filesystem>
 #include <string>
 
@@ -34,6 +36,90 @@ static mcp::cap::Result call(mcp::cap::CapabilityProvider& p,
 }
 
 static mcp::Json obj() { return mcp::Json::object(); }
+
+// Regression: a small edit must produce a MINIMAL diff (not every line as '-'),
+// even on a large file or a CRLF file. Reproduces the reported "edit shows all
+// - lines" symptom. FileChange.before/after are diffed through the same engine
+// the card uses.
+TEST_CASE("edit diff stays minimal on large + CRLF files") {
+    namespace diff = mcp::tools::detail::diff;
+    auto root = fs::temp_directory_path() /
+        ("mcp_editmin_" + std::to_string(mcp_getpid()));
+    fs::create_directories(root);
+    util::set_workspace_root(root);
+    HostServices svc;
+    auto provider = make_provider(svc, ToolsetConfig{}, "local");
+
+    auto edit_and_diff = [&](const std::string& fname, const std::string& body,
+                             const std::string& oldt, const std::string& newt,
+                             int& added, int& removed) {
+        auto p = (root / fname).string();
+        (void)util::write_file(root / fname, body);
+        auto e = obj(); e["old_text"] = oldt; e["new_text"] = newt;
+        auto args = obj(); args["path"] = p;
+        args["edits"] = mcp::Json::array({e});
+        auto r = call(*provider, "edit", args);
+        assert(!r.is_error);
+        auto ch = read_change(r);
+        assert(ch.has_value());
+        auto d = diff::compute(p, ch->before, ch->after);
+        added = d.added; removed = d.removed;
+    };
+
+    // (1) Large LF file, change one line in the middle.
+    {
+        std::string body;
+        for (int i = 0; i < 6000; ++i) body += "line " + std::to_string(i) + "\n";
+        int a = -1, rmv = -1;
+        edit_and_diff("big.c", body, "line 3000\n", "CHANGED 3000\n", a, rmv);
+        assert(a == 1);
+        assert(rmv == 1);   // NOT 6000 — the all-'-' bug
+        std::puts("edit-min: 6000-line file, 1-line edit -> +1/-1 (not all-)");
+    }
+
+    // (2) CRLF file, change one line. The CRLF splice must NOT LF-normalize
+    //     the whole buffer (which would make every line differ => all '-').
+    {
+        std::string body;
+        for (int i = 0; i < 3000; ++i) body += "row " + std::to_string(i) + "\r\n";
+        int a = -1, rmv = -1;
+        edit_and_diff("win.c", body, "row 1500", "ROW-1500", a, rmv);
+        assert(a <= 2);      // one changed line (allow ±1 for CRLF boundary)
+        assert(rmv <= 2);    // NOT ~3000
+        std::printf("edit-min: 3000-line CRLF file, 1-line edit -> +%d/-%d\n",
+                    a, rmv);
+    }
+
+    // (3) HANG GUARD: an edit whose old_text does NOT match must fail FAST on
+    //     a large file — the failure path (full fuzzy scan + squashed-
+    //     whitespace search + "did you mean" hint) must stay bounded, not
+    //     spin O(file × needle). Reported as the edit tool "getting stuck".
+    {
+        std::string body;
+        for (int i = 0; i < 20000; ++i)
+            body += "source line number " + std::to_string(i) +
+                    " with some real content here\n";
+        auto p = (root / "huge.c").string();
+        (void)util::write_file(root / "huge.c", body);
+        auto e = obj();
+        e["old_text"] = "this block absolutely does not exist anywhere in\n"
+                        "the file even fuzzily so the matcher scans + fails";
+        e["new_text"] = "whatever";
+        auto args = obj(); args["path"] = p;
+        args["edits"] = mcp::Json::array({e});
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = call(*provider, "edit", args);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::printf("edit-min: no-match on 20000-line file -> %.1f ms "
+                    "(is_error=%d)\n", ms, r.is_error);
+        assert(r.is_error);           // it must report a miss
+        assert(ms < 3000.0);          // and it must NOT hang (generous 3s cap)
+    }
+
+    fs::remove_all(root);
+}
 
 TEST_CASE("fs_tools") {
     auto root = fs::temp_directory_path() / ("mcp_fs_test_" + std::to_string(mcp_getpid()));
