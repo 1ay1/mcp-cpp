@@ -29,6 +29,7 @@ add_executable(mcp_tests
     scheduler_test.cpp
     toolset_test.cpp
     fs_tools_test.cpp
+    diff_test.cpp
     apply_patch_test.cpp
     search_tools_test.cpp
     textproc_test.cpp

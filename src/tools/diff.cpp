@@ -34,37 +34,76 @@ struct Edit { enum K { Keep, Del, Ins } k; int a_idx, b_idx; };
 // (16M ints) and keeps a multi-MB paste from OOM-ing or hanging the host.
 constexpr std::size_t kMaxLcsCells = 16u * 1024u * 1024u;
 
-std::vector<Edit> full_replace_edits(std::size_t n, std::size_t m) {
-    std::vector<Edit> edits;
-    edits.reserve(n + m);
-    for (std::size_t i = 0; i < n; ++i)
-        edits.push_back({Edit::Del, static_cast<int>(i), -1});
-    for (std::size_t j = 0; j < m; ++j)
-        edits.push_back({Edit::Ins, -1, static_cast<int>(j)});
-    return edits;
-}
-
 std::vector<Edit> compute_edits(const std::vector<std::string>& a,
                                 const std::vector<std::string>& b) {
     const std::size_t n = a.size(), m = b.size();
-    if (n != 0 && m > kMaxLcsCells / n)
-        return full_replace_edits(n, m);
 
-    std::vector<std::vector<int>> dp(n + 1, std::vector<int>(m + 1, 0));
-    for (std::size_t i = 1; i <= n; ++i)
-        for (std::size_t j = 1; j <= m; ++j)
-            dp[i][j] = (a[i-1] == b[j-1]) ? dp[i-1][j-1] + 1
-                                          : std::max(dp[i-1][j], dp[i][j-1]);
+    // Trim the common PREFIX and SUFFIX before the O(n*m) LCS. A typical edit
+    // touches a few lines of a large file, so the vast majority of lines are a
+    // shared prefix/suffix that the DP would otherwise chew through — and,
+    // worse, whose n*m product trips the kMaxLcsCells cap on any file past
+    // ~4k lines, degrading a ONE-LINE edit into a whole-file delete+insert
+    // (every line shown as '-' then re-added). Trimming first keeps the diff
+    // MINIMAL and bounds the DP to the actually-changed window, so the cap
+    // effectively never fires on real edits.
+    std::size_t pre = 0;
+    while (pre < n && pre < m && a[pre] == b[pre]) ++pre;
+    std::size_t suf = 0;
+    while (suf < (n - pre) && suf < (m - pre) &&
+           a[n - 1 - suf] == b[m - 1 - suf]) ++suf;
+
+    const std::size_t an = n - pre - suf;   // changed lines in a
+    const std::size_t bm = m - pre - suf;   // changed lines in b
+
     std::vector<Edit> edits;
-    std::size_t i = n, j = m;
-    while (i > 0 && j > 0) {
-        if (a[i-1] == b[j-1]) { edits.push_back({Edit::Keep, static_cast<int>(i-1), static_cast<int>(j-1)}); --i; --j; }
-        else if (dp[i-1][j] >= dp[i][j-1]) { edits.push_back({Edit::Del, static_cast<int>(i-1), -1}); --i; }
-        else { edits.push_back({Edit::Ins, -1, static_cast<int>(j-1)}); --j; }
+    edits.reserve(pre + an + bm + suf);
+    // Shared prefix → Keeps.
+    for (std::size_t i = 0; i < pre; ++i)
+        edits.push_back({Edit::Keep, static_cast<int>(i), static_cast<int>(i)});
+
+    // LCS over the changed middle window only: a[pre .. n-suf), b[pre .. m-suf).
+    if (an == 0) {
+        for (std::size_t j = 0; j < bm; ++j)
+            edits.push_back({Edit::Ins, -1, static_cast<int>(pre + j)});
+    } else if (bm == 0) {
+        for (std::size_t i = 0; i < an; ++i)
+            edits.push_back({Edit::Del, static_cast<int>(pre + i), -1});
+    } else if (an > kMaxLcsCells / bm) {
+        // Even the trimmed window is genuinely huge (a massive rewrite): fall
+        // back to delete-all + insert-all for the MIDDLE only (prefix/suffix
+        // stay shared), still far better than the whole file.
+        for (std::size_t i = 0; i < an; ++i)
+            edits.push_back({Edit::Del, static_cast<int>(pre + i), -1});
+        for (std::size_t j = 0; j < bm; ++j)
+            edits.push_back({Edit::Ins, -1, static_cast<int>(pre + j)});
+    } else {
+        std::vector<std::vector<int>> dp(an + 1, std::vector<int>(bm + 1, 0));
+        for (std::size_t i = 1; i <= an; ++i)
+            for (std::size_t j = 1; j <= bm; ++j)
+                dp[i][j] = (a[pre + i-1] == b[pre + j-1]) ? dp[i-1][j-1] + 1
+                                              : std::max(dp[i-1][j], dp[i][j-1]);
+        std::vector<Edit> mid;
+        std::size_t i = an, j = bm;
+        while (i > 0 && j > 0) {
+            if (a[pre + i-1] == b[pre + j-1]) {
+                mid.push_back({Edit::Keep, static_cast<int>(pre + i-1),
+                               static_cast<int>(pre + j-1)}); --i; --j;
+            } else if (dp[i-1][j] >= dp[i][j-1]) {
+                mid.push_back({Edit::Del, static_cast<int>(pre + i-1), -1}); --i;
+            } else {
+                mid.push_back({Edit::Ins, -1, static_cast<int>(pre + j-1)}); --j;
+            }
+        }
+        while (i > 0) { --i; mid.push_back({Edit::Del, static_cast<int>(pre + i), -1}); }
+        while (j > 0) { --j; mid.push_back({Edit::Ins, -1, static_cast<int>(pre + j)}); }
+        std::reverse(mid.begin(), mid.end());
+        for (auto& e : mid) edits.push_back(e);
     }
-    while (i > 0) { --i; edits.push_back({Edit::Del, static_cast<int>(i), -1}); }
-    while (j > 0) { --j; edits.push_back({Edit::Ins, -1, static_cast<int>(j)}); }
-    std::reverse(edits.begin(), edits.end());
+
+    // Shared suffix → Keeps.
+    for (std::size_t s = 0; s < suf; ++s)
+        edits.push_back({Edit::Keep, static_cast<int>(n - suf + s),
+                         static_cast<int>(m - suf + s)});
     return edits;
 }
 } // namespace
