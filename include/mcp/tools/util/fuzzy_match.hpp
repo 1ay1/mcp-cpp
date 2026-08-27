@@ -32,4 +32,11 @@ FuzzyMatch fuzzy_find(std::string_view file,
                       std::string_view new_text,
                       std::uint32_t    line_hint);
 
+// Exact Levenshtein (edit) distance between two byte strings. Backed by
+// Myers' bit-parallel algorithm for the common short-string case; exported so
+// its correctness can be pinned by a differential test against a reference
+// matrix (a bit-parallel kernel is easy to get subtly wrong). Pure, noexcept.
+[[nodiscard]] std::size_t levenshtein(std::string_view a,
+                                      std::string_view b) noexcept;
+
 } // namespace mcp::tools::util

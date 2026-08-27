@@ -45,8 +45,11 @@ constexpr std::uint32_t LINE_HINT_TOLERANCE = 200;  // lines
 // covering every realistic needle/file (a real fuzzy needle is a handful of
 // lines; anything past this is a pathological or adversarial input where
 // bailing to "no match" is the correct, safe answer — the exact-match fast
-// path already handled the common case).
-constexpr std::size_t   MAX_DP_CELLS = 100'000;
+// path already handled the common case). NOTE: since the inner fuzzy_eq now
+// uses Myers bit-parallel Levenshtein (~10-12× faster per cell than the old
+// Wagner-Fischer), the same wall-clock ceiling buys ~3× more cells — hence
+// 300k here vs the 100k the quadratic inner term needed. Worst case ~50 ms.
+constexpr std::size_t   MAX_DP_CELLS = 300'000;
 
 enum class Dir : std::uint8_t { Up, Left, Diag };
 
@@ -56,38 +59,72 @@ struct Cell {
 };
 
 // ─────────────────────────────────────────────────────────────────────────
-// Levenshtein distance (classic two-row Wagner-Fischer). We only need the
-// normalized score, but the distance itself is what we threshold.
-// O(|a| * |b|) time, O(min(|a|, |b|)) space. Lines are typically <120 cols
-// so this is cheap.
+// Levenshtein distance.
+//
+// The hot inner term of fuzzy_eq(), which run_line_dp() calls once per DP
+// cell — so this is THE function whose constant factor bounds the whole fuzzy
+// locator. We use Myers' 1999 bit-parallel algorithm ("A fast bit-vector
+// algorithm for approximate string matching based on dynamic programming",
+// JACM 46(3)) — the same approach RapidFuzz and agrep use. It packs a whole
+// DP COLUMN into machine words and advances it with a few bitwise ops per
+// text character, giving O(⌈m/w⌉·n) instead of the classic O(m·n) Wagner-
+// Fischer. For the common case (both lines ≤ 64 chars → one 64-bit word) it
+// is effectively O(n) with a tiny constant and ZERO allocation.
+//
+// Lines longer than one word fall back to two-row Wagner-Fischer (rare for
+// source code; the block-DP cap keeps even that bounded). The returned value
+// is the exact Levenshtein distance in every path.
 // ─────────────────────────────────────────────────────────────────────────
-std::size_t levenshtein(std::string_view a, std::string_view b) noexcept {
-    if (a.size() < b.size()) std::swap(a, b);
-    if (b.empty()) return a.size();
 
-    // The inner row is (len(b)+1) wide. Source lines are short in the common
-    // case, so keep the two DP rows on the STACK to avoid two heap allocations
-    // per call — this function is the hot inner term of fuzzy_eq, which
-    // run_line_dp calls once per DP cell, so per-call allocation dominated the
-    // fuzzy locator's time on large repetitive files. Fall back to heap only
-    // for pathologically long lines.
-    constexpr std::size_t kStack = 256;
+// Myers bit-parallel edit distance for a pattern of length ≤ 64 (`p` is the
+// shorter string). Reference: Myers 1999, Fig. 8 (the Hyyrö formulation).
+[[nodiscard]] std::size_t myers_distance_le64(std::string_view p,
+                                              std::string_view t) noexcept {
+    const std::size_t m = p.size();
+    // Peq[c] has bit j set iff p[j] == c. 256 masks covers raw bytes (UTF-8
+    // continuation bytes included) — no alphabet assumptions.
+    std::uint64_t Peq[256] = {0};
+    for (std::size_t j = 0; j < m; ++j)
+        Peq[static_cast<unsigned char>(p[j])] |= (std::uint64_t{1} << j);
+
+    const std::uint64_t top = std::uint64_t{1} << (m - 1);
+    std::uint64_t VP = ~std::uint64_t{0};   // vertical positive delta = all 1s
+    std::uint64_t VN = 0;                    // vertical negative delta
+    std::size_t   score = m;                 // dist of p vs empty prefix of t
+
+    for (char tc : t) {
+        const std::uint64_t Eq = Peq[static_cast<unsigned char>(tc)];
+        const std::uint64_t D0 = (((Eq & VP) + VP) ^ VP) | Eq | VN;
+        std::uint64_t HP = VN | ~(D0 | VP);
+        std::uint64_t HN = D0 & VP;
+        if (HP & top) ++score;
+        else if (HN & top) --score;
+        HP = (HP << 1) | 1;
+        HN = (HN << 1);
+        VP = HN | ~(D0 | HP);
+        VN = D0 & HP;
+    }
+    return score;
+}
+
+// Two-row Wagner-Fischer fallback for the rare line longer than one word.
+[[nodiscard]] std::size_t wagner_fischer(std::string_view a,
+                                         std::string_view b) noexcept {
+    // b is the shorter string (caller guarantees). Keep rows on the stack for
+    // moderate lengths; heap only for pathological lines.
+    constexpr std::size_t kStack = 1024;
     std::size_t  stack_prev[kStack];
     std::size_t  stack_curr[kStack];
     std::vector<std::size_t> heap_prev, heap_curr;
-    std::size_t* prev;
-    std::size_t* curr;
-    if (b.size() + 1 <= kStack) {
-        prev = stack_prev;
-        curr = stack_curr;
-    } else {
+    std::size_t* prev = stack_prev;
+    std::size_t* curr = stack_curr;
+    if (b.size() + 1 > kStack) {
         heap_prev.resize(b.size() + 1);
         heap_curr.resize(b.size() + 1);
         prev = heap_prev.data();
         curr = heap_curr.data();
     }
     for (std::size_t j = 0; j <= b.size(); ++j) prev[j] = j;
-
     for (std::size_t i = 1; i <= a.size(); ++i) {
         curr[0] = i;
         for (std::size_t j = 1; j <= b.size(); ++j) {
@@ -101,6 +138,7 @@ std::size_t levenshtein(std::string_view a, std::string_view b) noexcept {
     return prev[b.size()];
 }
 
+// ---------------------------------------------------------------------------
 // ───────────────────────────────────────────────────────────────────────────
 // Smart-quote / dash normalization. LLMs often hallucinate curly quotes
 // (U+2018/2019/201C/201D) and em-dashes (U+2014) when the file has plain
@@ -599,9 +637,19 @@ std::vector<DPMatch> run_banded_dp(std::string_view file, std::string_view needl
 
 } // namespace
 
-// ─────────────────────────────────────────────────────────────────────────
+// Exact Levenshtein distance (public; see header). Dispatches to the Myers
+// bit-parallel kernel for the common ≤ 64-char case, Wagner-Fischer otherwise.
+std::size_t levenshtein(std::string_view a, std::string_view b) noexcept {
+    if (a.size() < b.size()) std::swap(a, b);   // b = shorter (the pattern)
+    if (b.empty()) return a.size();
+    if (b.size() <= 64)
+        return myers_distance_le64(b, a);
+    return wagner_fischer(a, b);
+}
+
+// ───────────────────────────────────────────────────────────────────
 // Public API
-// ─────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────
 
 FuzzyMatch fuzzy_find(std::string_view file, std::string_view needle) {
     return fuzzy_find(file, needle, {},

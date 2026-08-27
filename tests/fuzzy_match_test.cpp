@@ -26,6 +26,8 @@ static int g_failures = 0;
 #include <cstdio>
 #include <limits>
 #include <chrono>
+#include <random>
+#include <vector>
 #include <string>
 #include <string_view>
 
@@ -248,6 +250,46 @@ TEST_CASE("fuzzy_match") {
         // 1 s is ~50× the post-fix time and far under the pre-fix seconds; it
         // catches a cap regression without flaking on a slow/loaded CI box.
         CHECK(elapsed < 1'000);
+    }
+
+    // ── 12. Myers bit-parallel Levenshtein == reference matrix. The fuzzy
+    //     locator's inner term is a hand-written bit-vector kernel (easy to get
+    //     subtly wrong); pin it against an obviously-correct full-matrix
+    //     Levenshtein over many random pairs, including the word boundaries
+    //     (len 0, exactly 64, > 64 fallback) and multi-byte UTF-8 bytes.
+    {
+        auto ref = [](std::string_view a, std::string_view b) -> std::size_t {
+            std::vector<std::size_t> prev(b.size() + 1), curr(b.size() + 1);
+            for (std::size_t j = 0; j <= b.size(); ++j) prev[j] = j;
+            for (std::size_t i = 1; i <= a.size(); ++i) {
+                curr[0] = i;
+                for (std::size_t j = 1; j <= b.size(); ++j)
+                    curr[j] = std::min({prev[j] + 1, curr[j - 1] + 1,
+                                        prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)});
+                std::swap(prev, curr);
+            }
+            return prev[b.size()];
+        };
+        const char alpha[] = "ab \t{}();=x\xe2\x80\x98";   // incl. a UTF-8 char
+        const int A = sizeof(alpha) - 1;
+        std::mt19937_64 rng(0xBEEF);
+        std::size_t mism = 0;
+        for (int trial = 0; trial < 60'000; ++trial) {
+            // Bias lengths around the 64-bit word boundary.
+            std::uniform_int_distribution<int> la(0, 70), lb(0, 70);
+            std::string a, b;
+            std::uniform_int_distribution<int> pick(0, A - 1);
+            for (int i = 0, na = la(rng); i < na; ++i) a += alpha[pick(rng)];
+            for (int i = 0, nb = lb(rng); i < nb; ++i) b += alpha[pick(rng)];
+            if (mcp::tools::util::levenshtein(a, b) != ref(a, b)) ++mism;
+        }
+        CHECK(mism == 0);
+        // Spot-check exact values so a build that silently returns 0 still fails.
+        CHECK(mcp::tools::util::levenshtein("kitten", "sitting") == 3);
+        CHECK(mcp::tools::util::levenshtein("", "abc") == 3);
+        CHECK(mcp::tools::util::levenshtein("abc", "abc") == 0);
+        CHECK(mcp::tools::util::levenshtein(std::string(64, 'a'),
+                                            std::string(64, 'b')) == 64);
     }
     CHECK(g_failures == 0);
 }
