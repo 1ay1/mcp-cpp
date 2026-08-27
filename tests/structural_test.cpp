@@ -14,6 +14,7 @@
 
 #include "agtest.hpp"
 #include <cstdio>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -366,6 +367,38 @@ TEST_CASE("search_structural") {
         assert(r.text.find("return opts") != std::string::npos); // tail shown
         assert(r.text.find("def other") == std::string::npos);   // next def excluded
         std::puts("structural: python expand = indent scope ok");
+    }
+
+    // ── DoS BOUND: multi-$$$ backtracking must stay bounded. Several `$$$`
+    //    separated by a literal, matched against a long run of that literal
+    //    with a final token that never appears, forces the matcher to explore
+    //    exponentially many split combinations — a ReDoS-class hang reachable
+    //    from one search_structural call. kMaxMatchSteps must cap it: the
+    //    call still returns (no match / partial), just fast. We assert it
+    //    completes well under a wall-clock ceiling.
+    {
+        // Long run of `y,` so the separators the pattern splits on ARE present
+        // — that's what makes the multi-$$$ backtracking actually explode
+        // (each $$$ can absorb any prefix of the run). A trailing `z)` that the
+        // pattern's final `w)` never matches forces the full backtrack.
+        std::string big = "call(";
+        for (int i = 0; i < 2000; ++i) big += "y, ";
+        big += "z);\n";
+        swrite(root / "dos.js", big);
+
+        auto args = sobj();
+        // 5 variadic holes separated by `y` (present) + absent trailing `w`.
+        args["pattern"] = "call($$$A, y, $$$B, y, $$$C, y, $$$D, y, $$$E, w)";
+        args["path"]    = root.string();
+        args["glob"]    = "dos.js";
+
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = scall(*provider, "search_structural", args);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        assert(!r.is_error);              // bounded, not a crash/error
+        assert(ms < 2'000);               // was unbounded (seconds+) before cap
+        std::printf("structural: multi-$$$ DoS bounded (%lld ms)\n", (long long)ms);
     }
 
     fs::current_path(prev_cwd);

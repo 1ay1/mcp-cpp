@@ -554,15 +554,28 @@ bool atoms_equal(const Token& a, const Token& b) {
 // On success returns true and sets di_end to the doc index just past the match.
 bool match_seq(const std::vector<PNode>& pat, std::size_t pi,
                const std::vector<Node>& doc, std::size_t di,
-               Binds& binds, std::size_t& di_end);
+               Binds& binds, std::size_t& di_end, std::size_t& steps);
+
+// Global per-file match-operation budget. The `$$$` (MetaKind::Many) matcher
+// backtracks over every split point and recurses on the pattern remainder, so
+// a pattern with several `$$$` against a long sibling run backtracks
+// EXPONENTIALLY (measured ~10× per added `$$$`) — a ReDoS-class DoS reachable
+// from one search_structural/rewrite_structural call, since the file-size cap
+// (2 MiB) still admits tens of thousands of tokens. We charge every match_seq
+// / match_node step against this budget and abort the match (as "no match")
+// once it's spent, bounding total work per file to O(kMaxMatchSteps)
+// regardless of how adversarial the pattern/document are. Legitimate shapes
+// resolve in a few thousand steps; the ceiling is ~1000× that.
+constexpr std::size_t kMaxMatchSteps = 500'000;
 
 // Does pattern node `p` match a single doc node `d` (one-to-one)?
-bool match_node(const PNode& p, const Node& d, Binds& binds) {
+bool match_node(const PNode& p, const Node& d, Binds& binds, std::size_t& steps) {
+    if (++steps > kMaxMatchSteps) return false;
     if (p.kind == NodeKind::Group) {
         if (d.kind != NodeKind::Group || d.open != p.open) return false;
         std::size_t end = 0;
         Binds trial = binds;
-        if (!match_seq(p.kids, 0, d.kids, 0, trial, end)) return false;
+        if (!match_seq(p.kids, 0, d.kids, 0, trial, end, steps)) return false;
         if (end != d.kids.size()) return false;   // group children fully consumed
         binds = std::move(trial);
         return true;
@@ -574,8 +587,9 @@ bool match_node(const PNode& p, const Node& d, Binds& binds) {
 
 bool match_seq(const std::vector<PNode>& pat, std::size_t pi,
                const std::vector<Node>& doc, std::size_t di,
-               Binds& binds, std::size_t& di_end) {
+               Binds& binds, std::size_t& di_end, std::size_t& steps) {
     while (pi < pat.size()) {
+        if (++steps > kMaxMatchSteps) return false;
         const PNode& p = pat[pi];
 
         if (p.meta == MetaKind::One) {
@@ -611,7 +625,7 @@ bool match_seq(const std::vector<PNode>& pat, std::size_t pi,
                     }
                 }
                 std::size_t sub_end = 0;
-                if (ok && match_seq(pat, pi + 1, doc, end, trial, sub_end)) {
+                if (ok && match_seq(pat, pi + 1, doc, end, trial, sub_end, steps)) {
                     binds = std::move(trial);
                     di_end = sub_end;
                     return true;
@@ -622,7 +636,7 @@ bool match_seq(const std::vector<PNode>& pat, std::size_t pi,
 
         // Literal atom or group.
         if (di >= doc.size()) return false;
-        if (!match_node(p, doc[di], binds)) return false;
+        if (!match_node(p, doc[di], binds, steps)) return false;
         ++pi; ++di;
     }
     di_end = di;
@@ -640,17 +654,19 @@ struct Hit {
 // of siblings beginning at that position.
 void match_in_scope(const std::vector<PNode>& pat,
                     const std::vector<Node>& doc,
-                    std::vector<Hit>& hits) {
+                    std::vector<Hit>& hits,
+                    std::size_t& steps) {
     for (std::size_t i = 0; i < doc.size(); ++i) {
+        if (steps > kMaxMatchSteps) return;   // budget spent for this file
         Binds binds;
         std::size_t end = 0;
-        if (match_seq(pat, 0, doc, i, binds, end) && end > i) {
+        if (match_seq(pat, 0, doc, i, binds, end, steps) && end > i) {
             hits.push_back({doc[i].line, doc[i].beg, doc[end-1].end,
                             std::move(binds)});
         }
         // Recurse into this node's group children so nested calls match too.
         if (doc[i].kind == NodeKind::Group)
-            match_in_scope(pat, doc[i].kids, hits);
+            match_in_scope(pat, doc[i].kids, hits, steps);
     }
 }
 
@@ -658,7 +674,13 @@ std::vector<Hit> match_file(const std::vector<PNode>& pat,
                             const std::vector<Node>& tree) {
     std::vector<Hit> hits;
     if (pat.empty() || tree.empty()) return hits;
-    match_in_scope(pat, tree, hits);
+    // One match-op budget for the ENTIRE file scan (shared across every start
+    // position and nested scope), so an adversarial pattern can't multiply the
+    // per-position cost by the sibling count. When it trips we simply stop
+    // finding more hits in this file — sound (never a false positive) and
+    // bounded.
+    std::size_t steps = 0;
+    match_in_scope(pat, tree, hits, steps);
     // De-dup by span start (a nested recursion can re-report the same match).
     std::sort(hits.begin(), hits.end(),
               [](const Hit& a, const Hit& b) {
