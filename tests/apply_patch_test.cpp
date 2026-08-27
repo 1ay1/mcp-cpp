@@ -5,6 +5,7 @@
 // clean multi-hunk apply, fuzzy apply after the file drifts, ATOMICITY (a bad
 // hunk writes nothing), ambiguity rejection, and the FileChange carry.
 
+#include <chrono>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
@@ -187,6 +188,30 @@ TEST_CASE("apply_patch") {
         d["patch"] = "@@ -0,0 +1,1 @@\n+inserted with no context\n";
         check(call(*provider, "apply_patch", d).is_error,
               "a context-less pure insertion is rejected (can't place it)");
+    }
+
+    // ── DoS BOUND: hunk count is capped. Each hunk runs a full fuzzy_find
+    //    over the file; the per-hunk cost is bounded but the COUNT was not, so
+    //    a patch with thousands of hunks turned a bounded search into a
+    //    minutes-long apply. A patch far over the cap must be REJECTED fast,
+    //    not ground through. (Well over any real edit to a small file.)
+    {
+        wr(root / "many.txt", base);
+        std::string patch;
+        for (int i = 0; i < 5000; ++i)
+            patch += "@@ -1,1 +1,1 @@\n-line one\n+changed\n";
+        auto a = obj();
+        a["path"]  = (root / "many.txt").string();
+        a["patch"] = patch;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = call(*provider, "apply_patch", a);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        check(r.is_error, "a patch with thousands of hunks is rejected");
+        check(has(r.text, "hunks") || has(r.text, "cap"),
+              "rejection names the hunk cap");
+        check(ms < 1'000, "over-cap patch is rejected fast, not ground through");
+        check(rd(root / "many.txt") == base, "ATOMIC: nothing written on reject");
     }
 
     fs::current_path(prev);

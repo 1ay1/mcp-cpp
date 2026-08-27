@@ -1137,6 +1137,18 @@ ExecResult run_apply_patch(const ApplyPatchArgs& a) {
     auto hunks = parse_hunks(a.patch, err);
     if (hunks.empty())
         return std::unexpected(ToolError::invalid_args(std::move(err)));
+    // Each hunk runs a full fuzzy_find over the (≤ 1 MiB) file. That per-hunk
+    // cost is bounded (Myers + the DP-cell cap), but the hunk COUNT was not —
+    // so a patch with thousands of hunks multiplied a bounded ~10 ms search
+    // into a minutes-long apply from one tool call. A real patch to a file this
+    // size has at most a few dozen hunks; cap well above that and reject the
+    // pathological/adversarial rest.
+    constexpr std::size_t kMaxHunks = 256;
+    if (hunks.size() > kMaxHunks)
+        return std::unexpected(ToolError::invalid_args(std::format(
+            "patch has {} hunks (> {} cap) — that's far more than a real edit to "
+            "a file this size. Split it into smaller patches, or use `edit` for "
+            "targeted changes.", hunks.size(), kMaxHunks)));
 
     std::string original;
     try { original = util::read_file(a.path); }

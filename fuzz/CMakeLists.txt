@@ -15,7 +15,8 @@
 # Enabled via -DMCP_BUILD_FUZZERS=ON from the top-level build.
 
 set(FUZZ_fuzzy_match_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src/tools/util/fuzzy_match.cpp")
-set(MCP_FUZZ_TARGETS fuzzy_match)
+set(FUZZ_apply_patch_SRC "")   # parser is self-contained in the harness
+set(MCP_FUZZ_TARGETS fuzzy_match apply_patch)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     set(MCP_FUZZ_SANITIZE "fuzzer,address,undefined")
