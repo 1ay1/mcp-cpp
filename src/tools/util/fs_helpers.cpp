@@ -335,6 +335,22 @@ const fs::path& workspace_root() {
     return mutable_workspace_root();
 }
 
+// Thread-local: concurrent subagents each stream on their own worker, so a
+// process-wide value would let one context's id leak into another's reads
+// — reintroducing exactly the cross-context starvation this exists to stop.
+std::string& mutable_read_context() {
+    static thread_local std::string id;
+    return id;
+}
+
+void set_read_context(std::string id) {
+    mutable_read_context() = std::move(id);
+}
+
+const std::string& read_context() {
+    return mutable_read_context();
+}
+
 namespace {
 // Component-wise "child is at-or-under parent". Both sides must already be
 // canonical/normalised. Shared shape with is_within_workspace()'s prefix

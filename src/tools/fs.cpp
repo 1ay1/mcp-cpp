@@ -48,6 +48,18 @@ namespace {
 // ─────────────────────────────────────────────────────────────────────────
 
 struct ReadCacheKey {
+    // WHOSE context already holds this read. The dedup sentinel below tells
+    // the caller "refer to the earlier tool_result instead" — a claim that is
+    // only TRUE for the conversation that actually received those bytes.
+    //
+    // This cache is a process-global static, so without this field a SUBAGENT
+    // (fresh context, own turn budget) inherited the parent's entries and got
+    // refusals for files it had never seen. Observed in the wild: a coder
+    // subagent burned all 23 of its turns re-requesting overlapping ranges of
+    // one file, receiving the sentinel every time, and made zero edits. The
+    // dedup is a context-economy optimisation; starving a reader is strictly
+    // worse than re-sending bytes, so it must never fire across contexts.
+    std::string context_id;
     std::string canonical_path;
     int offset = 1;
     int limit  = 2000;
@@ -55,7 +67,8 @@ struct ReadCacheKey {
 };
 struct ReadCacheKeyHash {
     [[nodiscard]] std::size_t operator()(const ReadCacheKey& k) const noexcept {
-        std::size_t h = std::hash<std::string>{}(k.canonical_path);
+        std::size_t h = std::hash<std::string>{}(k.context_id);
+        h = h * 31u + std::hash<std::string>{}(k.canonical_path);
         h = h * 31u + static_cast<std::size_t>(k.offset);
         h = h * 31u + static_cast<std::size_t>(k.limit);
         return h;
@@ -412,7 +425,8 @@ ExecResult run_read(const ReadArgs& a) {
             std::error_code canon_ec;
             auto canon = fs::weakly_canonical(p, canon_ec);
             if (!canon_ec) {
-                ReadCacheKey key{canon.string(), a.offset, a.limit};
+                ReadCacheKey key{util::read_context(), canon.string(),
+                                 a.offset, a.limit};
                 std::lock_guard lk{read_cache().mu};
                 auto it = read_cache().seen.find(key);
                 if (it != read_cache().seen.end() && it->second == current_mtime) {
@@ -525,7 +539,8 @@ ExecResult run_read(const ReadArgs& a) {
             std::error_code canon_ec;
             auto canon = fs::weakly_canonical(p, canon_ec);
             if (!canon_ec) {
-                ReadCacheKey key{canon.string(), a.offset, a.limit};
+                ReadCacheKey key{util::read_context(), canon.string(),
+                                 a.offset, a.limit};
                 std::lock_guard lk{read_cache().mu};
                 read_cache().seen[std::move(key)] = current_mtime;
             }
@@ -622,7 +637,8 @@ ExecResult run_read(const ReadArgs& a) {
         std::error_code canon_ec;
         auto canon = fs::weakly_canonical(p, canon_ec);
         if (!canon_ec) {
-            ReadCacheKey key{canon.string(), eff_offset, eff_limit};
+            ReadCacheKey key{util::read_context(), canon.string(),
+                             eff_offset, eff_limit};
             std::lock_guard lk{read_cache().mu};
             read_cache().seen[std::move(key)] = current_mtime;
         }

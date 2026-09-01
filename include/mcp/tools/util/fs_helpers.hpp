@@ -76,6 +76,40 @@ void set_workspace_root(fs::path root);
 
 [[nodiscard]] const fs::path& workspace_root();
 
+// ── Read-dedup context ───────────────────────────────────────
+// WHICH conversation the current tool call belongs to.
+//
+// `read` de-duplicates identical re-reads by answering "the earlier
+// tool_result is still current — refer to that instead". That claim is only
+// true for the context that actually RECEIVED those bytes. The cache behind
+// it is a process-global static, so a subagent — fresh context, own turn
+// budget — would otherwise inherit the parent's entries and be refused
+// content it has never seen. That is not hypothetical: a coder subagent
+// spent its entire 23-turn budget re-requesting one file, got the sentinel
+// every time, and produced nothing.
+//
+// Set this to a stable per-conversation id (thread id, subagent id) around
+// a tool invocation; it is THREAD-LOCAL, so concurrent subagents each carry
+// their own. Empty (the default) means the primary conversation.
+void set_read_context(std::string id);
+
+[[nodiscard]] const std::string& read_context();
+
+// RAII scope: restores the previous context on exit, so nested invocations
+// (a subagent spawning its own tools) can't leak an id to their caller.
+class ReadContextScope {
+public:
+    explicit ReadContextScope(std::string id) : prev_{read_context()} {
+        set_read_context(std::move(id));
+    }
+    ~ReadContextScope() { set_read_context(prev_); }
+    ReadContextScope(const ReadContextScope&)            = delete;
+    ReadContextScope& operator=(const ReadContextScope&) = delete;
+
+private:
+    std::string prev_;
+};
+
 // The ACTIVE PROJECT directory: the process cwd (the directory the user
 // launched agentty in), clamped to stay inside the access boundary. This
 // is distinct from workspace_root(), which is the widenable ACCESS
