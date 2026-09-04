@@ -29,6 +29,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace mcp::tools::util {
@@ -40,6 +41,18 @@ struct SubprocessOptions {
     // intact.
     std::optional<std::string>              shell_command = std::nullopt;
     std::optional<std::vector<std::string>> argv = std::nullopt;
+
+    // Working directory for the child. Empty ⇒ inherit the parent's cwd. Set
+    // via a real chdir in the child (posix_spawn file-action / pre-exec, or
+    // CreateProcess lpCurrentDirectory on Windows) rather than a `cd &&`
+    // string prefix, so the path can't be re-parsed or mangled by the shell.
+    std::string cwd;
+
+    // Extra environment variables for the child, layered on top of the
+    // parent env (later entries win). Used both for the sane non-interactive
+    // defaults the tool injects (NO_COLOR, PAGER=cat, GIT_TERMINAL_PROMPT=0,
+    // …) and for caller/model-supplied vars. Empty ⇒ inherit env unchanged.
+    std::vector<std::pair<std::string, std::string>> env;
 
     // `timeout` is an IDLE watchdog: it fires only after this many seconds
     // of *silence*, so a chatty build/test that keeps printing progress is
@@ -88,7 +101,9 @@ struct Subprocess {
 [[nodiscard]] SubprocessResult run_command_s(
     const std::string& cmd,
     std::size_t          max_bytes = 30'000,
-    std::chrono::seconds timeout   = std::chrono::seconds{120});
+    std::chrono::seconds timeout   = std::chrono::seconds{120},
+    std::string_view     cwd       = {},
+    const std::vector<std::pair<std::string, std::string>>& env = {});
 
 [[nodiscard]] SubprocessResult run_argv_s(
     const std::vector<std::string>& argv,

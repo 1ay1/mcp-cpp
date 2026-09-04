@@ -243,11 +243,15 @@ std::atomic<Backend> g_backend{Backend::None};
 
 [[nodiscard]] SubprocessResult run_wrapped(std::string_view cmd,
                                            std::size_t max_bytes,
-                                           std::chrono::seconds timeout) {
+                                           std::chrono::seconds timeout,
+                                           std::string_view cwd,
+                                           const std::vector<std::pair<std::string, std::string>>& env) {
     SubprocessOptions opts;
     opts.argv = build_bwrap_argv(cmd);
     opts.max_bytes = max_bytes;
     opts.timeout = timeout;
+    opts.cwd = std::string{cwd};
+    opts.env = env;
     opts.on_progress = [](std::string_view snap) { progress::emit(snap); };
     return Subprocess::run(std::move(opts));
 }
@@ -320,7 +324,9 @@ std::atomic<Backend> g_backend{Backend::None};
 
 [[nodiscard]] SubprocessResult run_wrapped(std::string_view cmd,
                                            std::size_t max_bytes,
-                                           std::chrono::seconds timeout) {
+                                           std::chrono::seconds timeout,
+                                           std::string_view cwd,
+                                           const std::vector<std::pair<std::string, std::string>>& env) {
     SubprocessOptions opts;
     auto profile = build_profile(workspace_root().string());
     opts.argv = std::vector<std::string>{
@@ -329,6 +335,8 @@ std::atomic<Backend> g_backend{Backend::None};
     };
     opts.max_bytes = max_bytes;
     opts.timeout = timeout;
+    opts.cwd = std::string{cwd};
+    opts.env = env;
     opts.on_progress = [](std::string_view snap) { progress::emit(snap); };
     return Subprocess::run(std::move(opts));
 }
@@ -358,10 +366,12 @@ std::atomic<Backend> g_backend{Backend::None};
 
 [[nodiscard]] SubprocessResult run_wrapped(std::string_view cmd,
                                            std::size_t max_bytes,
-                                           std::chrono::seconds timeout) {
+                                           std::chrono::seconds timeout,
+                                           std::string_view cwd,
+                                           const std::vector<std::pair<std::string, std::string>>& env) {
     // Should never be called — is_active() returns false on this
     // platform — but defensively fall through to the unsandboxed path.
-    return run_command_s(std::string{cmd}, max_bytes, timeout);
+    return run_command_s(std::string{cmd}, max_bytes, timeout, cwd, env);
 }
 
 [[nodiscard]] SubprocessResult run_wrapped_argv(const std::vector<std::string>& user_argv,
@@ -445,10 +455,12 @@ std::string describe_state() {
 
 SubprocessResult run_shell_command(std::string_view cmd,
                                    std::size_t max_bytes,
-                                   std::chrono::seconds timeout) {
+                                   std::chrono::seconds timeout,
+                                   std::string_view cwd,
+                                   const std::vector<std::pair<std::string, std::string>>& env) {
     if (!is_active())
-        return run_command_s(std::string{cmd}, max_bytes, timeout);
-    return run_wrapped(cmd, max_bytes, timeout);
+        return run_command_s(std::string{cmd}, max_bytes, timeout, cwd, env);
+    return run_wrapped(cmd, max_bytes, timeout, cwd, env);
 }
 
 std::vector<std::string> prepare_shell_argv(std::string_view cmd) {

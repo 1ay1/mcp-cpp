@@ -51,6 +51,7 @@ struct BashArgs {
     std::string command;
     int         timeout;   // [1, 300]
     std::string cd;        // optional; empty = inherit cwd
+    std::vector<std::pair<std::string, std::string>> env;  // caller overrides
     std::string display_description;
 };
 
@@ -85,10 +86,27 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j) {
         if (auto wp = util::make_workspace_path_checked(cd, "shell"); !wp)
             return std::unexpected(std::move(wp.error()));
     }
+
+    // Optional env overrides: {"env": {"CI": "1", "RUST_LOG": "debug"}}.
+    // Values are stringified defensively (a model may pass a number/bool).
+    std::vector<std::pair<std::string, std::string>> env;
+    if (const json* e = ar.raw("env"); e && e->is_object()) {
+        for (auto it = e->begin(); it != e->end(); ++it) {
+            if (it.key().empty()) continue;
+            std::string val;
+            if (it.value().is_string())        val = it.value().get<std::string>();
+            else if (it.value().is_number_integer()) val = std::to_string(it.value().get<long long>());
+            else if (it.value().is_boolean())  val = it.value().get<bool>() ? "1" : "0";
+            else if (!it.value().is_null())    val = it.value().dump();
+            env.emplace_back(it.key(), std::move(val));
+        }
+    }
+
     return BashArgs{
         std::move(cmd),
         timeout_int,
         std::move(cd),
+        std::move(env),
         ar.str("display_description", ""),
     };
 }
@@ -151,27 +169,42 @@ ExecResult run_bash(const BashArgs& a) {
     const int           tmo_s   = a.timeout;
 
     std::string effective = cmd_str;
-    if (!a.cd.empty()) {
-#ifdef _WIN32
-        if (a.cd.find('"') != std::string::npos)
-            return std::unexpected(ToolError::invalid_args(
-                "cd path contains '\"', which cmd.exe cannot quote"));
-        effective = "cd /d \"" + a.cd + "\" && " + cmd_str;
-#else
-        std::string q;
-        q.reserve(a.cd.size() + 4);
-        q.push_back('\'');
-        for (char c : a.cd) { if (c == '\'') q += "'\\''"; else q.push_back(c); }
-        q.push_back('\'');
-        effective = "cd " + q + " && " + cmd_str;
-#endif
-    }
+    // Real working directory (passed to the child via chdir), NOT a `cd &&`
+    // shell prefix — the path can't be re-parsed/mangled and works even for a
+    // command that isn't shell-wrapped.
+    const std::string& cwd = a.cd;
+
+    // Non-interactive, deterministic child environment. These defaults keep
+    // captured output clean (no ANSI colour to bloat the model's context) and
+    // stop tools from BLOCKING on a tty they'll never get (git credential/
+    // editor prompts, pagers). Model-supplied env (a.env) layers on top and
+    // wins, so a caller can still force colour or a pager if it really wants.
+    std::vector<std::pair<std::string, std::string>> child_env = {
+        {"NO_COLOR", "1"},              // https://no-color.org
+        {"CLICOLOR", "0"},
+        {"CLICOLOR_FORCE", "0"},
+        {"TERM", "dumb"},               // discourages cursor/colour escapes
+        {"PAGER", "cat"},
+        {"GIT_PAGER", "cat"},
+        {"GIT_TERMINAL_PROMPT", "0"},   // never block on a credential prompt
+        {"GIT_OPTIONAL_LOCKS", "0"},
+        {"DEBIAN_FRONTEND", "noninteractive"},
+        {"PYTHONUNBUFFERED", "1"},      // stream python output to the idle watchdog
+    };
+    for (const auto& kv : a.env) child_env.push_back(kv);   // caller overrides win
+
     constexpr std::size_t kCaptureCap       = 8u * 1024u * 1024u;
     constexpr std::size_t kModelPreviewBytes = 30000;
     constexpr std::size_t kSpillPreviewHead = 2000;   // first 2 KB
     constexpr std::size_t kSpillPreviewTail = 1000;   // last 1 KB
     auto r = util::sandbox::run_shell_command(effective, kCaptureCap,
-                                              std::chrono::seconds{tmo_s});
+                                              std::chrono::seconds{tmo_s},
+                                              cwd, child_env);
+    // NOTE: r.output is already ANSI-stripped + UTF-8-scrubbed by the
+    // subprocess layer's clean_capture(). The NO_COLOR/TERM=dumb env above
+    // suppresses colour at the SOURCE (cleaner than post-stripping, and it
+    // also disables progress-bar cursor thrash), so by the time we get here
+    // the bytes are already clean.
 
     std::string spill_path;
     std::size_t spill_total = 0;
@@ -327,7 +360,18 @@ json bash_schema() {
                                "recommended."}}},
             {"command", {{"type","string"}, {"description","The shell command to execute"}}},
             {"cd",      {{"type","string"}, {"description",
-                "Working directory for the command. If set, runs as `cd <dir> && <command>`."}}},
+                "Working directory to run the command in (a real chdir in the "
+                "child, so relative paths and the command's own $PWD are "
+                "correct). Must be an existing directory inside the workspace."}}},
+            {"env",     {{"type","object"},
+                {"additionalProperties", {{"type","string"}}},
+                {"description",
+                "Extra environment variables for THIS command, e.g. "
+                "{\"CI\":\"1\",\"RUST_LOG\":\"debug\"}. Layered on top of the "
+                "inherited environment (your values win). The tool already "
+                "forces a clean non-interactive env (NO_COLOR, PAGER=cat, "
+                "GIT_TERMINAL_PROMPT=0, TERM=dumb, \u2026) so output is quiet and "
+                "nothing blocks on a prompt \u2014 only set this to add/override."}}},
             {"timeout", {{"type","integer"}, {"description","Timeout in seconds (default 60, max 300)"}}},
             {"timeout_ms", {{"type","integer"}, {"description",
                 "Alternative timeout in milliseconds (rounded up to seconds)."}}},

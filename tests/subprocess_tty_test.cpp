@@ -22,8 +22,11 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <unistd.h>
 
@@ -117,6 +120,41 @@ int main() {
     errno = 0;
     CHECK(held_descendant > 0 && ::kill(held_descendant, 0) < 0 && errno == ESRCH,
           "process stop killed stdout-holding descendant");
+
+    // ── cwd: a real chdir in the child (not a `cd &&` prefix) ──────────────
+    {
+        namespace fs = std::filesystem;
+        auto dir = fs::temp_directory_path() /
+            ("agentty_cwd_" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        fs::create_directories(dir);
+        auto real = fs::canonical(dir).string();
+
+        auto r = run_command_s("pwd", 4096, std::chrono::seconds{10}, real, {});
+        CHECK(r.started, "cwd: child started");
+        // pwd prints the requested dir (allow trailing newline / symlink-canon).
+        CHECK(r.output.find(real) != std::string::npos,
+              "cwd: command ran in the requested directory");
+        fs::remove_all(dir);
+    }
+
+    // ── env: overrides are visible to the child and win over the parent ────
+    {
+        ::setenv("AGENTTY_ENV_PROBE", "parent", /*overwrite=*/1);
+        std::vector<std::pair<std::string, std::string>> env = {
+            {"AGENTTY_ENV_PROBE", "child"},   // override parent value
+            {"AGENTTY_ENV_NEW", "fresh"}};    // brand-new var
+        auto r = run_command_s(
+            "printf '%s\\n' \"$AGENTTY_ENV_PROBE\" \"$AGENTTY_ENV_NEW\"",
+            4096, std::chrono::seconds{10}, {}, env);
+        CHECK(r.started, "env: child started");
+        CHECK(r.output.find("child") != std::string::npos,
+              "env: override wins over the inherited value");
+        CHECK(r.output.find("fresh") != std::string::npos,
+              "env: a new variable reaches the child");
+        CHECK(r.output.find("parent") == std::string::npos,
+              "env: the parent value did not leak through");
+    }
 
     if (failures == 0) std::puts("all subprocess-tty tests passed");
     return failures ? 1 : 0;

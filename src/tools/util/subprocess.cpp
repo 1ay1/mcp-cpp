@@ -195,12 +195,50 @@ SubprocessResult run_win32_cmdline(const std::string& cmdline,
     std::vector<wchar_t> mutable_cmdline(wcmd.begin(), wcmd.end());
     mutable_cmdline.push_back(L'\0');
 
+    // Working directory (lpCurrentDirectory): a real chdir for the child, not
+    // a `cd &&` prefix. nullptr ⇒ inherit the parent's cwd.
+    std::wstring cwd_w;
+    const wchar_t* cwd_ptr = nullptr;
+    if (!opts.cwd.empty()) { cwd_w = utf8_to_wide(opts.cwd); cwd_ptr = cwd_w.c_str(); }
+
+    // Environment block: when opts.env is set, layer it over the parent env
+    // (override wins, case-insensitive key match per Windows convention) into
+    // the double-NUL-terminated UTF-16 block CreateProcessW wants. Empty ⇒
+    // nullptr = inherit the parent env unchanged.
+    std::wstring env_block;
+    void* env_ptr = nullptr;
+    if (!opts.env.empty()) {
+        auto wkey_upper = [](std::wstring_view kv) {
+            auto eq = kv.find(L'=');
+            std::wstring k{kv.substr(0, eq == std::wstring_view::npos ? kv.size() : eq)};
+            for (auto& c : k) c = (c >= L'a' && c <= L'z') ? c - L'a' + L'A' : c;
+            return k;
+        };
+        std::vector<std::wstring> entries;
+        for (const auto& [k, v] : opts.env)
+            entries.push_back(utf8_to_wide(k) + L"=" + utf8_to_wide(v));
+        const std::size_t n_over = entries.size();
+        if (const wchar_t* parent = ::GetEnvironmentStringsW()) {
+            for (const wchar_t* e = parent; *e; e += ::wcslen(e) + 1) {
+                std::wstring_view ev{e};
+                std::wstring pk = wkey_upper(ev);
+                bool overridden = false;
+                for (std::size_t i = 0; i < n_over; ++i)
+                    if (wkey_upper(entries[i]) == pk) { overridden = true; break; }
+                if (!overridden) entries.emplace_back(ev);
+            }
+        }
+        for (const auto& s : entries) { env_block += s; env_block.push_back(L'\0'); }
+        env_block.push_back(L'\0');
+        env_ptr = env_block.data();
+    }
+
     PROCESS_INFORMATION pi{};
     BOOL ok = ::CreateProcessW(nullptr, mutable_cmdline.data(),
                                nullptr, nullptr,
                                TRUE,
                                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-                               nullptr, nullptr,
+                               env_ptr, cwd_ptr,
                                &si, &pi);
     ::CloseHandle(wr);
     ::CloseHandle(nul);
@@ -457,6 +495,34 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     pid_t pid = -1;
     int   rc  = 0;
 
+    // ---- Child environment ------------------------------------------------
+    // Layer opts.env over the inherited parent env (override wins, matched by
+    // KEY=). Built once here and used by BOTH the posix_spawn and fork paths.
+    // When opts.env is empty we pass `environ` straight through (zero cost).
+    std::vector<std::string> env_store;
+    std::vector<char*>       env_ptrs;
+    char** child_environ = environ;
+    if (!opts.env.empty()) {
+        auto key_of = [](std::string_view kv) {
+            auto eq = kv.find('=');
+            return kv.substr(0, eq == std::string_view::npos ? kv.size() : eq);
+        };
+        // Overrides first so we can skip any parent entry they replace.
+        for (const auto& [k, v] : opts.env) env_store.push_back(k + "=" + v);
+        const std::size_t n_over = env_store.size();
+        for (char** e = environ; e && *e; ++e) {
+            std::string_view pk = key_of(*e);
+            bool overridden = false;
+            for (std::size_t i = 0; i < n_over; ++i)
+                if (key_of(env_store[i]) == pk) { overridden = true; break; }
+            if (!overridden) env_store.emplace_back(*e);
+        }
+        env_ptrs.reserve(env_store.size() + 1);
+        for (auto& s : env_store) env_ptrs.push_back(s.data());
+        env_ptrs.push_back(nullptr);
+        child_environ = env_ptrs.data();
+    }
+
 #if MCP_HAVE_POSIX_SPAWN
     // Preferred path: posix_spawn. file_actions redirect stdin from
     // /dev/null (so the child can't steal terminal input from the TUI),
@@ -475,6 +541,22 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     ::posix_spawn_file_actions_adddup2 (&actions, pipefd[1], STDERR_FILENO);
     ::posix_spawn_file_actions_addclose(&actions, pipefd[1]);
     ::posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+
+    // Working directory. addchdir_np runs the chdir INSIDE the child after the
+    // fork but before exec — a real chdir, not a `cd &&` shell prefix. Not in
+    // POSIX proper; guarded by availability (glibc ≥ 2.29, macOS ≥ 10.15). When
+    // it's missing we fall through to the fork() path below, which chdir()s by
+    // hand. `spawn_cwd_ok` tracks whether posix_spawn can honour the request.
+    bool spawn_cwd_ok = opts.cwd.empty();
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29))
+    if (!opts.cwd.empty()
+        && ::posix_spawn_file_actions_addchdir_np(&actions, opts.cwd.c_str()) == 0)
+        spawn_cwd_ok = true;
+#elif defined(__APPLE__)
+    if (!opts.cwd.empty()
+        && ::posix_spawn_file_actions_addchdir_np(&actions, opts.cwd.c_str()) == 0)
+        spawn_cwd_ok = true;
+#endif
 
     // Detach the child into its own session so it has NO controlling
     // terminal. Redirecting stdin/out/err to /dev/null + pipe isn't
@@ -508,8 +590,18 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     }
 #endif
 
-    rc = ::posix_spawnp(&pid, arg_ptrs[0], &actions, attrp,
-                        arg_ptrs.data(), environ);
+    // If a cwd was requested but this libc's posix_spawn can't chdir (no
+    // addchdir_np — only pre-2.29 glibc / very old macOS, effectively never on
+    // a supported target), report a clean start error rather than silently
+    // running in the wrong directory. rc carries an errno-shaped code the
+    // failure path below turns into r.start_error.
+    if (spawn_cwd_ok) {
+        rc = ::posix_spawnp(&pid, arg_ptrs[0], &actions, attrp,
+                            arg_ptrs.data(), child_environ);
+    } else {
+        rc  = ENOSYS;   // "cwd requested but unsupported by this posix_spawn"
+        pid = -1;
+    }
     if (have_attr) ::posix_spawnattr_destroy(&attr);
     ::posix_spawn_file_actions_destroy(&actions);
 #else
@@ -532,6 +624,13 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
         ::dup2(pipefd[1], STDERR_FILENO);
         ::close(pipefd[1]);
         ::close(pipefd[0]);
+        // Real chdir in the child (not a `cd &&` prefix). Fail hard rather
+        // than run in the wrong directory.
+        if (!opts.cwd.empty() && ::chdir(opts.cwd.c_str()) != 0)
+            ::_exit(127);
+        // Apply env overrides on top of the inherited env (override wins).
+        for (const auto& [k, v] : opts.env)
+            ::setenv(k.c_str(), v.c_str(), /*overwrite=*/1);
         ::execvp(arg_ptrs[0], arg_ptrs.data());
         // execvp only returns on failure. Report via errno and _exit so we
         // don't run parent atexit handlers / flush shared buffers twice.
@@ -811,11 +910,15 @@ SubprocessResult Subprocess::run(SubprocessOptions opts) {
 
 SubprocessResult run_command_s(const std::string& cmd,
                                std::size_t max_bytes,
-                               std::chrono::seconds timeout) {
+                               std::chrono::seconds timeout,
+                               std::string_view cwd,
+                               const std::vector<std::pair<std::string, std::string>>& env) {
     SubprocessOptions opts;
     opts.shell_command = cmd;
     opts.max_bytes   = max_bytes;
     opts.timeout     = timeout;
+    opts.cwd         = std::string{cwd};
+    opts.env         = env;
     opts.on_progress = [](std::string_view snap) { progress::emit(snap); };
     return Subprocess::run(std::move(opts));
 }

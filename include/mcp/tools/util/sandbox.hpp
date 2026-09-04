@@ -85,7 +85,9 @@ enum class Backend : std::uint8_t {
 [[nodiscard]] SubprocessResult run_shell_command(
     std::string_view cmd,
     std::size_t max_bytes,
-    std::chrono::seconds timeout);
+    std::chrono::seconds timeout,
+    std::string_view cwd = {},
+    const std::vector<std::pair<std::string, std::string>>& env = {});
 
 // argv-form variant for callers that already build a typed argv (e.g.
 // `diagnostics` invoking `cmake --build build`). Same wrap policy as
