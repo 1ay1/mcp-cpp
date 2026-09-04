@@ -419,6 +419,47 @@ TEST_CASE("fs_tools") {
         std::puts("read: negative offset tail ok");
     }
 
+    // ── read on an IMAGE file returns it as a vision image, not a binary
+    //    refusal. The picture rides the structured-meta channel (read_images);
+    //    the text carries a compact [image …] note for non-vision models. ──
+    {
+        // Minimal but valid PNG header (8-byte signature + a stub IHDR start).
+        // sniff_image_media_type keys on the 8-byte signature only.
+        std::string png;
+        const unsigned char sig[8] = {0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A};
+        png.append(reinterpret_cast<const char*>(sig), 8);
+        png.append("\x00\x00\x00\x0DIHDR", 8);      // length + "IHDR"
+        png.append(64, '\x00');                       // some body bytes
+        (void)util::write_file(root / "pic.png", png);
+
+        auto args = obj();
+        args["path"] = (root / "pic.png").string();
+        auto r = call(*provider, "read", args);
+        assert(!r.is_error);                          // NOT refused as binary
+        assert(r.text.find("[image") != std::string::npos);
+        assert(r.text.find("image/png") != std::string::npos);
+
+        auto imgs = read_images(r);
+        assert(imgs.size() == 1);
+        assert(imgs[0].media_type == "image/png");
+        assert(imgs[0].bytes == png);                 // exact bytes round-trip
+        std::puts("read: image file returns a vision image, not a binary refusal");
+    }
+
+    // A file that is NOT an image still refuses as binary (with the shell hint).
+    {
+        std::string blob(64, '\x00');
+        blob[0] = 'M'; blob[1] = 'Z';                 // DOS/PE header, not an image
+        (void)util::write_file(root / "prog.bin", blob);
+        auto args = obj();
+        args["path"] = (root / "prog.bin").string();
+        auto r = call(*provider, "read", args);
+        assert(r.is_error);
+        assert(r.text.find("binary") != std::string::npos);
+        assert(read_images(r).empty());
+        std::puts("read: non-image binary still refused");
+    }
+
     // ── read paging: offset WITHOUT a limit returns a FOCUSED window, not
     //    the whole rest of the file (the "why is every read huge" fix). ──
     {

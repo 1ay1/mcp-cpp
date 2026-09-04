@@ -441,6 +441,34 @@ ExecResult run_read(const ReadArgs& a) {
     }
     constexpr uintmax_t kMaxBytes = 1024u * 1024u;
     uintmax_t sz = fs::file_size(p, ec);
+
+    // Image files: hand the picture to a vision model instead of refusing it
+    // as binary. Sniffed by magic bytes (extension-agnostic), capped larger
+    // than text since a screenshot is legitimately a few MiB. The host maps
+    // ToolOutput.images onto this call's tool_result image blocks; a non-vision
+    // model just sees the text note. Checked BEFORE the 1 MiB text cap so a
+    // normal-sized image isn't rejected for being "too large".
+    if (a.symbol.empty()) {
+        if (auto mime = util::sniff_image_media_type(p); !mime.empty()) {
+            constexpr uintmax_t kMaxImageBytes = 8u * 1024u * 1024u;
+            if (!ec && sz > kMaxImageBytes)
+                return std::unexpected(ToolError::too_large(std::format(
+                    "image is {} KiB (> 8 MiB cap): {}",
+                    sz / 1024, a.path.string())));
+            std::string raw = util::read_file(a.path);
+            if (raw.empty())
+                return std::unexpected(ToolError::io(
+                    "cannot read image " + a.path.string()));
+            ToolOutput out;
+            out.text = std::format(
+                "[image {} \xc2\xb7 {} \xc2\xb7 {} KiB] attached to this "
+                "result; if you can see images it is shown above.",
+                a.path.string(), mime, raw.size() / 1024);
+            out.images.push_back(util::ToolImage{std::move(mime), std::move(raw)});
+            return out;
+        }
+    }
+
     if (!ec && sz > kMaxBytes) {
         return std::unexpected(ToolError::too_large(std::format(
             "file is {} KiB (> 1 MiB cap). "
@@ -452,7 +480,7 @@ ExecResult run_read(const ReadArgs& a) {
     if (util::is_binary_file(p)) {
         return std::unexpected(ToolError::binary(std::format(
             "cannot read binary file: {} ({} bytes). "
-            "Use the bash tool with `file`, `hexdump`, or similar.",
+            "Use the `shell` tool with `file`, `hexdump`, or similar.",
             a.path.string(), static_cast<uintmax_t>(ec ? 0 : sz))));
     }
     auto content = util::read_file(a.path);

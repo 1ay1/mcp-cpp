@@ -231,6 +231,11 @@ promote_to_workspace_path(NormalizedPath p, std::string_view tool_name);
 // grep'ing PNGs / executables / model weights into the prompt.
 [[nodiscard]] bool is_binary_file(const fs::path& p);
 
+// Identify an image file by its magic bytes (PNG/JPEG/GIF/WebP) — returns the
+// MIME type, or "" if it isn't a recognised image. Extension-agnostic. Lets
+// `read` hand an image to a vision model instead of refusing it as binary.
+[[nodiscard]] std::string sniff_image_media_type(const fs::path& p);
+
 // ── Per-file state cache ────────────────────────────────────────────────
 // Shared across tools so edit/write can detect "the file changed since the
 // model last looked at it". Keyed on canonical path; value is the mtime

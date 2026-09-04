@@ -590,6 +590,35 @@ bool is_binary_file(const fs::path& p) {
     return false;
 }
 
+// Identify an image file by its MAGIC BYTES (never the extension — a model may
+// `read` a screenshot saved with no/odd suffix). Returns the MIME type when the
+// header matches a format vision models accept, else "". Covers PNG, JPEG, GIF,
+// and WebP — the same set the composer's paste path recognises.
+std::string sniff_image_media_type(const fs::path& p) {
+    std::ifstream ifs(p, std::ios::binary);
+    if (!ifs) return {};
+    unsigned char h[16] = {0};
+    ifs.read(reinterpret_cast<char*>(h), sizeof(h));
+    const auto n = ifs.gcount();
+    if (n < 4) return {};
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if (n >= 8 && h[0]==0x89 && h[1]=='P' && h[2]=='N' && h[3]=='G' &&
+        h[4]==0x0D && h[5]==0x0A && h[6]==0x1A && h[7]==0x0A)
+        return "image/png";
+    // JPEG: FF D8 FF
+    if (h[0]==0xFF && h[1]==0xD8 && h[2]==0xFF)
+        return "image/jpeg";
+    // GIF: "GIF87a" / "GIF89a"
+    if (n >= 6 && h[0]=='G' && h[1]=='I' && h[2]=='F' && h[3]=='8' &&
+        (h[4]=='7' || h[4]=='9') && h[5]=='a')
+        return "image/gif";
+    // WebP: "RIFF"????"WEBP"
+    if (n >= 12 && h[0]=='R' && h[1]=='I' && h[2]=='F' && h[3]=='F' &&
+        h[8]=='W' && h[9]=='E' && h[10]=='B' && h[11]=='P')
+        return "image/webp";
+    return {};
+}
+
 // ── File snapshot cache ────────────────────────────────────────────────────
 namespace {
 

@@ -32,7 +32,7 @@ inline mcp::cap::Result lower(util::ExecResult r) {
         return mcp::cap::Result::error(r.error().render());
     }
     mcp::cap::Result out = mcp::cap::Result::ok(std::move(r->text));
-    if (r->change || !r->changes.empty()) {
+    if (r->change || !r->changes.empty() || !r->images.empty()) {
         out.structured = Json::object();
         Json m = Json::object();
         auto encode = [](const mcp::tools::FileChange& c) {
@@ -49,6 +49,20 @@ inline mcp::cap::Result lower(util::ExecResult r) {
             Json arr = Json::array();
             for (const auto& c : r->changes) arr.push_back(encode(c));
             m["changes"] = std::move(arr);
+        }
+        // Images ride the SAME structured-meta channel that carries
+        // FileChanges to the host (attach_meta -> the host bridge). Base64 here
+        // because structured meta is JSON; the host decodes back to raw bytes
+        // and maps onto its ImageContent. Kept out of `text` so a non-vision
+        // model just sees the [image ...] note, never a megabyte of base64.
+        if (!r->images.empty()) {
+            Json arr = Json::array();
+            for (const auto& img : r->images)
+                arr.push_back(Json{
+                    {"media_type", img.media_type},
+                    {"data",       mcp::tools::util::b64_encode(img.bytes)},
+                });
+            m["images"] = std::move(arr);
         }
         out.structured[kMetaKey] = std::move(m);
     }

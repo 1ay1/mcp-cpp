@@ -19,6 +19,7 @@
 
 #include <mcp/cap/capability.hpp>
 #include <mcp/tools/toolset.hpp>
+#include <mcp/tools/util/error.hpp>   // util::ToolImage, util::b64_decode
 
 #include <optional>
 #include <string>
@@ -33,6 +34,17 @@ inline void attach_meta(mcp::cap::Result& r, EffectSet fx,
                         const std::optional<FileChange>& change = std::nullopt,
                         const std::vector<FileChange>& changes = {}) {
     if (!r.structured.is_object()) r.structured = mcp::Json::object();
+    // Preserve any image blocks a tool body already stashed here (read on an
+    // image file, via lower()); attach_meta otherwise REBUILDS the meta object
+    // and would clobber them. Effects/change come from the dispatch layer,
+    // images from the tool body — both must survive into the final meta.
+    mcp::Json preserved_images;
+    if (auto it = r.structured.find(kMetaKey);
+        it != r.structured.end() && it->is_object()) {
+        if (auto im = it->find("images");
+            im != it->end() && im->is_array() && !im->empty())
+            preserved_images = *im;
+    }
     mcp::Json m = mcp::Json::object();
     m["effects"] = fx.bits();
     auto encode = [](const FileChange& c) {
@@ -50,6 +62,7 @@ inline void attach_meta(mcp::cap::Result& r, EffectSet fx,
         for (const auto& c : changes) arr.push_back(encode(c));
         m["changes"] = std::move(arr);
     }
+    if (!preserved_images.is_null()) m["images"] = std::move(preserved_images);
     r.structured[kMetaKey] = std::move(m);
 }
 
@@ -100,6 +113,31 @@ inline void attach_meta(mcp::cap::Result& r, EffectSet fx,
         out.push_back(decode(*c));
     if (auto cs = it->find("changes"); cs != it->end() && cs->is_array())
         for (const auto& c : *cs) if (c.is_object()) out.push_back(decode(c));
+    return out;
+}
+
+// Decode the images a tool surfaced (read on an image file). Mirror of
+// read_changes: pulls the base64 blobs the tool body stashed under the carry
+// key and returns them as raw-byte ToolImages the host maps onto its own
+// ImageContent. Empty for text-only results.
+[[nodiscard]] inline std::vector<mcp::tools::util::ToolImage>
+read_images(const mcp::cap::Result& r) {
+    std::vector<mcp::tools::util::ToolImage> out;
+    if (!r.structured.is_object()) return out;
+    auto it = r.structured.find(kMetaKey);
+    if (it == r.structured.end() || !it->is_object()) return out;
+    auto imgs = it->find("images");
+    if (imgs == it->end() || !imgs->is_array()) return out;
+    for (const auto& im : *imgs) {
+        if (!im.is_object()) continue;
+        std::string data = im.value("data", std::string{});
+        std::string bytes = mcp::tools::util::b64_decode(data);
+        if (bytes.empty()) continue;
+        out.push_back(mcp::tools::util::ToolImage{
+            im.value("media_type", std::string{"image/png"}),
+            std::move(bytes),
+        });
+    }
     return out;
 }
 
