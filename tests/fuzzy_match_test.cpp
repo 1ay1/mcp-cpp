@@ -134,6 +134,41 @@ TEST_CASE("fuzzy_match") {
         CHECK(m.pos == 0 && m.len == 0);
     }
 
+    // ── 6b. RELAXED acceptance: a UNIQUE block that drifted below the strict
+    //        0.8 ratio still applies (previously reported "not found even
+    //        fuzzily"). Here a 3-line block has one reworded line + one
+    //        reflowed line — ratio dips under 0.8 but stays above the 0.6
+    //        relaxed floor, and the location is unambiguous. ────────────────
+    {
+        std::string file =
+            "void setup() {\n"
+            "    // initialise the widget registry\n"
+            "    registry.init();\n"
+            "    log.info(\"ready\");\n"
+            "}\n";
+        // Model's copy drifted: comment reworded, spacing changed. Only
+        // `registry.init();` survives verbatim, but the block is unique.
+        auto m = fuzzy_find(file,
+            "    // init the widget registry\n"
+            "    registry.init();\n"
+            "    log.info( \"ready\" );\n");
+        CHECK(m.ok);
+        CHECK(m.count == 1);
+        CHECK(matched(file, m).find("registry.init();") != std::string_view::npos);
+    }
+
+    // ── 6c. RELAXED floor still rejects half-garbage: a 2-line needle where
+    //        one line matches and the other is absent is exactly 0.5 ratio —
+    //        below the 0.6 floor — so it must stay an honest no-match (this is
+    //        the invariant patch atomicity relies on). ─────────────────────
+    {
+        std::string file =
+            "line one\nline two\nline three\nline four\nline five\n";
+        auto m = fuzzy_find(file,
+            "line four\nthis line does not exist anywhere\n");
+        CHECK(!m.ok);
+    }
+
     // ── 7. indent re-basing of new_text ──────────────────────────────────
     {
         std::string file =

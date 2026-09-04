@@ -656,6 +656,30 @@ int apply_one(std::string& buf, const OneEdit& e,
                     if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
                         ++consumed;
                 }
+                // If the squashed needle occurs EXACTLY ONCE, the location is
+                // unambiguous — the only difference from the file is
+                // whitespace/newline layout the line-DP couldn't reconcile
+                // (e.g. the model collapsed a wrapped call onto one line, or
+                // tab/space drift the reindenter didn't catch). Apply the edit
+                // there rather than bouncing the model with a re-read hint:
+                // the text really is present and the target is unique.
+                if (squashed_buf.find(squashed_old, sq_pos + 1)
+                        == std::string::npos) {
+                    // Walk forward to the byte AFTER the last non-ws char of
+                    // the matched region so the splice length is exact.
+                    std::size_t need = squashed_old.size();
+                    std::size_t got = 0, byte_end = byte_pos;
+                    for (; byte_end < buf.size() && got < need; ++byte_end) {
+                        char c = buf[byte_end];
+                        if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+                            ++got;
+                    }
+                    if (got == need && byte_end > byte_pos) {
+                        buf = minimal_splice(buf, byte_pos,
+                                             byte_end - byte_pos, e.new_text);
+                        return 1;
+                    }
+                }
                 int ln = line_of_offset(buf, byte_pos);
                 hint = std::format(
                     " The text appears around line {} but differs in "

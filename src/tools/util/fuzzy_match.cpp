@@ -34,6 +34,14 @@ constexpr std::uint32_t INSERTION_COST   = 3;
 constexpr std::uint32_t DELETION_COST    = 10;
 constexpr double        FUZZY_EQ_THRESHOLD = 0.8;   // line-level
 constexpr double        MATCH_RATIO        = 0.8;   // accepted match
+// Floor for the RELAXED (sub-MATCH_RATIO) acceptance path. A unique min-cost
+// candidate below MATCH_RATIO is applied only if MORE than half of its query
+// lines still aligned. This rescues a genuinely-drifted block (a 3-line block
+// with one reworded line is 2/3 ≈ 0.67; a reflowed-indent block stays high)
+// while rejecting a needle where half or more is absent — e.g. a bad diff hunk
+// whose sole deletion line doesn't exist ("line four" + one bogus line = 1/2 =
+// 0.5) must stay an honest no-match so patch atomicity holds.
+constexpr double        RELAXED_RATIO_FLOOR = 0.6;
 constexpr std::uint32_t LINE_HINT_TOLERANCE = 200;  // lines
 // Beyond this many DP cells we bail to "no match" rather than burn the
 // watchdog. This is NOT free per cell: each cell runs fuzzy_eq(), whose inner
@@ -398,6 +406,7 @@ struct DPMatch {
     std::size_t row_start;     // inclusive
     std::size_t row_end;       // inclusive
     std::uint32_t cost;
+    double ratio;              // fraction of query lines that aligned cleanly
 };
 
 std::vector<DPMatch> run_line_dp(std::string_view file,
@@ -507,8 +516,14 @@ std::vector<DPMatch> run_line_dp(std::string_view file,
         std::size_t buf_rows  = end_col - c;         // band-local span (rows used)
         double ratio = static_cast<double>(matched)
                      / static_cast<double>(std::max(buf_rows, Q));
-        if (ratio >= MATCH_RATIO)
-            matches.push_back({row_start, row_end, best_cost});
+        // Keep EVERY min-cost candidate, tagged with its alignment ratio.
+        // The strict MATCH_RATIO gate used to drop sub-0.8 matches here,
+        // which turned a correct-but-drifted UNIQUE location into a hard
+        // "not found even fuzzily". We now defer that decision to the
+        // caller: a candidate below MATCH_RATIO is accepted only when it is
+        // the single unambiguous match (see fuzzy_find), so ambiguous or
+        // truly-garbage inputs still fail, but a lone drifted block applies.
+        matches.push_back({row_start, row_end, best_cost, ratio});
     }
     return matches;
 }
@@ -630,7 +645,31 @@ std::vector<DPMatch> run_banded_dp(std::string_view file, std::string_view needl
         for (const auto& m : all) best = std::min(best, m.cost);
         std::vector<DPMatch> keep;
         for (auto& m : all) if (m.cost == best) keep.push_back(m);
-        return keep;
+
+        // MATCH_RATIO tiering. Prefer candidates that cleared the strict
+        // 0.8 alignment ratio — those are high-confidence and preserve the
+        // historical behaviour exactly. Only when NONE clear the bar do we
+        // consider the sub-threshold set, and then a match is returned ONLY
+        // if it is unambiguous (a single min-cost candidate). This rescues
+        // the common failure — a unique block whose lines drifted enough to
+        // dip under 0.8 (reworded comment, reflowed indent, dropped blank
+        // line) — which previously reported "not found even fuzzily", while
+        // an ambiguous low-confidence set still falls through to the
+        // caller's "appears N times" / no-match diagnostics.
+        std::vector<DPMatch> strict;
+        for (const auto& m : keep)
+            if (m.ratio >= MATCH_RATIO) strict.push_back(m);
+        if (!strict.empty())
+            return strict;
+        // No high-confidence match. Accept the lone location ONLY when it is
+        // both unambiguous AND still shares real content with the file
+        // (ratio ≥ floor). A truly-absent needle aligns to some min-cost row
+        // but at a near-zero ratio — that must stay a no-match.
+        if (keep.size() == 1 && keep.front().ratio >= RELAXED_RATIO_FLOOR)
+            return keep;
+        if (keep.size() >= 2)
+            return keep;       // ambiguous: hand the count to the caller
+        return {};             // unique but too weak → honest no-match
     }
     return all;
 }
