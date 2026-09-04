@@ -33,7 +33,7 @@ EffectSet effects_for_builtin(const std::string& name) {
         {"apply_patch",     EffectSet{E::ReadFs, E::WriteFs}},
         {"move",            EffectSet{E::ReadFs, E::WriteFs}},
         {"remove",          EffectSet{E::ReadFs, E::WriteFs}},
-        {"bash",            EffectSet{E::Exec, E::ReadFs, E::WriteFs, E::Net}},
+        {"shell",           EffectSet{E::Exec, E::ReadFs, E::WriteFs, E::Net}},
         {"process_start",   EffectSet{E::Exec, E::ReadFs, E::WriteFs, E::Net}},
         {"process_poll",    EffectSet{}},
         {"process_stop",    EffectSet{E::Exec}},

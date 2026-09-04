@@ -340,7 +340,7 @@ TEST_CASE("search_tools") {
     {
         auto args = obj();
         args["command"] = "echo hello_from_bash";
-        auto r = call(*provider, "bash", args);
+        auto r = call(*provider, "shell", args);
         assert(!r.is_error);
         assert(r.text.find("hello_from_bash") != std::string::npos);
         assert(read_effects(r).has(Effect::Exec));
@@ -351,7 +351,7 @@ TEST_CASE("search_tools") {
     {
         auto args = obj();
         args["command"] = "exit 7";
-        auto r = call(*provider, "bash", args);
+        auto r = call(*provider, "shell", args);
         assert(!r.is_error);  // tool succeeds; payload reports the failure
         assert(r.text.find("exit code 7") != std::string::npos);
         std::puts("bash: exit-code reporting ok");
@@ -360,7 +360,7 @@ TEST_CASE("search_tools") {
     // ── bash empty command rejected ──────────────────────────────────────
     {
         auto args = obj(); args["command"] = "";
-        auto r = call(*provider, "bash", args);
+        auto r = call(*provider, "shell", args);
         assert(r.is_error);
         std::puts("bash: empty command refused");
     }
@@ -392,7 +392,7 @@ TEST_CASE("search_tools") {
         // init a repo inside the workspace + configure identity
         auto g = obj(); g["command"] =
             "git init -q && git config user.email t@t.t && git config user.name T";
-        auto gi = call(*provider, "bash", g);
+        auto gi = call(*provider, "shell", g);
         assert(!gi.is_error);
 
         // git_status on a clean-ish repo (untracked files present)
@@ -454,7 +454,7 @@ TEST_CASE("search_tools") {
             "git -C nested config user.email t@t.t && "
             "git -C nested config user.name T && "
             "printf nested > nested/inside.txt";
-        auto ngi = call(*provider, "bash", ng);
+        auto ngi = call(*provider, "shell", ng);
         assert(!ngi.is_error);
 
         auto nc = obj();
@@ -497,7 +497,7 @@ TEST_CASE("search_tools") {
                 "git commit -q -m 'add submodule' && "
                 // Dirty the submodule working tree with an untracked file.
                 "echo scratch > mod/untracked.txt";
-            auto smi = call(*provider, "bash", sm);
+            auto smi = call(*provider, "shell", sm);
             assert(!smi.is_error && "submodule setup must succeed");
 
             // git_status names the dirty submodule.
@@ -649,7 +649,7 @@ TEST_CASE("search_tools") {
 
         // Clean the working tree back up for the following tests.
         auto cl = obj(); cl["command"] = "git checkout -- amend_me.txt";
-        (void)call(*provider, "bash", cl);
+        (void)call(*provider, "shell", cl);
 
         // push with nothing to stash is a friendly no-op, not an error.
         auto spn = obj(); spn["action"] = "push";
@@ -668,7 +668,7 @@ TEST_CASE("search_tools") {
             "printf cherry > cherry_file.txt && git add cherry_file.txt && "
             "git commit -q -m 'cherry commit' && "
             "echo SHA=$(git rev-parse HEAD) && git switch master -q";
-        auto sr = call(*provider, "bash", setup);
+        auto sr = call(*provider, "shell", setup);
         assert(!sr.is_error);
         // Extract the printed SHA.
         std::string txt = sr.text;
@@ -716,7 +716,7 @@ TEST_CASE("search_tools") {
             "git switch master -q && "
             "printf mainline > mainline.txt && git add mainline.txt && "
             "git commit -q -m 'mainline work' && git switch rb-topic -q";
-        auto sr = call(*provider, "bash", setup);
+        auto sr = call(*provider, "shell", setup);
         assert(!sr.is_error);
 
         auto rb = obj(); rb["action"] = "onto"; rb["upstream"] = "master";
@@ -728,7 +728,7 @@ TEST_CASE("search_tools") {
 
         // After the rebase, mainline.txt is reachable from the topic branch.
         auto chk = obj(); chk["command"] = "test -f mainline.txt && echo HAS_MAINLINE";
-        auto chkr = call(*provider, "bash", chk);
+        auto chkr = call(*provider, "shell", chk);
         assert(!chkr.is_error && chkr.text.find("HAS_MAINLINE") != std::string::npos
                && "rebase must replay topic on top of advanced master");
         std::puts("git_rebase: topic replayed on advanced master");
@@ -742,7 +742,7 @@ TEST_CASE("search_tools") {
         assert(rbcr.is_error && "continue with no rebase in progress must error");
         std::puts("git_rebase: guard rails ok");
 
-        (void)call(*provider, "bash", [] {
+        (void)call(*provider, "shell", [] {
             auto o = obj(); o["command"] = "git switch master -q"; return o; }());
     }
 

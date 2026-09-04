@@ -82,7 +82,7 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j) {
         if (!std::filesystem::is_directory(cd, ec))
             return std::unexpected(ToolError::invalid_args(
                 "cd '" + cd + "' is not a directory"));
-        if (auto wp = util::make_workspace_path_checked(cd, "bash"); !wp)
+        if (auto wp = util::make_workspace_path_checked(cd, "shell"); !wp)
             return std::unexpected(std::move(wp.error()));
     }
     return BashArgs{
@@ -338,9 +338,9 @@ json bash_schema() {
 } // namespace
 
 void register_shell_tools(Shells& sh) {
-    sh.add("bash",
+    sh.add("shell",
 #ifdef _WIN32
-        "Run a shell command via Windows cmd.exe and return its output. "
+        "Executes a shell command and returns its combined output. "
         "Output is truncated at 30k chars. Use for builds, tests, git, etc. "
         "This runs under cmd.exe on Windows — use native equivalents like "
         "`dir`, `where`, `systeminfo`, `type`, `findstr`, or `powershell -c`. "
@@ -348,10 +348,12 @@ void register_shell_tools(Shells& sh) {
         "`sw_vers`, `ls`, `grep`, `sed`, `awk`, heredocs) — they will fail. "
         "Do NOT use for file IO — use the write/edit/read tools instead.",
 #else
-        "Run a shell command and return its output. "
-        "Output is truncated at 30k chars. Use for builds, tests, git, etc. "
-        "Do NOT use for file IO — use the write/edit/read tools instead "
-        "(no cat/echo/sed/heredoc to create or modify files).",
+        "Executes a shell command and returns its combined output. The "
+        "command runs under the operating-system shell (POSIX /bin/sh on "
+        "Linux and macOS), NOT bash — keep commands portable and avoid "
+        "bashisms. Output is truncated at 30k chars. Use for builds, tests, "
+        "git, etc. Do NOT use for file IO — use the write/edit/read tools "
+        "instead (no cat/echo/sed/heredoc to create or modify files).",
 #endif
         bash_schema(), EffectSet{Effect::Exec},
         body<BashArgs>(run_bash, parse_bash_args), 30'000);

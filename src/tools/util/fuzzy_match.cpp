@@ -661,15 +661,19 @@ std::vector<DPMatch> run_banded_dp(std::string_view file, std::string_view needl
             if (m.ratio >= MATCH_RATIO) strict.push_back(m);
         if (!strict.empty())
             return strict;
-        // No high-confidence match. Accept the lone location ONLY when it is
-        // both unambiguous AND still shares real content with the file
-        // (ratio ≥ floor). A truly-absent needle aligns to some min-cost row
-        // but at a near-zero ratio — that must stay a no-match.
-        if (keep.size() == 1 && keep.front().ratio >= RELAXED_RATIO_FLOOR)
-            return keep;
-        if (keep.size() >= 2)
-            return keep;       // ambiguous: hand the count to the caller
-        return {};             // unique but too weak → honest no-match
+        // No high-confidence match. Consider only sub-threshold candidates
+        // that still share REAL content with the file (ratio ≥ floor); a
+        // truly-absent needle aligns to some min-cost row but at a near-zero
+        // ratio and must be dropped BEFORE the ambiguity count is taken, or
+        // two garbage rows would masquerade as an "appears 2 times" match.
+        std::vector<DPMatch> relaxed;
+        for (const auto& m : keep)
+            if (m.ratio >= RELAXED_RATIO_FLOOR) relaxed.push_back(m);
+        if (relaxed.size() == 1)
+            return relaxed;    // unique, real content: accept the location
+        if (relaxed.size() >= 2)
+            return relaxed;    // genuinely ambiguous: hand the count to caller
+        return {};             // nothing shares real content → honest no-match
     }
     return all;
 }
