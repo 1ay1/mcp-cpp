@@ -95,12 +95,10 @@ public:
         tools_fresh_until_ = {};
     }
     void invalidate_resources() {
-        std::lock_guard<std::mutex> lk(state_mu_);
-        resources_stale_ = true;
+        resources_stale_.store(true, std::memory_order_relaxed);
     }
     void invalidate_prompts() {
-        std::lock_guard<std::mutex> lk(state_mu_);
-        prompts_stale_ = true;
+        prompts_stale_.store(true, std::memory_order_relaxed);
     }
     void refresh() { refresh_tools(); }   // back-compat alias
 
@@ -165,14 +163,24 @@ public:
         std::lock_guard<std::mutex> lk(state_mu_);
         resources_ = std::move(all);
         resource_templates_ = std::move(tpls);
-        resources_stale_ = false;
+        // Deliberately NOT clearing resources_stale_ here: the accessor's
+        // exchange() already claimed it. A notification that lands MID-
+        // refresh sets the flag again, and clearing it now would lose that
+        // invalidation — the next access must re-enumerate.
     }
     [[nodiscard]] std::vector<Resource> resources() const override {
-        if (resources_stale_) refresh_resources();
+        // exchange, not load: the first caller to observe stale CLAIMS the
+        // refresh, so a burst of host threads after one notification does
+        // one re-enumeration, not N. If the refresh throws, the flag was
+        // already cleared — acceptable: the caller gets the previous list
+        // and the next notification re-arms it.
+        if (resources_stale_.exchange(false, std::memory_order_relaxed))
+            refresh_resources();
         std::lock_guard<std::mutex> lk(state_mu_); return resources_;
     }
     [[nodiscard]] std::vector<ResourceTemplate> resource_templates() const override {
-        if (resources_stale_) refresh_resources();
+        if (resources_stale_.exchange(false, std::memory_order_relaxed))
+            refresh_resources();
         std::lock_guard<std::mutex> lk(state_mu_); return resource_templates_;
     }
     [[nodiscard]] bool read_resource(const std::string& uri,
@@ -200,10 +208,12 @@ public:
         } while (cursor.has_value());
         std::lock_guard<std::mutex> lk(state_mu_);
         prompts_ = std::move(all);
-        prompts_stale_ = false;
+        // NOT cleared here — see refresh_resources: the accessor's exchange
+        // claimed the flag; clearing now would lose a mid-refresh notify.
     }
     [[nodiscard]] std::vector<Prompt> prompts() const override {
-        if (prompts_stale_) refresh_prompts();
+        if (prompts_stale_.exchange(false, std::memory_order_relaxed))
+            refresh_prompts();
         std::lock_guard<std::mutex> lk(state_mu_); return prompts_;
     }
     [[nodiscard]] bool get_prompt(const std::string& name,
@@ -355,8 +365,14 @@ protected:
     ServerCapabilities          server_caps_;
     mutable std::vector<Tool>   tools_;
     mutable std::chrono::steady_clock::time_point tools_fresh_until_{};  // 2026-07-28 cache TTL
-    mutable bool                resources_stale_ = false;  // set by the reader-thread notify
-    mutable bool                prompts_stale_   = false;  // (see the list() comment: never
+    // ATOMIC, not plain bools: the reader thread SETS these from the
+    // *_list_changed notification handler while a host thread READS them
+    // un-locked at the top of resources()/prompts() (taking state_mu_ there
+    // would hold it across the refresh's network round-trip). Relaxed is
+    // enough — the worst reordering serves one stale list, which the next
+    // access heals; the lists themselves stay under state_mu_.
+    mutable std::atomic<bool>   resources_stale_{false};  // set by the reader-thread notify
+    mutable std::atomic<bool>   prompts_stale_{false};    // (see the list() comment: never
     // refresh ON the reader thread — invalidate here, re-enumerate lazily on a host thread)
     mutable std::vector<Resource>       resources_;
     mutable std::vector<ResourceTemplate> resource_templates_;
