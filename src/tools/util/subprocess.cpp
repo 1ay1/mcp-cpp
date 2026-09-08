@@ -544,15 +544,23 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
 
     // Working directory. addchdir_np runs the chdir INSIDE the child after the
     // fork but before exec — a real chdir, not a `cd &&` shell prefix. Not in
-    // POSIX proper; guarded by availability (glibc ≥ 2.29, macOS ≥ 10.15). When
-    // it's missing we fall through to the fork() path below, which chdir()s by
-    // hand. `spawn_cwd_ok` tracks whether posix_spawn can honour the request.
+    // POSIX proper, but present on every libc we ship on: glibc ≥ 2.29,
+    // musl ≥ 1.1.24 (the Alpine static release!), macOS ≥ 10.15, bionic ≥
+    // API 34. The old guard keyed on __GLIBC__ — which musl deliberately
+    // does NOT define — so the static release binary took the ENOSYS branch
+    // for EVERY command with a cwd ("spawn failed: Function not
+    // implemented" while the same command without `cd` worked). The guard
+    // now covers each libc explicitly, with musl as the
+    // linux-and-not-glibc-and-not-bionic arm.
     bool spawn_cwd_ok = opts.cwd.empty();
-#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29))
-    if (!opts.cwd.empty()
-        && ::posix_spawn_file_actions_addchdir_np(&actions, opts.cwd.c_str()) == 0)
-        spawn_cwd_ok = true;
-#elif defined(__APPLE__)
+#if (defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29))) \
+    || defined(__APPLE__) \
+    || (defined(__linux__) && !defined(__GLIBC__) && !defined(__BIONIC__))
+    // The last arm is musl (it deliberately defines no version macro):
+    // addchdir_np has been there since 1.1.24 (2019), and the Alpine 3.21
+    // image the static release builds on ships 1.2.x — if a hypothetical
+    // older musl lacked it, the LINK fails loudly rather than the runtime
+    // lying.
     if (!opts.cwd.empty()
         && ::posix_spawn_file_actions_addchdir_np(&actions, opts.cwd.c_str()) == 0)
         spawn_cwd_ok = true;
@@ -590,10 +598,9 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     }
 #endif
 
-    // If a cwd was requested but this libc's posix_spawn can't chdir (no
-    // addchdir_np — only pre-2.29 glibc / very old macOS, effectively never on
-    // a supported target), report a clean start error rather than silently
-    // running in the wrong directory. rc carries an errno-shaped code the
+    // A cwd was requested but this build's posix_spawn can't chdir (the
+    // #if above excluded the libc — pre-2.29 glibc / bionic — or the
+    // addchdir call itself failed). rc carries an errno-shaped code the
     // failure path below turns into r.start_error.
     if (spawn_cwd_ok) {
         rc = ::posix_spawnp(&pid, arg_ptrs[0], &actions, attrp,

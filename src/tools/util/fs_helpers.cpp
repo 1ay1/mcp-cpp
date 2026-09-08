@@ -504,12 +504,36 @@ make_readable_path_checked(std::string_view raw, std::string_view tool_name) {
     NormalizedPath p{raw};
     if (is_within_workspace(p.path()) || is_read_allowlisted(p.path()))
         return WorkspacePath{std::move(p)};
-    return std::unexpected(ToolError::out_of_workspace(
-        "tool '" + std::string{tool_name} + "' refused: '"
+    // Name the ACTUAL readable roots. Observed failure: skills live in
+    // ~/.agents/skills but the model GUESSED ~/.agentty/skills/<name> (a
+    // sibling dialect root that happens not to exist) and the old message
+    // ("not under any skill directory") gave it nothing to correct with —
+    // it either retried the same wrong path or gave up. Listing the
+    // allowlisted roots turns the refusal into a one-shot redirect.
+    std::string msg = "tool '" + std::string{tool_name} + "' refused: '"
         + p.string() + "' is outside the workspace root '"
         + workspace_root().string() + "' and not under any skill "
-        "directory. Restart agentty in a parent directory or pass "
-        "--workspace <dir> to widen the scope."));
+        "directory.";
+    {
+        auto& rr = read_roots();
+        std::lock_guard lk{rr.mu};
+        if (!rr.roots.empty()) {
+            msg += " Readable skill directories:";
+            for (const auto& r : rr.roots) {
+                msg += ' ';
+                msg += r.string();
+                msg += ';';
+            }
+            msg.back() = '.';
+            msg += " Use the exact directory listed (skills resolve "
+                   "against several roots — do not guess a sibling "
+                   "root).";
+        } else {
+            msg += " Restart agentty in a parent directory or pass "
+                   "--workspace <dir> to widen the scope.";
+        }
+    }
+    return std::unexpected(ToolError::out_of_workspace(std::move(msg)));
 }
 
 // ── Checked read/write delegates ────────────────────────────────

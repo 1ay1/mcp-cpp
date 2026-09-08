@@ -84,6 +84,14 @@ void register_todo_tool(Shells& sh, const std::shared_ptr<TodoSink>& sink) {
                 if (!set_err.empty())
                     return mcp::cap::Result::error(std::move(set_err));
             }
+            // NEVER return an empty success. An empty string back from a
+            // tool reads as "nothing happened" to many models — observed
+            // in the field as a call loop: a model (behind a compressing
+            // proxy) sent `todos: []` or malformed items, got "" back,
+            // concluded the call was dropped, and retried identically for
+            // whole turns. Say what the list now is, explicitly.
+            if (out.empty())
+                out = "(todo list is now empty — 0 items)";
             return mcp::cap::Result::ok(out);
         });
 }
