@@ -46,13 +46,26 @@ public:
 
     [[nodiscard]] std::string_view origin() const noexcept override { return origin_; }
 
+    // Lazy refresh on ACCESS (host thread), not on notification (reader thread).
+    // A *_list_changed notification arrives ON the transport's reader thread;
+    // issuing list_tools().get() from there can never be satisfied — the
+    // response can only be pumped by the very thread that is blocked waiting
+    // for it — so the refresh deadlocks until the call timeout. During that
+    // window a pool swap destroys the provider/engine under the detached
+    // reader, and the parked handler resumes into freed memory (field SIGSEGV,
+    // crash report 2026-09-06: std::function::operator() jmp through a dead
+    // closure from handle_notification). So notifications only INVALIDATE;
+    // the next host-side list()/resources()/prompts() call sees the stale
+    // marker and refreshes on the caller's thread, where the reader is free
+    // to pump the response.
     [[nodiscard]] std::vector<Tool> list() const override {
+        refresh_tools_if_stale();
         std::lock_guard<std::mutex> lk(state_mu_); return tools_;
     }
     [[nodiscard]] const ServerCapabilities& server_capabilities() const noexcept { return server_caps_; }
 
     // ── tools ────────────────────────────────────────────────────────────
-    void refresh_tools() {
+    void refresh_tools() const {
         std::vector<Tool> all;
         Maybe<std::string> cursor = Nothing;
         Maybe<std::int64_t> ttl;
@@ -74,7 +87,21 @@ public:
                std::chrono::steady_clock::now() < tools_fresh_until_;
     }
     // Refresh only if the cache TTL has lapsed (or none was advertised).
-    void refresh_tools_if_stale() { if (!tools_cache_fresh()) refresh_tools(); }
+    void refresh_tools_if_stale() const { if (!tools_cache_fresh()) refresh_tools(); }
+    // Notification path: drop the cached list so the next host-side accessor
+    // re-enumerates. No I/O here — see the list() comment for why.
+    void invalidate_tools() {
+        std::lock_guard<std::mutex> lk(state_mu_);
+        tools_fresh_until_ = {};
+    }
+    void invalidate_resources() {
+        std::lock_guard<std::mutex> lk(state_mu_);
+        resources_stale_ = true;
+    }
+    void invalidate_prompts() {
+        std::lock_guard<std::mutex> lk(state_mu_);
+        prompts_stale_ = true;
+    }
     void refresh() { refresh_tools(); }   // back-compat alias
 
     [[nodiscard]] Result execute(const Request& req) override {
@@ -118,7 +145,7 @@ public:
     }
 
     // ── resources ────────────────────────────────────────────────────────
-    void refresh_resources() {
+    void refresh_resources() const {
         std::vector<Resource> all;
         Maybe<std::string> cursor = Nothing;
         do {
@@ -138,11 +165,14 @@ public:
         std::lock_guard<std::mutex> lk(state_mu_);
         resources_ = std::move(all);
         resource_templates_ = std::move(tpls);
+        resources_stale_ = false;
     }
     [[nodiscard]] std::vector<Resource> resources() const override {
+        if (resources_stale_) refresh_resources();
         std::lock_guard<std::mutex> lk(state_mu_); return resources_;
     }
     [[nodiscard]] std::vector<ResourceTemplate> resource_templates() const override {
+        if (resources_stale_) refresh_resources();
         std::lock_guard<std::mutex> lk(state_mu_); return resource_templates_;
     }
     [[nodiscard]] bool read_resource(const std::string& uri,
@@ -160,7 +190,7 @@ public:
     }
 
     // ── prompts ──────────────────────────────────────────────────────────
-    void refresh_prompts() {
+    void refresh_prompts() const {
         std::vector<Prompt> all;
         Maybe<std::string> cursor = Nothing;
         do {
@@ -168,9 +198,12 @@ public:
             for (auto& p : res.prompts) all.push_back(std::move(p));
             cursor = res.nextCursor;
         } while (cursor.has_value());
-        std::lock_guard<std::mutex> lk(state_mu_); prompts_ = std::move(all);
+        std::lock_guard<std::mutex> lk(state_mu_);
+        prompts_ = std::move(all);
+        prompts_stale_ = false;
     }
     [[nodiscard]] std::vector<Prompt> prompts() const override {
+        if (prompts_stale_) refresh_prompts();
         std::lock_guard<std::mutex> lk(state_mu_); return prompts_;
     }
     [[nodiscard]] bool get_prompt(const std::string& name,
@@ -237,14 +270,20 @@ protected:
         if (has_roots)
             client_caps.roots = RootsCapability{true};
 
-        // *_list_changed → refresh + fire host callback. Installed via the
+        // *_list_changed → INVALIDATE + fire host callback. Installed via the
         // engine directly (the Client was constructed before we had `this`).
+        // NEVER refresh here: the handler runs on the transport's reader
+        // thread, where a synchronous re-enumeration self-deadlocks (the
+        // response can only be pumped by the blocked thread itself) and the
+        // long stall turns teardown's bounded stop() into a detach — the
+        // detached handler then resumes into destroyed provider/engine state.
+        // The next host-thread list()/resources()/prompts() refreshes lazily.
         client_->engine().on_notification(std::string(method::ToolsListChanged),
-            [this](const Json&) { try { refresh_tools(); } catch (...) {} if (on_list_changed_) on_list_changed_(); });
+            [this](const Json&) { invalidate_tools(); if (on_list_changed_) on_list_changed_(); });
         client_->engine().on_notification(std::string(method::ResourcesListChanged),
-            [this](const Json&) { try { refresh_resources(); } catch (...) {} if (on_list_changed_) on_list_changed_(); });
+            [this](const Json&) { invalidate_resources(); if (on_list_changed_) on_list_changed_(); });
         client_->engine().on_notification(std::string(method::PromptsListChanged),
-            [this](const Json&) { try { refresh_prompts(); } catch (...) {} if (on_list_changed_) on_list_changed_(); });
+            [this](const Json&) { invalidate_prompts(); if (on_list_changed_) on_list_changed_(); });
 
         client_->set_default_timeout(handshake_timeout);
 
@@ -314,11 +353,14 @@ protected:
     std::string                 origin_;
     std::unique_ptr<Client>     client_;
     ServerCapabilities          server_caps_;
-    std::vector<Tool>           tools_;
-    std::chrono::steady_clock::time_point tools_fresh_until_{};  // 2026-07-28 cache TTL
-    std::vector<Resource>       resources_;
-    std::vector<ResourceTemplate> resource_templates_;
-    std::vector<Prompt>         prompts_;
+    mutable std::vector<Tool>   tools_;
+    mutable std::chrono::steady_clock::time_point tools_fresh_until_{};  // 2026-07-28 cache TTL
+    mutable bool                resources_stale_ = false;  // set by the reader-thread notify
+    mutable bool                prompts_stale_   = false;  // (see the list() comment: never
+    // refresh ON the reader thread — invalidate here, re-enumerate lazily on a host thread)
+    mutable std::vector<Resource>       resources_;
+    mutable std::vector<ResourceTemplate> resource_templates_;
+    mutable std::vector<Prompt>         prompts_;
     mutable std::mutex          state_mu_;  // guards cached lists (reader writes)
     std::mutex                  call_mu_;   // serialize tool/resource/prompt calls
     std::mutex                  progress_mu_;
