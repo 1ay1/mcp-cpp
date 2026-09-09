@@ -561,9 +561,25 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     // image the static release builds on ships 1.2.x — if a hypothetical
     // older musl lacked it, the LINK fails loudly rather than the runtime
     // lying.
+    //
+    // macOS 26 deprecated the _np spelling in favour of the POSIX-2024
+    // posix_spawn_file_actions_addchdir(3). We deliberately keep _np: the
+    // un-suffixed symbol only exists in the macOS 26 SDK, so switching
+    // would either break the build on older SDKs or — worse — link a
+    // symbol absent at runtime on every deployment target below 26.0.
+    // _np remains present and functional there, so the deprecation is
+    // noise until the floor moves; silence it at this one call, not
+    // project-wide, so other deprecations still surface.
+#if defined(__APPLE__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
     if (!opts.cwd.empty()
         && ::posix_spawn_file_actions_addchdir_np(&actions, opts.cwd.c_str()) == 0)
         spawn_cwd_ok = true;
+#if defined(__APPLE__)
+#pragma clang diagnostic pop
+#endif
 #endif
 
     // Detach the child into its own session so it has NO controlling
