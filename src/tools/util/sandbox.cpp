@@ -80,123 +80,8 @@ HostSandbox& host_sandbox() { static HostSandbox hs; return hs; }
     return r.started && !r.timed_out && r.exit_code == 0;
 }
 
-// bastion: Landlock path-set authority instead of mount topology.
-//
-// Preferred over bwrap where it actually works, for three reasons measured
-// against this file's own bwrap path:
-//
-//   * EGRESS. The bwrap prefix below passes --share-net and documents it as
-//     an accepted residual, so an approved command reaches any host. bastion
-//     T3 denies egress in the kernel and brokers an allowlist.
-//   * PATH SETS DON'T NEED A BIND LIST. wrap_shell_command hand-enumerates
-//     ~20 --ro-bind arguments plus specific /etc files and $HOME toolchain
-//     caches; every new toolchain is a patch to that list.
-//   * IT EXPLAINS ITS DENIALS in-band, structured, with a remedy — so a
-//     model can correct itself instead of thrashing.
-//
-// The probe is a REAL confinement attempt, not `--version`, for exactly the
-// reason bwrap_can_sandbox() is: issue #21 shipped "sandbox: active" on
-// hosts where the binary existed and the kernel refused. `bastion doctor`
-// asserts its own ergonomic floor and exits non-zero when the floor or the
-// requested tier is unavailable, which is the check we want.
-[[nodiscard]] bool bastion_can_sandbox() {
-    // NOT can_invoke(): that runs `<exe> --version`, and bastion has no such
-    // subcommand (it exits 2 with usage). Probing the wrong flag would have
-    // reported "no bastion" on a host where it works perfectly — the same
-    // false-negative shape as issue #21's false POSITIVE, from the other
-    // direction. `doctor` IS the capability probe: it checks the backend and
-    // asserts the ergonomic floor, and exits non-zero when either fails.
-    auto r = run_argv_s({"bastion", "doctor"}, /*max_bytes=*/8192,
-                        std::chrono::seconds{5});
-    if (!r.started || r.timed_out || r.exit_code != 0) return false;
-    // Require a tier that actually constrains the filesystem. A bastion on a
-    // kernel too old for Landlock reports a lower ceiling and would be
-    // strictly worse than bwrap here — the tier says so, so read it.
-    return r.output.find("max tier:    T2") != std::string::npos
-        || r.output.find("max tier:    T3") != std::string::npos;
-}
-
 [[nodiscard]] Backend probe() {
-    // Opt-in for now. bastion is measured on one kernel (7.2.2, Landlock ABI
-    // v10) and its behaviour on older ABI levels is explicitly unverified by
-    // its own docs, so defaulting every agentty user onto it would be
-    // betting the sandbox story on a single measurement. bwrap stays the
-    // default until the ABI matrix is filled in.
-    if (const char* v = std::getenv("AGENTTY_SANDBOX_BACKEND");
-        v && std::string_view{v} == "bastion") {
-        if (bastion_can_sandbox()) return Backend::Bastion;
-        // Asked for explicitly and unavailable: fall through to bwrap rather
-        // than silently running unsandboxed. init() reports what was chosen.
-    }
     return bwrap_can_sandbox() ? Backend::Bwrap : Backend::None;
-}
-
-// bastion argv: the workspace is the grant. No bind list to maintain — the
-// ergonomic floor ($TMPDIR, toolchain caches, /dev/null) is bastion's own
-// preflight.
-//
-// THREE knobs, in increasing order of how much they let a project say:
-//
-//   AGENTTY_SANDBOX_TIER   t0|t1|t2|t3, default t2. t2 matches what bwrap
-//                          delivers today (path containment, shared net);
-//                          t3 additionally denies egress in the kernel and
-//                          brokers a per-host allowlist.
-//   AGENTTY_SANDBOX_NET    host:port grants, comma-separated. Only MEANS
-//                          anything at t3 — at t2 the kernel matches sockets,
-//                          not hostnames, and bastion says so rather than
-//                          implying otherwise.
-//   .agentty/bastion.toml  a policy FILE, which is what `bastion synthesize`
-//                          writes after a `bastion observe` run. This is the
-//                          seam that scales: a project declares what its own
-//                          build actually reaches, from evidence, instead of
-//                          anyone hand-maintaining a host list here.
-//
-// The file is preferred because it is the only one that can be reviewed in a
-// diff. Flags still combine with it (bastion applies both), so the tier and
-// any extra grants remain available without editing the policy.
-//
-// Deliberately NOT hardcoding provider hosts: agentty's own API traffic is
-// in-process and never crosses this boundary — only SPAWNED TOOLS do. What
-// those need is a property of the project's toolchain (its package registry,
-// its git remote), which this layer cannot know and must not guess.
-[[nodiscard]] std::vector<std::string> build_bastion_argv(std::string_view shell_cmd) {
-    const char* tier = std::getenv("AGENTTY_SANDBOX_TIER");
-    std::vector<std::string> argv{
-        "bastion", "run",
-        "-t", (tier && *tier) ? std::string{tier} : std::string{"t2"},
-        "-w", workspace_root().string()};
-
-    // Project policy, when the repo ships one.
-    std::error_code pec;
-    const auto policy = workspace_root() / ".agentty" / "bastion.toml";
-    if (fs::exists(policy, pec) && !pec) {
-        argv.emplace_back("-p");
-        argv.emplace_back(policy.string());
-    }
-
-    // Extra egress grants. Split on commas; empty entries are skipped so a
-    // trailing comma is not an error the user has to debug.
-    if (const char* net = std::getenv("AGENTTY_SANDBOX_NET"); net && *net) {
-        std::string_view rest{net};
-        while (!rest.empty()) {
-            const auto comma = rest.find(',');
-            auto one = rest.substr(0, comma);
-            while (!one.empty() && one.front() == ' ') one.remove_prefix(1);
-            while (!one.empty() && one.back()  == ' ') one.remove_suffix(1);
-            if (!one.empty()) {
-                argv.emplace_back("--net");
-                argv.emplace_back(std::string{one});
-            }
-            if (comma == std::string_view::npos) break;
-            rest.remove_prefix(comma + 1);
-        }
-    }
-
-    argv.emplace_back("--");
-    argv.emplace_back("/bin/sh");
-    argv.emplace_back("-c");
-    argv.emplace_back(std::string{shell_cmd});
-    return argv;
 }
 
 // Build the bwrap argv prefix. Workspace gets read-write bound to
@@ -369,14 +254,10 @@ HostSandbox& host_sandbox() { static HostSandbox hs; return hs; }
 // against a boundary it cannot see. The sandbox knows the answer and was
 // throwing it away.
 //
-// Two shapes, because the backends differ in what they can tell us:
-//
-//   bastion  already emits a structured verdict with a remedy on stderr,
-//            which the subprocess layer captured into r.output. Nothing to
-//            add — detect it and leave it alone.
-//   bwrap    says nothing at all. The kernel returns EACCES and that is the
-//            whole story, so the note has to be synthesized from the fact
-//            that a sandbox was active and the command failed.
+// bwrap says nothing at all: the kernel returns EACCES and that is the whole
+// story, so the note has to be synthesized from the fact that a sandbox was
+// active and the command failed. A backend that explains itself on stderr
+// needs no help here -- detect its prefix and leave the output alone.
 //
 // Deliberately conservative: appended only when the command FAILED and the
 // output looks like a boundary refusal. A note on every failure would train
@@ -448,8 +329,6 @@ HostSandbox& host_sandbox() { static HostSandbox hs; return hs; }
 
 void annotate_sandbox_denial(SubprocessResult& r) {
     if (!is_active() || r.exit_code == 0) return;
-    // bastion already explained itself — its remedy line is in the output.
-    if (r.output.find("bastion:") != std::string::npos) return;
     if (!looks_like_boundary(r.output)) return;
     if (!mentions_path_outside_workspace(r.output)) return;
 
@@ -458,7 +337,6 @@ void annotate_sandbox_denial(SubprocessResult& r) {
     switch (detected_backend()) {
         case Backend::Bwrap:       note += "bwrap";        break;
         case Backend::SandboxExec: note += "sandbox-exec"; break;
-        case Backend::Bastion:     note += "bastion";      break;
         case Backend::None:        note += "none";         break;
     }
     note += "), so a missing or unreadable path may be the sandbox rather "
@@ -467,8 +345,7 @@ void annotate_sandbox_denial(SubprocessResult& r) {
             "the workspace (";
     note += workspace_root().string();
     note += ") and $TMPDIR. The network is available.\nIf the path is "
-            "genuinely needed, ask the user to re-run with --sandbox off, or "
-            "to grant it in .agentty/bastion.toml.";
+            "genuinely needed, ask the user to re-run with --sandbox off.";
     r.output += note;
 }
 
@@ -478,9 +355,7 @@ void annotate_sandbox_denial(SubprocessResult& r) {
                                            std::string_view cwd,
                                            const std::vector<std::pair<std::string, std::string>>& env) {
     SubprocessOptions opts;
-    opts.argv = detected_backend() == Backend::Bastion
-                    ? build_bastion_argv(cmd)
-                    : build_bwrap_argv(cmd);
+    opts.argv = build_bwrap_argv(cmd);
     opts.max_bytes = max_bytes;
     opts.timeout = timeout;
     opts.cwd = std::string{cwd};
@@ -503,14 +378,12 @@ void annotate_sandbox_denial(SubprocessResult& r) {
         return r;
     }
     // Build prefix with no shell command, then splice the user's argv.
-    // Same prefix the shell form uses, built by whichever backend is live.
-    // Both builders end with the same four elements ("--", "/bin/sh", "-c",
-    // cmd), so the pop below is backend-independent — but assert the shape
-    // rather than trusting it, because a builder that changed its tail would
-    // otherwise silently splice the user's argv into the wrong position.
-    auto wrapped = detected_backend() == Backend::Bastion
-                       ? build_bastion_argv("")
-                       : build_bwrap_argv("");
+    // Same prefix the shell form uses. The builder ends with four elements
+    // ("--", "/bin/sh", "-c", cmd), so the pop below matches its tail — but
+    // assert the shape rather than trusting it, because a builder that
+    // changed its tail would otherwise silently splice the user's argv into
+    // the wrong position.
+    auto wrapped = build_bwrap_argv("");
     // Pop the trailing 4 elements added by the builder ("--",
     // "/bin/sh", "-c", ""), then append user argv directly.
     if (wrapped.size() >= 4) wrapped.resize(wrapped.size() - 4);
@@ -652,8 +525,8 @@ Backend detected_backend() noexcept { return g_backend.load(std::memory_order_ac
 
 bool is_active() noexcept {
     if (requested_mode() == Mode::Off) return false;
-    // A host sandbox IS a sandbox, even when our own probe found no backend
-    // (agentty links bastion; this library cannot).
+    // A host sandbox IS a sandbox, even when our own probe found no backend:
+    // the host may have an engine this library cannot reach on its own.
     return has_host_sandbox() || detected_backend() != Backend::None;
 }
 
@@ -667,7 +540,6 @@ std::string describe_state() {
     const char* tag = nullptr;
     switch (b) {
         case Backend::Bwrap:       tag = "bwrap";        break;
-        case Backend::Bastion:     tag = "bastion";      break;
         case Backend::SandboxExec: tag = "sandbox-exec"; break;
         case Backend::None:        tag = nullptr;        break;
     }
@@ -732,10 +604,6 @@ SubprocessResult run_shell_command(std::string_view cmd,
 std::vector<std::string> prepare_shell_argv(std::string_view cmd) {
     if (is_active()) {
 #if defined(__linux__)
-        // Backend, not platform: Linux now has two, and which one is live is
-        // a probe result rather than a compile-time fact.
-        if (detected_backend() == Backend::Bastion)
-            return build_bastion_argv(cmd);
         return build_bwrap_argv(cmd);
 #elif defined(__APPLE__)
         return {"sandbox-exec", "-p", build_profile(workspace_root().string()),

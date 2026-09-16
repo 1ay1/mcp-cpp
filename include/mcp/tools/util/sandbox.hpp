@@ -56,17 +56,17 @@ enum class Backend : std::uint8_t {
     None,         // no backend detected / sandbox disabled
     Bwrap,        // Linux bubblewrap
     SandboxExec,  // macOS sandbox-exec
-    Bastion,      // Linux Landlock via `bastion` (preferred where available)
 };
 
 // Let the HOST supply the sandbox, instead of this library finding one.
 //
-// mcp-cpp is a standalone library: it cannot depend on agentty's submodules,
-// so it cannot link bastion even though agentty does. Shelling out to a
-// `bastion` binary was the workaround, and it produced the exact split this
-// hook removes — agentty's own sandbox ran bastion IN-PROCESS while the tool
-// layer fell back to bwrap, so hooks and tools were confined by different
-// engines while one status banner described both.
+// mcp-cpp is a standalone library: it cannot depend on a host's submodules, so
+// there are sandbox engines a host can link that this library cannot reach on
+// its own. Shelling out to such an engine's CLI is the obvious workaround and
+// the wrong one -- it depends on a binary being installed and on PATH, and it
+// splits confinement across two implementations, so the host's own hooks and
+// this library's tools can end up in different engines while one status banner
+// describes both.
 //
 // A host that has a better sandbox installs it here at startup; everything
 // mcp-cpp runs then goes through the host's implementation, and the two
