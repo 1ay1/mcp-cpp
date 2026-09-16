@@ -47,6 +47,121 @@ HostSandbox& host_sandbox() { static HostSandbox hs; return hs; }
 
 #endif // posix backends
 
+// ---------------------------------------------------------------------
+// Denial diagnostics -- PLATFORM-INDEPENDENT, and deliberately above the
+// backend split below.
+//
+// These sit outside #if because both backends need them: the comment on
+// looks_like_boundary() names sandbox-exec explicitly as a backend that
+// returns EACCES. Leaving them inside the __linux__ arm compiled fine on
+// Linux and broke the macOS release leg, which is the worst place for a
+// guard to be wrong -- nothing a developer runs locally sees it.
+// ---------------------------------------------------------------------
+// Tell the model WHY a command failed, when the reason was us.
+//
+// A sandboxed failure reaches a tool as whatever the child printed:
+// `cat: /etc/shadow: Permission denied`, `fatal: unable to access …`. That
+// is indistinguishable from the file genuinely not being readable, so a
+// model retries it, tries sudo, tries a different path, and burns turns
+// against a boundary it cannot see. The sandbox knows the answer and was
+// throwing it away.
+//
+// bwrap says nothing at all: the kernel returns EACCES and that is the whole
+// story, so the note has to be synthesized from the fact that a sandbox was
+// active and the command failed. A backend that explains itself on stderr
+// needs no help here -- detect its prefix and leave the output alone.
+//
+// Deliberately conservative: appended only when the command FAILED and the
+// output looks like a boundary refusal. A note on every failure would train
+// the model to ignore it, which is worse than no note.
+//
+// "Permission denied" is NOT the main shape, which is what made the first
+// version of this fire on nothing. bwrap does not deny a path — it declines
+// to bind it, so the path simply is not there and the child reports
+// `No such file or directory`. Measured:
+//
+//     $ cat /etc/shadow            (inside bwrap)
+//     cat: /etc/shadow: No such file or directory
+//
+// That is the more dangerous message of the two, because a model reads it as
+// "this file does not exist on this machine" and stops — or worse, tries to
+// CREATE it. So an absent-path failure on an ABSOLUTE path outside the
+// workspace is the primary trigger; EACCES/EPERM are kept for backends that
+// do return them (sandbox-exec, Landlock).
+[[nodiscard]] bool looks_like_boundary(std::string_view out) {
+    for (std::string_view needle : {
+             "Permission denied", "permission denied",
+             "Operation not permitted", "EACCES", "EPERM",
+             "Read-only file system",
+             "No such file or directory", "no such file or directory"}) {
+        if (out.find(needle) != std::string_view::npos) return true;
+    }
+    return false;
+}
+
+// Does the output mention an ABSOLUTE path that the sandbox would not have
+// made visible? Without this, every `cat typo.txt` in the workspace would be
+// blamed on the sandbox — the note has to be wrong far less often than it is
+// right, or it becomes noise the model learns to skip.
+//
+// Absolute specifically. A first attempt scanned for any '/', which matched
+// `./missing.txt` and `nope/inner.txt` and annotated two plain typos — the
+// exact noise this guard exists to prevent. A relative path resolves inside
+// the cwd, which is inside the grant, so it can never be the sandbox's
+// doing.
+[[nodiscard]] bool mentions_path_outside_workspace(std::string_view out) {
+    const std::string ws = workspace_root().string();
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        if (out[i] != '/') continue;
+        // Absolute means the '/' opens the token: preceded by start of line,
+        // whitespace, or a quote — not by a path character.
+        if (i > 0) {
+            const char p = out[i - 1];
+            const bool opens = p == ' ' || p == '\n' || p == '\t'
+                            || p == '\'' || p == '"' || p == '(' || p == '=';
+            if (!opens) continue;    // mid-path slash (./x, a/b) — not absolute
+        }
+        std::size_t j = i;
+        while (j < out.size() && out[j] != ' ' && out[j] != '\n'
+               && out[j] != '\t' && out[j] != ':' && out[j] != '\''
+               && out[j] != '"')
+            ++j;
+        const auto cand = out.substr(i, j - i);
+        if (cand.size() <= 1) continue;
+        // Inside the workspace, or somewhere the sandbox deliberately grants?
+        // Then the failure is real, not ours.
+        if (!ws.empty() && cand.rfind(ws, 0) == 0) continue;
+        if (cand.rfind("/tmp", 0) == 0 || cand.rfind("/var/tmp", 0) == 0
+            || cand.rfind("/dev", 0) == 0 || cand.rfind("/proc", 0) == 0)
+            continue;
+        return true;
+    }
+    return false;
+}
+
+void annotate_sandbox_denial(SubprocessResult& r) {
+    if (!is_active() || r.exit_code == 0) return;
+    if (!looks_like_boundary(r.output)) return;
+    if (!mentions_path_outside_workspace(r.output)) return;
+
+    std::string note =
+        "\n\n[sandbox] This command ran inside agentty's sandbox (";
+    switch (detected_backend()) {
+        case Backend::Bwrap:       note += "bwrap";        break;
+        case Backend::SandboxExec: note += "sandbox-exec"; break;
+        case Backend::None:        note += "none";         break;
+    }
+    note += "), so a missing or unreadable path may be the sandbox rather "
+            "than the filesystem — paths outside the grant are not made "
+            "visible, so they report as ABSENT rather than denied. Writable: "
+            "the workspace (";
+    note += workspace_root().string();
+    note += ") and $TMPDIR. The network is available.\nIf the path is "
+            "genuinely needed, ask the user to re-run with --sandbox off.";
+    r.output += note;
+}
+
+
 #if defined(__linux__)
 
 // A GENUINE minimal-sandbox probe. `bwrap --version` (the old check via
@@ -243,110 +358,6 @@ HostSandbox& host_sandbox() { static HostSandbox hs; return hs; }
     argv.emplace_back("-c");
     argv.emplace_back(std::string{shell_cmd});
     return argv;
-}
-
-// Tell the model WHY a command failed, when the reason was us.
-//
-// A sandboxed failure reaches a tool as whatever the child printed:
-// `cat: /etc/shadow: Permission denied`, `fatal: unable to access …`. That
-// is indistinguishable from the file genuinely not being readable, so a
-// model retries it, tries sudo, tries a different path, and burns turns
-// against a boundary it cannot see. The sandbox knows the answer and was
-// throwing it away.
-//
-// bwrap says nothing at all: the kernel returns EACCES and that is the whole
-// story, so the note has to be synthesized from the fact that a sandbox was
-// active and the command failed. A backend that explains itself on stderr
-// needs no help here -- detect its prefix and leave the output alone.
-//
-// Deliberately conservative: appended only when the command FAILED and the
-// output looks like a boundary refusal. A note on every failure would train
-// the model to ignore it, which is worse than no note.
-//
-// "Permission denied" is NOT the main shape, which is what made the first
-// version of this fire on nothing. bwrap does not deny a path — it declines
-// to bind it, so the path simply is not there and the child reports
-// `No such file or directory`. Measured:
-//
-//     $ cat /etc/shadow            (inside bwrap)
-//     cat: /etc/shadow: No such file or directory
-//
-// That is the more dangerous message of the two, because a model reads it as
-// "this file does not exist on this machine" and stops — or worse, tries to
-// CREATE it. So an absent-path failure on an ABSOLUTE path outside the
-// workspace is the primary trigger; EACCES/EPERM are kept for backends that
-// do return them (sandbox-exec, Landlock).
-[[nodiscard]] bool looks_like_boundary(std::string_view out) {
-    for (std::string_view needle : {
-             "Permission denied", "permission denied",
-             "Operation not permitted", "EACCES", "EPERM",
-             "Read-only file system",
-             "No such file or directory", "no such file or directory"}) {
-        if (out.find(needle) != std::string_view::npos) return true;
-    }
-    return false;
-}
-
-// Does the output mention an ABSOLUTE path that the sandbox would not have
-// made visible? Without this, every `cat typo.txt` in the workspace would be
-// blamed on the sandbox — the note has to be wrong far less often than it is
-// right, or it becomes noise the model learns to skip.
-//
-// Absolute specifically. A first attempt scanned for any '/', which matched
-// `./missing.txt` and `nope/inner.txt` and annotated two plain typos — the
-// exact noise this guard exists to prevent. A relative path resolves inside
-// the cwd, which is inside the grant, so it can never be the sandbox's
-// doing.
-[[nodiscard]] bool mentions_path_outside_workspace(std::string_view out) {
-    const std::string ws = workspace_root().string();
-    for (std::size_t i = 0; i < out.size(); ++i) {
-        if (out[i] != '/') continue;
-        // Absolute means the '/' opens the token: preceded by start of line,
-        // whitespace, or a quote — not by a path character.
-        if (i > 0) {
-            const char p = out[i - 1];
-            const bool opens = p == ' ' || p == '\n' || p == '\t'
-                            || p == '\'' || p == '"' || p == '(' || p == '=';
-            if (!opens) continue;    // mid-path slash (./x, a/b) — not absolute
-        }
-        std::size_t j = i;
-        while (j < out.size() && out[j] != ' ' && out[j] != '\n'
-               && out[j] != '\t' && out[j] != ':' && out[j] != '\''
-               && out[j] != '"')
-            ++j;
-        const auto cand = out.substr(i, j - i);
-        if (cand.size() <= 1) continue;
-        // Inside the workspace, or somewhere the sandbox deliberately grants?
-        // Then the failure is real, not ours.
-        if (!ws.empty() && cand.rfind(ws, 0) == 0) continue;
-        if (cand.rfind("/tmp", 0) == 0 || cand.rfind("/var/tmp", 0) == 0
-            || cand.rfind("/dev", 0) == 0 || cand.rfind("/proc", 0) == 0)
-            continue;
-        return true;
-    }
-    return false;
-}
-
-void annotate_sandbox_denial(SubprocessResult& r) {
-    if (!is_active() || r.exit_code == 0) return;
-    if (!looks_like_boundary(r.output)) return;
-    if (!mentions_path_outside_workspace(r.output)) return;
-
-    std::string note =
-        "\n\n[sandbox] This command ran inside agentty's sandbox (";
-    switch (detected_backend()) {
-        case Backend::Bwrap:       note += "bwrap";        break;
-        case Backend::SandboxExec: note += "sandbox-exec"; break;
-        case Backend::None:        note += "none";         break;
-    }
-    note += "), so a missing or unreadable path may be the sandbox rather "
-            "than the filesystem — paths outside the grant are not made "
-            "visible, so they report as ABSENT rather than denied. Writable: "
-            "the workspace (";
-    note += workspace_root().string();
-    note += ") and $TMPDIR. The network is available.\nIf the path is "
-            "genuinely needed, ask the user to re-run with --sandbox off.";
-    r.output += note;
 }
 
 [[nodiscard]] SubprocessResult run_wrapped(std::string_view cmd,
