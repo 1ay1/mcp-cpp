@@ -36,6 +36,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -56,6 +58,41 @@ enum class Backend : std::uint8_t {
     SandboxExec,  // macOS sandbox-exec
     Bastion,      // Linux Landlock via `bastion` (preferred where available)
 };
+
+// Let the HOST supply the sandbox, instead of this library finding one.
+//
+// mcp-cpp is a standalone library: it cannot depend on agentty's submodules,
+// so it cannot link bastion even though agentty does. Shelling out to a
+// `bastion` binary was the workaround, and it produced the exact split this
+// hook removes — agentty's own sandbox ran bastion IN-PROCESS while the tool
+// layer fell back to bwrap, so hooks and tools were confined by different
+// engines while one status banner described both.
+//
+// A host that has a better sandbox installs it here at startup; everything
+// mcp-cpp runs then goes through the host's implementation, and the two
+// layers cannot disagree. Unset (the default) keeps the built-in bwrap /
+// sandbox-exec behaviour, so a standalone mcp-cpp user loses nothing.
+//
+// `label` is what describe_state() reports, so the banner names whatever the
+// host actually installed rather than guessing.
+struct HostSandbox {
+    std::string label;
+    // Runs argv under the host's sandbox. Returning nullopt means "I could
+    // not take this one" and mcp-cpp falls back to its own backend, so a
+    // host need not reimplement every path to install the hook.
+    std::function<std::optional<SubprocessResult>(
+        const std::vector<std::string>& argv,
+        std::size_t max_bytes,
+        std::chrono::seconds timeout,
+        std::string_view cwd,
+        const std::vector<std::pair<std::string, std::string>>& env)> run;
+};
+
+// Install (or clear, with a default-constructed value) the host sandbox.
+// Call once before any tool runs; not synchronised, because it is startup
+// configuration rather than live state.
+void set_host_sandbox(HostSandbox hs);
+[[nodiscard]] bool has_host_sandbox() noexcept;
 
 // Set the requested mode (from --sandbox CLI flag) and probe the
 // system for a usable backend. Idempotent; the result is cached.

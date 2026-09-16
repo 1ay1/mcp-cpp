@@ -23,6 +23,10 @@ namespace {
 std::atomic<Mode>    g_mode{Mode::Auto};
 std::atomic<Backend> g_backend{Backend::None};
 
+// Host-installed sandbox (see sandbox.hpp). Plain globals: set once at
+// startup, read on every tool run, never mutated concurrently.
+HostSandbox& host_sandbox() { static HostSandbox hs; return hs; }
+
 // Only the POSIX backends (Linux bwrap, macOS sandbox-exec) need the
 // "can we run this binary?" probe — the Windows/unsupported branch
 // just hard-codes Backend::None.
@@ -640,18 +644,26 @@ bool init(Mode requested) {
     return true;
 }
 
+void set_host_sandbox(HostSandbox hs) { host_sandbox() = std::move(hs); }
+bool has_host_sandbox() noexcept { return static_cast<bool>(host_sandbox().run); }
+
 Mode    requested_mode()   noexcept { return g_mode.load(std::memory_order_acquire); }
 Backend detected_backend() noexcept { return g_backend.load(std::memory_order_acquire); }
 
 bool is_active() noexcept {
-    return requested_mode() != Mode::Off
-        && detected_backend() != Backend::None;
+    if (requested_mode() == Mode::Off) return false;
+    // A host sandbox IS a sandbox, even when our own probe found no backend
+    // (agentty links bastion; this library cannot).
+    return has_host_sandbox() || detected_backend() != Backend::None;
 }
 
 std::string describe_state() {
     auto m = requested_mode();
     auto b = detected_backend();
     if (m == Mode::Off) return "sandbox: off";
+    // Name what will actually run the command.
+    if (has_host_sandbox() && !host_sandbox().label.empty())
+        return "sandbox: active (" + host_sandbox().label + ")";
     const char* tag = nullptr;
     switch (b) {
         case Backend::Bwrap:       tag = "bwrap";        break;
@@ -703,6 +715,15 @@ SubprocessResult run_shell_command(std::string_view cmd,
                                    std::chrono::seconds timeout,
                                    std::string_view cwd,
                                    const std::vector<std::pair<std::string, std::string>>& env) {
+    // A host-installed sandbox takes precedence over our own backend: it is
+    // the one the host's OTHER execution paths use, and two engines confining
+    // two halves of the same session is the split this hook exists to close.
+    if (has_host_sandbox()) {
+        if (auto r = host_sandbox().run({"/bin/sh", "-c", std::string{cmd}},
+                                        max_bytes, timeout, cwd, env))
+            return std::move(*r);
+        // nullopt => the host declined this one; fall through.
+    }
     if (!is_active())
         return run_command_s(std::string{cmd}, max_bytes, timeout, cwd, env);
     return run_wrapped(cmd, max_bytes, timeout, cwd, env);
@@ -731,6 +752,10 @@ std::vector<std::string> prepare_shell_argv(std::string_view cmd) {
 SubprocessResult run_argv(const std::vector<std::string>& argv,
                           std::size_t max_bytes,
                           std::chrono::seconds timeout) {
+    if (has_host_sandbox()) {
+        if (auto r = host_sandbox().run(argv, max_bytes, timeout, {}, {}))
+            return std::move(*r);
+    }
     if (!is_active())
         return run_argv_s(argv, max_bytes, timeout);
     return run_wrapped_argv(argv, max_bytes, timeout);
