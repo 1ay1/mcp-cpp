@@ -76,8 +76,80 @@ std::atomic<Backend> g_backend{Backend::None};
     return r.started && !r.timed_out && r.exit_code == 0;
 }
 
+// bastion: Landlock path-set authority instead of mount topology.
+//
+// Preferred over bwrap where it actually works, for three reasons measured
+// against this file's own bwrap path:
+//
+//   * EGRESS. The bwrap prefix below passes --share-net and documents it as
+//     an accepted residual, so an approved command reaches any host. bastion
+//     T3 denies egress in the kernel and brokers an allowlist.
+//   * PATH SETS DON'T NEED A BIND LIST. wrap_shell_command hand-enumerates
+//     ~20 --ro-bind arguments plus specific /etc files and $HOME toolchain
+//     caches; every new toolchain is a patch to that list.
+//   * IT EXPLAINS ITS DENIALS in-band, structured, with a remedy — so a
+//     model can correct itself instead of thrashing.
+//
+// The probe is a REAL confinement attempt, not `--version`, for exactly the
+// reason bwrap_can_sandbox() is: issue #21 shipped "sandbox: active" on
+// hosts where the binary existed and the kernel refused. `bastion doctor`
+// asserts its own ergonomic floor and exits non-zero when the floor or the
+// requested tier is unavailable, which is the check we want.
+[[nodiscard]] bool bastion_can_sandbox() {
+    // NOT can_invoke(): that runs `<exe> --version`, and bastion has no such
+    // subcommand (it exits 2 with usage). Probing the wrong flag would have
+    // reported "no bastion" on a host where it works perfectly — the same
+    // false-negative shape as issue #21's false POSITIVE, from the other
+    // direction. `doctor` IS the capability probe: it checks the backend and
+    // asserts the ergonomic floor, and exits non-zero when either fails.
+    auto r = run_argv_s({"bastion", "doctor"}, /*max_bytes=*/8192,
+                        std::chrono::seconds{5});
+    if (!r.started || r.timed_out || r.exit_code != 0) return false;
+    // Require a tier that actually constrains the filesystem. A bastion on a
+    // kernel too old for Landlock reports a lower ceiling and would be
+    // strictly worse than bwrap here — the tier says so, so read it.
+    return r.output.find("max tier:    T2") != std::string::npos
+        || r.output.find("max tier:    T3") != std::string::npos;
+}
+
 [[nodiscard]] Backend probe() {
+    // Opt-in for now. bastion is measured on one kernel (7.2.2, Landlock ABI
+    // v10) and its behaviour on older ABI levels is explicitly unverified by
+    // its own docs, so defaulting every agentty user onto it would be
+    // betting the sandbox story on a single measurement. bwrap stays the
+    // default until the ABI matrix is filled in.
+    if (const char* v = std::getenv("AGENTTY_SANDBOX_BACKEND");
+        v && std::string_view{v} == "bastion") {
+        if (bastion_can_sandbox()) return Backend::Bastion;
+        // Asked for explicitly and unavailable: fall through to bwrap rather
+        // than silently running unsandboxed. init() reports what was chosen.
+    }
     return bwrap_can_sandbox() ? Backend::Bwrap : Backend::None;
+}
+
+// bastion argv. One flag instead of twenty binds: the workspace is the
+// grant, and the ergonomic floor ($TMPDIR, toolchain caches, /dev/null) is
+// bastion's own preflight rather than a list this file has to maintain.
+//
+// T2 is the default tier here, matching what bwrap actually delivers today
+// (path containment, shared network). T3 additionally brokers egress against
+// an allowlist, which is strictly better but needs a policy this layer does
+// not have — the caller that knows which hosts a command may reach should
+// ask for it. AGENTTY_SANDBOX_TIER exists so that can be tried without a
+// rebuild.
+[[nodiscard]] std::vector<std::string> build_bastion_argv(std::string_view shell_cmd) {
+    std::vector<std::string> argv{"bastion", "run"};
+    const char* tier = std::getenv("AGENTTY_SANDBOX_TIER");
+    argv.emplace_back("-t");
+    argv.emplace_back(tier && *tier ? tier : "t2");
+    // The workspace is read-write; everything else follows bastion's floor.
+    argv.emplace_back("-w");
+    argv.emplace_back(workspace_root().string());
+    argv.emplace_back("--");
+    argv.emplace_back("/bin/sh");
+    argv.emplace_back("-c");
+    argv.emplace_back(std::string{shell_cmd});
+    return argv;
 }
 
 // Build the bwrap argv prefix. Workspace gets read-write bound to
@@ -247,7 +319,9 @@ std::atomic<Backend> g_backend{Backend::None};
                                            std::string_view cwd,
                                            const std::vector<std::pair<std::string, std::string>>& env) {
     SubprocessOptions opts;
-    opts.argv = build_bwrap_argv(cmd);
+    opts.argv = detected_backend() == Backend::Bastion
+                    ? build_bastion_argv(cmd)
+                    : build_bwrap_argv(cmd);
     opts.max_bytes = max_bytes;
     opts.timeout = timeout;
     opts.cwd = std::string{cwd};
@@ -268,10 +342,17 @@ std::atomic<Backend> g_backend{Backend::None};
         return r;
     }
     // Build prefix with no shell command, then splice the user's argv.
-    auto wrapped = build_bwrap_argv("");
-    // Pop the trailing 4 elements added by build_bwrap_argv ("--",
+    // Same prefix the shell form uses, built by whichever backend is live.
+    // Both builders end with the same four elements ("--", "/bin/sh", "-c",
+    // cmd), so the pop below is backend-independent — but assert the shape
+    // rather than trusting it, because a builder that changed its tail would
+    // otherwise silently splice the user's argv into the wrong position.
+    auto wrapped = detected_backend() == Backend::Bastion
+                       ? build_bastion_argv("")
+                       : build_bwrap_argv("");
+    // Pop the trailing 4 elements added by the builder ("--",
     // "/bin/sh", "-c", ""), then append user argv directly.
-    wrapped.resize(wrapped.size() - 4);
+    if (wrapped.size() >= 4) wrapped.resize(wrapped.size() - 4);
     wrapped.emplace_back("--");
     for (const auto& a : user_argv) wrapped.push_back(a);
 
@@ -411,6 +492,7 @@ std::string describe_state() {
     const char* tag = nullptr;
     switch (b) {
         case Backend::Bwrap:       tag = "bwrap";        break;
+        case Backend::Bastion:     tag = "bastion";      break;
         case Backend::SandboxExec: tag = "sandbox-exec"; break;
         case Backend::None:        tag = nullptr;        break;
     }
@@ -466,6 +548,10 @@ SubprocessResult run_shell_command(std::string_view cmd,
 std::vector<std::string> prepare_shell_argv(std::string_view cmd) {
     if (is_active()) {
 #if defined(__linux__)
+        // Backend, not platform: Linux now has two, and which one is live is
+        // a probe result rather than a compile-time fact.
+        if (detected_backend() == Backend::Bastion)
+            return build_bastion_argv(cmd);
         return build_bwrap_argv(cmd);
 #elif defined(__APPLE__)
         return {"sandbox-exec", "-p", build_profile(workspace_root().string()),
