@@ -92,7 +92,9 @@ TEST_CASE("bash_validate") {
     expect_allowed("git push origin main");                  // no --force
 
     // ── out-of-the-box native-tool nudges (advisory, never blocks) ──────
+    using mcp::tools::util::analyze_detour;
     using mcp::tools::util::bash_tool_suggestion;
+    using mcp::tools::util::Intent;
     auto nudges = [](std::string_view c) { return !bash_tool_suggestion(c).empty(); };
     // Bare file-inspection shell-outs get a tip toward the native tool.
     CHECK(nudges("cat src/main.cpp"));
@@ -107,13 +109,64 @@ TEST_CASE("bash_validate") {
     CHECK(bash_tool_suggestion("sed -n '1,5p' f").find("symbol=") != std::string::npos);
     CHECK(bash_tool_suggestion("cat f").find("read") != std::string::npos);
     CHECK(bash_tool_suggestion("find . -name x").find("glob") != std::string::npos);
-    // SILENT when the shell is doing real work: pipes, redirects, chaining,
-    // substitution — bash is the right call there, no nudge.
-    CHECK(!nudges("cat f | grep x"));
+
+    // ── A `| head -N` tail stage is a RESULT LIMIT, not shell work ──────
+    //
+    // The old detector bailed on the first `|`, reasoning that a pipe meant
+    // bash was doing something native tools can't. A probe over one real
+    // session's shell-outs showed that premise was backwards: it caught only
+    // 4 of 10, and EVERY miss was a `|` or a `2>`. `grep … | head -20` is
+    // not shell work — it is grep plus a limit the tool already takes as a
+    // parameter, and the model reaches for the pipe precisely because it
+    // doesn't know that. These are the exact commands that were missed.
+    CHECK(nudges("grep -rn \"pending_permission\" src/tool.cpp | head -20"));
+    CHECK(nudges("grep -rn \"subtitle(\" --include=*.cpp src include | head -20"));
+    CHECK(nudges("ls build/*probe* build/bin 2>/dev/null | head -20"));
+    CHECK(nudges("ls maya/src/widget/panel* 2>/dev/null"));
+    // The bound is RECOVERED, so the tip can name the parameter that
+    // replaces the pipe — naming the tool alone is what got ignored.
+    {
+        auto d = analyze_detour("grep -rn foo src | head -20");
+        CHECK(d.bound.has_value());
+        CHECK(d.bound && d.bound->limit == 20);
+        CHECK(bash_tool_suggestion("grep -rn foo src | head -20")
+                  .find("limit:20") != std::string::npos);
+    }
+    // `tail -N` maps to a real parameter (offset:-N); say so by name.
+    CHECK(bash_tool_suggestion("tail -50 build.log").find("offset:-N")
+          != std::string::npos);
+
+    // ── READ vs WRITE is the safety boundary ────────────────────────────
+    //
+    // `sed -i` edits in place and `cat > f` writes — both matched a READ
+    // suggestion before. A tip is survivable; any caller that ACTS on that
+    // verdict silently turns a write into a read and reports success, which
+    // is the one failure a coding agent cannot recover from. So writes are
+    // classified, never suggested, and never substitutable.
+    CHECK(!nudges("sed -i 's/a/b/' f"));
+    CHECK(!nudges("cat > f.txt"));
+    CHECK(!nudges("tee out.txt"));
+    CHECK(analyze_detour("sed -i 's/a/b/' f").intent == Intent::Write);
+    CHECK(analyze_detour("cat > f.txt").intent == Intent::Write);
+    CHECK(!analyze_detour("sed -i 's/a/b/' f").substitutable());
+    CHECK(!analyze_detour("cat > f.txt").substitutable());
+    // A count is its own intent — not a read, not a search result.
+    CHECK(analyze_detour("wc -l f").intent == Intent::CountOnly);
+    CHECK(analyze_detour("grep -c foo f").intent == Intent::CountOnly);
+
+    // SILENT when the shell is genuinely doing work a native tool can't:
+    // a real transform, a redirect to a file, chaining, substitution.
     CHECK(!nudges("grep x f > out.txt"));
     CHECK(!nudges("ls && echo done"));
     CHECK(!nudges("cat $(ls)"));
     CHECK(!nudges("wc -l < f"));
+    CHECK(!nudges("ls -la | wc -l"));        // pipe into a real transform
+    CHECK(!nudges("ls tests | grep -i appear")); // two-tool composition
+    CHECK(!nudges("cat f | sort | uniq -c"));
+    // A word that merely LOOKS like a command must not trip it.
+    CHECK(!nudges("echo grep"));
+    CHECK(!nudges("git grep foo"));      // not GNU grep
+    CHECK(!nudges("xargs grep foo"));    // grep is not the command
     // Non-inspection commands never nudge.
     CHECK(!nudges("python build.py"));
     CHECK(!nudges("git status"));
