@@ -27,7 +27,180 @@ std::string_view first_token(std::string_view cmd) noexcept {
     return tok;
 }
 
-} // namespace
+// ── Destructive-rm analysis ───────────────────────────────────────
+//
+// This gate used to scan for the literal prefixes "rm -rf " / "rm -fr " /
+// "rm -r -f " / "rm -f -r ". A probe of 22 filesystem-destroying commands
+// found 19 of them walked straight through — `rm -Rf /` bypassed it on a
+// single capital letter, as did `rm -rfv /`, `rm --recursive --force /`,
+// `rm / -rf` (flags after the path), `rm -rf /tmp/../../` (traversal back to
+// root), `rm -rf /tmp /` (one legit path hiding a fatal one), `rm -rf $HOME`
+// and `rm -rf .`.
+//
+// A prefix list cannot be made complete: flag spellings are combinatorial,
+// order is free, and the dangerous part is the resolved PATH, not the text.
+// So tokenize the command, collect flags and paths separately regardless of
+// order, normalize each path (resolving `..` the way the kernel will), and
+// judge each resolved target on its own — the approach Zed's agent takes,
+// minus its bash AST, which is more machinery than this one check needs.
+
+// Split on whitespace, honouring quotes so a path with a space stays one
+// token and a quoted string is never mistaken for syntax.
+std::vector<std::string> shell_tokens(std::string_view s) {
+    std::vector<std::string> out;
+    std::string cur;
+    bool have = false;
+    char quote = '\0';
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '\\' && i + 1 < s.size()) { cur += s[++i]; have = true; continue; }
+        if (quote) {
+            if (c == quote) quote = '\0';
+            else { cur += c; }
+            have = true;
+            continue;
+        }
+        if (c == '\'' || c == '"') { quote = c; have = true; continue; }
+        if (c == ' ' || c == '\t' || c == '\n') {
+            if (have) { out.push_back(cur); cur.clear(); have = false; }
+            continue;
+        }
+        cur += c;
+        have = true;
+    }
+    if (have) out.push_back(cur);
+    return out;
+}
+
+// Resolve `.` and `..` lexically, the way the kernel will when it walks the
+// path. `/tmp/../..` is the root; not resolving it is how a traversal slips
+// past a gate that only compares text.
+std::string normalize_path(std::string_view p) {
+    const bool absolute = !p.empty() && (p.front() == '/' || p.front() == '\\');
+    std::vector<std::string_view> parts;
+    size_t i = 0;
+    while (i < p.size()) {
+        size_t j = p.find_first_of("/\\", i);
+        auto seg = p.substr(i, j == std::string_view::npos ? j : j - i);
+        if (seg == "..") {
+            if (!parts.empty()) parts.pop_back();
+            // Popping past the root stays at the root — `/..` is `/`, which
+            // is exactly the case that must stay dangerous.
+        } else if (!seg.empty() && seg != ".") {
+            parts.push_back(seg);
+        }
+        if (j == std::string_view::npos) break;
+        i = j + 1;
+    }
+    std::string out;
+    if (absolute) out += '/';
+    for (size_t k = 0; k < parts.size(); ++k) {
+        if (k) out += '/';
+        out += std::string{parts[k]};
+    }
+    if (out.empty()) out = absolute ? "/" : ".";
+    return out;
+}
+
+// Is this resolved target catastrophic to delete recursively?
+std::string_view rm_target_danger(std::string_view raw) {
+    // Trailing glob: `/`, `/*`, `~/*` all destroy the same tree.
+    std::string_view t = raw;
+    if (t.size() >= 2 && t.ends_with("*")) t.remove_suffix(1);
+
+    // Environment spellings of the home directory, before normalization —
+    // the shell would expand these, and `$HOME/../..` is the root.
+    for (std::string_view home : {"$HOME", "${HOME}", "~"}) {
+        if (t == home) return "refusing to recursively delete the home directory";
+        if (t.size() > home.size() && t.starts_with(home)
+            && (t[home.size()] == '/' || t[home.size()] == '\\')) {
+            auto rest = normalize_path(t.substr(home.size()));
+            if (rest == "/" || rest == ".")
+                return "refusing to recursively delete the home directory";
+            // `$HOME/../..` climbs above home into the filesystem root.
+            size_t up = 0;
+            for (size_t k = home.size(); k + 1 < t.size(); ++k)
+                if (t[k] == '.' && t[k + 1] == '.') { ++up; ++k; }
+            if (up >= 2)
+                return "refusing wide rm that could wipe the filesystem root";
+            return {};
+        }
+    }
+    if (t.starts_with("$")) return {};   // some other variable — unknowable
+
+    const auto norm = normalize_path(t);
+    if (norm == "/")
+        return "refusing wide rm that could wipe the filesystem root";
+    // `.` and `..` as a whole target wipe the working tree — the repo the
+    // agent is editing. Zed blocks these for the same reason.
+    if (norm == ".")
+        return "refusing `rm -r .` — it would delete the working directory";
+    return {};
+}
+
+// Does this token enable recursion? Covers -r/-R/--recursive and any short
+// cluster containing r (-rf, -Rfv, -fR…), which is where the prefix list
+// failed: `rm -Rf /` differs from `rm -rf /` by one capital letter.
+bool is_recursive_flag(std::string_view t) {
+    if (t == "--recursive") return true;
+    if (t.size() < 2 || t[0] != '-' || t[1] == '-') return false;
+    for (size_t i = 1; i < t.size(); ++i)
+        if (t[i] == 'r' || t[i] == 'R') return true;
+    return false;
+}
+
+// Scan ONE command (no chaining operators) for a catastrophic rm.
+std::string check_rm_command(const std::vector<std::string>& tok) {
+    if (tok.empty()) return {};
+    // The command word may be a path (`/bin/rm`) or have an .exe suffix.
+    std::string_view name = tok.front();
+    if (auto slash = name.find_last_of("/\\"); slash != std::string_view::npos)
+        name.remove_prefix(slash + 1);
+    if (name != "rm") return {};
+
+    bool recursive = false, end_of_flags = false;
+    std::vector<std::string_view> paths;
+    for (size_t i = 1; i < tok.size(); ++i) {
+        std::string_view t = tok[i];
+        if (!end_of_flags && t == "--") { end_of_flags = true; continue; }
+        // Flags are collected wherever they appear: `rm / -rf` puts them
+        // AFTER the path, which the old prefix scan could never see.
+        if (!end_of_flags && t.size() > 1 && t[0] == '-') {
+            if (is_recursive_flag(t)) recursive = true;
+            continue;
+        }
+        paths.push_back(t);
+    }
+    if (!recursive) return {};
+    // Every path is judged on its own, so one fatal target cannot hide
+    // behind a legitimate one (`rm -rf /tmp /`).
+    for (auto p : paths)
+        if (auto why = rm_target_danger(p); !why.empty()) return std::string{why};
+    return {};
+}
+
+// Split a command line on chaining operators so each simple command is
+// checked separately — `make && rm -rf /` must not hide behind the `make`.
+std::string check_rm_anywhere(std::string_view cmd) {
+    size_t start = 0;
+    char quote = '\0';
+    auto flush = [&](size_t end) -> std::string {
+        return check_rm_command(shell_tokens(cmd.substr(start, end - start)));
+    };
+    for (size_t i = 0; i < cmd.size(); ++i) {
+        char c = cmd[i];
+        if (c == '\\') { ++i; continue; }
+        if (quote) { if (c == quote) quote = '\0'; continue; }
+        if (c == '\'' || c == '"') { quote = c; continue; }
+        if (c == ';' || c == '|' || c == '&' || c == '\n') {
+            if (auto why = flush(i); !why.empty()) return why;
+            start = i + 1;
+        }
+    }
+    return flush(cmd.size());
+}
+
+}  // namespace
 
 std::string validate_bash_command(std::string_view cmd) {
     auto tok = first_token(cmd);
@@ -87,39 +260,9 @@ std::string validate_bash_command(std::string_view cmd) {
                    "Pass -m \"<message>\" to commit non-interactively, or use the "
                    "git_commit tool.";
     }
-    // Root-wipe patterns need the `/` to be a WHOLE argument, not a
-    // path prefix — otherwise `rm -rf /home/x/build` (a legitimate
-    // absolute-path delete) is falsely refused because it contains the
-    // substring "rm -rf /". Match only when the slash is the target:
-    // end-of-command, followed by whitespace, or the `/*` glob.
-    {
-        static constexpr std::string_view kRmPrefixes[] = {
-            "rm -rf ", "rm -fr ", "rm -r -f ", "rm -f -r ",
-        };
-        for (auto pre : kRmPrefixes) {
-            size_t p = 0;
-            while ((p = cmd.find(pre, p)) != std::string::npos) {
-                size_t a = p + pre.size();
-                while (a < cmd.size() && (cmd[a] == ' ' || cmd[a] == '\t')) a++;
-                if (a < cmd.size() && cmd[a] == '/') {
-                    size_t after = a + 1;
-                    bool root_target =
-                        after == cmd.size()
-                        || cmd[after] == ' ' || cmd[after] == '\t'
-                        || cmd[after] == ';' || cmd[after] == '&'
-                        || cmd[after] == '|' || cmd[after] == '\n'
-                        || (cmd[after] == '*');
-                    if (root_target)
-                        return "refusing wide rm that could wipe the filesystem root";
-                }
-                if (a < cmd.size() && cmd[a] == '~'
-                    && (a + 1 == cmd.size() || cmd[a + 1] == ' '
-                        || cmd[a + 1] == '\t' || cmd[a + 1] == '/'))
-                    return "refusing to recursively delete the home directory";
-                p += pre.size();
-            }
-        }
-    }
+    // Root-wipe / home-wipe / working-tree-wipe, judged on the RESOLVED
+    // target of every `rm -r` in the line (see check_rm_anywhere above).
+    if (auto why = check_rm_anywhere(cmd); !why.empty()) return why;
     static const std::vector<std::pair<std::string_view, std::string_view>> danger = {
         {":(){ :|:& };:",          "fork-bomb pattern refused"},
         {"mkfs",                   "refusing mkfs — would reformat a filesystem"},
@@ -301,9 +444,17 @@ Detour analyze_detour(std::string_view cmd) {
             if (in_quotes(stage, i)) continue;
             if (stage[i] == '`' || stage[i] == ';' || stage[i] == '\n'
                 || stage[i] == '&') { d.needs_shell = true; break; }
-            if (stage[i] == '$' && i + 1 < stage.size() && stage[i + 1] == '(') {
-                d.needs_shell = true; break;
-            }
+            // `$` unquoted is parameter expansion, arithmetic, or command
+            // substitution — all three produce a value only the shell knows,
+            // so no native tool can stand in. `cat $HOME/f` used to slip
+            // through because only the `$(` spelling was checked; a native
+            // `read` would look for a literal "$HOME" directory.
+            //
+            // Single-quoted `$` is literal text and stays substitutable,
+            // which is why this is checked outside quotes only (the same
+            // Safe-vs-Unsafe split brush_parser makes between
+            // SingleQuotedText and ParameterExpansion).
+            if (stage[i] == '$') { d.needs_shell = true; break; }
             if (stage[i] == '<') { d.needs_shell = true; break; } // heredoc
         }
         if (d.needs_shell) break;
@@ -405,7 +556,26 @@ Detour analyze_detour(std::string_view cmd) {
 
 std::string bash_tool_suggestion(std::string_view cmd) {
     const auto d = analyze_detour(cmd);
-    if (!d.substitutable()) return {};
+    // A bounded pipe on a command that genuinely needs the shell still has a
+    // native answer — just not a different TOOL. `make 2>&1 | tail -20`
+    // should stay in bash, but the pipe filters at the wrong layer: it
+    // discards the rest before the terminal card sees it, so the user loses
+    // output they were watching in order to save the model's context.
+    // head_lines/tail_lines bound only what reaches the model.
+    if (!d.substitutable()) {
+        if (d.bound && d.intent != Intent::Write) {
+            std::string tip = "tip: `";
+            tip += d.bound->from_tail ? "tail_lines" : "head_lines";
+            tip += ": " + std::to_string(d.bound->limit);
+            tip += "` bounds what comes back to you without hiding the rest "
+                   "from the user \u2014 a `| ";
+            tip += d.bound->from_tail ? "tail" : "head";
+            tip += "` drops those lines before the terminal card ever "
+                   "shows them.";
+            return tip;
+        }
+        return {};
+    }
     std::string tip = "tip: " + d.reason;
     // When the model bounded the output with `| head -N`, name the native
     // parameter that replaces the pipe — otherwise it keeps reaching for it

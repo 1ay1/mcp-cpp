@@ -58,6 +58,10 @@ if(NOT WIN32)
     add_executable(mcp_process_tools_test process_tools_test.cpp)
     target_link_libraries(mcp_process_tools_test PRIVATE mcp::tools Threads::Threads)
     add_test(NAME mcp_process_tools_test COMMAND mcp_process_tools_test)
+
+    add_executable(mcp_shell_bound_test shell_bound_test.cpp)
+    target_link_libraries(mcp_shell_bound_test PRIVATE mcp::tools Threads::Threads)
+    add_test(NAME mcp_shell_bound_test COMMAND mcp_shell_bound_test)
 endif()
 
 # ── Tier-1 tool evals (evals/run.py) ────────────────────────────────────────

@@ -63,6 +63,67 @@ TEST_CASE("bash_validate") {
     expect_allowed("rm -rf build node_modules");
     expect_allowed("rm -rf /var/cache/foo && echo done");
 
+    // ── rm bypasses the old PREFIX scan could not see ─────────────────
+    //
+    // The gate matched four literal prefixes ("rm -rf ", "rm -fr ",
+    // "rm -r -f ", "rm -f -r "). A probe of 22 filesystem-destroying
+    // commands found 19 walked straight through. A prefix list cannot be
+    // completed: flag spellings are combinatorial, flag ORDER is free, and
+    // the dangerous part is the RESOLVED PATH, not the text. Each line
+    // below deletes the root, the home directory, or the working tree.
+
+    // Flag spellings outside the list — `rm -Rf /` differed by one capital.
+    expect_refused("rm -Rf /");
+    expect_refused("rm -rfv /");
+    expect_refused("rm -fR /");
+    expect_refused("rm --recursive --force /");
+    expect_refused("rm -r -f -v /");
+    expect_refused("rm -f -r -- /");
+    // Flags AFTER the path: the prefix scan looked only to the right of the
+    // flags, so a path that came first was never examined.
+    expect_refused("rm / -rf");
+    expect_refused("rm ~ -rf");
+    // Traversal back to the root. Text comparison cannot see that
+    // `/tmp/../..` IS `/`; the path has to be resolved the way the kernel
+    // will resolve it.
+    expect_refused("rm -rf /tmp/../../");
+    expect_refused("rm -rf /home/ayush/../../");
+    expect_refused("rm -rf $HOME/../..");
+    // A fatal target hiding behind a legitimate one — every path is judged
+    // on its own, so the second argument cannot ride along.
+    expect_refused("rm -rf /tmp /");
+    expect_refused("rm -rf build /");
+    // The home directory by environment spelling.
+    expect_refused("rm -rf $HOME");
+    expect_refused("rm -rf ${HOME}");
+    // The working tree itself — the repo the agent is editing.
+    expect_refused("rm -rf .");
+    expect_refused("rm -rf ./");
+    expect_refused("rm -rf ./*");
+    expect_refused("rm -rf ..");
+
+    // ── …and the other half of the contract: real work still RUNS ───────
+    //
+    // A gate that blocks legitimate deletes gets switched off, and then it
+    // protects nothing. These must all pass.
+    expect_allowed("rm -rf ./build/CMakeFiles");
+    expect_allowed("rm -rf $HOME/.cache/agentty");
+    expect_allowed("rm -rf ${HOME}/projects/x/target");
+    expect_allowed("rm -rf ~/.cache/foo");
+    expect_allowed("rm -f somefile.txt");        // not recursive at all
+    expect_allowed("rm somefile.txt");
+    expect_allowed("rm -rf a b c");
+    expect_allowed("rm -rf /tmp/a /tmp/b");
+    expect_allowed("rm -rf build/../build");     // normalizes back to build
+    expect_allowed("rm -rf ../sibling-project/build");  // above cwd, not root
+    expect_allowed("make clean && rm -rf build");
+    // Quoted text is a STRING, not a command — searching for the pattern
+    // must not be mistaken for running it.
+    expect_allowed("echo 'rm -rf /'");
+    expect_allowed("grep -rn 'rm -rf /' src");
+    // `git rm` is a different command with a different meaning.
+    expect_allowed("git rm -r --cached .");
+
     // ── other dangerous patterns: still refused ─────────────────────────
     expect_refused(":(){ :|:& };:");
     expect_refused("mkfs.ext4 /dev/sda1");
@@ -167,6 +228,26 @@ TEST_CASE("bash_validate") {
     CHECK(!nudges("echo grep"));
     CHECK(!nudges("git grep foo"));      // not GNU grep
     CHECK(!nudges("xargs grep foo"));    // grep is not the command
+
+    // ── Expansion is the shell's job, and quoting decides what IS one ───
+    //
+    // Zed's agent resolves this with a real bash AST (brush_parser), whose
+    // word-level classification marks SingleQuotedText Safe and
+    // ParameterExpansion Unsafe. The same distinction, reached with a
+    // quote-aware scan: an unquoted `$` produces a value only the shell
+    // knows, so no native tool can stand in — a `read` would look for a
+    // directory literally named "$HOME".
+    CHECK(!nudges("cat $HOME/f"));         // parameter expansion
+    CHECK(!nudges("cat ${HOME}/f"));
+    CHECK(!nudges("head -$((2+3)) f"));    // arithmetic
+    CHECK(!nudges("cat `ls`"));            // backquoted substitution
+    CHECK(!nudges("cat <(ls)"));           // process substitution
+    // …but the same bytes INSIDE quotes are literal text, so the command is
+    // still a plain search and stays substitutable.
+    CHECK(nudges("grep -rn '$HOME' src"));
+    CHECK(nudges("grep -rn \"cat file.txt\" src"));
+    CHECK(nudges("cat \"my grep dir/f.txt\""));
+
     // Non-inspection commands never nudge.
     CHECK(!nudges("python build.py"));
     CHECK(!nudges("git status"));

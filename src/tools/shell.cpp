@@ -53,7 +53,45 @@ struct BashArgs {
     std::string cd;        // optional; empty = inherit cwd
     std::vector<std::pair<std::string, std::string>> env;  // caller overrides
     std::string display_description;
+    // Bound the output returned TO THE MODEL without bounding what the USER
+    // sees. `cmd | head -20` filters at the wrong layer: it throws the rest
+    // away before the terminal card ever gets it, so the human loses output
+    // they were watching in order to save the model's context. These do the
+    // filtering at the boundary instead — the card keeps the full stream,
+    // the model gets the slice. 0 = unbounded.
+    int         head_lines = 0;
+    int         tail_lines = 0;
 };
+
+// Keep the first `head` and/or last `tail` lines, marking what was dropped.
+// When both are set the two windows are returned with the elision between
+// them, which is the shape a build log wants: the command that started it
+// and the error that ended it.
+std::string bound_lines(const std::string& in, int head, int tail) {
+    if (head <= 0 && tail <= 0) return in;
+    std::vector<std::string_view> lines;
+    size_t start = 0;
+    while (start <= in.size()) {
+        size_t nl = in.find('\n', start);
+        if (nl == std::string::npos) {
+            if (start < in.size()) lines.emplace_back(in.data() + start, in.size() - start);
+            break;
+        }
+        lines.emplace_back(in.data() + start, nl - start);
+        start = nl + 1;
+    }
+    const int n = static_cast<int>(lines.size());
+    const int h = head > 0 ? std::min(head, n) : 0;
+    const int t = tail > 0 ? std::min(tail, n - h) : 0;
+    if (h + t >= n) return in;   // nothing actually elided
+
+    std::string out;
+    for (int i = 0; i < h; ++i) { out += lines[static_cast<size_t>(i)]; out += '\n'; }
+    out += "\n… " + std::to_string(n - h - t) + " lines elided (the terminal "
+           "card still shows them in full) …\n\n";
+    for (int i = n - t; i < n; ++i) { out += lines[static_cast<size_t>(i)]; out += '\n'; }
+    return out;
+}
 
 std::expected<BashArgs, ToolError> parse_bash_args(const json& j) {
     util::ArgReader ar(j);
@@ -102,12 +140,24 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j) {
         }
     }
 
+    // Clamped: a model asking for 100k lines wants "all of it", and the
+    // spill path already handles genuinely huge output better than a slice
+    // would. Negative is meaningless, so it reads as unset.
+    auto bound = [&](const char* key) {
+        int v = ar.integer(key, 0);
+        if (v < 0) v = 0;
+        if (v > 2000) v = 2000;
+        return v;
+    };
+
     return BashArgs{
         std::move(cmd),
         timeout_int,
         std::move(cd),
         std::move(env),
         ar.str("display_description", ""),
+        bound("head_lines"),
+        bound("tail_lines"),
     };
 }
 
@@ -274,6 +324,13 @@ ExecResult run_bash(const BashArgs& a) {
         return std::unexpected(ToolError::spawn(
             "failed to spawn command: " + r.start_error));
 
+    // Slice for the MODEL only, and only after the spill path has had its
+    // say — the user's card already holds the whole stream, and a spilled
+    // output is a preview envelope that must not be re-sliced.
+    if ((a.head_lines > 0 || a.tail_lines > 0) && !r.output.empty()
+        && r.output.rfind("<persisted-output>", 0) != 0)
+        r.output = bound_lines(r.output, a.head_lines, a.tail_lines);
+
     auto fence = [](const std::string& body) {
         return std::string{"```\n"} + body + (body.empty() || body.back() == '\n'
                                               ? "" : "\n") + "```";
@@ -375,6 +432,17 @@ json bash_schema() {
             {"timeout", {{"type","integer"}, {"description","Timeout in seconds (default 60, max 300)"}}},
             {"timeout_ms", {{"type","integer"}, {"description",
                 "Alternative timeout in milliseconds (rounded up to seconds)."}}},
+            {"head_lines", {{"type","integer"}, {"description",
+                "Return only the FIRST N lines of output to you. Use this "
+                "instead of piping to `head`: the pipe throws the rest away "
+                "before the terminal card sees it, so the user loses output "
+                "they were watching \u2014 this bounds only what reaches you, "
+                "and the card still shows everything."}}},
+            {"tail_lines", {{"type","integer"}, {"description",
+                "Return only the LAST N lines of output to you (the usual "
+                "choice for build/test logs, where the failure is at the "
+                "end). Use this instead of piping to `tail`. Combine with "
+                "head_lines to get both ends with the middle elided."}}},
         }},
     };
 }
