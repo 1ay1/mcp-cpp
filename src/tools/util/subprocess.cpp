@@ -29,6 +29,9 @@
 #  include <signal.h>
 #  include <sys/wait.h>
 #  include <unistd.h>
+#  if defined(__linux__)
+#    include <sys/syscall.h>   // SYS_close_range (see close_inherited_fds)
+#  endif
 // posix_spawn lives in <spawn.h>, but on Bionic that header is gated behind
 // __ANDROID_API__ >= 28 and is simply absent from the sysroot on lower API
 // levels (Termux on some devices). Prefer it when available; otherwise fall
@@ -443,6 +446,40 @@ bool drain_pipe(int fd, std::ostringstream& out, std::size_t& total,
     }
 }
 
+// Close every descriptor above stderr in the child.
+//
+// Access rights attach to the open file DESCRIPTION, not to the path — true
+// of Landlock and Seatbelt alike. A descriptor the parent opened before
+// confinement keeps working after it, and survives exec. One leaked fd voids
+// the entire filesystem policy: measured here, a child read an UNLINKED
+// secret through /proc/self/fd/N, having no path to it at all.
+//
+// An agent host is precisely the program this hurts — it holds credential
+// stores, session files and logs open while spawning tools it does not
+// trust. Relying on every open() site remembering O_CLOEXEC is not a
+// boundary; it is a convention that holds until one caller forgets, and a
+// sandbox that is only safe when every caller is careful is not a sandbox.
+// (bastion DESIGN.md §6.1 measures the same hole from the other side.)
+//
+// Belt and braces with the O_CLOEXEC already set on our own pipes: this
+// catches descriptors opened ANYWHERE in the process, including ones a
+// library opened without asking us.
+//
+// Called in the child AFTER the 0/1/2 wiring, so the pipe ends are already
+// duplicated onto stdout/stderr and the high-numbered originals may go.
+[[maybe_unused]] inline void close_inherited_fds() noexcept {
+#if defined(__linux__) && defined(SYS_close_range)
+    // One syscall, no /proc walk, async-signal-safe — the only form that is
+    // fully safe between fork() and exec() in a threaded process.
+    if (::syscall(SYS_close_range, 3u, ~0u, 0u) == 0) return;
+#endif
+    // Fallback sweep. An unbounded RLIMIT_NOFILE would take effectively
+    // forever, so cap it: a descriptor above this was not opened by us.
+    long maxfd = ::sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+    for (int fd = 3; fd < static_cast<int>(maxfd); ++fd) (void)::close(fd);
+}
+
 } // namespace
 
 // argv form: arguments passed verbatim, no shell. shell_command form:
@@ -614,6 +651,39 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     }
 #endif
 
+    // Inherited descriptors are the child's way around the sandbox (see
+    // close_inherited_fds). posix_spawn cannot run arbitrary code in the
+    // child, so the two platforms close them differently:
+    //
+    //   macOS  POSIX_SPAWN_CLOEXEC_DEFAULT inverts the default — every fd is
+    //          close-on-exec unless a file_action names it. Ours name 0/1/2,
+    //          which is exactly the set the child should keep.
+    //   Linux  no such flag. addclose() each descriptor we might be holding
+    //          instead: file_actions run in order in the child, so this
+    //          closes the same range the fork path sweeps.
+    //
+    // Both are additive to the O_CLOEXEC already on our pipes; the point is
+    // to catch fds opened elsewhere in the process, by us or by a library.
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    if (have_attr) {
+        short f = 0;
+        (void)::posix_spawnattr_getflags(&attr, &f);
+        if (::posix_spawnattr_setflags(
+                &attr, static_cast<short>(f | POSIX_SPAWN_CLOEXEC_DEFAULT)) == 0)
+            attrp = &attr;
+    }
+#else
+    {
+        // Bounded: sweeping to RLIMIT_NOFILE would queue a file_action per
+        // descriptor. A few hundred covers anything this process realistically
+        // holds, and the fork fallback below closes the full range anyway.
+        long lim = ::sysconf(_SC_OPEN_MAX);
+        if (lim < 0 || lim > 1024) lim = 1024;
+        for (int fd = 3; fd < static_cast<int>(lim); ++fd)
+            (void)::posix_spawn_file_actions_addclose(&actions, fd);
+    }
+#endif
+
     // A cwd was requested but this build's posix_spawn can't chdir (the
     // #if above excluded the libc — pre-2.29 glibc / bionic — or the
     // addchdir call itself failed). rc carries an errno-shaped code the
@@ -647,6 +717,11 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
         ::dup2(pipefd[1], STDERR_FILENO);
         ::close(pipefd[1]);
         ::close(pipefd[0]);
+        // Everything above stderr goes, so a descriptor this process happened
+        // to hold cannot become the child's back door around the sandbox.
+        // After the dup2s on purpose: 0/1/2 are wired, the originals are not
+        // needed, and nothing below here opens a new one before exec.
+        close_inherited_fds();
         // Real chdir in the child (not a `cd &&` prefix). Fail hard rather
         // than run in the wrong directory.
         if (!opts.cwd.empty() && ::chdir(opts.cwd.c_str()) != 0)

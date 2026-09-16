@@ -59,6 +59,10 @@ if(NOT WIN32)
     target_link_libraries(mcp_process_tools_test PRIVATE mcp::tools Threads::Threads)
     add_test(NAME mcp_process_tools_test COMMAND mcp_process_tools_test)
 
+    add_executable(mcp_fd_leak_test fd_leak_test.cpp)
+    target_link_libraries(mcp_fd_leak_test PRIVATE mcp::tools Threads::Threads)
+    add_test(NAME mcp_fd_leak_test COMMAND mcp_fd_leak_test)
+
     add_executable(mcp_shell_bound_test shell_bound_test.cpp)
     target_link_libraries(mcp_shell_bound_test PRIVATE mcp::tools Threads::Threads)
     add_test(NAME mcp_shell_bound_test COMMAND mcp_shell_bound_test)
