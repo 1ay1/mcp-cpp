@@ -92,10 +92,27 @@ inline Codec<T> build_codec() {
 // One lazily-built, immutable codec per type (Meyers singleton). Building a
 // codec allocates a tree of std::functions; doing that per-message was the hot
 // path. Thread-safe: static init is once; the codec is const thereafter.
+//
+// NEVER DESTROYED, on purpose. A plain `static const Codec<T>` is registered
+// with atexit and torn down when main returns, but the threads that read it
+// are not all joined by then: a connect/handshake worker that outlived its
+// waiter (see the orphan path in hosts that time out a slow server) calls
+// codec<InitializeParams>() while exit handlers are already running, and the
+// std::functions inside have been freed. That is a use-after-free with a
+// backtrace pointing at std::function::operator(), which reads like a
+// corrupted stack rather than a destruction-order bug, so it survives as an
+// intermittent "teardown crash" that nobody can place.
+//
+// Leaking one small immutable object per codec'd type is the standard answer:
+// it is bounded (one per type, built once), the memory returns to the OS at
+// process exit anyway, and it makes the lifetime match the actual contract —
+// a codec is readable for as long as any thread can run. The alternative,
+// joining every worker before static destruction, is not something a library
+// can enforce on its hosts.
 template <class T>
 inline const Codec<T>& codec() {
-    static const Codec<T> instance = build_codec<T>();
-    return instance;
+    static const Codec<T>* const instance = new Codec<T>(build_codec<T>());
+    return *instance;
 }
 
 template <class T> inline Json to_json(const T& v)      { return codec<T>().encode(v); }
