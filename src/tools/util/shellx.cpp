@@ -16,6 +16,8 @@
 #include <array>
 #include <charconv>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -1574,6 +1576,7 @@ std::optional<Parsed> parse_sed(const Command& c) {
     s.remove_suffix(1);
 
     LineRange r;
+    r.clamp_inverted = true;             // GNU sed: 'A,Bp' with B<A prints A
     if (!dyn) {
         const auto comma = s.find(',');
         const auto a = to_int(s.substr(0, comma));
@@ -2052,6 +2055,138 @@ std::string_view category(const Plan& p) noexcept {
         else if (cat != c) return "mixed";
     }
     return cat;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  7. Native execution
+// ═════════════════════════════════════════════════════════════════════════
+//
+// Semantics are pinned to GNU coreutils/sed by a differential test that runs
+// both paths over real files (no-trailing-newline, empty, CRLF, blank lines,
+// ranges past EOF, inverted sed ranges). The rules the code below encodes:
+//   * a "line" is a run of bytes ended by \n; a final unterminated run is a
+//     line too, and it is emitted WITHOUT a newline (cat/head/tail/sed all
+//     preserve the file's missing final newline);
+//   * sed -n 'A,Bp' with B < A prints line A only; ranges past EOF print
+//     what exists; `A,+N` is A..A+N;
+//   * wc -l counts \n bytes, prints "N\n".
+
+namespace {
+
+// A byte string cut into lines, each keeping its own terminator (or none).
+struct Lines {
+    std::vector<std::string_view> v;
+    static Lines of(std::string_view s) {
+        Lines l;
+        std::size_t i = 0;
+        while (i < s.size()) {
+            const auto nl = s.find('\n', i);
+            const std::size_t e = nl == std::string_view::npos ? s.size() : nl + 1;
+            l.v.push_back(s.substr(i, e - i));
+            i = e;
+        }
+        return l;
+    }
+    [[nodiscard]] std::string join(std::size_t b, std::size_t e) const {
+        std::string o;
+        for (std::size_t i = b; i < e && i < v.size(); ++i) o.append(v[i]);
+        return o;
+    }
+};
+
+// The read a ReadAction denotes, applied to a file's bytes.
+std::string apply_read(std::string_view bytes, const LineRange& r) {
+    const Lines L = Lines::of(bytes);
+    const std::size_t n = L.v.size();
+    if (r.from_end) {                                       // tail -N
+        const std::size_t k = static_cast<std::size_t>(std::max<std::int64_t>(0, r.first.value_or(10)));
+        return L.join(n > k ? n - k : 0, n);
+    }
+    const std::int64_t a = r.first.value_or(1);
+    if (a < 1) return {};
+    std::int64_t b = r.last ? *r.last : static_cast<std::int64_t>(n);
+    if (r.clamp_inverted && r.last && b < a) b = a;         // sed: B<A → line A only
+    const std::size_t lo = static_cast<std::size_t>(a - 1);
+    const std::size_t hi = static_cast<std::size_t>(std::max<std::int64_t>(b, 0));
+    if (lo >= n || hi <= lo) return {};                     // incl. head -0
+    return L.join(lo, std::min(hi, n));
+}
+
+std::optional<std::string> apply_shape(const std::string& in, const Shape& sh) {
+    const Lines L = Lines::of(in);
+    const std::size_t n = L.v.size();
+    switch (sh.kind) {
+        case Shape::Kind::Head: {
+            const auto k = static_cast<std::size_t>(std::max<std::int64_t>(0, sh.n));
+            return L.join(0, std::min(k, n));
+        }
+        case Shape::Kind::Tail: {
+            const auto k = static_cast<std::size_t>(std::max<std::int64_t>(0, sh.n));
+            return L.join(n > k ? n - k : 0, n);
+        }
+        case Shape::Kind::CountLines:
+            return std::to_string(std::count(in.begin(), in.end(), '\n')) + "\n";
+        default:
+            return std::nullopt;       // sort/uniq/filter: locale-dependent; decline
+    }
+}
+
+// Read a whole regular file. Declines (nullopt) on anything where the shell's
+// output involves an error message or a special file we'd have to imitate.
+std::optional<std::string> slurp_plain(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto st = fs::status(path, ec);
+    if (ec || !fs::is_regular_file(st)) return std::nullopt;   // missing/dir/fifo/dev
+    const auto sz = fs::file_size(path, ec);
+    if (ec || sz > (64u << 20)) return std::nullopt;           // huge: let the shell stream it
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return std::nullopt;                                // EACCES etc.
+    std::string s(static_cast<std::size_t>(sz), '\0');
+    f.read(s.data(), static_cast<std::streamsize>(sz));
+    if (static_cast<std::uintmax_t>(f.gcount()) != sz) return std::nullopt;   // raced
+    return s;
+}
+
+} // namespace
+
+std::optional<NativeResult> native_run(std::string_view command, std::string_view cwd) {
+    const Script s = analyze(command);
+    if (!s.clean || s.truncated) return std::nullopt;
+    // Anything nested, conditional, backgrounded or substituted: decline.
+    for (const auto& c : s.commands)
+        if ((static_cast<std::uint16_t>(c.ctx) & ~static_cast<std::uint16_t>(Ctx::Piped)) != 0)
+            return std::nullopt;
+    const Plan p = plan(s);
+    if (p.steps.empty() || !p.all_exact()) return std::nullopt;
+    // Steps must run unconditionally in order: only `;`-style sequencing
+    // between them. `a && b` / `a || b` depend on exit status we'd have to
+    // model for every branch — fine when every step succeeds, which we
+    // guarantee below (any would-be failure declines), so && is OK; || is
+    // not (the second step would NOT run).
+    for (const auto& c : s.commands) if (c.join == Join::Or) return std::nullopt;
+
+    NativeResult out;
+    for (const auto& st : p.steps) {
+        const auto* rd = std::get_if<ReadAction>(&st.action);
+        if (!rd) return std::nullopt;                 // exact Search/List: not implemented natively yet
+        std::string path = rd->path;
+        if (!path.empty() && path.front() != '/' && !cwd.empty())
+            path = std::string{cwd} + (cwd.back() == '/' ? "" : "/") + path;
+        auto bytes = slurp_plain(path);
+        if (!bytes) return std::nullopt;
+        // Binary content: cat would print it raw, and the capture path then
+        // sanitises it — identical only if we reproduce that. Decline.
+        if (bytes->find('\0') != std::string::npos) return std::nullopt;
+        std::string cur = apply_read(*bytes, rd->range);
+        for (const auto& sh : st.shapes) {
+            auto next = apply_shape(cur, sh);
+            if (!next) return std::nullopt;
+            cur = std::move(*next);
+        }
+        out.output += cur;
+    }
+    return out;
 }
 
 } // namespace mcp::tools::util::shellx

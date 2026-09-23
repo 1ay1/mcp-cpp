@@ -169,6 +169,7 @@ struct LineRange {
     std::optional<std::int64_t> first;   // 1-based, inclusive
     std::optional<std::int64_t> last;    // inclusive; nullopt = to EOF
     bool from_end = false;               // tail: `first` counts from the end
+    bool clamp_inverted = false;         // sed 'A,Bp' with B<A prints line A
 };
 
 struct ReadAction   { std::string path; LineRange range; };
@@ -221,5 +222,22 @@ struct Plan {
 [[nodiscard]] std::string native_call(const Step& st);
 // Telemetry category of a whole plan: read|search|list|git|mixed|other|none
 [[nodiscard]] std::string_view category(const Plan& p) noexcept;
+
+// ── Native execution ──────────────────────────────────────────────────────────
+//
+// Run a whole command in-process when EVERY step is an exact read shape this
+// layer implements byte-for-byte (today: `sed -n A,Bp F`, `cat F`,
+// `head -N F`, `tail -N F`, `tail -n +K F`, optionally piped through
+// `head -N` / `tail -N` / `wc -l`), producing exactly the stdout+stderr and
+// exit status the shell would. Anything else — a flag, a glob, a dynamic
+// word, a missing file whose error text we'd have to imitate, a binary file,
+// a step we don't implement — returns nullopt and the caller runs the real
+// shell. Declining is always correct; answering differently never is.
+struct NativeResult {
+    std::string output;   // stdout + stderr, in the order the shell prints them
+    int exit_code = 0;
+};
+[[nodiscard]] std::optional<NativeResult> native_run(std::string_view command,
+                                                     std::string_view cwd);
 
 } // namespace mcp::tools::util::shellx
