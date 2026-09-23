@@ -215,8 +215,11 @@ private:
                 r.capabilities = caps_;
                 if (!instructions_.empty()) r.instructions = instructions_;
                 if (discover_cache_.ttl_ms > 0) {
-                    r.ttlMs      = discover_cache_.ttl_ms;
-                    r.cacheScope = discover_cache_.scope;
+                    // Clamp: the schema says `minimum: 0` and int64_t
+                    // cannot express it, so enforce at the boundary.
+                    r.ttlMs      = std::max<std::int64_t>(0, discover_cache_.ttl_ms);
+                    r.cacheScope = discover_cache_.scope.empty()
+                                 ? std::string{"private"} : discover_cache_.scope;
                 }
                 r.meta = Json::object();
                 r.meta[std::string(meta_key::ServerInfo)] = to_json(info_);
@@ -274,8 +277,9 @@ private:
                 std::sort(r.tools.begin(), r.tools.end(),
                           [](const Tool& a, const Tool& b) { return a.name < b.name; });
                 if (discover_cache_.ttl_ms > 0) {
-                    r.ttlMs = discover_cache_.ttl_ms;
-                    r.cacheScope = discover_cache_.scope;
+                    r.ttlMs      = std::max<std::int64_t>(0, discover_cache_.ttl_ms);
+                    r.cacheScope = discover_cache_.scope.empty()
+                                 ? std::string{"private"} : discover_cache_.scope;
                 }
                 return Just<Json>(to_json(r));
             });

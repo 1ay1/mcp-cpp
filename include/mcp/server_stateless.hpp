@@ -436,11 +436,18 @@ struct CacheHint {
 };
 
 // Attach a cache hint to any result object (adds ttlMs / cacheScope in-place).
+//
+// ALWAYS both keys: the schema marks ttlMs and cacheScope `required` on
+// every cacheable result, so skipping them for a zero TTL emitted a
+// response missing two required fields — and a zero TTL is the ordinary way
+// to say "do not cache this", not an edge case.
+//
+// Clamped at 0 because the schema also says `minimum: 0`. std::int64_t
+// cannot express that, so this is where the constraint is enforced: one
+// choke point, rather than trusting every caller.
 inline Json& apply_cache_hint(Json& result, const CacheHint& h) {
-    if (h.ttl_ms > 0) {
-        result["ttlMs"]      = h.ttl_ms;
-        result["cacheScope"] = h.scope;
-    }
+    result["ttlMs"]      = h.ttl_ms > 0 ? h.ttl_ms : 0;
+    result["cacheScope"] = h.scope.empty() ? std::string{"private"} : h.scope;
     return result;
 }
 inline Json with_cache_hint(Json result, const CacheHint& h) {
