@@ -424,17 +424,19 @@ namespace {
 // Drain whatever's currently readable on `fd` without blocking.
 // Returns true if EOF (read==0) was observed; the caller uses that to
 // distinguish "more might come later" from "writer closed for good".
-bool drain_pipe(int fd, std::ostringstream& out, std::size_t& total,
+bool drain_pipe(int fd, std::string& out, std::size_t& total,
                 std::size_t max_bytes, bool& truncated) {
     if (fd < 0) return true;
-    char buf[4096];
+    // 64 KiB per read: a chatty child (rg --json over a repo, a build log)
+    // emits megabytes, and 4 KiB reads meant ~20k syscalls per MB.
+    static thread_local std::array<char, 64 * 1024> buf;
     for (;;) {
-        ssize_t n = ::read(fd, buf, sizeof(buf));
+        ssize_t n = ::read(fd, buf.data(), buf.size());
         if (n > 0) {
             if (truncated) continue;
             std::size_t room = (total < max_bytes) ? max_bytes - total : 0;
             std::size_t w = std::min<std::size_t>(static_cast<std::size_t>(n), room);
-            out.write(buf, static_cast<std::streamsize>(w));
+            out.append(buf.data(), w);
             total += w;
             if (w < static_cast<std::size_t>(n)) truncated = true;
             continue;
@@ -508,6 +510,12 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     (void)::fcntl(pipefd[1], F_SETFD, ::fcntl(pipefd[1], F_GETFD) | FD_CLOEXEC);
 #endif
     (void)::fcntl(pipefd[0], F_SETFL, ::fcntl(pipefd[0], F_GETFL) | O_NONBLOCK);
+#if defined(__linux__) && defined(F_SETPIPE_SZ)
+    // Default pipe is 64 KiB: a fast writer fills it and blocks until we
+    // wake, so a 1.5 MB rg run became ~25 fill/wake round-trips. 1 MiB is
+    // the unprivileged max (/proc/sys/fs/pipe-max-size); failure is fine.
+    (void)::fcntl(pipefd[1], F_SETPIPE_SZ, 1024 * 1024);
+#endif
 
     // Build child argv. Shell form goes through `/bin/sh -c <cmd>` so
     // pipes / redirects / globs work; argv form bypasses the shell for
@@ -796,13 +804,14 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     bool eof        = false;
     int  wait_status = 0;
 
-    std::ostringstream out;
+    std::string out;
     std::size_t total     = 0;
     bool        truncated = false;
+    bool        stopped_early = false;
 
     auto emit_progress = [&]{
         if (!opts.on_progress) return;
-        opts.on_progress(clean_capture(out.str()));
+        opts.on_progress(clean_capture(out));
         last_emit = clock::now();
     };
 
@@ -821,6 +830,8 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     bool reaped = false;
     bool group_done = false;
     auto cleanup_deadline = clock::time_point::max();
+    int  exit_fd = -2;   // pidfd for the reap wait; -2 = not opened yet
+    auto reap_backoff = std::chrono::microseconds{200};
     while (!eof || !reaped || (sent_term && !group_done)) {
         auto now = clock::now();
 
@@ -835,6 +846,13 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
             signal_group(SIGTERM);
             sent_term = true;
             cancelled = true;
+            kill_at = now + kKillGrace;
+        }
+        if (!sent_term && opts.stop_when && !out.empty()
+            && opts.stop_when(std::string_view{out})) {
+            signal_group(SIGTERM);
+            sent_term = true;
+            stopped_early = true;
             kill_at = now + kKillGrace;
         }
         if (!sent_term && has_idle_window && now >= idle_deadline) {
@@ -878,13 +896,19 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
         if (wait_ms < 0)   wait_ms = 0;
         if (wait_ms > 100) wait_ms = 100;
 
+        bool got_data = false;
         if (!eof) {
             struct pollfd pfd{pipefd[0], POLLIN, 0};
             int pn = ::poll(&pfd, 1, static_cast<int>(wait_ms));
             if (pn > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
                 const auto bytes_before = total;
+                const bool was_truncated = truncated;
                 if (drain_pipe(pipefd[0], out, total, opts.max_bytes, truncated))
                     eof = true;
+                // Past max_bytes drain_pipe discards, so `total` stops moving;
+                // the revents still mean the child is producing.
+                got_data = total > bytes_before || was_truncated
+                         || (pfd.revents & POLLIN);
                 // Any forward progress in stdout/stderr resets the idle
                 // window — a chatty child (build with progress lines, log
                 // tail, long-running test runner) never starves the
@@ -897,16 +921,34 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
                 eof = true;   // poll error → stop trying to read
             }
         } else {
-            // Pipe is done; just sleep briefly until reap completes.
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(std::min<long>(wait_ms, 20)));
+            // Pipe is done; wait for the reap. On Linux block on a pidfd,
+            // which wakes the instant the child exits (this used to be a
+            // flat 20 ms sleep on EVERY command — the child had long exited,
+            // we just weren't looking). Elsewhere back off 0.2 ms → 20 ms.
+            const long cap = std::min<long>(wait_ms, 20);
+#if defined(__linux__) && defined(SYS_pidfd_open)
+            if (exit_fd == -2)
+                exit_fd = static_cast<int>(::syscall(SYS_pidfd_open, pid, 0));
+            if (exit_fd >= 0) {
+                struct pollfd xfd{exit_fd, POLLIN, 0};
+                (void)::poll(&xfd, 1, static_cast<int>(cap));
+            } else
+#endif
+            {
+                std::this_thread::sleep_for(reap_backoff);
+                reap_backoff = std::min<std::chrono::microseconds>(
+                    reap_backoff * 2, std::chrono::milliseconds(cap > 0 ? cap : 1));
+            }
         }
 
         // Non-blocking reap. If the child is gone but the pipe's still
         // open (grandchild inherited stdout), force-close the read end
         // so the next loop iteration sees eof=true and we exit cleanly
         // instead of waiting forever on a phantom writer.
-        if (!reaped) {
+        // While the pipe is still flowing there's nothing to reap-check
+        // every iteration; do it only once the pipe is done, or on the
+        // slow path (no data this round) to catch the phantom-writer case.
+        if (!reaped && (eof || !got_data)) {
             int status = 0;
             pid_t w = ::waitpid(pid, &status, WNOHANG);
             if (w == pid) {
@@ -932,6 +974,7 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     }
 
     if (pipefd[0] >= 0) ::close(pipefd[0]);
+    if (exit_fd >= 0) ::close(exit_fd);
     emit_progress();   // final flush so the UI sees the last bytes
 
     if      (WIFEXITED  (wait_status)) r.exit_code = WEXITSTATUS(wait_status);
@@ -939,7 +982,15 @@ SubprocessResult run_posix(const std::vector<std::string>& argv_in,
     r.timed_out = timed_out;
     r.cancelled = cancelled;
     r.truncated = truncated;
-    r.output    = clean_capture(out.str());
+    r.stopped_early = stopped_early;
+    // We stopped it on purpose: the SIGTERM exit status is ours, not the
+    // child's. Report what the child would have: success with output.
+    if (stopped_early
+        && WIFSIGNALED(wait_status)
+        && (WTERMSIG(wait_status) == SIGTERM || WTERMSIG(wait_status) == SIGKILL
+            || WTERMSIG(wait_status) == SIGPIPE))
+        r.exit_code = 0;
+    r.output    = clean_capture(std::move(out));
     return r;
 }
 

@@ -75,6 +75,12 @@ struct SubprocessOptions {
     // flush — no need for delta-aware splitting on the caller side.
     std::function<void(std::string_view snapshot)> on_progress = nullptr;
     std::function<bool()> cancelled = nullptr;
+    // Checked against the raw captured bytes after each read. Returning
+    // true means "I have all I will use": the child is stopped (SIGTERM to
+    // its group) and the result is returned as a normal exit, not a
+    // timeout. Lets a consumer that reads only the first N records (grep's
+    // match cap) skip the rest of the child's work.
+    std::function<bool(std::string_view captured)> stop_when = nullptr;
 };
 
 struct SubprocessResult {
@@ -83,6 +89,7 @@ struct SubprocessResult {
     bool timed_out   = false;
     bool cancelled   = false;
     bool truncated   = false;
+    bool stopped_early = false;        // stop_when fired
     bool started     = true;           // false iff spawn itself failed
     std::string start_error;           // populated when started==false
 };
