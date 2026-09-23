@@ -16,6 +16,7 @@
 #include <cctype>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -212,6 +213,91 @@ std::vector<std::string> dirty_submodules(const std::string& git_dir) {
     // the overwhelmingly common non-submodule repo.
     std::error_code ec;
     if (!fs::exists(fs::path{git_dir} / ".gitmodules", ec)) return out;
+    // A submodule.<n>.ignore / diff.ignoreSubmodules setting hides some
+    // submodules from `git status` but not from the foreach walk, so with
+    // one present keep the exhaustive walk (the old behaviour, exactly).
+    const bool has_ignore_cfg = [&] {
+        for (const auto& argv : {
+                 std::vector<std::string>{"git", "-C", git_dir, "config",
+                     "--get-regexp",
+                     "^(submodule\\..*\\.ignore|diff\\.ignoresubmodules)$"},
+                 std::vector<std::string>{"git", "-C", git_dir, "config",
+                     "-f", (fs::path{git_dir} / ".gitmodules").string(),
+                     "--get-regexp", "^submodule\\..*\\.ignore$"}}) {
+            auto c = util::run_argv_s(hardened_git_argv(argv), 4096);
+            if (c.started && c.exit_code == 0 && !c.output.empty()) return true;
+        }
+        return false;
+    }();
+    if (!has_ignore_cfg) {
+        // `git status --porcelain=v2` puts a submodule state on every gitlink
+        // row: `S<c><m><u>` — m = tracked changes inside, u = untracked
+        // content inside. Those are exactly the cases the walk's
+        // `git diff / diff --cached / status --porcelain` test reports.
+        // (c = the checked-out commit moved, which the walk ignores too.)
+        // So only descend into submodules status already flags, instead of
+        // spawning a shell + 3 git processes for every submodule.
+        std::function<void(const fs::path&, const std::string&)> scan =
+            [&](const fs::path& dir, const std::string& prefix) {
+                auto st = util::run_argv_s(hardened_git_argv(
+                    {"git", "-c", "core.quotePath=false", "-C", dir.string(),
+                     "status", "--porcelain=v2",
+                     "--ignore-submodules=none"}), 200'000);
+                if (!st.started || st.exit_code != 0) return;
+                // Can't use -z: captured output goes through clean_capture,
+                // which strips NUL. With quotePath=false git only quotes a
+                // path holding `"`, `\` or a control char, C-style.
+                auto unquote = [](std::string_view q) {
+                    if (q.size() < 2 || q.front() != '"' || q.back() != '"')
+                        return std::string{q};
+                    std::string o;
+                    for (std::size_t i = 1; i + 1 < q.size(); ++i) {
+                        char c = q[i];
+                        if (c != '\\' || i + 2 >= q.size()) { o += c; continue; }
+                        char e = q[++i];
+                        switch (e) {
+                            case 'n': o += '\n'; break;
+                            case 't': o += '\t'; break;
+                            case '"': o += '"';  break;
+                            case '\\': o += '\\'; break;
+                            default:
+                                if (e >= '0' && e <= '7' && i + 2 < q.size()) {
+                                    o += static_cast<char>(((e - '0') << 6)
+                                        | ((q[i + 1] - '0') << 3) | (q[i + 2] - '0'));
+                                    i += 2;
+                                } else { o += e; }
+                        }
+                    }
+                    return o;
+                };
+                std::string_view sv{st.output};
+                std::size_t lo = 0;
+                while (lo < sv.size()) {
+                    auto nl = sv.find('\n', lo);
+                    std::string_view row = sv.substr(
+                        lo, (nl == std::string_view::npos ? sv.size() : nl) - lo);
+                    lo = nl == std::string_view::npos ? sv.size() : nl + 1;
+                    // `1 XY SCMU mH mI mW hH hI path` — gitlink rows only.
+                    if (row.size() < 10 || row[0] != '1' || row[5] != 'S') continue;
+                    const bool dirty = row[7] == 'M' || row[8] == 'U';
+                    std::size_t f = 0, p = 0;
+                    for (; p < row.size() && f < 8; ++p) if (row[p] == ' ') ++f;
+                    if (f < 8 || p >= row.size()) continue;
+                    std::string path = unquote(row.substr(p));
+                    const std::string disp = prefix + path;
+                    if (dirty) {
+                        out.push_back(disp);
+                        // Nested submodules can only be dirty if this one is
+                        // (their dirt shows up as this one's `m`/`u`).
+                        if (fs::exists(dir / path / ".gitmodules", ec))
+                            scan(dir / path, disp + "/");
+                    }
+                }
+            };
+        scan(fs::path{git_dir}, "");
+        std::sort(out.begin(), out.end());
+        return out;
+    }
     // `git submodule status` prefixes each line with a status char:
     //   ' ' clean, '+' checked-out commit differs, '-' not initialised,
     //   'U' merge conflicts. A trailing ` (dirty)`-style suffix isn't emitted

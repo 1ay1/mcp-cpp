@@ -528,6 +528,48 @@ TEST_CASE("search_tools") {
             assert(sir.text.find("untracked.txt") != std::string::npos
                    && "git_status path=mod must operate inside the submodule");
             std::puts("git_status: path into submodule routes to submodule repo");
+
+            // The dirty-submodule list is now derived from porcelain=v2
+            // instead of a foreach walk. Pin it to the OLD walk's answer
+            // in every state: clean, untracked, modified, staged, moved
+            // commit (walk ignores it), and a nested dirty submodule.
+            auto walk = [&] {
+                auto w = obj(); w["command"] =
+                    "git submodule --quiet foreach --recursive "
+                    "'git diff --quiet && git diff --cached --quiet && "
+                    "test -z \"$(git status --porcelain)\" || echo \"$displaypath\"'";
+                return call(*provider, "shell", w).text;
+            };
+            auto flagged = [&](const std::string& name) {
+                auto r = call(*provider, "git_status", obj());
+                return r.text.find("submodules with uncommitted changes")
+                           != std::string::npos
+                    && r.text.find(name) != std::string::npos;
+            };
+            auto sh = [&](const std::string& c) {
+                auto s = obj(); s["command"] = c;
+                auto r = call(*provider, "shell", s);
+                assert(!r.is_error);
+            };
+            struct St { const char* name; std::string setup; };
+            const std::vector<St> states = {
+                {"clean",     "rm -f mod/untracked.txt"},
+                {"untracked", "echo u > mod/u2.txt"},
+                {"modified",  "rm -f mod/u2.txt && echo m >> mod/f.txt"},
+                {"staged",    "git -C mod add f.txt"},
+                {"committed", "git -C mod -c user.email=t@t.t -c user.name=T "
+                              "commit -q -m moved"},
+            };
+            for (const auto& s : states) {
+                sh(s.setup);
+                const bool old_says = walk().find("mod") != std::string::npos;
+                const bool new_says = flagged("mod");
+                std::printf("submodule state %-9s old=%d new=%d\n",
+                            s.name, old_says, new_says);
+                assert(old_says == new_says
+                       && "dirty-submodule detection must match the old walk");
+            }
+            std::puts("git_status: submodule detection matches old walk");
         }
 
         // git_commit with empty message rejected
