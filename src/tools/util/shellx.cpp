@@ -1960,35 +1960,72 @@ bool Plan::all_exact() const noexcept {
 }
 
 std::string describe(const Step& st) {
+    // Card label: must stay short. A 120-char regex or a 5-path search list
+    // would push the raw command (shown after the label) off the row.
+    auto clip = [](std::string s, std::size_t n) {
+        if (s.size() <= n) return s;
+        std::size_t cut = n;
+        while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) --cut;   // UTF-8 boundary
+        return s.substr(0, cut) + "\xe2\x80\xa6";
+    };
     return std::visit([&](const auto& a) -> std::string {
         using A = std::decay_t<decltype(a)>;
         if constexpr (std::is_same_v<A, ReadAction>) {
-            std::string r = "Read " + a.path;
+            std::string r = "Read " + clip(a.path, 60);
             if (a.range.from_end && a.range.first) r += " (last " + std::to_string(*a.range.first) + " lines)";
             else if (a.range.first && a.range.last) r += ":" + std::to_string(*a.range.first) + "-" + std::to_string(*a.range.last);
             else if (a.range.first && *a.range.first > 1) r += ":" + std::to_string(*a.range.first) + "-";
             return r;
         } else if constexpr (std::is_same_v<A, SearchAction>) {
-            std::string r = "Search `" + a.pattern + "`";
+            std::string r = "Search `" + clip(a.pattern, 32) + "`";
             if (!a.paths.empty()) {
-                r += " in ";
-                for (std::size_t k = 0; k < a.paths.size(); ++k) { if (k) r += ", "; r += a.paths[k]; }
+                r += " in " + clip(a.paths[0], 40);
+                if (a.paths.size() > 1) r += " +" + std::to_string(a.paths.size() - 1);
             }
-            if (!a.include_globs.empty()) r += " (" + a.include_globs.front() + ")";
+            if (!a.include_globs.empty()) r += " (" + clip(a.include_globs.front(), 16) + ")";
             return r;
         } else if constexpr (std::is_same_v<A, ListAction>) {
             std::string r = a.recursive ? "Find " : "List ";
-            r += a.path;
-            if (a.name_glob) r += " " + *a.name_glob;
+            r += clip(a.path, 50);
+            if (a.name_glob) r += " " + clip(*a.name_glob, 20);
             return r;
         } else if constexpr (std::is_same_v<A, GitReadAction>) {
             std::string r = "git " + a.sub;
-            for (const auto& x : a.args) { if (r.size() > 60) { r += " …"; break; } r += " " + x; }
+            for (const auto& x : a.args) { if (r.size() > 40) { r += " \xe2\x80\xa6"; break; } r += " " + x; }
             return r;
         } else {
             return "Run " + a.program;
         }
     }, st.action);
+}
+
+std::string describe(const Plan& p) {
+    if (p.steps.empty()) return {};
+    if (p.steps.size() == 1) return describe(p.steps[0]);
+    // Several steps: one line can't hold them all. Count by kind:
+    // "3 searches, 1 read" — the raw command after the label says which.
+    int reads = 0, searches = 0, lists = 0, gits = 0, other = 0;
+    for (const auto& s : p.steps)
+        std::visit([&](const auto& a) {
+            using A = std::decay_t<decltype(a)>;
+            if constexpr (std::is_same_v<A, ReadAction>) ++reads;
+            else if constexpr (std::is_same_v<A, SearchAction>) ++searches;
+            else if constexpr (std::is_same_v<A, ListAction>) ++lists;
+            else if constexpr (std::is_same_v<A, GitReadAction>) ++gits;
+            else ++other;
+        }, s.action);
+    std::string r;
+    auto add = [&](int n, const char* one, const char* many) {
+        if (!n) return;
+        if (!r.empty()) r += ", ";
+        r += std::to_string(n) + " " + (n == 1 ? one : many);
+    };
+    add(searches, "search", "searches");
+    add(reads, "read", "reads");
+    add(lists, "listing", "listings");
+    add(gits, "git query", "git queries");
+    add(other, "command", "commands");
+    return r;
 }
 
 std::string native_call(const Step& st) {
