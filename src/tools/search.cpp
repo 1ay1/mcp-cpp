@@ -903,15 +903,32 @@ ExecResult run_ripgrep(const GrepArgs& a) {
     argv.push_back(a.pattern);
     argv.push_back(a.root.empty() ? std::string{"."} : a.root);
 
+    // rg streams every match in the tree, but we only ever use the first
+    // kMaxScanned. Stop it as soon as we have them; the count shown is then
+    // "500+" exactly as before. Counting the `"type":"match"` marker is
+    // exact: rg escapes the same text inside JSON strings.
+    std::size_t seen_upto = 0;
+    int seen_matches = 0;
+    auto enough = [&](std::string_view cap) {
+        constexpr std::string_view kMark = "{\"type\":\"match\"";
+        for (std::size_t p = cap.find(kMark, seen_upto);
+             p != std::string_view::npos; p = cap.find(kMark, p + 1)) {
+            if (++seen_matches > kMaxScanned) return true;
+            seen_upto = p + 1;
+        }
+        if (cap.size() > kMark.size()) seen_upto = std::max(seen_upto, cap.size() - kMark.size());
+        return false;
+    };
     auto r = util::Subprocess::run(util::SubprocessOptions{
         .argv      = std::move(argv),
         .timeout   = std::chrono::seconds(60),
         .max_bytes = 8 * 1024 * 1024,
+        .stop_when = enough,
     });
     if (!r.started)
         return std::unexpected(ToolError::spawn(
             "rg failed to start: " + r.start_error));
-    if (r.exit_code == 1)
+    if (r.exit_code == 1 && !r.stopped_early)
         return ToolOutput{grep_no_match_hint(a), std::nullopt};
     if (r.exit_code != 0)
         return std::unexpected(ToolError::subprocess(
