@@ -178,6 +178,7 @@ struct SearchAction {
     std::vector<std::string> paths;      // empty = cwd
     bool regex = true, ignore_case = false, word = false, fixed = false;
     bool recursive = false, line_numbers = false, count = false, files_only = false;
+    bool extended = false;               // -E (ERE syntax); false = BRE
     int  context_before = 0, context_after = 0;
     std::vector<std::string> include_globs;
 };
