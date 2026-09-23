@@ -73,7 +73,12 @@ public:
             ListToolsResult res = client_->list_tools(cursor).get();
             for (auto& t : res.tools) all.push_back(std::move(t));
             cursor = res.nextCursor;
-            if (res.ttlMs.has_value()) ttl = res.ttlMs;   // first page's hint
+            // ttlMs is REQUIRED by the schema and non-nullable, so it is a
+            // total field now rather than a Maybe. 0 and "absent" already
+            // meant the same thing here — deadline_from_ttl treats a
+            // zero/negative TTL as "do not cache" — so keep the first
+            // page's hint and let a 0 flow through unchanged.
+            if (res.ttlMs > 0 && !ttl.has_value()) ttl = res.ttlMs;
         } while (cursor.has_value());
         std::lock_guard<std::mutex> lk(state_mu_);
         tools_ = std::move(all);

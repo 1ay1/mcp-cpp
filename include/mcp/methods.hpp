@@ -153,8 +153,8 @@ struct DiscoverResult {
     Maybe<std::string>      instructions;
     // Cache directives (schema.ts caching utility): time-to-live in ms and the
     // cache scope ("public" | "private").
-    Maybe<std::int64_t>     ttlMs;
-    Maybe<std::string>      cacheScope;
+    std::int64_t     ttlMs = 0;
+    std::string      cacheScope = "private";
     // serverInfo travels under _meta["io.modelcontextprotocol/serverInfo"].
     Json                    meta = Json::object();
 };
@@ -165,8 +165,8 @@ template <> struct CodecOf<DiscoverResult> {
             defaulted("supportedVersions", &DiscoverResult::supportedVersions, List<std::string>{}),
             defaulted("capabilities",     &DiscoverResult::capabilities, ServerCapabilities{}),
             optional ("instructions",     &DiscoverResult::instructions),
-            optional ("ttlMs",            &DiscoverResult::ttlMs),
-            optional ("cacheScope",       &DiscoverResult::cacheScope),
+            defaulted("ttlMs",            &DiscoverResult::ttlMs, std::int64_t{0}),
+            defaulted("cacheScope",       &DiscoverResult::cacheScope, std::string{"private"}),
             meta     ("_meta",            &DiscoverResult::meta));
     }
 };
@@ -190,8 +190,8 @@ using ListResourcesParams = PaginatedParams;
 struct ListResourcesResult {
     List<Resource>      resources;
     Maybe<std::string>  nextCursor;
-    Maybe<std::int64_t> ttlMs;
-    Maybe<std::string>  cacheScope;
+    std::int64_t ttlMs = 0;
+    std::string  cacheScope = "private";
     // REQUIRED from 2026-07-28 (see CallToolResult::resultType for the
     // full rule). Defaulted both ways: always emitted so the MUST holds,
     // and an older server omitting it decodes as "complete".
@@ -203,8 +203,8 @@ template <> struct CodecOf<ListResourcesResult> {
         return record<ListResourcesResult>(
             defaulted("resources",  &ListResourcesResult::resources, List<Resource>{}),
             optional ("nextCursor", &ListResourcesResult::nextCursor),
-            optional ("ttlMs",      &ListResourcesResult::ttlMs),
-            optional ("cacheScope", &ListResourcesResult::cacheScope),
+            defaulted("ttlMs",      &ListResourcesResult::ttlMs, std::int64_t{0}),
+            defaulted("cacheScope", &ListResourcesResult::cacheScope, std::string{"private"}),
             defaulted("resultType",        &ListResourcesResult::resultType,
                       std::string{"complete"}),
             meta     ("_meta",      &ListResourcesResult::meta));
@@ -219,8 +219,8 @@ struct ListResourceTemplatesResult {
     // was the odd one out — ListTools/ListPrompts/ListResources/ReadResource
     // all carried it, so a client that caches by scope silently treated
     // template listings as uncacheable.
-    Maybe<std::int64_t>    ttlMs;
-    Maybe<std::string>     cacheScope;
+    std::int64_t    ttlMs = 0;
+    std::string     cacheScope = "private";
     // REQUIRED from 2026-07-28 (see CallToolResult::resultType for the
     // full rule). Defaulted both ways: always emitted so the MUST holds,
     // and an older server omitting it decodes as "complete".
@@ -232,8 +232,8 @@ template <> struct CodecOf<ListResourceTemplatesResult> {
         return record<ListResourceTemplatesResult>(
             defaulted("resourceTemplates", &ListResourceTemplatesResult::resourceTemplates, List<ResourceTemplate>{}),
             optional ("nextCursor",        &ListResourceTemplatesResult::nextCursor),
-            optional ("ttlMs",             &ListResourceTemplatesResult::ttlMs),
-            optional ("cacheScope",        &ListResourceTemplatesResult::cacheScope),
+            defaulted("ttlMs",             &ListResourceTemplatesResult::ttlMs, std::int64_t{0}),
+            defaulted("cacheScope",        &ListResourceTemplatesResult::cacheScope, std::string{"private"}),
             defaulted("resultType",        &ListResourceTemplatesResult::resultType,
                       std::string{"complete"}),
             meta     ("_meta",             &ListResourceTemplatesResult::meta));
@@ -250,8 +250,8 @@ template <> struct CodecOf<ReadResourceParams> {
 };
 struct ReadResourceResult {
     List<ResourceContents> contents;
-    Maybe<std::int64_t>    ttlMs;
-    Maybe<std::string>     cacheScope;
+    std::int64_t    ttlMs = 0;
+    std::string     cacheScope = "private";
     // REQUIRED from 2026-07-28 (see CallToolResult::resultType for the
     // full rule). Defaulted both ways: always emitted so the MUST holds,
     // and an older server omitting it decodes as "complete".
@@ -262,8 +262,8 @@ template <> struct CodecOf<ReadResourceResult> {
     static Codec<ReadResourceResult> get() {
         return record<ReadResourceResult>(
             required("contents",   &ReadResourceResult::contents),
-            optional("ttlMs",      &ReadResourceResult::ttlMs),
-            optional("cacheScope", &ReadResourceResult::cacheScope),
+            defaulted("ttlMs",      &ReadResourceResult::ttlMs, std::int64_t{0}),
+            defaulted("cacheScope", &ReadResourceResult::cacheScope, std::string{"private"}),
             defaulted("resultType",        &ReadResourceResult::resultType,
                       std::string{"complete"}),
             meta    ("_meta",      &ReadResourceResult::meta));
@@ -292,8 +292,8 @@ using ListPromptsParams = PaginatedParams;
 struct ListPromptsResult {
     List<Prompt>        prompts;
     Maybe<std::string>  nextCursor;
-    Maybe<std::int64_t> ttlMs;
-    Maybe<std::string>  cacheScope;
+    std::int64_t ttlMs = 0;
+    std::string  cacheScope = "private";
     // REQUIRED from 2026-07-28 (see CallToolResult::resultType for the
     // full rule). Defaulted both ways: always emitted so the MUST holds,
     // and an older server omitting it decodes as "complete".
@@ -305,8 +305,8 @@ template <> struct CodecOf<ListPromptsResult> {
         return record<ListPromptsResult>(
             defaulted("prompts",    &ListPromptsResult::prompts, List<Prompt>{}),
             optional ("nextCursor", &ListPromptsResult::nextCursor),
-            optional ("ttlMs",      &ListPromptsResult::ttlMs),
-            optional ("cacheScope", &ListPromptsResult::cacheScope),
+            defaulted("ttlMs",      &ListPromptsResult::ttlMs, std::int64_t{0}),
+            defaulted("cacheScope", &ListPromptsResult::cacheScope, std::string{"private"}),
             defaulted("resultType",        &ListPromptsResult::resultType,
                       std::string{"complete"}),
             meta     ("_meta",      &ListPromptsResult::meta));
@@ -372,8 +372,8 @@ struct ListToolsResult {
     Maybe<std::string>  nextCursor;
     // Caching utility (SEP-2549): how long this catalog stays fresh + at what
     // scope, so a client can cache it and keep prompt caches stable.
-    Maybe<std::int64_t> ttlMs;
-    Maybe<std::string>  cacheScope;
+    std::int64_t ttlMs = 0;
+    std::string  cacheScope = "private";
     // REQUIRED from 2026-07-28 (see CallToolResult::resultType for the
     // full rule). Defaulted both ways: always emitted so the MUST holds,
     // and an older server omitting it decodes as "complete".
@@ -385,8 +385,8 @@ template <> struct CodecOf<ListToolsResult> {
         return record<ListToolsResult>(
             defaulted("tools",      &ListToolsResult::tools, List<Tool>{}),
             optional ("nextCursor", &ListToolsResult::nextCursor),
-            optional ("ttlMs",      &ListToolsResult::ttlMs),
-            optional ("cacheScope", &ListToolsResult::cacheScope),
+            defaulted("ttlMs",      &ListToolsResult::ttlMs, std::int64_t{0}),
+            defaulted("cacheScope", &ListToolsResult::cacheScope, std::string{"private"}),
             defaulted("resultType",        &ListToolsResult::resultType,
                       std::string{"complete"}),
             meta     ("_meta",      &ListToolsResult::meta));
