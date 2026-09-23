@@ -215,6 +215,12 @@ using ListResourceTemplatesParams = PaginatedParams;
 struct ListResourceTemplatesResult {
     List<ResourceTemplate> resourceTemplates;
     Maybe<std::string>     nextCursor;
+    // Caching utility (SEP-2549), same as the sibling list results. This one
+    // was the odd one out — ListTools/ListPrompts/ListResources/ReadResource
+    // all carried it, so a client that caches by scope silently treated
+    // template listings as uncacheable.
+    Maybe<std::int64_t>    ttlMs;
+    Maybe<std::string>     cacheScope;
     // REQUIRED from 2026-07-28 (see CallToolResult::resultType for the
     // full rule). Defaulted both ways: always emitted so the MUST holds,
     // and an older server omitting it decodes as "complete".
@@ -226,6 +232,8 @@ template <> struct CodecOf<ListResourceTemplatesResult> {
         return record<ListResourceTemplatesResult>(
             defaulted("resourceTemplates", &ListResourceTemplatesResult::resourceTemplates, List<ResourceTemplate>{}),
             optional ("nextCursor",        &ListResourceTemplatesResult::nextCursor),
+            optional ("ttlMs",             &ListResourceTemplatesResult::ttlMs),
+            optional ("cacheScope",        &ListResourceTemplatesResult::cacheScope),
             defaulted("resultType",        &ListResourceTemplatesResult::resultType,
                       std::string{"complete"}),
             meta     ("_meta",             &ListResourceTemplatesResult::meta));
