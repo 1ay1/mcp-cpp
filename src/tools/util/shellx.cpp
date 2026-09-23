@@ -2159,6 +2159,13 @@ std::optional<NativeResult> native_run(std::string_view command, std::string_vie
             return std::nullopt;
     const Plan p = plan(s);
     if (p.steps.empty() || !p.all_exact()) return std::nullopt;
+    // plan() drops no-op commands (echo, pwd, date, cd, printf …) because
+    // they don't change what a call is FOR. But they PRINT. If any top-level
+    // command didn't become a step, its output would silently vanish from a
+    // native answer: decline. (Every step is one pipeline; count heads.)
+    std::size_t heads = 0;
+    for (const auto& c : s.commands) if (c.stage == 0) ++heads;
+    if (heads != p.steps.size()) return std::nullopt;
     // Steps must run unconditionally in order: only `;`-style sequencing
     // between them. `a && b` / `a || b` depend on exit status we'd have to
     // model for every branch — fine when every step succeeds, which we

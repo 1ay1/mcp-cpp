@@ -395,7 +395,10 @@ TEST_CASE("shellx native_run matches coreutils bytes") {
              "cat -A nl", "cat nl nl", "cat nl > out", "cat $HOME/x", "cat *.txt",
              "sed -n 1p nl | sort", "head -1 nl &", "cat nl | grep a",
              "x=$(cat nl)", "if true; then cat nl; fi", "bash -c 'cat nl'",
-             "cat nl |& head -1", "sed -i 's/a/b/' nl", "FOO=1 cat nl", "echo hi"}) {
+             "cat nl |& head -1", "sed -i 's/a/b/' nl", "FOO=1 cat nl", "echo hi",
+             // no-op commands PRINT: dropping them would lose output
+             "cat nl; echo ---; cat nl", "head -1 nl && pwd", "cat nl && printf 'x\\n'",
+             "sed -n 1p nl; date", "cd . && cat nl"}) {
         INFO(cmd);
         CHECK_FALSE(run(cmd).has_value());
     }
