@@ -315,6 +315,80 @@ TEST_CASE("fs_tools") {
         std::puts("read: symbol= resolves noexcept/override/trailing-return sigs");
     }
 
+    // ── read symbol= on the shapes that failed in real sessions ─────────
+    //    (71 of 73 mined lookups missed before): wrapped parameter lists,
+    //    return type on the line above, Class::method, a CALL of the name
+    //    before its definition, a C++14 digit separator in the signature,
+    //    and a `/*` inside a `//` comment above the definition.
+    {
+        auto sp = (root / "shapes.cpp").string();
+        auto wargs = obj();
+        wargs["file_path"] = sp;
+        wargs["content"] =
+            "// helpers for agents/*.md discovery\n"                         // `/*` in a // comment
+            "int use_it() { return wrapped(1, 2); }\n"                        // call BEFORE def
+            "auth::Header wrapped(int spec,\n"                                // wrapped params
+            "                     int creds) {\n"
+            "    return {spec + creds};\n"
+            "}\n"
+            "std::expected<std::string, Error>\n"                              // return type above
+            "run_git(const std::vector<std::string>& argv,\n"
+            "        std::size_t max_bytes = 30'000) {\n"                     // digit separator
+            "    return argv.front();\n"
+            "}\n"
+            "Panel::Body Panel::measure_body() const {\n"                      // Class::method
+            "    return body_;\n"
+            "}\n";
+        call(*provider, "write", wargs);
+        auto want = [&](const char* sym, const char* needle, const char* not_needle) {
+            auto args = obj();
+            args["path"]   = sp;
+            args["symbol"] = sym;
+            auto rd = call(*provider, "read", args);
+            assert(!rd.is_error);
+            assert(rd.text.find(needle) != std::string::npos);
+            if (not_needle) assert(rd.text.find(not_needle) == std::string::npos);
+        };
+        want("wrapped", "return {spec + creds};", "use_it");   // the def, not the call
+        want("run_git", "return argv.front();", nullptr);
+        want("measure_body", "return body_;", nullptr);
+        want("Panel::measure_body", "return body_;", nullptr);
+        std::puts("read: symbol= resolves wrapped / qualified / call-first shapes");
+    }
+
+    // ── read symbol= falls back to the paired source when the model names
+    //    the header (declaration only) and the body lives in the .cpp.
+    {
+        auto h = (root / "pair.hpp").string();
+        auto c = (root / "pair.cpp").string();
+        auto wh = obj(); wh["file_path"] = h;
+        wh["content"] = "#pragma once\nint paired_fn(int x);\n";
+        call(*provider, "write", wh);
+        auto wc = obj(); wc["file_path"] = c;
+        wc["content"] = "#include \"pair.hpp\"\nint paired_fn(int x) {\n    return x * 3;\n}\n";
+        call(*provider, "write", wc);
+        // The header only declares paired_fn; read symbol= on the header
+        // should land on pair.cpp's body. A name only in a sibling resolves
+        // via the same fallback and says where it went.
+        auto wo = obj(); wo["file_path"] = (root / "other.cpp").string();
+        wo["content"] = "static int sibling_only(int y) {\n    return y + 9;\n}\n";
+        call(*provider, "write", wo);
+        auto args = obj();
+        args["path"] = h;
+        args["symbol"] = "sibling_only";
+        auto rd = call(*provider, "read", args);
+        assert(!rd.is_error);
+        assert(rd.text.find("return y + 9;") != std::string::npos);
+        assert(rd.text.find("other.cpp") != std::string::npos);
+        // Header has only `int paired_fn(int x);` — the body in pair.cpp wins.
+        auto ah = obj(); ah["path"] = h; ah["symbol"] = "paired_fn";
+        auto rh = call(*provider, "read", ah);
+        assert(!rh.is_error);
+        assert(rh.text.find("return x * 3;") != std::string::npos);
+        assert(rh.text.find("only declared") != std::string::npos);
+        std::puts("read: symbol= falls back to paired/sibling files");
+    }
+
     // ── edit applies a fuzzy splice and carries a FileChange ─────────────
     {
         auto e = obj();

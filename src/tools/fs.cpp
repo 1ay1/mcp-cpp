@@ -174,6 +174,332 @@ constexpr std::size_t kAutoOutlineSize = 32 * 1024;
     return out;
 }
 
+// Find the 1-based line where `symbol` is DEFINED, or -1.
+//
+// The old matcher required the whole definition to fit on ONE line that the
+// outline regex accepts. Real C++ signatures usually wrap:
+//     auth::AuthHeader resolve_auth_for(std::string_view spec,
+//                                       const auth::AuthHeader& creds) {
+// so `read symbol=` missed 71 of 73 real lookups mined from saved sessions.
+//
+// Here a line is a candidate when the symbol appears as a whole word (or as
+// the tail of a `Qualified::name`, so `Runtime::render` and `render` both
+// work) and is not inside a comment. What follows the name decides:
+//   name(...) <quals> {        → definition with a body   (best)
+//   name(...) <quals> ;        → declaration              (fallback)
+//   class|struct|enum|... name → type definition
+//   using name = / name = ...  → alias / variable / lambda
+// The `(...)` group may span lines; parentheses are balanced across lines,
+// skipping string and char literals. Calls are rejected because a call
+// site's `(...)` is followed by `;` `,` `)` `.` `->` or an operator, and
+// its line also has code BEFORE the name that is not a type (e.g. `return`,
+// `=`, `(`).
+[[nodiscard]] static int find_definition_line(
+        const std::vector<std::string_view>& lines, std::string_view symbol,
+        bool* decl_only = nullptr) {
+    if (decl_only) *decl_only = false;
+    if (symbol.empty()) return -1;
+    const int n = static_cast<int>(lines.size());
+    auto is_ident = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    };
+    // Leaf name + optional qualifier the caller asked for (`A::b` → "b", "A::").
+    std::string_view leaf = symbol, qual;
+    if (auto p = symbol.rfind("::"); p != std::string_view::npos) {
+        leaf = symbol.substr(p + 2);
+        qual = symbol.substr(0, p + 2);
+    } else if (auto d = symbol.rfind('.'); d != std::string_view::npos) {
+        leaf = symbol.substr(d + 1);   // Python / JS `Class.method`
+    }
+    if (leaf.empty()) return -1;
+
+    // Strip // and # comments and blank out string literal contents so a name
+    // mentioned in a comment or a string is never taken as a definition.
+    auto code_of = [](std::string_view s) {
+        std::string out{s};
+        bool in_str = false; char q = 0;
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            char c = out[i];
+            if (in_str) {
+                if (c == '\\') { out[i] = ' '; if (i + 1 < out.size()) out[++i] = ' '; continue; }
+                if (c == q) { in_str = false; continue; }
+                out[i] = ' ';
+                continue;
+            }
+            if (c == '"' || c == '`') { in_str = true; q = c; continue; }
+            if (c == '\'') {
+                // C++14 digit separator (30'000) — not a char literal.
+                if (i > 0 && std::isxdigit(static_cast<unsigned char>(out[i - 1]))
+                    && i + 1 < out.size()
+                    && std::isxdigit(static_cast<unsigned char>(out[i + 1])))
+                    continue;
+                in_str = true; q = c; continue;
+            }
+            if (c == '/' && i + 1 < out.size() && out[i + 1] == '/') { out.resize(i); break; }
+            if (c == '/' && i + 1 < out.size() && out[i + 1] == '*') {
+                auto e = out.find("*/", i + 2);
+                std::size_t stop = e == std::string::npos ? out.size() : e + 2;
+                for (std::size_t k = i; k < stop; ++k) out[k] = ' ';
+                i = stop - 1;
+                continue;
+            }
+        }
+        return out;
+    };
+    // Lines inside /* ... */ blocks that span lines. Scan the real code of
+    // each line (a `/*` inside a `//` comment or a string literal — e.g.
+    // `// agents/*.md` — must NOT open a block).
+    std::vector<char> in_block(static_cast<std::size_t>(n), 0);
+    {
+        bool open = false;
+        for (int i = 0; i < n; ++i) {
+            std::string_view s = lines[i];
+            std::size_t k = 0;
+            if (open) {
+                auto e = s.find("*/");
+                if (e == std::string_view::npos) { in_block[i] = 1; continue; }
+                open = false;
+                if (s.find_first_not_of(" \t*/", e + 2) == std::string_view::npos)
+                    in_block[i] = 1;
+                k = e + 2;
+            }
+            // Walk the rest honouring strings and `//`.
+            bool in_str = false; char q = 0;
+            for (; k < s.size(); ++k) {
+                char c = s[k];
+                if (in_str) {
+                    if (c == '\\') { ++k; continue; }
+                    if (c == q) in_str = false;
+                    continue;
+                }
+                if (c == '"') { in_str = true; q = c; continue; }
+                if (c == '\'') {
+                    if (k > 0 && std::isxdigit(static_cast<unsigned char>(s[k - 1]))
+                        && k + 1 < s.size()
+                        && std::isxdigit(static_cast<unsigned char>(s[k + 1])))
+                        continue;               // digit separator
+                    in_str = true; q = c; continue;
+                }
+                if (c == '/' && k + 1 < s.size() && s[k + 1] == '/') break;
+                if (c == '/' && k + 1 < s.size() && s[k + 1] == '*') {
+                    auto e = s.find("*/", k + 2);
+                    if (e == std::string_view::npos) {
+                        if (s.find_first_not_of(" \t") == k) in_block[i] = 1;
+                        open = true;
+                        break;
+                    }
+                    k = e + 1;
+                }
+            }
+        }
+    }
+
+    // Keywords that, sitting right before the name, make it a type definition.
+    static constexpr std::string_view kTypeKw[] = {
+        "class", "struct", "enum", "union", "namespace", "concept",
+        "interface", "trait", "impl", "type", "typedef", "def", "fn",
+        "func", "function", "module", "mod", "record", "object",
+    };
+    // Tokens that, right before the name, mean it's an expression (a call,
+    // a use) and not a declarator.
+    static constexpr std::string_view kExprKw[] = {
+        "return", "co_return", "co_await", "throw", "case", "new",
+        "delete", "sizeof", "decltype", "if", "while", "for", "switch",
+        "await", "yield", "not", "and", "or", "in", "is", "else", "do",
+    };
+
+    // Scan forward from (line i, col c) across lines, balancing (), until the
+    // closing paren of the group that starts at c. Returns {line, col-after}.
+    auto close_parens = [&](int i, std::size_t c) -> std::pair<int, std::size_t> {
+        int depth = 0;
+        for (int li = i; li < n && li < i + 40; ++li) {
+            const std::string code = code_of(lines[li]);
+            for (std::size_t k = (li == i ? c : 0); k < code.size(); ++k) {
+                if (code[k] == '(') ++depth;
+                else if (code[k] == ')' && --depth == 0) return {li, k + 1};
+            }
+        }
+        return {-1, 0};
+    };
+    // First significant character after (line, col), skipping blank space,
+    // trailing qualifiers (const, noexcept(...), override, -> Ret, etc.).
+    auto after_signature = [&](int li, std::size_t col) -> char {
+        for (int l = li; l < n && l < li + 8; ++l) {
+            const std::string code = code_of(lines[l]);
+            std::size_t k = (l == li ? col : 0);
+            while (k < code.size()) {
+                char ch = code[k];
+                if (ch == ' ' || ch == '\t') { ++k; continue; }
+                if (is_ident(ch)) {                     // const / noexcept / override / final / mutable / throws
+                    std::size_t e = k;
+                    while (e < code.size() && (is_ident(code[e]) || code[e] == ':')) ++e;
+                    std::string_view w{code.data() + k, e - k};
+                    if (w == "const" || w == "noexcept" || w == "override" || w == "final"
+                        || w == "mutable" || w == "volatile" || w == "throws"
+                        || w == "try" || w == "requires" || w == "where" || w == "async") {
+                        k = e;
+                        if (k < code.size() && code[k] == '(') {    // noexcept(...) / requires(...)
+                            int d = 0;
+                            for (; k < code.size(); ++k) {
+                                if (code[k] == '(') ++d;
+                                else if (code[k] == ')' && --d == 0) { ++k; break; }
+                            }
+                        }
+                        continue;
+                    }
+                    return 'w';                              // some other word: e.g. `-> Ret` body, K&R
+                }
+                if (ch == '-' && k + 1 < code.size() && code[k + 1] == '>') {   // trailing return type
+                    k += 2;
+                    while (k < code.size() && code[k] != '{' && code[k] != ';' && code[k] != '=') ++k;
+                    continue;
+                }
+                if (ch == '&' ) { ++k; continue; }           // ref-qualifier
+                if (ch == '[' && k + 1 < code.size() && code[k + 1] == '[') {  // attribute
+                    auto e = code.find("]]", k);
+                    k = e == std::string::npos ? code.size() : e + 2;
+                    continue;
+                }
+                return ch;
+            }
+        }
+        return 0;
+    };
+
+    int best_body = -1, best_type = -1, best_decl = -1, best_assign = -1;
+    for (int i = 0; i < n; ++i) {
+        if (in_block[i]) continue;
+        std::string_view raw = lines[i];
+        auto lead = raw.find_first_not_of(" \t");
+        if (lead == std::string_view::npos) continue;
+        if (raw.substr(lead).starts_with("*") || raw.substr(lead).starts_with("///")) continue;
+        const std::string code = code_of(raw);
+        for (std::size_t pos = code.find(leaf); pos != std::string::npos;
+             pos = code.find(leaf, pos + 1)) {
+            const std::size_t end = pos + leaf.size();
+            if (pos > 0 && is_ident(code[pos - 1])) continue;
+            if (end < code.size() && is_ident(code[end])) continue;
+            // Qualifier the caller gave must match what precedes the name.
+            std::size_t name_start = pos;
+            while (name_start >= 2 && code[name_start - 1] == ':' && code[name_start - 2] == ':') {
+                std::size_t q = name_start - 2;
+                while (q > 0 && (is_ident(code[q - 1]) || code[q - 1] == '<' || code[q - 1] == '>')) --q;
+                name_start = q;
+            }
+            if (!qual.empty()) {
+                std::string_view have{code.data() + name_start, pos - name_start};
+                if (!have.ends_with(qual)) continue;
+            }
+            // What sits before the (qualified) name on this line.
+            std::string_view before{code.data(), name_start};
+            while (!before.empty() && (before.back() == ' ' || before.back() == '\t')) before.remove_suffix(1);
+            std::string_view prev_word;
+            {
+                std::size_t e = before.size(), b = e;
+                while (b > 0 && is_ident(before[b - 1])) --b;
+                prev_word = before.substr(b, e - b);
+            }
+            const char prev_ch = before.empty() ? 0 : before.back();
+            bool type_kw = false;
+            for (auto k : kTypeKw) if (prev_word == k) type_kw = true;
+            bool expr_ctx = false;
+            for (auto k : kExprKw) if (prev_word == k) expr_ctx = true;
+            if (prev_ch == '.' || (prev_ch == '>' && before.size() >= 2 && before[before.size() - 2] == '-'))
+                expr_ctx = true;                          // obj.name / ptr->name
+            if (prev_ch == '=' || prev_ch == '(' || prev_ch == ',' || prev_ch == '!'
+                || prev_ch == '+' || prev_ch == '|' || prev_ch == '?' || prev_ch == '{'
+                || prev_ch == '[' || prev_ch == ';')
+                expr_ctx = true;
+            // Skip `name` used as a macro argument etc.
+            std::size_t k = end;
+            while (k < code.size() && (code[k] == ' ' || code[k] == '\t')) ++k;
+            // Template args right after the name: name<T>(...)
+            if (k < code.size() && code[k] == '<' && !type_kw) {
+                int d = 0; std::size_t t = k;
+                for (; t < code.size(); ++t) {
+                    if (code[t] == '<') ++d;
+                    else if (code[t] == '>' && --d == 0) { ++t; break; }
+                }
+                k = t;
+                while (k < code.size() && (code[k] == ' ' || code[k] == '\t')) ++k;
+            }
+
+            if (type_kw) {
+                if (best_type < 0) best_type = i + 1;
+                break;
+            }
+            if (prev_word == "using" || prev_word == "alias") {
+                if (best_type < 0) best_type = i + 1;
+                break;
+            }
+            if (expr_ctx) continue;
+
+            if (k < code.size() && code[k] == '(') {
+                // Something must precede a C-family definition's name (a
+                // return type / qualifier) unless it's a constructor-ish
+                // `Class::name(` or a line-leading K&R / Go-style name.
+                const bool has_decl_prefix = !before.empty() || name_start != pos
+                                             || name_start == lead;
+                if (!has_decl_prefix) continue;
+                auto [cl, cc] = close_parens(i, k);
+                if (cl < 0) continue;
+                const char nx = after_signature(cl, cc);
+                if (nx == '{' || nx == ':' ) {          // body, ctor init list, or Python `def f(...):`
+                    if (best_body < 0) best_body = i + 1;
+                    break;
+                }
+                if (nx == '=') {                        // = default / = delete / = 0 / => expr
+                    if (best_body < 0) best_body = i + 1;
+                    break;
+                }
+                if (nx == ';') {
+                    if (!before.empty() && best_decl < 0) best_decl = i + 1;
+                    break;
+                }
+                if (nx == 'w' && !before.empty()) {     // `-> Ret {` split oddly, K&R
+                    if (best_decl < 0) best_decl = i + 1;
+                    break;
+                }
+                continue;
+            }
+            // `name = ...` / `name := ...` / `name: Type =` (vars, consts,
+            // JS arrow functions, lambdas, Python assignments).
+            if (k < code.size() && (code[k] == '=' || code[k] == ':')
+                && !(k + 1 < code.size() && code[k + 1] == '=')
+                && !(code[k] == ':' && k + 1 < code.size() && code[k + 1] == ':')) {
+                if (best_assign < 0) best_assign = i + 1;
+                break;
+            }
+        }
+        if (best_body > 0) break;          // earliest definition-with-body wins
+    }
+    if (best_body > 0) return best_body;
+    if (best_type > 0) return best_type;
+
+    // Fallback: the original whole-line outline match (covers shapes the
+    // scanner above doesn't model, e.g. markdown headings).
+    for (int i = 0; i < n; ++i) {
+        const auto& ln = lines[i];
+        if (ln.empty() || in_block[i]) continue;
+        auto pos = ln.find(leaf);
+        bool whole = false;
+        while (pos != std::string_view::npos) {
+            bool lok = pos == 0 || !is_ident(ln[pos - 1]);
+            std::size_t after = pos + leaf.size();
+            bool rok = after >= ln.size() || !is_ident(ln[after]);
+            if (lok && rok) { whole = true; break; }
+            pos = ln.find(leaf, pos + 1);
+        }
+        if (!whole) continue;
+        char c0 = ln.front();
+        if (c0 == '}' || c0 == ')' || c0 == ']' || c0 == ';' || c0 == '/') continue;
+        if (outline_line_is_def(ln)) return i + 1;
+    }
+    if (best_decl > 0) { if (decl_only) *decl_only = true; return best_decl; }
+    if (best_assign > 0) return best_assign;
+    return -1;
+}
+
 // Resolve `symbol` to a [start,end] 1-based line range within `content`: find
 // the line that DEFINES it (via the outline def-pattern, whole-word) and return
 // its enclosing brace scope. Powers `read(path, symbol=)` — so the model can
@@ -181,8 +507,8 @@ constexpr std::size_t kAutoOutlineSize = 32 * 1024;
 // nullopt when the symbol has no definition line here. Brace scan skips // and
 // # line comments and quoted strings.
 [[nodiscard]] std::optional<std::pair<int,int>>
-resolve_symbol_range(std::string_view content, std::string_view symbol) {
-    // Split into lines once.
+resolve_symbol_range(std::string_view content, std::string_view symbol,
+                     bool* decl_only = nullptr) {
     std::vector<std::string_view> lines;
     {
         std::size_t start = 0;
@@ -195,28 +521,7 @@ resolve_symbol_range(std::string_view content, std::string_view symbol) {
             }
         }
     }
-    // Find the definition line: an outline-pattern line that mentions `symbol`
-    // as a whole word. Prefer the first such line.
-    const auto& re = outline_pattern();
-    int def_line = -1;
-    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
-        const auto& ln = lines[i];
-        if (ln.empty()) continue;
-        // whole-word containment check
-        auto pos = ln.find(symbol);
-        bool whole = false;
-        while (pos != std::string_view::npos) {
-            bool lok = pos == 0 || !(std::isalnum((unsigned char)ln[pos-1]) || ln[pos-1] == '_');
-            std::size_t after = pos + symbol.size();
-            bool rok = after >= ln.size() || !(std::isalnum((unsigned char)ln[after]) || ln[after] == '_');
-            if (lok && rok) { whole = true; break; }
-            pos = ln.find(symbol, pos + 1);
-        }
-        if (!whole) continue;
-        char c0 = ln.front();
-        if (c0 == '}' || c0 == ')' || c0 == ']' || c0 == ';' || c0 == '/') continue;
-        if (outline_line_is_def(ln)) { def_line = i + 1; break; }
-    }
+    int def_line = find_definition_line(lines, symbol, decl_only);
     if (def_line < 0) return std::nullopt;
 
     // Multi-line signatures: the outline regex matches the line with the NAME,
@@ -525,12 +830,104 @@ ExecResult run_read(const ReadArgs& a) {
     }
     std::string symbol_header;
     if (!a.symbol.empty()) {
-        auto rng = resolve_symbol_range(content, a.symbol);
-        if (!rng) {
+        bool decl_only = false;
+        auto rng = resolve_symbol_range(content, a.symbol, &decl_only);
+        // Found only a declaration (`int f(int);` in a header): the body the
+        // model wants is usually in the paired source — try there first and
+        // fall back to the declaration if it isn't.
+        if (!rng || decl_only) {
+            // Common miss: the model names the header but the body is in the
+            // .cpp (or the reverse), or it's in a sibling file of the same
+            // directory. Look there before giving up, and say where we went.
+            // Only files next to / paired with the named one: cheap, bounded,
+            // and never wanders the tree.
+            std::vector<fs::path> near;
+            {
+                static constexpr std::string_view kSrc[] = {".cpp", ".cc", ".cxx", ".c", ".mm"};
+                static constexpr std::string_view kHdr[] = {".hpp", ".h", ".hh", ".hxx"};
+                const auto stem = p.stem().string();
+                const auto dir  = p.parent_path();
+                const auto ext  = p.extension().string();
+                auto push = [&](const fs::path& q) {
+                    std::error_code qec;
+                    if (q != p && fs::is_regular_file(q, qec)
+                        && std::find(near.begin(), near.end(), q) == near.end())
+                        near.push_back(q);
+                };
+                const bool is_hdr = std::ranges::find(kHdr, ext) != std::end(kHdr);
+                const bool is_src = std::ranges::find(kSrc, ext) != std::end(kSrc);
+                // Pair across include/ <-> src/ too: include/x/y/z.hpp <-> src/y/z.cpp
+                auto swap_root = [&](std::string_view from, std::string_view to) {
+                    std::string s = dir.string();
+                    auto at = s.find(std::string{"/"} + std::string{from} + "/");
+                    if (at == std::string::npos) return fs::path{};
+                    std::string rest = s.substr(at + from.size() + 2);
+                    fs::path base = fs::path{s.substr(0, at)} / std::string{to};
+                    // include/<project>/a/b -> src/a/b (drop the project dir)
+                    if (from == "include") {
+                        auto slash = rest.find('/');
+                        rest = slash == std::string::npos ? std::string{} : rest.substr(slash + 1);
+                    }
+                    return rest.empty() ? base : base / rest;
+                };
+                if (is_hdr) {
+                    for (auto e : kSrc) push(dir / (stem + std::string{e}));
+                    if (auto d2 = swap_root("include", "src"); !d2.empty())
+                        for (auto e : kSrc) push(d2 / (stem + std::string{e}));
+                }
+                if (is_src) {
+                    for (auto e : kHdr) push(dir / (stem + std::string{e}));
+                }
+                // Siblings with the same extension family, capped.
+                std::error_code dec;
+                int budget = 60;
+                for (const auto& e : fs::directory_iterator(dir, dec)) {
+                    if (--budget < 0) break;
+                    if (!e.is_regular_file(dec)) continue;
+                    const auto x = e.path().extension().string();
+                    if (std::ranges::find(kSrc, x) != std::end(kSrc)
+                        || std::ranges::find(kHdr, x) != std::end(kHdr)
+                        || x == ext)
+                        push(e.path());
+                }
+            }
+            for (const auto& q : near) {
+                std::error_code qec;
+                if (fs::file_size(q, qec) > kMaxBytes || qec) continue;
+                std::string other;
+                try { other = util::read_file(q); } catch (...) { continue; }
+                bool other_decl = false;
+                auto r2 = resolve_symbol_range(other, a.symbol, &other_decl);
+                if (!r2 || (rng && other_decl)) continue;
+                // Render the span from that file, same plain-lines shape as
+                // a normal read.
+                std::string body;
+                int ln = 1; std::size_t st = 0;
+                for (std::size_t i = 0; i <= other.size(); ++i) {
+                    if (i == other.size() || other[i] == '\n') {
+                        if (ln >= r2->first && ln <= r2->second) {
+                            std::size_t e = i;
+                            if (e > st && other[e - 1] == '\r') --e;
+                            body.append(other, st, e - st);
+                            body.push_back('\n');
+                        }
+                        if (ln > r2->second) break;
+                        ++ln; st = i + 1;
+                    }
+                }
+                return ToolOutput{util::to_valid_utf8(std::format(
+                    "SUCCESS: `{}` is {} in {}; its definition is in {}:{} "
+                    "(lines {}\xe2\x80\x93{}).\n\n{}",
+                    a.symbol, rng ? "only declared" : "not defined",
+                    a.path.string(), q.string(), r2->first,
+                    r2->first, r2->second, body)), std::nullopt};
+            }
+            if (!rng)
             return std::unexpected(ToolError::not_found(std::format(
-                "no definition of `{}` found in {}. Use `grep` (or "
-                "`find_definition`) to locate it, or drop `symbol` to read "
-                "the whole file.", a.symbol, a.path.string())));
+                "no definition of `{}` found in {} (or its paired header/source "
+                "and sibling files). Use `find_definition` to search the "
+                "whole tree, or drop `symbol` to read the whole file.",
+                a.symbol, a.path.string())));
         }
         eff_offset = rng->first;
         eff_limit  = rng->second - rng->first + 1;
