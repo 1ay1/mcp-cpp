@@ -11,6 +11,7 @@
 
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/bash_validate.hpp>
+#include <mcp/tools/util/shellx.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/sandbox.hpp>
 #include <mcp/tools/util/subprocess.hpp>
@@ -99,8 +100,17 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j) {
     if (!cmd_opt)
         return std::unexpected(ToolError::invalid_args("command required"));
     std::string cmd = *std::move(cmd_opt);
-    if (auto why = util::validate_bash_command(cmd); !why.empty())
-        return std::unexpected(ToolError::invalid_args(std::move(why)));
+    // AST guard: judges every command in the script (pipes, chains, $(…),
+    // control flow, bash -c, sudo/env/xargs/find -exec). If the script does
+    // not parse cleanly, ALSO run the legacy text validator — fail closed.
+    {
+        const auto script = util::shellx::analyze(cmd);
+        if (auto r = util::shellx::guard(script))
+            return std::unexpected(ToolError::invalid_args(std::move(r->message)));
+        if (!script.clean || script.truncated)
+            if (auto why = util::validate_bash_command(cmd); !why.empty())
+                return std::unexpected(ToolError::invalid_args(std::move(why)));
+    }
     if (cmd.empty())
         return std::unexpected(ToolError::invalid_args("command must not be empty"));
 
@@ -394,13 +404,27 @@ ExecResult run_bash(const BashArgs& a) {
             << "]";
 
     std::string body = out.str();
-    // Out-of-the-box nudge: if this was a bare file-inspection shell-out
-    // (cat/sed/head/grep/find/ls/wc) that a smart native tool does better,
-    // prepend a one-line tip. NEVER blocks — the command already ran; this
-    // just teaches the model to reach for `read`/`grep`/`glob`/`list_dir`
-    // next time. Silent for pipes/redirects, where bash is the right call.
-    if (auto tip = util::bash_tool_suggestion(a.command); !tip.empty())
-        body = tip + "\n\n" + body;
+    // Out-of-the-box nudge: if this call was pure file inspection a native
+    // tool answers (every step typed by shellx), name the EXACT call that
+    // replaces it. NEVER blocks — the command already ran; this teaches the
+    // model to reach for read/grep/list_dir next time. Otherwise fall back
+    // to the older pipe-bound tip (`| head` → head_lines).
+    {
+        const auto pl = util::shellx::plan(util::shellx::analyze(a.command));
+        std::string calls;
+        if (pl.pure_inspection()) {
+            for (const auto& st : pl.steps) {
+                const std::string c = util::shellx::native_call(st);
+                if (c.empty()) { calls.clear(); break; }
+                calls += (calls.empty() ? "" : "; ") + c;
+            }
+        }
+        if (!calls.empty())
+            body = "tip: a native tool does this directly (faster, and the user "
+                   "sees a proper card): " + calls + "\n\n" + body;
+        else if (auto tip = util::bash_tool_suggestion(a.command); !tip.empty())
+            body = tip + "\n\n" + body;
+    }
     if (!a.display_description.empty())
         body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
