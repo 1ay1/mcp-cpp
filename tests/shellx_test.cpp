@@ -20,7 +20,6 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
-#include <tuple>
 #include <unistd.h>
 #include <string_view>
 #include <variant>
@@ -390,31 +389,6 @@ TEST_CASE("shellx native_run matches coreutils bytes") {
         CHECK(r->output == want);
         CHECK(r->exit_code == 0);
     }
-    // grep: bytes pinned from GNU grep 3.x, plus its exit status (1 = none).
-    put("g", "foo bar\nFoo\nbaz foo\nfoobar\n");
-    put("gnonl", "foo\nx");
-    const std::tuple<const char*, std::string_view, int> greps[] = {
-        {"grep -n foo g",        "1:foo bar\n3:baz foo\n4:foobar\n", 0},
-        {"grep foo g",           "foo bar\nbaz foo\nfoobar\n", 0},
-        {"grep -c foo g",        "3\n", 0},
-        {"grep -ni foo g",       "1:foo bar\n2:Foo\n3:baz foo\n4:foobar\n", 0},
-        {"grep -nw foo g",       "1:foo bar\n3:baz foo\n", 0},
-        {"grep -n zzz g",        "", 1},
-        {"grep -c zzz g",        "0\n", 1},
-        {"grep -n x gnonl",      "2:x\n", 0},     // grep terminates the last line
-        {"grep -n 'baz\\|Foo' g", "2:Foo\n3:baz foo\n", 0},
-        {"grep -nE 'baz|Foo' g", "2:Foo\n3:baz foo\n", 0},
-        {"grep -F 'o b' g",      "foo bar\n", 0},
-        {"grep -n foo g | head -1", "1:foo bar\n", 0},
-        {"grep -n zzz g | wc -l", "0\n", 0},     // pipeline status = last stage
-    };
-    for (auto [cmd, want, status] : greps) {
-        INFO(cmd);
-        auto r = run(cmd);
-        REQUIRE(r.has_value());
-        CHECK(r->output == want);
-        CHECK(r->exit_code == status);
-    }
     // Anything it can't reproduce exactly must decline, never guess.
     for (const char* cmd : {
              "cat missing", "cat dir", "cat bin", "head -1 nl || echo no",
@@ -424,11 +398,7 @@ TEST_CASE("shellx native_run matches coreutils bytes") {
              "cat nl |& head -1", "sed -i 's/a/b/' nl", "FOO=1 cat nl", "echo hi",
              // no-op commands PRINT: dropping them would lose output
              "cat nl; echo ---; cat nl", "head -1 nl && pwd", "cat nl && printf 'x\\n'",
-             "sed -n 1p nl; date", "cd . && cat nl",
-             // grep forms we don't reproduce exactly
-             "grep -v foo g", "grep -o foo g", "grep -l foo g", "grep -H foo g",
-             "grep -n 'fo.' g", "grep -rn foo .", "grep -nA1 foo g", "egrep -n foo g",
-             "grep -n zzz g && cat nl", "grep -n '^foo' g", "grep foo"}) {
+             "sed -n 1p nl; date", "cd . && cat nl"}) {
         INFO(cmd);
         CHECK_FALSE(run(cmd).has_value());
     }

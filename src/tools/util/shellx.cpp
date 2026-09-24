@@ -1617,8 +1617,7 @@ std::optional<Parsed> parse_grep(const Command& c, bool rg) {
             if (k == "-i" || k == "--ignore-case") { a.ignore_case = true; return true; }
             if (k == "-w" || k == "--word-regexp") { a.word = true; return true; }
             if (k == "-F" || k == "--fixed-strings") { a.fixed = true; a.regex = false; return true; }
-            if (k == "-E" || k == "--extended-regexp") { a.extended = true; return true; }
-            if (k == "-P" || k == "--perl-regexp") { exact = false; return true; }
+            if (k == "-E" || k == "--extended-regexp" || k == "-P" || k == "--perl-regexp") { exact = exact && k != "-P"; return true; }
             if (k == "-r" || k == "-R" || k == "--recursive") { a.recursive = true; return true; }
             if (k == "-c" || k == "--count") { a.count = true; return true; }
             if (k == "-l" || k == "--files-with-matches") { a.files_only = true; return true; }
@@ -1791,10 +1790,6 @@ std::optional<Parsed> translate(const Command& c) {
     if (p == "grep" || p == "egrep" || p == "fgrep") {
         auto r = parse_grep(c, false);
         if (r && p == "fgrep") if (auto* s = std::get_if<SearchAction>(&r->action)) { s->fixed = true; s->regex = false; }
-        if (r && p == "egrep") if (auto* s = std::get_if<SearchAction>(&r->action)) s->extended = true;
-        // GNU egrep/fgrep print "warning: egrep is obsolescent" on stderr,
-        // which the shell tool captures — a native answer can't match that.
-        if (r && p != "grep") r->exact = false;
         return r;
     }
     if (p == "rg")                         return parse_grep(c, true);
@@ -2153,116 +2148,6 @@ std::optional<std::string> slurp_plain(const std::string& path) {
     return s;
 }
 
-// ── native grep ──────────────────────────────────────────────────────────────────────
-//
-// One file, no recursion, and a pattern that is a set of LITERALS: either a
-// plain string, or (BRE) `a\|b\|c` / (-E) `a|b|c` alternatives of plain
-// strings. That is 55% of real single-file greps and needs no regex engine,
-// so there is nothing to disagree with GNU about. Supported flags: -n -c -i
-// (ASCII-only pattern AND file — GNU folds Unicode case, we don't) -w -F.
-// Everything else (-A/-B/-C context, -o, -v, -x, -l, anchors, classes,
-// backrefs, `.`, `*`) declines to the real grep.
-
-struct Alternatives { std::vector<std::string> lits; };
-
-// Split a pattern into literal alternatives, or nullopt if it uses any regex
-// feature beyond `|` alternation. `ere` = -E syntax, `fixed` = -F (no
-// metachars at all; a newline would split, but argv can't hold one usefully).
-std::optional<Alternatives> literal_alternatives(std::string_view p, bool ere, bool fixed) {
-    Alternatives out;
-    if (fixed) {
-        if (p.find('\n') != std::string_view::npos) return std::nullopt;
-        out.lits.emplace_back(p);
-        return out;
-    }
-    std::string cur;
-    for (std::size_t i = 0; i < p.size(); ++i) {
-        const char c = p[i];
-        if (c == '\\') {
-            if (i + 1 >= p.size()) return std::nullopt;
-            const char n = p[i + 1];
-            if (!ere && n == '|') { out.lits.push_back(std::move(cur)); cur.clear(); ++i; continue; }
-            // `\.` `\/` `\-` etc.: an escaped punctuation char is itself.
-            // Escaped letters/digits are classes, anchors or backrefs.
-            if (std::isalnum(static_cast<unsigned char>(n)) || n == '<' || n == '>' || n == '{' || n == '}'
-                || (!ere && (n == '(' || n == ')' || n == '+' || n == '?')))
-                return std::nullopt;
-            cur += n; ++i;
-            continue;
-        }
-        if (ere && c == '|') { out.lits.push_back(std::move(cur)); cur.clear(); continue; }
-        // Metacharacters of BRE; ERE adds + ? ( ) { }.
-        if (c == '.' || c == '[' || c == ']' || c == '*' || c == '^' || c == '$') return std::nullopt;
-        if (ere && (c == '+' || c == '?' || c == '(' || c == ')' || c == '{' || c == '}')) return std::nullopt;
-        cur += c;
-    }
-    out.lits.push_back(std::move(cur));
-    // An empty alternative matches every line — fine, but rare and easy to
-    // get subtly wrong with -w; decline.
-    for (const auto& l : out.lits) if (l.empty()) return std::nullopt;
-    return out;
-}
-
-bool is_ascii(std::string_view s) noexcept {
-    for (unsigned char c : s) if (c >= 0x80) return false;
-    return true;
-}
-
-char lower_ascii(char c) noexcept { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c; }
-
-// GNU -w: a match counts only if the chars around it are not word chars
-// (alnum or _). GNU retries later/shorter matches in the same line; with
-// literals, "try every occurrence of every alternative" is exactly that.
-bool line_matches(std::string_view line, const Alternatives& alt, bool icase, bool word) {
-    auto is_w = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
-    for (const auto& lit : alt.lits) {
-        if (lit.size() > line.size()) continue;
-        for (std::size_t i = 0; i + lit.size() <= line.size(); ++i) {
-            bool eq = true;
-            for (std::size_t k = 0; k < lit.size(); ++k) {
-                char a = line[i + k], b = lit[k];
-                if (icase) { a = lower_ascii(a); b = lower_ascii(b); }
-                if (a != b) { eq = false; break; }
-            }
-            if (!eq) continue;
-            if (!word) return true;
-            const bool left_ok = i == 0 || !is_w(line[i - 1]);
-            const bool right_ok = i + lit.size() == line.size() || !is_w(line[i + lit.size()]);
-            if (left_ok && right_ok) return true;
-        }
-    }
-    return false;
-}
-
-struct GrepOut { std::string text; int status; };
-
-// Run the search over one file's bytes. status follows grep: 0 = matched,
-// 1 = no match.
-std::optional<GrepOut> native_grep(const SearchAction& a, bool ere, std::string_view bytes) {
-    if (a.recursive || a.paths.size() != 1 || a.files_only || a.context_before || a.context_after)
-        return std::nullopt;
-    auto alt = literal_alternatives(a.pattern, ere, a.fixed);
-    if (!alt) return std::nullopt;
-    if (a.ignore_case && (!is_ascii(a.pattern) || !is_ascii(bytes))) return std::nullopt;
-    const Lines L = Lines::of(bytes);
-    GrepOut o{{}, 1};
-    std::size_t count = 0;
-    for (std::size_t i = 0; i < L.v.size(); ++i) {
-        std::string_view line = L.v[i];
-        const bool terminated = !line.empty() && line.back() == '\n';
-        if (terminated) line.remove_suffix(1);
-        if (!line_matches(line, *alt, a.ignore_case, a.word)) continue;
-        ++count;
-        if (a.count) continue;
-        if (a.line_numbers) { o.text += std::to_string(i + 1); o.text += ':'; }
-        o.text.append(line);
-        o.text += '\n';          // grep always terminates an output line
-    }
-    if (a.count) o.text = std::to_string(count) + "\n";
-    o.status = count ? 0 : 1;
-    return o;
-}
-
 } // namespace
 
 std::optional<NativeResult> native_run(std::string_view command, std::string_view cwd) {
@@ -2289,48 +2174,24 @@ std::optional<NativeResult> native_run(std::string_view command, std::string_vie
     for (const auto& c : s.commands) if (c.join == Join::Or) return std::nullopt;
 
     NativeResult out;
-    for (std::size_t k = 0; k < p.steps.size(); ++k) {
-        const auto& st = p.steps[k];
-        std::string cur;
-        int status = 0;
-        if (const auto* sr = std::get_if<SearchAction>(&st.action)) {
-            if (sr->paths.size() != 1) return std::nullopt;
-            std::string path = sr->paths[0];
-            if (!path.empty() && path.front() != '/' && !cwd.empty())
-                path = std::string{cwd} + (cwd.back() == '/' ? "" : "/") + path;
-            auto bytes = slurp_plain(path);
-            if (!bytes || bytes->find('\0') != std::string::npos) return std::nullopt;
-            auto g = native_grep(*sr, sr->extended, *bytes);
-            if (!g) return std::nullopt;
-            cur = std::move(g->text);
-            status = g->status;
-        } else if (const auto* rd = std::get_if<ReadAction>(&st.action)) {
-            std::string path = rd->path;
-            if (!path.empty() && path.front() != '/' && !cwd.empty())
-                path = std::string{cwd} + (cwd.back() == '/' ? "" : "/") + path;
-            auto bytes = slurp_plain(path);
-            if (!bytes) return std::nullopt;
-            // Binary content: cat would print it raw, and the capture path
-            // then sanitises it — identical only if we reproduce that. Decline.
-            if (bytes->find('\0') != std::string::npos) return std::nullopt;
-            cur = apply_read(*bytes, rd->range);
-        } else {
-            return std::nullopt;                      // exact List/Git: not native yet
-        }
-        // A pipeline's status is its LAST stage's. Every modelled shape
-        // (head/tail/wc -l) exits 0, so shapes reset it.
+    for (const auto& st : p.steps) {
+        const auto* rd = std::get_if<ReadAction>(&st.action);
+        if (!rd) return std::nullopt;                 // exact Search/List: not implemented natively yet
+        std::string path = rd->path;
+        if (!path.empty() && path.front() != '/' && !cwd.empty())
+            path = std::string{cwd} + (cwd.back() == '/' ? "" : "/") + path;
+        auto bytes = slurp_plain(path);
+        if (!bytes) return std::nullopt;
+        // Binary content: cat would print it raw, and the capture path then
+        // sanitises it — identical only if we reproduce that. Decline.
+        if (bytes->find('\0') != std::string::npos) return std::nullopt;
+        std::string cur = apply_read(*bytes, rd->range);
         for (const auto& sh : st.shapes) {
             auto next = apply_shape(cur, sh);
             if (!next) return std::nullopt;
             cur = std::move(*next);
-            status = 0;
         }
         out.output += cur;
-        out.exit_code = status;
-        // `a && b` with a failing a does NOT run b. We could model that, but
-        // a non-zero status in the MIDDLE of a chain is rare and subtle
-        // (`set -e`-like expectations); decline instead of guessing.
-        if (status != 0 && k + 1 < p.steps.size()) return std::nullopt;
     }
     return out;
 }
