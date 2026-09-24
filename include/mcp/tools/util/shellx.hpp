@@ -216,10 +216,6 @@ struct Plan {
 
 // Short human label for a step ("Read src/x.cpp:10-40", "Search `foo` in src")
 [[nodiscard]] std::string describe(const Step& st);
-// Card label for a whole plan: the step's label when there is one step,
-// else a count by kind ("3 searches, 1 read"). Always short enough that the
-// raw command after it still shows on a card row.
-[[nodiscard]] std::string describe(const Plan& p);
 // The equivalent native tool call for a typed step, spelled as the model
 // would write it: `read path=src/x.cpp start_line=10 end_line=40`. Empty for
 // Other / git (git_* tools don't take shell argv). Head/Tail shapes fold
