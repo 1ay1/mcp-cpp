@@ -46,6 +46,7 @@ enum class Intent : std::uint8_t {
     FindFiles, // find                           → `glob`
     ListDir,   // ls                             → `list_dir`
     CountOnly, // wc -l / grep -c                → a tool's count mode
+    GitRead,   // git log/status/diff/show/blame → git_log / git_status / …
     Write,     // cat > f, heredoc, sed -i, tee  → NEVER a read tool
 };
 
@@ -71,6 +72,10 @@ struct Detour {
     // end_line: 40", `grep -l` → "output: \"files\"". Empty when the
     // command has nothing more specific to say than `reason`.
     std::string      param;
+    // One "tool param" entry per native step, in order, when a call chains
+    // several inspections (`git log -3; git status`). The tip lists them so
+    // the model sees each call it should have made. Advisory text only.
+    std::vector<std::string> steps;
     // A bounded tail stage folded into the verdict (see Bound).
     std::optional<Bound> bound;
     // True when the shell is genuinely required: an unbounded pipe into a

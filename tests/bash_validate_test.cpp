@@ -250,7 +250,7 @@ TEST_CASE("bash_validate") {
 
     // Non-inspection commands never nudge.
     CHECK(!nudges("python build.py"));
-    CHECK(!nudges("git status"));
+    CHECK(!nudges("git push"));
     CHECK(!nudges("make -j8"));
 
     // ── Hardening: decided on the tree-sitter parse, not bytes ──────────
@@ -379,6 +379,51 @@ TEST_CASE("bash_validate") {
         INFO(s);
         CHECK_FALSE(nudges(s));
     }
+    // ── git: read-only subcommands with a native twin ──────────────────────
+    CHECK(tip("git status").find("`git_status`") != std::string::npos);
+    CHECK(tip("git status --short").find("git_status") != std::string::npos);
+    CHECK(tip("git log --oneline -5").find("count: 5, oneline: true") != std::string::npos);
+    CHECK(tip("git log -n 3 src/a.cpp").find("count: 3, path: \"src/a.cpp\"") != std::string::npos);
+    CHECK(tip("git log HEAD~3..HEAD").find("ref: \"HEAD~3..HEAD\"") != std::string::npos);
+    CHECK(tip("git diff --stat").find("stat_only: true") != std::string::npos);
+    CHECK(tip("git diff --cached").find("staged: true") != std::string::npos);
+    CHECK(tip("git diff -U8 -- a.txt").find("context: 8, path: \"a.txt\"") != std::string::npos);
+    CHECK(tip("git show HEAD:src/a.cpp").find("format: \"file\"") != std::string::npos);
+    CHECK(tip("git show abc123").find("ref: \"abc123\"") != std::string::npos);
+    CHECK(tip("git blame -L10,20 a.cpp").find("start_line: 10, end_line: 20") != std::string::npos);
+    CHECK(tip("git -C mcp-cpp log -3").find("path: \"mcp-cpp\"") != std::string::npos);
+    CHECK(tip("cd sub && git status").find("git_status") != std::string::npos);
+    CHECK(analyze_detour("git status").intent == Intent::GitRead);
+    // A chain of native steps lists each call it should have been.
+    {
+        const auto t = tip("echo '=== log'; git log --oneline -5; echo '=== st'; git status --short");
+        CHECK(t.find("2 native calls") != std::string::npos);
+        CHECK(t.find("`git_log count: 5, oneline: true`") != std::string::npos);
+        CHECK(t.find("`git_status`") != std::string::npos);
+        const auto m = tip("sed -n 1,5p a.cpp; grep -n x b.cpp");
+        CHECK(m.find("`read start_line: 1, end_line: 5`") != std::string::npos);
+        CHECK(m.find("`grep case_sensitive: true`") != std::string::npos);
+        // capped at four
+        const auto l = tip("cat a; cat b; cat c; cat d; cat e; cat f");
+        CHECK(l.find("6 native calls") != std::string::npos);
+        CHECK(l.find("\u2026") != std::string::npos);
+        // each step says where it runs when a `cd` moved it
+        const auto c = tip("cd maya && git log --oneline -3 && cd .. && git status -s");
+        CHECK(c.find("oneline: true (in maya)`") != std::string::npos);
+        CHECK(c.find("`git_status`") != std::string::npos);            // back at start
+        CHECK(tip("cd a && cd b/../c && cat x; cat y").find("`read (in a/c)`") != std::string::npos);
+    }
+    // Anything that writes, or a shape the native tool doesn't produce: silent.
+    for (const char* s : {"git add .", "git commit -m x", "git push", "git checkout main",
+                          "git stash", "git log -p", "git log --stat", "git log --grep=x",
+                          "git log --format=%h", "git show --stat HEAD", "git diff --word-diff",
+                          "git log -S foo", "git status && git add .", "git -c x=y log",
+                          "git log $REF", "git blame -L 1,5 f", "git log -5 | cat"}) {
+        INFO(s);
+        CHECK_FALSE(nudges(s));
+        CHECK_FALSE(analyze_detour(s).substitutable());
+    }
+
     // Things list_dir/glob/read can't express stay silent.
     for (const char* s : {"ls -lt", "ls -S build", "find . -newer f", "find . -mtime -1",
                           "find . -size +1M", "head -c 100 f", "tail -F log", "head -5 a b"}) {

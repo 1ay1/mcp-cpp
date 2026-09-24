@@ -2,6 +2,7 @@
 #include <mcp/tools/util/bash_validate.hpp>
 #include <mcp/tools/util/shellx.hpp>
 
+#include <filesystem>
 #include <initializer_list>
 #include <optional>
 #include <string>
@@ -704,6 +705,150 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
         if (p == "tree" || has_flag(head, "R", "--recursive")) v.param = "recursive: true";
         return v;
     }
+    if (p == "git") {
+        // Only read-only subcommands with a native twin, and only flags that
+        // twin can express. Anything else (a push, an add, --grep, -S,
+        // --word-diff, pathspec magic) is silent: a wrong tip is worse than
+        // none.
+        std::vector<std::string_view> a;
+        for (std::size_t i = 1; i < head.argv.size(); ++i) {
+            const std::string* w = sx::lit(head.argv[i]);
+            if (!w) { v.shell = true; return v; }
+            a.push_back(*w);
+        }
+        std::string dir;
+        if (a.size() >= 2 && a[0] == "-C") { dir = std::string{a[1]}; a.erase(a.begin(), a.begin() + 2); }
+        if (a.empty() || a[0].starts_with("-")) { v.shell = true; return v; }
+        const std::string_view sub = a[0];
+        std::vector<std::string_view> flags, pos;
+        bool after_dd = false;
+        for (std::size_t i = 1; i < a.size(); ++i) {
+            if (a[i] == "--") { after_dd = true; continue; }
+            (!after_dd && a[i].starts_with("-") ? flags : pos).push_back(a[i]);
+        }
+        auto only = [&](std::initializer_list<std::string_view> ok) {
+            for (auto f : flags) {
+                bool hit = false;
+                for (auto o : ok)
+                    if (f == o || (o.ends_with("=") && f.starts_with(o))) hit = true;
+                if (!hit) return false;
+            }
+            return true;
+        };
+        auto has = [&](std::string_view f) {
+            for (auto x : flags) if (x == f || x.starts_with(std::string{f} + "=")) return true;
+            return false;
+        };
+        std::vector<std::string> ps;
+        if (!dir.empty()) ps.push_back("path: \"" + dir + "\"");
+        // A positional is a path after `--`, or when it has a `/` or a file
+        // extension and no rev syntax. `HEAD~3..HEAD` and `v1.2` are refs.
+        auto as_arg = [&](std::string_view x) {
+            const bool rev = x.find("..") != std::string_view::npos || x.find('~') != std::string_view::npos
+                          || x.find('^') != std::string_view::npos || x.find('@') != std::string_view::npos;
+            const bool pathy = after_dd || x.find('/') != std::string_view::npos
+                            || (x.find('.') != std::string_view::npos && !x.starts_with("v"));
+            return (!rev && pathy ? "path: \"" : "ref: \"") + std::string{x} + "\"";
+        };
+        auto count_flag_ok = [](std::string_view f) { return f.size() > 1 && is_int(f.substr(1)); };
+        v.intent = Intent::GitRead;
+        if (sub == "status") {
+            if (!only({"-s", "--short", "-sb", "-b", "--branch", "--porcelain"}) || !pos.empty()) {
+                v.shell = true;
+                return v;
+            }
+            v.tool = "git_status";
+        } else if (sub == "log") {
+            // Custom --format/--pretty/--stat/-p ask for a shape git_log
+            // doesn't give; stay silent rather than promise it.
+            for (auto f : flags)
+                if (!(f == "--oneline" || f == "-n" || f.starts_with("--max-count=")
+                      || f == "--no-merges" || f == "--first-parent" || f == "--no-decorate"
+                      || count_flag_ok(f))) {
+                    v.shell = true;
+                    return v;
+                }
+            v.tool = "git_log";
+            int n = 0;
+            for (auto f : flags) {
+                if (count_flag_ok(f)) n = to_int(f.substr(1));
+                if (f.starts_with("--max-count=") && is_int(f.substr(12))) n = to_int(f.substr(12));
+            }
+            if (has("-n")) {                         // `-n 5`: value is the next word
+                if (pos.empty() || !is_int(pos.front())) { v.shell = true; return v; }
+                n = to_int(pos.front());
+                pos.erase(pos.begin());
+            }
+            if (n > 0) ps.push_back("count: " + std::to_string(n));
+            if (has("--oneline")) ps.push_back("oneline: true");
+            if (pos.size() > 2) { v.shell = true; return v; }
+            for (auto x : pos) ps.push_back(as_arg(x));
+        } else if (sub == "diff") {
+            for (auto f : flags)
+                if (!(f == "--stat" || f == "--staged" || f == "--cached" || f == "--no-color"
+                      || (f.starts_with("-U") && is_int(f.substr(2))))) {
+                    v.shell = true;
+                    return v;
+                }
+            if (pos.size() > 2) { v.shell = true; return v; }
+            v.tool = "git_diff";
+            if (has("--staged") || has("--cached")) ps.push_back("staged: true");
+            if (has("--stat")) ps.push_back("stat_only: true");
+            for (auto f : flags)
+                if (f.starts_with("-U") && is_int(f.substr(2)))
+                    ps.push_back("context: " + std::string{f.substr(2)});
+            for (auto x : pos) ps.push_back(as_arg(x));
+        } else if (sub == "show") {
+            // git_show gives metadata + patch, or a file at a rev. --stat
+            // and custom formats are shapes it doesn't have.
+            if (!only({"--no-color"}) || pos.size() > 1) { v.shell = true; return v; }
+            v.tool = "git_show";
+            if (!pos.empty()) {
+                const std::string_view x = pos.front();
+                if (auto c = x.find(':'); c != std::string_view::npos && c + 1 < x.size()) {
+                    ps.push_back("ref: \"" + std::string{x.substr(0, c)} + "\"");
+                    ps.push_back("path: \"" + std::string{x.substr(c + 1)} + "\"");
+                    ps.push_back("format: \"file\"");
+                } else {
+                    ps.push_back("ref: \"" + std::string{x} + "\"");
+                }
+            }
+        } else if (sub == "blame") {
+            if (pos.empty() || pos.size() > 2) { v.shell = true; return v; }
+            int lo = 0, hi = 0;
+            for (std::size_t i = 0; i < flags.size(); ++i) {
+                std::string_view f = flags[i];
+                if (f == "-L") { v.shell = true; return v; }   // value was split off; rare
+                if (f.starts_with("-L")) {
+                    f.remove_prefix(2);
+                    const auto c = f.find(',');
+                    if (c == std::string_view::npos || !is_int(f.substr(0, c)) || !is_int(f.substr(c + 1))) {
+                        v.shell = true;
+                        return v;
+                    }
+                    lo = to_int(f.substr(0, c));
+                    hi = to_int(f.substr(c + 1));
+                } else if (f != "--no-color") {
+                    v.shell = true;
+                    return v;
+                }
+            }
+            v.tool = "git_blame";
+            if (pos.size() == 2) ps.push_back("ref: \"" + std::string{pos[0]} + "\"");
+            ps.push_back("path: \"" + std::string{pos.back()} + "\"");
+            if (lo > 0) {
+                ps.push_back("start_line: " + std::to_string(lo));
+                ps.push_back("end_line: " + std::to_string(hi));
+            }
+        } else {
+            v.shell = true;        // add, push, commit, checkout, stash …
+            return v;
+        }
+        v.reason = "it returns structured output, keeps the pager out, and the "
+                   "user gets a proper card.";
+        for (auto& s : ps) v.param += (v.param.empty() ? "" : ", ") + s;
+        return v;
+    }
     v.shell = true;
     return v;
 }
@@ -745,6 +890,7 @@ Detour analyze_detour(std::string_view cmd) {
         d.tool = {};
         d.reason.clear();
         d.param.clear();
+        d.steps.clear();
         d.bound.reset();
         if (!tops.empty() && tops.back()->stage > 0)
             if (auto b = as_bound(*tops.back())) d.bound = *b;
@@ -763,10 +909,31 @@ Detour analyze_detour(std::string_view cmd) {
     // Judge each non-scaffolding pipeline. All must be inspection, and they
     // must agree on the tool, or the tip would be naming half a call.
     bool any = false;
+    std::string cwd;           // literal `cd` target so far, for the steps list
     for (const auto& pl : pipes) {
+        if (pl.size() == 1 && base_name(pl.front()->program()) == "cd") {
+            const sx::Command& c = *pl.front();
+            const std::string* t = c.argv.size() == 2 ? sx::lit(c.argv[1]) : nullptr;
+            if (!t || t->empty() || *t == "-") cwd = "?";          // unknown dir
+            else if (cwd == "?" ) { if (t->front() == '/') cwd = *t; }
+            else if (t->front() == '/') cwd = *t;
+            else cwd = cwd.empty() ? *t : cwd + "/" + *t;
+            if (cwd != "?") {
+                cwd = std::filesystem::path{cwd}.lexically_normal().generic_string();
+                if (cwd == "." || cwd == "./") cwd.clear();
+                while (cwd.size() > 1 && cwd.back() == '/') cwd.pop_back();
+            }
+            continue;
+        }
         if (pl.size() == 1 && scaffolding(*pl.front())) continue;
         PipeVerdict v = judge(pl);
         if (v.shell) return shell_work();
+        {
+            std::string st{v.tool};
+            if (!v.param.empty()) st += " " + v.param;
+            if (!cwd.empty() && cwd != "?") st += " (in " + cwd + ")";
+            d.steps.push_back(std::move(st));
+        }
         if (!any) {
             d.intent = v.intent;
             d.tool   = v.tool;
@@ -776,13 +943,12 @@ Detour analyze_detour(std::string_view cmd) {
             any = true;
         } else {
             if (v.tool != d.tool) {
-                // Mixed native tools (a read and a grep): still a detour,
-                // just nothing single to name.
+                // Mixed native tools (a read and a grep): still a detour.
+                // The steps list names each call.
                 d.param.clear();
                 d.bound.reset();
-                d.reason = "each step here is a native tool call (`read`, "
-                           "`grep`, `list_dir`, `glob`) \u2014 call them directly, "
-                           "several in one turn run in parallel.";
+                d.reason = "each step is its own native call; make them in one "
+                           "turn and they run in parallel, each with its own card.";
                 d.tool = "read";
                 d.intent = Intent::ReadFile;
             } else if (v.param != d.param) {
@@ -818,9 +984,23 @@ std::string bash_tool_suggestion(const Detour& d) {
     // tool is the advice that was already being ignored; naming the exact
     // value it just typed is not.
     std::string tip = "tip: ";
+    if (d.steps.size() > 1) {
+        // Several native steps: list each call, capped so a long chain
+        // doesn't turn the tip into a wall.
+        tip += "these are " + std::to_string(d.steps.size()) + " native calls: ";
+        constexpr std::size_t kShow = 4;
+        for (std::size_t i = 0; i < d.steps.size() && i < kShow; ++i)
+            tip += (i ? "; " : "") + ("`" + d.steps[i] + "`");
+        if (d.steps.size() > kShow) tip += "; \u2026";
+        tip += " \u2014 make them in one turn and they run in parallel, each "
+               "with its own card.";
+        return tip;
+    }
     if (!d.param.empty()) {
         tip += "`" + std::string{d.tool} + "` with `" + d.param + "` does this directly \u2014 ";
         tip += d.reason;
+    } else if (d.intent == Intent::GitRead) {
+        tip += "`" + std::string{d.tool} + "` does this directly \u2014 " + d.reason;
     } else {
         tip += d.reason;
     }

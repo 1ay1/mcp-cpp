@@ -173,8 +173,8 @@ TEST_CASE("server_stateless") {
         CHECK(d.supportedVersions.size() >= 2);
         CHECK(d.supportedVersions[0] == std::string(kProtocolVersion));
         CHECK(d.instructions.has_value() && *d.instructions == "stateless demo");
-        CHECK(d.ttlMs.has_value() && *d.ttlMs == 3600000);
-        CHECK(d.cacheScope.has_value() && *d.cacheScope == "public");
+        CHECK(d.ttlMs == 3600000);
+        CHECK(d.cacheScope == "public");
         // serverInfo travels under _meta.
         CHECK(d.meta.contains(std::string(meta_key::ServerInfo)));
         CHECK(d.meta[std::string(meta_key::ServerInfo)]["name"] == "srv");
@@ -197,8 +197,8 @@ TEST_CASE("server_stateless") {
     {
         auto lt = c.list_tools().get();
         CHECK(lt.tools.size() == 1);
-        CHECK(lt.ttlMs.has_value() && *lt.ttlMs == 60000);
-        CHECK(lt.cacheScope.has_value() && *lt.cacheScope == "public");
+        CHECK(lt.ttlMs == 60000);
+        CHECK(lt.cacheScope == "public");
     }
 
     // ── 6. capability enforcement (MissingRequiredClientCapability) ──────

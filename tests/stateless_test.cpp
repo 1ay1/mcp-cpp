@@ -125,8 +125,8 @@ TEST_CASE("stateless") {
         CHECK(d.supportedVersions.size() == 2);
         CHECK(d.supportedVersions[0] == "2026-07-28");
         CHECK(d.instructions.has_value() && *d.instructions == "demo stateless server");
-        CHECK(d.ttlMs.has_value() && *d.ttlMs == 3600000);
-        CHECK(d.cacheScope.has_value() && *d.cacheScope == "public");
+        CHECK(d.ttlMs == 3600000);
+        CHECK(d.cacheScope == "public");
         // The server saw our per-request protocol metadata.
         CHECK(last_method == "server/discover");
         CHECK(last_meta.contains(std::string(meta_key::ProtocolVersion)));
