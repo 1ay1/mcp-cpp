@@ -2,19 +2,18 @@
 //
 // shellx — understand a shell command before running it.
 //
-// One real parse (tree-sitter-bash) feeds two consumers:
+// One real parse (tree-sitter-bash), two consumers:
 //   * the GUARD, which judges every simple command in the script — including
 //     the ones hidden in pipelines, `&&` chains, `$(…)`, control flow,
 //     `bash -c '…'`, `xargs …` and `find -exec …` — for catastrophic effects;
-//   * the ACTION translation, which says what the command is FOR (read this
-//     file's lines 10-40, search for X under Y, list Z) so a host can show a
-//     meaningful card, measure detours, suggest the native tool, and — when the
-//     translation is exact — run it natively with identical output.
+//   * analyze_detour (bash_validate), which reads the parse to build an
+//     ADVISORY tip. Nothing here ever runs a native tool in place of the
+//     shell: a tip is survivable, acting on a verdict is not.
 //
 // Design rules:
 //   * Fail closed. A script that doesn't parse cleanly still gets a guard pass
-//     (on whatever the parser recovered, plus a raw-text fallback) and is never
-//     translated. `Unknown` is always a correct answer; a wrong `Read` is not.
+//     (on whatever the parser recovered, plus a raw-text fallback) and no
+//     advice.
 //   * Static knowledge is typed. A word is either `Lit` (its value is known
 //     without running anything) or `Dyn` (depends on expansion). Code that
 //     needs a literal has to prove it has one — there is no "string that is
@@ -87,7 +86,7 @@ struct Redirect {
 // ── Commands ─────────────────────────────────────────────────────────────
 
 // Where a simple command sits. Bits combine; the guard ignores them (every
-// command is judged), the translator refuses anything not at top level.
+// command is judged), analyze_detour only advises on top-level commands.
 enum class Ctx : std::uint16_t {
     None         = 0,
     Piped        = 1 << 0,  // not the first stage of its pipeline
@@ -158,68 +157,5 @@ struct Refusal {
 
 // First refusal found, or nullopt. Judges EVERY command in the script.
 [[nodiscard]] std::optional<Refusal> guard(const Script& s);
-
-// ── Actions ──────────────────────────────────────────────────────────────
-//
-// What a command is for, when that is a file-inspection intent a native tool
-// answers. Everything else is `Other` (carries the program for display/
-// telemetry). Paths are as written (Lit), resolved against a tracked `cd`.
-
-struct LineRange {
-    std::optional<std::int64_t> first;   // 1-based, inclusive
-    std::optional<std::int64_t> last;    // inclusive; nullopt = to EOF
-    bool from_end = false;               // tail: `first` counts from the end
-};
-
-struct ReadAction   { std::string path; LineRange range; };
-struct SearchAction {
-    std::string pattern;
-    std::vector<std::string> paths;      // empty = cwd
-    bool regex = true, ignore_case = false, word = false, fixed = false;
-    bool recursive = false, line_numbers = false, count = false, files_only = false;
-    int  context_before = 0, context_after = 0;
-    std::vector<std::string> include_globs;
-};
-struct ListAction   { std::string path; bool long_format = false, all = false, recursive = false;
-                      std::optional<std::string> name_glob; std::optional<char> type; };
-struct GitReadAction{ std::string sub; std::vector<std::string> args; };
-struct OtherAction  { std::string program; };
-
-using Action = std::variant<ReadAction, SearchAction, ListAction, GitReadAction, OtherAction>;
-
-// A formatting stage after the action (… | head -20). Modelled stages have a
-// typed meaning; anything else is opaque (still fine for display, blocks exact
-// native execution).
-struct Shape {
-    enum class Kind : std::uint8_t { Head, Tail, CountLines, Sort, Uniq, Filter, Opaque } kind;
-    std::int64_t n = 0;          // Head/Tail count
-    std::string  arg;            // Filter pattern / Opaque program
-};
-
-struct Step {
-    Action action;
-    std::vector<Shape> shapes;   // downstream formatting stages, in order
-    bool exact = false;          // action + every shape modelled, all literal, no redirect/ctx
-    std::uint32_t begin = 0, end = 0;
-};
-
-struct Plan {
-    std::vector<Step> steps;     // one per top-level pipeline that is not a no-op
-    // Every non-noop step is an inspection action (Read/Search/List/GitRead)?
-    [[nodiscard]] bool pure_inspection() const noexcept;
-    [[nodiscard]] bool all_exact() const noexcept;
-};
-
-[[nodiscard]] Plan plan(const Script& s);
-
-// Short human label for a step ("Read src/x.cpp:10-40", "Search `foo` in src")
-[[nodiscard]] std::string describe(const Step& st);
-// The equivalent native tool call for a typed step, spelled as the model
-// would write it: `read path=src/x.cpp start_line=10 end_line=40`. Empty for
-// Other / git (git_* tools don't take shell argv). Head/Tail shapes fold
-// into the call's own bound (limit / offset) where the tool supports one.
-[[nodiscard]] std::string native_call(const Step& st);
-// Telemetry category of a whole plan: read|search|list|git|mixed|other|none
-[[nodiscard]] std::string_view category(const Plan& p) noexcept;
 
 } // namespace mcp::tools::util::shellx

@@ -8,9 +8,6 @@
 //      non-interactive REPL/editor invocations) stay allowed.
 //   2. LOWERING: analyze() produces typed words (Lit vs Dyn), redirects,
 //      and context bits for every simple command.
-//   3. PLAN: inspection commands translate to Read/Search/List/GitRead
-//      actions, with `exact` only when the native tool would reproduce the
-//      output byte-for-byte; everything else is Other.
 
 #include "agtest.hpp"
 
@@ -39,8 +36,6 @@ bool is_lit(const sx::Word& w, std::string_view v) {
     auto* l = sx::lit(w);
     return l && *l == v;
 }
-
-sx::Plan plan_of(std::string_view cmd) { return sx::plan(sx::analyze(cmd)); }
 
 } // namespace
 
@@ -176,175 +171,5 @@ TEST_CASE("shellx lowering: unterminated quote is unclean, not a crash") {
     auto s = sx::analyze("echo 'unterminated");
     CHECK(!s.clean);
     (void)sx::guard(s);
-    (void)sx::plan(s);
 }
 
-// ── Plan ─────────────────────────────────────────────────────────────────
-
-TEST_CASE("shellx plan: sed -n ranges") {
-    {
-        auto p = plan_of("sed -n '10,40p' a.cpp");
-        REQUIRE(p.steps.size() == 1);
-        auto* r = std::get_if<sx::ReadAction>(&p.steps[0].action);
-        REQUIRE(r != nullptr);
-        CHECK(r->path == "a.cpp");
-        CHECK(r->range.first == 10);
-        CHECK(r->range.last == 40);
-        CHECK(p.steps[0].exact);
-        CHECK(sx::category(p) == "read");
-    }
-    {
-        auto p = plan_of("sed -n '5,+3p' a.cpp");
-        REQUIRE(p.steps.size() == 1);
-        auto* r = std::get_if<sx::ReadAction>(&p.steps[0].action);
-        REQUIRE(r != nullptr);
-        CHECK(r->range.first == 5);
-        CHECK(r->range.last == 8);
-        CHECK(p.steps[0].exact);
-    }
-    {
-        auto p = plan_of("sed -n '/struct x/,/};/p' h.h | head -30");
-        REQUIRE(p.steps.size() == 1);
-        CHECK(std::holds_alternative<sx::ReadAction>(p.steps[0].action));
-        CHECK(!p.steps[0].exact);
-        REQUIRE(p.steps[0].shapes.size() == 1);
-        CHECK(p.steps[0].shapes[0].kind == sx::Shape::Kind::Head);
-        CHECK(p.steps[0].shapes[0].n == 30);
-    }
-    for (const char* c : {"sed -n '1,5p;w /tmp/x' a", "sed -i 's/a/b/' f", "sed -n 's/a/b/p' f"}) {
-        INFO("cmd: ", c);
-        auto p = plan_of(c);
-        REQUIRE(p.steps.size() == 1);
-        CHECK(std::holds_alternative<sx::OtherAction>(p.steps[0].action));
-    }
-}
-
-TEST_CASE("shellx plan: cat/head/tail reads") {
-    {
-        auto p = plan_of("cat a.txt | head -5");
-        REQUIRE(p.steps.size() == 1);
-        auto* r = std::get_if<sx::ReadAction>(&p.steps[0].action);
-        REQUIRE(r != nullptr);
-        CHECK(r->path == "a.txt");
-        CHECK(p.steps[0].exact);
-        REQUIRE(p.steps[0].shapes.size() == 1);
-        CHECK(p.steps[0].shapes[0].kind == sx::Shape::Kind::Head);
-        CHECK(p.steps[0].shapes[0].n == 5);
-    }
-    {
-        auto p = plan_of("head -20 f");
-        REQUIRE(p.steps.size() == 1);
-        auto* r = std::get_if<sx::ReadAction>(&p.steps[0].action);
-        REQUIRE(r != nullptr);
-        CHECK(r->range.first == 1);
-        CHECK(r->range.last == 20);
-    }
-    {
-        auto p = plan_of("tail -50 f");
-        REQUIRE(p.steps.size() == 1);
-        auto* r = std::get_if<sx::ReadAction>(&p.steps[0].action);
-        REQUIRE(r != nullptr);
-        CHECK(r->range.from_end);
-        CHECK(r->range.first == 50);
-    }
-    {
-        auto p = plan_of("tail -n +100 f");
-        REQUIRE(p.steps.size() == 1);
-        auto* r = std::get_if<sx::ReadAction>(&p.steps[0].action);
-        REQUIRE(r != nullptr);
-        CHECK(!r->range.from_end);
-        CHECK(r->range.first == 100);
-    }
-}
-
-TEST_CASE("shellx plan: grep searches") {
-    {
-        auto p = plan_of("cd src && grep -n foo a.cpp | head -20");
-        REQUIRE(p.steps.size() == 1);
-        auto* s = std::get_if<sx::SearchAction>(&p.steps[0].action);
-        REQUIRE(s != nullptr);
-        CHECK(s->pattern == "foo");
-        CHECK(s->paths == std::vector<std::string>{"src/a.cpp"});
-        CHECK(s->line_numbers);
-        CHECK(p.steps[0].exact);
-        CHECK(sx::category(p) == "search");
-    }
-    {
-        auto p = plan_of("grep -rn \"x\" maya/include/maya/*.hpp | head -3");
-        REQUIRE(p.steps.size() == 1);
-        CHECK(std::holds_alternative<sx::SearchAction>(p.steps[0].action));
-        CHECK(!p.steps[0].exact);
-    }
-    {
-        auto p = plan_of("grep -n x f.cpp | grep -v y | head");
-        REQUIRE(p.steps.size() == 1);
-        CHECK(std::holds_alternative<sx::SearchAction>(p.steps[0].action));
-        CHECK(!p.steps[0].exact);
-    }
-    {
-        auto p = plan_of("grep foo");   // no file: reads stdin
-        REQUIRE(p.steps.size() == 1);
-        CHECK(std::holds_alternative<sx::OtherAction>(p.steps[0].action));
-    }
-}
-
-TEST_CASE("shellx plan: ls listings") {
-    {
-        auto p = plan_of("ls");
-        REQUIRE(p.steps.size() == 1);
-        auto* l = std::get_if<sx::ListAction>(&p.steps[0].action);
-        REQUIRE(l != nullptr);
-        CHECK(l->path == ".");
-        CHECK(p.steps[0].exact);
-    }
-    for (const char* c : {"ls -la src", "ls a b"}) {
-        INFO("cmd: ", c);
-        auto p = plan_of(c);
-        REQUIRE(p.steps.size() == 1);
-        CHECK(std::holds_alternative<sx::ListAction>(p.steps[0].action));
-        CHECK(!p.steps[0].exact);
-    }
-}
-
-TEST_CASE("shellx plan: git read vs write") {
-    for (const char* c : {"git status --short", "git log --oneline -5"}) {
-        INFO("cmd: ", c);
-        auto p = plan_of(c);
-        REQUIRE(p.steps.size() == 1);
-        CHECK(std::holds_alternative<sx::GitReadAction>(p.steps[0].action));
-        CHECK(sx::category(p) == "git");
-    }
-    for (const char* c : {"git push", "git commit -m x"}) {
-        INFO("cmd: ", c);
-        auto p = plan_of(c);
-        REQUIRE(p.steps.size() == 1);
-        CHECK(std::holds_alternative<sx::OtherAction>(p.steps[0].action));
-    }
-}
-
-TEST_CASE("shellx plan: other, none, mixed") {
-    {
-        auto p = plan_of("cmake --build build 2>&1 | tail -20");
-        REQUIRE(p.steps.size() == 1);
-        auto* o = std::get_if<sx::OtherAction>(&p.steps[0].action);
-        REQUIRE(o != nullptr);
-        CHECK(o->program == "cmake");
-        CHECK(sx::category(p) == "other");
-    }
-    {
-        auto p = plan_of("echo hi; pwd");
-        CHECK(p.steps.empty());
-        CHECK(sx::category(p) == "none");
-    }
-    {
-        auto p = plan_of("grep -n a f && sed -n 1,5p f");
-        REQUIRE(p.steps.size() == 2);
-        CHECK(p.pure_inspection());
-        CHECK(sx::category(p) == "mixed");
-    }
-    {
-        auto p = plan_of("cat a > b");   // writes a file
-        REQUIRE(p.steps.size() == 1);
-        CHECK(std::holds_alternative<sx::OtherAction>(p.steps[0].action));
-    }
-}
