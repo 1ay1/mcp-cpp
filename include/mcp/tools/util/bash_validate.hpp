@@ -66,6 +66,11 @@ struct Detour {
     std::string_view tool;
     // Why the native tool is better, phrased for a model to act on.
     std::string      reason;
+    // The exact parameter this command maps to, read off its own argv:
+    // `head -50 f` → "limit: 50", `sed -n 10,40p f` → "start_line: 10,
+    // end_line: 40", `grep -l` → "output: \"files\"". Empty when the
+    // command has nothing more specific to say than `reason`.
+    std::string      param;
     // A bounded tail stage folded into the verdict (see Bound).
     std::optional<Bound> bound;
     // True when the shell is genuinely required: an unbounded pipe into a
@@ -90,5 +95,8 @@ struct Detour {
 // toward the native tool, or "" when the command is fine as-is. The bash
 // tool prepends this to its output; it NEVER blocks execution.
 [[nodiscard]] std::string bash_tool_suggestion(std::string_view cmd);
+// Same, from a verdict already computed (so a caller that also logs the
+// verdict parses the command once).
+[[nodiscard]] std::string bash_tool_suggestion(const Detour& d);
 
 } // namespace mcp::tools::util

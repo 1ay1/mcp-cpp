@@ -76,6 +76,30 @@ TEST_CASE("search_tools") {
         std::puts("grep: ok (found across files)");
     }
 
+    // ── grep limit: replaces `| head -N` (the tip and prompt name it) ────
+    {
+        std::string many;
+        for (int i = 0; i < 40; ++i)
+            many += "LIMIT_hit " + std::to_string(i) + "\nfiller\nfiller\n";   // own block each
+        write_file(root / "many.txt", many);
+        auto args = obj();
+        args["pattern"] = "LIMIT_hit"; args["path"] = root.string(); args["limit"] = 3;
+        args["context"] = "0";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("Showing matches 1-3 of 40") != std::string::npos);
+        assert(r.text.find("Use offset: 3") != std::string::npos);
+        args["limit"] = 0;             // clamped to 1, never unbounded
+        r = call(*provider, "grep", args);
+        assert(r.text.find("Showing matches 1-1 of 40") != std::string::npos);
+        // context beyond the old cap of 10 is honoured (grep -A 30 use).
+        args["limit"] = 1; args["context"] = "30";
+        r = call(*provider, "grep", args);
+        assert(r.text.find("LIMIT_hit 10") != std::string::npos);   // 30 lines = 10 hits later
+        fs::remove(root / "many.txt");
+        std::puts("grep: limit + wide context ok");
+    }
+
     // ── grep with file glob narrows to .cpp ──────────────────────────────
     {
         auto args = obj();

@@ -218,7 +218,7 @@ TEST_CASE("bash_validate") {
     // SILENT when the shell is genuinely doing work a native tool can't:
     // a real transform, a redirect to a file, chaining, substitution.
     CHECK(!nudges("grep x f > out.txt"));
-    CHECK(!nudges("ls && echo done"));
+    CHECK(!nudges("ls && make"));             // chained with real work
     CHECK(!nudges("cat $(ls)"));
     CHECK(!nudges("wc -l < f"));
     CHECK(!nudges("ls -la | wc -l"));        // pipe into a real transform
@@ -317,6 +317,74 @@ TEST_CASE("bash_validate") {
     // A parse that isn't clean gets no advice at all.
     CHECK_FALSE(nudges("cat 'unterminated"));
     CHECK_FALSE(nudges("grep -rn x src | "));
+
+    // ── Scaffolding: cd / echo separators carry no intent ──────────────────
+    //
+    // On 11.5k real calls, 19% were `cd X && inspect` and 28% carried
+    // `echo "=== x ==="` separators. Treating those as shell work silenced
+    // the tip on most detours that matter.
+    CHECK(analyze_detour("cd src && grep -rn foo .").substitutable());
+    CHECK(analyze_detour("cd /a/b && sed -n '10,20p' x.cpp").substitutable());
+    CHECK(analyze_detour("echo '=== a ==='; grep -n x a.cpp; echo '=== b ==='; grep -n x b.cpp")
+              .substitutable());
+    CHECK(analyze_detour("cd src; cat a.cpp; cat b.cpp").substitutable());
+    // Mixed native tools is still a detour; nothing single to name.
+    {
+        const auto d = analyze_detour("cat a.cpp; grep -n x b.cpp");
+        CHECK(d.substitutable());
+        CHECK(d.param.empty());
+    }
+    // Scaffolding that does work is not scaffolding.
+    CHECK_FALSE(analyze_detour("echo $(date); cat f").substitutable());
+    CHECK_FALSE(analyze_detour("echo hi > f; cat f").substitutable());
+    // Only scaffolding: nothing to say.
+    CHECK_FALSE(nudges("cd src && echo ok"));
+    // One real-work pipeline anywhere: silent (Codex's all-or-nothing rule).
+    CHECK_FALSE(nudges("cd build && make && grep -n err log.txt"));
+    CHECK_FALSE(nudges("grep -n x f; python3 t.py"));
+
+    // ── The tip names the EXACT parameter, read off the command ───────────
+    auto tip = [](const char* c) { return bash_tool_suggestion(c); };
+    CHECK(tip("sed -n '147,162p' a.cpp").find("start_line: 147, end_line: 162") != std::string::npos);
+    CHECK(tip("sed -n 30p a.cpp").find("start_line: 30, end_line: 30") != std::string::npos);
+    CHECK(tip("head -50 log").find("limit: 50") != std::string::npos);
+    CHECK(tip("head -n 50 log").find("limit: 50") != std::string::npos);
+    CHECK(tip("tail -n 30 log").find("offset: -30") != std::string::npos);
+    CHECK(tip("cat log | tail -40").find("offset: -40") != std::string::npos);
+    CHECK(tip("grep -rl foo src").find("output: \"files\"") != std::string::npos);
+    CHECK(tip("grep -rc foo src").find("output: \"count\"") != std::string::npos);
+    CHECK(tip("grep -rn foo src | wc -l").find("output: \"count\"") != std::string::npos);
+    CHECK(tip("grep -rnw foo src").find("word: true") != std::string::npos);
+    CHECK(tip("ls -R src").find("recursive: true") != std::string::npos);
+    // Bounds never name a parameter the tool doesn't have.
+    CHECK(tip("ls src | head -5").find("limit") == std::string::npos);
+    CHECK(tip("grep -rn foo src | head -7").find("limit:7") != std::string::npos);
+    // grep flags map to the native params the model should use instead.
+    {
+        const auto t = tip("grep -rn -A 8 --include=*.cpp foo src");
+        CHECK(t.find("context: \"8\"") != std::string::npos);
+        CHECK(t.find("glob: \"*.cpp\"") != std::string::npos);
+        CHECK(t.find("case_sensitive: true") != std::string::npos);   // grep is, the tool isn't
+    }
+    CHECK(tip("grep -rni foo src").find("case_sensitive") == std::string::npos);
+    CHECK(tip("grep -n -C3 foo f").find("context: \"3\"") != std::string::npos);
+    CHECK(tip("grep -n -B60 foo f").find("context: \"60\"") != std::string::npos);
+    // BRE `\|` is a literal pipe to ripgrep: the tip must say so.
+    CHECK(tip("grep -rn 'a\\|b' src").find("`a|b`") != std::string::npos);
+    CHECK(tip("grep -rnE 'a|b' src").find("`a|b`") == std::string::npos);
+    CHECK(tip("grep -rn 'ab' src").find("`a|b`") == std::string::npos);
+    // sed programs that aren't a plain range print stay silent.
+    for (const char* s : {"sed -n '/foo/p' f", "sed -n 's/a/b/p' f", "sed -n -E '1,5p' f",
+                          "sed -n '1,5p' a b", "sed '1,5p' f"}) {
+        INFO(s);
+        CHECK_FALSE(nudges(s));
+    }
+    // Things list_dir/glob/read can't express stay silent.
+    for (const char* s : {"ls -lt", "ls -S build", "find . -newer f", "find . -mtime -1",
+                          "find . -size +1M", "head -c 100 f", "tail -F log", "head -5 a b"}) {
+        INFO(s);
+        CHECK_FALSE(nudges(s));
+    }
 
     CHECK(g_failures == 0);
 }

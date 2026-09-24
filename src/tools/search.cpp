@@ -356,7 +356,11 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
 
 constexpr std::size_t kMaxFileBytes = 8 * 1024 * 1024;
 constexpr int         kPerPage      = 20;
+constexpr int         kMaxPage      = 200;
 constexpr int         kContext      = 2;
+// Real `grep -A/-B/-C` use goes to 60 (a third are over 10), so the native
+// window has to reach that far or the shell stays the better tool.
+constexpr int         kMaxContext   = 60;
 constexpr int         kMaxScanned   = 500;
 constexpr std::size_t kMaxOutputBytes = 20'000;
 // File-parallel scan scales with cores; cap high enough to saturate a big
@@ -372,6 +376,10 @@ struct GrepArgs {
     bool        block;     // return the whole enclosing function/block per hit
     int         context_lines = kContext;  // ±N lines (context:"N")
     int         offset;    // ≥ 0
+    // Matches per page. `limit` lets a caller ask for fewer (or more, up to
+    // kMaxPage) instead of piping to `| head -N`, which is what the prompt
+    // and the shell tip tell the model to do.
+    int         per_page = kPerPage;
     // Output mode: Content (default) renders matching lines w/ context;
     // FilesOnly renders one path + match-count per line (rg -l — the survey
     // shape: "which files touch X" without the line noise); Count renders
@@ -393,7 +401,8 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
             "pattern must not be blank (received only whitespace)"));
     int offset = ar.integer("offset", 0);
     if (offset < 0) offset = 0;
-    // `context`: "block" returns the enclosing scope; a NUMBER ("0".."10",
+    const int per_page = std::clamp(ar.integer("limit", kPerPage), 1, kMaxPage);
+    // `context`: "block" returns the enclosing scope; a NUMBER ("0".."60",
     // or a bare integer) sets the ±N window; anything else is the default ±2.
     bool block = false;
     int  ctx_lines = kContext;
@@ -402,12 +411,12 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
         if (ctx.empty() && ar.has("context")) {
             // Model sent a bare integer (context: 5) — ArgReader.str returns
             // "" for non-strings; read it as an integer instead.
-            ctx_lines = std::clamp(ar.integer("context", kContext), 0, 10);
+            ctx_lines = std::clamp(ar.integer("context", kContext), 0, kMaxContext);
         } else if (ctx == "block") {
             block = true;
         } else if (!ctx.empty()
                    && ctx.find_first_not_of("0123456789") == std::string::npos) {
-            ctx_lines = std::clamp(std::atoi(ctx.c_str()), 0, 10);
+            ctx_lines = std::clamp(std::atoi(ctx.c_str()), 0, kMaxContext);
         }
     }
     GrepArgs::Mode mode = GrepArgs::Mode::Content;
@@ -425,6 +434,7 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
         block,
         ctx_lines,
         offset,
+        per_page,
         mode,
         ar.str("display_description", ""),
     };
@@ -1011,7 +1021,7 @@ ExecResult run_ripgrep(const GrepArgs& a) {
     int shown = 0, skipped = 0;
     bool size_capped = false;
     for (auto& f : files) {
-        if (shown >= kPerPage || size_capped) break;
+        if (shown >= a.per_page || size_capped) break;
         struct Block { int s, e; std::vector<const LineRow*> rows; int matches; };
         std::vector<Block> blocks;
         for (const auto& row : f.rows) {
@@ -1042,7 +1052,7 @@ ExecResult run_ripgrep(const GrepArgs& a) {
                 skipped += b.matches;
                 continue;
             }
-            if (shown >= kPerPage) break;
+            if (shown >= a.per_page) break;
             if (static_cast<std::size_t>(out.tellp()) >= kMaxOutputBytes) {
                 size_capped = true;
                 break;
@@ -1073,7 +1083,7 @@ ExecResult run_ripgrep(const GrepArgs& a) {
         out << "Showing matches " << (a.offset + 1) << "-"
             << (a.offset + shown) << " of " << total_matches
             << (total_matches >= kMaxScanned ? "+ (scan limit reached)" : "")
-            << ". Use offset: " << (a.offset + kPerPage)
+            << ". Use offset: " << (a.offset + a.per_page)
             << " to see the next page.";
     } else if (shown == 0) {
         return ToolOutput{
@@ -1262,7 +1272,7 @@ ExecResult run_builtin(const GrepArgs& a) {
     bool size_capped = false;
     for (const auto& h : hits) {
         if (h.path.empty()) continue;
-        if (shown >= kPerPage || size_capped) break;
+        if (shown >= a.per_page || size_capped) break;
         if (static_cast<std::size_t>(out.tellp()) >= kMaxOutputBytes) {
             size_capped = true;
             break;
@@ -1287,7 +1297,7 @@ ExecResult run_builtin(const GrepArgs& a) {
         std::vector<std::pair<int,int>> page_ranges;
         for (const auto& li : lines) {
             if (skipped < a.offset) { ++skipped; continue; }
-            if (shown >= kPerPage) break;
+            if (shown >= a.per_page) break;
             int row = li.line_no - 1;
             int start, end;
             if (a.block) {
@@ -1352,7 +1362,7 @@ ExecResult run_builtin(const GrepArgs& a) {
         out << "Showing matches " << (a.offset + 1) << "-"
             << (a.offset + shown) << " of " << total
             << (total >= kMaxScanned ? "+ (scan limit reached)" : "")
-            << ". Use offset: " << (a.offset + kPerPage)
+            << ". Use offset: " << (a.offset + a.per_page)
             << " to see the next page.";
     } else if (shown == 0) {
         return ToolOutput{
@@ -1423,9 +1433,10 @@ json grep_schema() {
             {"glob",           {{"type","string"}, {"description","Filter files by glob. A bare pattern like `*.cpp` matches the filename anywhere; a slash pattern like `src/*.ts` or `**/test/*.py` matches the workspace-relative path."}}},
             {"case_sensitive", {{"type","boolean"}, {"description","Case-sensitive match (default: false)"}}},
             {"word",           {{"type","boolean"}, {"description","Whole-word match: `foo` won't match `foobar` or `do_foo`. Use for finding all USES of an identifier."}}},
-            {"context",        {{"type","string"}, {"description","`line` (default) = ±2 lines around each hit. `block` = the WHOLE enclosing function/block, so you rarely need a follow-up `read`. A number `0`-`10` = ±N lines (use `0` for match lines only — densest content view)."}}},
+            {"context",        {{"type","string"}, {"description","`line` (default) = ±2 lines around each hit. `block` = the WHOLE enclosing function/block, so you rarely need a follow-up `read`. A number `0`-`60` = ±N lines (like grep -C N) (use `0` for match lines only — densest content view)."}}},
             {"output",         {{"type","string"}, {"enum", {"content","files","count"}}, {"description","`content` (default) = matching lines with context. `files` = one path + match-count per line, no line bodies (the survey view: WHICH files touch X). `count` = per-file match counts only (the cheapest probe: HOW WIDESPREAD is X — run this before a bulk rewrite)."}}},
             {"offset",         {{"type","integer"}, {"description","Skip this many matches (for pagination)"}}},
+            {"limit",          {{"type","integer"}, {"description","Matches per page (default 20, max 200). Use this instead of piping to `head`."}}},
         }},
     };
 }
@@ -1437,7 +1448,7 @@ void register_search_tools(Shells& sh) {
         "Search for a regex pattern across files. Returns matches grouped by "
         "file with 2 lines of context, each block headed by the enclosing "
         "function/class when detectable (e.g. `### fn foo \xe2\x80\xba L12-14`). "
-        "Paginated 20 results per page. Case-insensitive by default; pass "
+        "Paginated 20 results per page (`limit` changes that). Case-insensitive by default; pass "
         "case_sensitive=true for exact case. Use offset for subsequent pages.",
         grep_schema(), EffectSet{Effect::ReadFs},
         body<GrepArgs>(run_grep, parse_grep_args), 30'000);

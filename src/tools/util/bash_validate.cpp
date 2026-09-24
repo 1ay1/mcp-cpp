@@ -2,6 +2,7 @@
 #include <mcp/tools/util/bash_validate.hpp>
 #include <mcp/tools/util/shellx.hpp>
 
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -406,6 +407,321 @@ bool has_flag(const sx::Command& c, std::string_view shortf, std::string_view lo
 
 }  // namespace
 
+
+// ── Verdict ─────────────────────────────────────────────────────────────
+//
+// How the verdict is reached (measured on 11.5k real shell calls):
+//
+//   * The script is split into top-level PIPELINES. `cd X`, `echo "=== x
+//     ==="` separators and `true` are scaffolding and carry no intent; the
+//     model adds them around real work. 19% of calls are `cd X && inspect`
+//     and 28% carry echo separators, so treating either as "shell work"
+//     silenced the tip on most of the detours that matter.
+//   * Each remaining pipeline is judged on its own. The whole call is a
+//     detour only when EVERY one of them is inspection a native tool
+//     answers; one build, one loop, one `sort | uniq` and it is shell work.
+//     This is the Codex rule (parse_command: all parts must summarize, or
+//     the call is Unknown), which errs toward silence.
+//   * Writes are found first over EVERY command, nested or not. A write
+//     anywhere means no advice at all, ever.
+//   * Formatting tails (`| head -N`, `| tail -N`, `| wc -l`) fold into the
+//     verdict as a bound or a count. Any other stage (sort, awk, a second
+//     grep) is a composition the native tools can't express: silent.
+
+namespace {
+
+struct PipeVerdict {
+    Intent intent = Intent::Other;
+    std::string_view tool;
+    std::string reason;
+    std::string param;
+    std::optional<Bound> bound;
+    bool shell = false;       // needs the shell (not inspection)
+};
+
+bool is_int(std::string_view v) {
+    return !v.empty() && v.find_first_not_of("0123456789") == std::string_view::npos;
+}
+int to_int(std::string_view v) {
+    int n = 0;
+    for (char ch : v) { n = n * 10 + (ch - '0'); if (n > 1'000'000) return 1'000'000; }
+    return n;
+}
+
+// Non-flag operands of an argv, skipping the values of flags that take one.
+// `--` ends flags. Glob/brace words are fine (they are patterns the native
+// tools take too); any other expansion ($X, $(…), ~) → nullopt.
+std::optional<std::vector<std::string_view>>
+operands(const sx::Command& c, std::initializer_list<std::string_view> takes_value) {
+    std::vector<std::string_view> out;
+    bool flags = true;
+    for (std::size_t i = 1; i < c.argv.size(); ++i) {
+        if (const auto* dy = std::get_if<sx::Dyn>(&c.argv[i]))
+            if (dy->why != sx::Dyn::Why::Glob && dy->why != sx::Dyn::Why::Brace)
+                return std::nullopt;
+        std::string_view v = sx::spelling(c.argv[i]);
+        if (flags && v == "--") { flags = false; continue; }
+        if (flags && v.size() > 1 && v[0] == '-') {
+            for (auto t : takes_value)
+                if (v == t) { ++i; break; }
+            continue;
+        }
+        out.push_back(v);
+    }
+    return out;
+}
+
+// `head -N f`, `head -n N f`, `head -nN f`, `tail -N f`, … → N, or 0.
+int count_flag(const sx::Command& c) {
+    for (std::size_t i = 1; i < c.argv.size(); ++i) {
+        const std::string* a = sx::lit(c.argv[i]);
+        if (!a) return 0;
+        std::string_view v = *a;
+        if ((v == "-n" || v == "--lines") && i + 1 < c.argv.size()) {
+            const std::string* nx = sx::lit(c.argv[i + 1]);
+            return nx && is_int(*nx) ? to_int(*nx) : 0;
+        }
+        if (v.starts_with("--lines=")) v.remove_prefix(8);
+        else if (v.starts_with("-n")) v.remove_prefix(2);
+        else if (v.starts_with("-")) v.remove_prefix(1);
+        else continue;
+        if (is_int(v)) return to_int(v);
+    }
+    return 0;
+}
+
+// `sed -n '10,40p' f` / `-n 10p f` / `-n -e '10,40p' f` → {10,40}. Only a
+// single address range with the `p` command; anything else is a real sed
+// program. The script is the `-e` value, or else the first operand.
+std::optional<std::pair<int, int>> sed_range(const sx::Command& c) {
+    std::optional<std::string_view> script;
+    for (std::size_t i = 1; i < c.argv.size(); ++i) {
+        const std::string* a = sx::lit(c.argv[i]);
+        if (!a) return std::nullopt;
+        std::string_view v = *a;
+        if (v == "-n" || v == "--quiet" || v == "--silent") continue;
+        if (v == "-e" || v == "--expression") {
+            if (script || i + 1 >= c.argv.size()) return std::nullopt;
+            const std::string* nx = sx::lit(c.argv[++i]);
+            if (!nx) return std::nullopt;
+            script = *nx;
+            continue;
+        }
+        if (v.starts_with("-")) return std::nullopt;   // -E, -z, -s …: a program
+        if (!script) script = v;                       // first operand = script
+    }
+    if (!script) return std::nullopt;
+    std::string_view v = *script;
+    if (!v.ends_with("p")) return std::nullopt;
+    v.remove_suffix(1);
+    const auto comma = v.find(',');
+    const auto lo = v.substr(0, comma);
+    const auto hi = comma == std::string_view::npos ? lo : v.substr(comma + 1);
+    if (!is_int(lo) || !(is_int(hi) || hi == "$")) return std::nullopt;
+    return std::pair{to_int(lo), hi == "$" ? 0 : to_int(hi)};
+}
+
+// Judge one top-level pipeline. `stages` are its commands in order.
+PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
+    PipeVerdict v;
+    const sx::Command& head = *stages.front();
+
+    // Formatting tails. `| head -N` / `| tail -N` bound; `| wc -l` counts.
+    bool counted = false;
+    for (std::size_t i = 1; i < stages.size(); ++i) {
+        const sx::Command& st = *stages[i];
+        if (auto b = as_bound(st)) { v.bound = *b; continue; }
+        const auto sp = base_name(st.program());
+        if (sp == "wc" && st.argv.size() == 2 && sx::spelling(st.argv[1]) == "-l"
+            && i + 1 == stages.size()) { counted = true; continue; }
+        v.shell = true;          // sort, uniq, awk, grep -v …: a composition
+        return v;
+    }
+
+    // Values only the shell knows. A quoted `$` is a Lit, so `grep '$x' f`
+    // passes; globs in arguments are patterns the native tools also take.
+    for (const auto* c : stages) {
+        if (!c->env.empty()) { v.shell = true; return v; }
+        for (std::size_t i = 0; i < c->argv.size(); ++i)
+            if (const auto* dy = std::get_if<sx::Dyn>(&c->argv[i])) {
+                const bool glob = dy->why == sx::Dyn::Why::Glob || dy->why == sx::Dyn::Why::Brace;
+                if (!(glob && i > 0 && c == &head)) { v.shell = true; return v; }
+            }
+        for (const auto& r : c->redirects)
+            if (!noise_redirect(r)) { v.shell = true; return v; }
+    }
+
+    const auto p = base_name(head.program());
+    const bool grep_like = p == "grep" || p == "rg" || p == "egrep" || p == "fgrep";
+
+    if (grep_like) {
+        // grep with no path reads stdin; rg with none searches cwd.
+        auto ops = operands(head, {"-e", "-f", "-A", "-B", "-C", "-m", "--include",
+                                   "--exclude", "--exclude-dir", "-g", "--glob", "-t",
+                                   "--type", "--max-count", "--context"});
+        if (!ops) { v.shell = true; return v; }
+        const bool has_e = has_flag(head, "e", "--regexp");
+        const std::size_t need = has_e ? 1 : 2;
+        if (p != "rg" && ops->size() < need) { v.shell = true; return v; }
+        if (has_flag(head, "f", "--file")) { v.shell = true; return v; }
+        v.tool = "grep";
+        if (counted || has_flag(head, "c", "--count")) {
+            v.intent = Intent::CountOnly;
+            v.reason = "`grep` with output:\"count\" returns per-file match counts "
+                       "directly \u2014 no shell-out, and it skips generated trees.";
+            v.param = "output: \"count\"";
+            return v;
+        }
+        v.intent = Intent::Search;
+        v.reason = "the `grep` tool is ripgrep-backed, skips build/vendor "
+                   "trees, groups hits by enclosing symbol, and supports "
+                   "word=true / context:\"block\".";
+        // Map the flags the model actually typed to the native params.
+        std::vector<std::string> ps;
+        if (has_flag(head, "l", "--files-with-matches")) ps.push_back("output: \"files\"");
+        if (has_flag(head, "w", "--word-regexp")) ps.push_back("word: true");
+        if (p != "rg" && !has_flag(head, "i", "--ignore-case")) ps.push_back("case_sensitive: true");
+        int ctx = -1;
+        std::string glob;
+        for (std::size_t i = 1; i < head.argv.size(); ++i) {
+            std::string_view a = sx::spelling(head.argv[i]);
+            if (a == "--") break;
+            std::string_view val;
+            if ((a == "-A" || a == "-B" || a == "-C" || a == "--context")
+                && i + 1 < head.argv.size())
+                val = sx::spelling(head.argv[i + 1]);
+            else if (a.size() > 2 && (a.starts_with("-A") || a.starts_with("-B") || a.starts_with("-C")))
+                val = a.substr(2);
+            if (is_int(val)) ctx = std::max(ctx, to_int(val));
+            if (a.starts_with("--include=")) glob = std::string{a.substr(10)};
+            else if ((a == "--include" || a == "-g" || a == "--glob") && i + 1 < head.argv.size())
+                glob = std::string{sx::spelling(head.argv[i + 1])};
+            else if (a.starts_with("--glob=")) glob = std::string{a.substr(7)};
+        }
+        if (ctx >= 0) ps.push_back("context: \"" + std::to_string(std::min(ctx, 60)) + "\"");
+        if (!glob.empty() && glob.find('"') == std::string::npos) ps.push_back("glob: \"" + glob + "\"");
+        for (auto& s : ps) v.param += (v.param.empty() ? "" : ", ") + s;
+        // GNU grep's BRE `\|` is alternation; ripgrep (the native tool)
+        // reads it as a literal `|` and silently finds nothing. 24% of real
+        // grep calls use it, so a model copying its pattern across would
+        // get a wrong "no matches". Say so.
+        if (p == "grep" && !has_flag(head, "E", "--extended-regexp")
+            && !has_flag(head, "F", "--fixed-strings") && !has_flag(head, "P", "--perl-regexp"))
+            for (std::size_t i = 1; i < head.argv.size(); ++i)
+                if (sx::spelling(head.argv[i]).find("\\|") != std::string_view::npos) {
+                    v.reason += " Its pattern is ripgrep syntax: write `a|b`, not `a\\|b`.";
+                    break;
+                }
+        return v;
+    }
+    if (counted) { v.shell = true; return v; }   // `ls | wc -l` etc.
+
+    if (p == "wc") {
+        v.intent = Intent::CountOnly;
+        v.tool   = "grep";
+        v.reason = "`grep` with output:\"count\" returns per-file match counts "
+                   "directly \u2014 no shell-out, and it skips generated trees.";
+        v.param  = "output: \"count\"";
+        auto ops = operands(head, {});
+        if (!ops || ops->empty()) { v.shell = true; }   // wc on stdin
+        return v;
+    }
+    if (p == "cat" || p == "head" || p == "tail" || p == "nl") {
+        auto ops = operands(head, {"-n", "-c", "--lines", "--bytes"});
+        if (!ops || ops->empty()) { v.shell = true; return v; }   // stdin
+        if (ops->size() > 1 && p != "cat") { v.shell = true; return v; }
+        if (has_flag(head, "f", "--follow") || has_flag(head, "F", "")) { v.shell = true; return v; }
+        if (has_flag(head, "c", "--bytes")) { v.shell = true; return v; }
+        v.intent = Intent::ReadFile;
+        v.tool   = "read";
+        const int n = count_flag(head);
+        if (p == "tail") {
+            v.reason = "`read` with offset:-N returns the LAST N lines (like "
+                       "`tail -n N`) \u2014 ideal for logs, and no need to know "
+                       "the file length.";
+            if (n > 0) v.param = "offset: -" + std::to_string(n);
+        } else {
+            v.reason = "`read` takes offset/limit (and start_line/end_line) "
+                       "for a line window, reports how many lines remain, and "
+                       "caches re-reads \u2014 so you don't re-shell for the next "
+                       "chunk.";
+            if (p == "head" && n > 0) v.param = "limit: " + std::to_string(n);
+        }
+        // `cat f | head -20` / `cat f | tail -20`: the bound IS the window.
+        if (v.param.empty() && v.bound) {
+            v.param = v.bound->from_tail ? "offset: -" + std::to_string(v.bound->limit)
+                                         : "limit: " + std::to_string(v.bound->limit);
+            v.bound.reset();
+        }
+        return v;
+    }
+    if (p == "sed") {
+        if (!has_flag(head, "n", "--quiet") && !has_flag(head, "n", "--silent")) {
+            v.shell = true;
+            return v;
+        }
+        auto r = sed_range(head);
+        auto ops = operands(head, {"-e", "--expression"});
+        const bool has_e = has_flag(head, "e", "--expression");
+        // exactly one file: `sed -n 5p a b` concatenates, read can't.
+        if (!r || !ops || ops->size() != (has_e ? 1u : 2u)) { v.shell = true; return v; }
+        v.intent = Intent::ReadFile;
+        v.tool   = "read";
+        v.reason = "to read one function/type's body use `read` with "
+                   "symbol=\"name\" \u2014 no line arithmetic.";
+        v.param  = r->second > 0
+            ? "start_line: " + std::to_string(r->first) + ", end_line: " + std::to_string(r->second)
+            : "start_line: " + std::to_string(r->first);
+        return v;
+    }
+    if (p == "find") {
+        for (std::size_t i = 1; i < head.argv.size(); ++i) {
+            const auto a = sx::spelling(head.argv[i]);
+            if (a == "-exec" || a == "-execdir" || a == "-delete" || a == "-ok"
+                || a == "-okdir" || a == "-fprint" || a == "-fprintf" || a == "-fls"
+                || a == "-fprint0" || a == "-printf" || a == "-newer" || a == "-mtime"
+                || a == "-mmin" || a == "-size" || a == "-perm" || a == "-user") {
+                v.shell = true;     // an action, or a predicate glob can't express
+                return v;
+            }
+        }
+        v.intent = Intent::FindFiles;
+        v.tool   = "glob";
+        v.reason = "the `glob` tool finds files by pattern (e.g. '**/*.ts') "
+                   "without crawling generated trees.";
+        return v;
+    }
+    if (p == "ls" || p == "tree") {
+        if (has_flag(head, "t", "") || has_flag(head, "S", "") || has_flag(head, "r", "")) {
+            v.shell = true;         // sorted by time/size: list_dir can't order
+            return v;
+        }
+        v.intent = Intent::ListDir;
+        v.tool   = "list_dir";
+        v.reason = "the `list_dir` tool gives a structured listing (type, "
+                   "size), and `glob` matches names without crawling "
+                   "generated trees.";
+        if (p == "tree" || has_flag(head, "R", "--recursive")) v.param = "recursive: true";
+        return v;
+    }
+    v.shell = true;
+    return v;
+}
+
+// Scaffolding the model wraps around real work: it has no intent of its own.
+bool scaffolding(const sx::Command& c) {
+    const auto p = base_name(c.program());
+    if (p == "cd" || p == "pwd" || p == "true" || p == ":") return true;
+    if (p == "echo" || p == "printf") {
+        for (std::size_t i = 1; i < c.argv.size(); ++i)
+            if (!sx::lit(c.argv[i])) return false;      // echo $(…) / $X does work
+        return c.redirects.empty();
+    }
+    return false;
+}
+
+}  // namespace
+
 Detour analyze_detour(std::string_view cmd) {
     Detour d;
     const sx::Script s = sx::analyze(cmd);
@@ -420,131 +736,70 @@ Detour analyze_detour(std::string_view cmd) {
     // A parse we can't fully trust gets no advice. Silence is always safe.
     if (!s.clean || s.truncated || s.commands.empty()) { d.needs_shell = true; return d; }
 
-    // One pipeline, no chaining, no nesting: `a && b`, `a; b`, `$(…)`,
-    // loops, subshells and `&` are shell work. Shell work can still end in
-    // `| tail -20`, and that bound has a native answer (head_lines /
-    // tail_lines), so recover it before going quiet.
+    // Anything nested ($(…), loops, if, subshells, functions, `&`) is shell
+    // work, but a bound on its last top-level stage still has an answer.
     const auto tops = s.top_level();
     auto shell_work = [&]() -> Detour& {
         d.needs_shell = true;
+        d.intent = Intent::Other;
+        d.tool = {};
+        d.reason.clear();
+        d.param.clear();
+        d.bound.reset();
         if (!tops.empty() && tops.back()->stage > 0)
             if (auto b = as_bound(*tops.back())) d.bound = *b;
         return d;
     };
     if (tops.size() != s.commands.size()) return shell_work();
-    for (const auto* c : tops)
-        if (c->pipeline != tops.front()->pipeline
-            || (c->ctx != sx::Ctx::None && c->ctx != sx::Ctx::Piped)
-            || c->join == sx::Join::PipeErr)
-            return shell_work();
 
-    const sx::Command& head = *tops.front();
-    // Expansion ($X, $(…), ~, globs in the program) is a value only the
-    // shell knows. A quoted `$` is a Lit, so `grep '$HOME' src` passes.
-    // Globs in ARGUMENTS are fine for ls/find (they describe a pattern the
-    // native tools also take); anything else Dyn bails.
+    // Group into pipelines; `|&` (stderr into the pipe) is shell plumbing.
+    std::vector<std::vector<const sx::Command*>> pipes;
     for (const auto* c : tops) {
-        if (!c->env.empty()) { d.needs_shell = true; return d; }
-        for (std::size_t i = 0; i < c->argv.size(); ++i)
-            if (const auto* dy = std::get_if<sx::Dyn>(&c->argv[i])) {
-                const bool glob = dy->why == sx::Dyn::Why::Glob || dy->why == sx::Dyn::Why::Brace;
-                if (!(glob && i > 0 && c == &head)) { d.needs_shell = true; return d; }
+        if (c->join == sx::Join::PipeErr) return shell_work();
+        if (pipes.empty() || c->stage == 0) pipes.emplace_back();
+        pipes.back().push_back(c);
+    }
+
+    // Judge each non-scaffolding pipeline. All must be inspection, and they
+    // must agree on the tool, or the tip would be naming half a call.
+    bool any = false;
+    for (const auto& pl : pipes) {
+        if (pl.size() == 1 && scaffolding(*pl.front())) continue;
+        PipeVerdict v = judge(pl);
+        if (v.shell) return shell_work();
+        if (!any) {
+            d.intent = v.intent;
+            d.tool   = v.tool;
+            d.reason = std::move(v.reason);
+            d.param  = std::move(v.param);
+            d.bound  = v.bound;
+            any = true;
+        } else {
+            if (v.tool != d.tool) {
+                // Mixed native tools (a read and a grep): still a detour,
+                // just nothing single to name.
+                d.param.clear();
+                d.bound.reset();
+                d.reason = "each step here is a native tool call (`read`, "
+                           "`grep`, `list_dir`, `glob`) \u2014 call them directly, "
+                           "several in one turn run in parallel.";
+                d.tool = "read";
+                d.intent = Intent::ReadFile;
+            } else if (v.param != d.param) {
+                d.param.clear();
             }
-        for (const auto& r : c->redirects)
-            if (!noise_redirect(r)) { d.needs_shell = true; return d; }   // `< f`, heredoc
-    }
-
-    // Trailing stages that only bound become a Bound; any real transform
-    // (sort, uniq, awk, a second grep) is a two-tool composition: silent.
-    for (std::size_t i = 1; i < tops.size(); ++i) {
-        auto b = as_bound(*tops[i]);
-        if (!b) { d.needs_shell = true; return d; }
-        d.bound = *b;
-    }
-
-    const auto p = base_name(head.program());
-    const bool grep_like = p == "grep" || p == "rg" || p == "egrep" || p == "fgrep";
-
-    // Counts are their own intent: a different parameter, not a read.
-    if (p == "wc" || (grep_like && has_flag(head, "c", "--count"))) {
-        d.intent = Intent::CountOnly;
-        d.tool   = "grep";
-        d.reason = "`grep` with output:\"count\" returns per-file match counts "
-                   "directly \u2014 no shell-out, and it skips generated trees.";
-        return d;
-    }
-    if (p == "cat" || p == "head" || p == "tail") {
-        if (head.argv.size() < 2) { d.needs_shell = true; return d; }   // reads stdin
-        if (p == "tail" && has_flag(head, "f", "--follow")) { d.needs_shell = true; return d; }
-        d.intent = Intent::ReadFile;
-        d.tool   = "read";
-        // Name the PARAMETER: a tip that names the tool gets ignored.
-        if (p == "tail")
-            d.reason = "`read` with offset:-N returns the LAST N lines (like "
-                       "`tail -n N`) \u2014 ideal for logs, and no need to know "
-                       "the file length.";
-        else
-            d.reason = "`read` takes offset/limit (and start_line/end_line) "
-                       "for a line window, reports how many lines remain, and "
-                       "caches re-reads \u2014 so you don't re-shell for the next "
-                       "chunk.";
-        return d;
-    }
-    if (p == "sed") {
-        // Only `sed -n …p` prints; anything else is a transform.
-        if (!has_flag(head, "n", "--quiet")) { d.needs_shell = true; return d; }
-        d.intent = Intent::ReadFile;
-        d.tool   = "read";
-        d.reason = "to read a line range use `read` with start_line/end_line; to "
-                   "read one function/type's body use `read` with symbol=\"name\" "
-                   "\u2014 no line arithmetic.";
-        return d;
-    }
-    if (grep_like) {
-        if (head.argv.size() < 3 && p != "rg") { d.needs_shell = true; return d; }   // grep on stdin
-        d.intent = Intent::Search;
-        d.tool   = "grep";
-        d.reason = "the `grep` tool is ripgrep-backed, skips build/vendor "
-                   "trees, groups hits by enclosing symbol, and supports "
-                   "word=true / context:\"block\".";
-        return d;
-    }
-    if (p == "find") {
-        // find with an action runs things; only a pure name search is a glob.
-        for (std::size_t i = 1; i < head.argv.size(); ++i) {
-            const auto a = sx::spelling(head.argv[i]);
-            if (a == "-exec" || a == "-execdir" || a == "-delete" || a == "-ok"
-                || a == "-okdir" || a == "-fprint" || a == "-fprintf" || a == "-fls") {
-                d.needs_shell = true;
-                return d;
-            }
+            if (!v.bound || !d.bound || v.bound->limit != d.bound->limit) d.bound.reset();
         }
-        d.intent = Intent::FindFiles;
-        d.tool   = "glob";
-        d.reason = "the `glob` tool finds files by pattern (e.g. '**/*.ts') "
-                   "without crawling generated trees.";
-        return d;
     }
-    if (p == "ls") {
-        d.intent = Intent::ListDir;
-        d.tool   = "list_dir";
-        d.reason = "the `list_dir` tool gives a structured listing (type, "
-                   "size), and `glob` matches names without crawling "
-                   "generated trees.";
-        return d;
-    }
-    d.needs_shell = true;
+    if (!any) return shell_work();       // only cd/echo: nothing to say
     return d;
 }
 
-std::string bash_tool_suggestion(std::string_view cmd) {
-    const auto d = analyze_detour(cmd);
-    // A bounded pipe on a command that genuinely needs the shell still has a
-    // native answer — just not a different TOOL. `make 2>&1 | tail -20`
-    // should stay in bash, but the pipe filters at the wrong layer: it
-    // discards the rest before the terminal card sees it, so the user loses
-    // output they were watching in order to save the model's context.
-    // head_lines/tail_lines bound only what reaches the model.
+std::string bash_tool_suggestion(const Detour& d) {
+    // Shell work that ends in `| head -N` / `| tail -N`: the pipe filters at
+    // the wrong layer. It discards the rest before the terminal card sees it,
+    // so the user loses output they were watching to save the model's
+    // context. head_lines/tail_lines bound only what reaches the model.
     if (!d.substitutable()) {
         if (d.bound && d.intent != Intent::Write) {
             std::string tip = "tip: `";
@@ -559,19 +814,38 @@ std::string bash_tool_suggestion(std::string_view cmd) {
         }
         return {};
     }
-    std::string tip = "tip: " + d.reason;
-    // When the model bounded the output with `| head -N`, name the native
-    // parameter that replaces the pipe — otherwise it keeps reaching for it
-    // because it doesn't know the tool can bound itself.
+    // Lead with the PARAMETER, read off the model's own command. Naming the
+    // tool is the advice that was already being ignored; naming the exact
+    // value it just typed is not.
+    std::string tip = "tip: ";
+    if (!d.param.empty()) {
+        tip += "`" + std::string{d.tool} + "` with `" + d.param + "` does this directly \u2014 ";
+        tip += d.reason;
+    } else {
+        tip += d.reason;
+    }
+    // A `| head -N` on a search/list: name the native tool's own bound. Only
+    // name parameters the tool really has: read and grep take limit (grep
+    // pages at 20 by default); list_dir/glob are already bounded. Naming a
+    // parameter the tool doesn't have is worse than no tip.
     if (d.bound) {
-        tip += " (`";
-        tip += d.bound->from_tail ? "offset:-" : "limit:";
-        tip += std::to_string(d.bound->limit);
-        tip += d.bound->from_tail
-            ? "` tails the last N lines directly.)"
-            : "` bounds the output \u2014 no `| head` needed.)";
+        if (d.tool == "read")
+            tip += d.bound->from_tail
+                ? " (`offset:-" + std::to_string(d.bound->limit) + "` tails it directly.)"
+                : " (`limit:" + std::to_string(d.bound->limit) + "` bounds it directly.)";
+        else if (d.tool == "grep" && !d.bound->from_tail)
+            tip += " (`limit:" + std::to_string(d.bound->limit)
+                 + "` bounds the output \u2014 no `| head` needed.)";
+        else if (d.tool == "grep")
+            tip += " (it pages 20 hits at a time; `offset:` pages on.)";
+        else
+            tip += " (its output is already bounded \u2014 no `| head` needed.)";
     }
     return tip;
+}
+
+std::string bash_tool_suggestion(std::string_view cmd) {
+    return bash_tool_suggestion(analyze_detour(cmd));
 }
 
 } // namespace mcp::tools::util
