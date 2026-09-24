@@ -253,5 +253,70 @@ TEST_CASE("bash_validate") {
     CHECK(!nudges("git status"));
     CHECK(!nudges("make -j8"));
 
+    // ── Hardening: decided on the tree-sitter parse, not bytes ──────────
+    //
+    // Writes hide in every shape a byte scanner misreads. Each must be
+    // Write and never substitutable, wherever it sits in the script.
+    for (const char* w : {
+             "sed -i.bak 's/a/b/' f", "sed -ni 's/a/b/p' f", "sed --in-place=.o 's/a/b/' f",
+             "perl -pi -e 's/a/b/' f", "sort -o f f", "awk -i inplace '{print}' f",
+             "cat f | tee g", "grep -n x f | tee -a log", "cat <<EOF > f\nhi\nEOF",
+             "cat a >> b", "head -5 f &> out", "cat f 1> g", "cat f >| g",
+             "cat f | sponge f", "truncate -s0 f", "dd if=/dev/zero of=f count=1",
+             "ls && cat f > g", "echo $(cat f > g)", "if true; then sed -i s/a/b/ f; fi",
+             "bash -c 'cat f > g'", "find . -name x -exec sed -i s/a/b/ {} +"}) {
+        INFO(w);
+        const auto d = analyze_detour(w);
+        CHECK(d.intent == Intent::Write);
+        CHECK_FALSE(d.substitutable());
+        CHECK_FALSE(nudges(w));
+    }
+    // Not writes: noise redirects, quoted `>`, sed flags that merely
+    // contain an `i` after a non-letter.
+    CHECK(analyze_detour("grep -rn '>' src").intent == Intent::Search);
+    CHECK(analyze_detour("cat f 2>/dev/null").intent == Intent::ReadFile);
+    CHECK(analyze_detour("grep -rn x src 2>&1 | head -5").intent == Intent::Search);
+    CHECK(analyze_detour("cat f >/dev/null").intent != Intent::Write);
+
+    // Things that look like inspection but aren't something a native tool
+    // can stand in for: stdin, following, actions, env, heredoc input.
+    for (const char* s : {"cat", "tail -f log", "tail --follow log", "grep foo",
+                          "find . -name x -delete", "find . -exec ls {} \\;",
+                          "LC_ALL=C ls", "cat < f", "cat <<EOF\nx\nEOF", "ls |& head -3",
+                          "(cat f)", "{ cat f; }", "cat f &", "! grep -q x f",
+                          "cat ~/f", "grep -rn x $DIR", "cat f | head -n +3"}) {
+        INFO(s);
+        CHECK_FALSE(analyze_detour(s).substitutable());
+    }
+    // Quoting is exact now: these are literal, so still plain inspection.
+    CHECK(analyze_detour("grep -rn 'a|b' src").substitutable());
+    CHECK(analyze_detour("grep -rn \"x; y\" src").substitutable());
+    CHECK(analyze_detour("grep -rn 'a && b' src").substitutable());
+    CHECK(analyze_detour("cat 'a b.txt'").substitutable());
+    // Globs in arguments describe a pattern the native tools also take.
+    CHECK(analyze_detour("ls src/*.cpp").substitutable());
+    // Every bound spelling folds.
+    for (const char* b : {"grep -rn x src | head -7", "grep -rn x src | head -n 7",
+                          "grep -rn x src | head -n7"}) {
+        INFO(b);
+        const auto d = analyze_detour(b);
+        CHECK(d.substitutable());
+        CHECK((d.bound && d.bound->limit == 7 && !d.bound->from_tail));
+    }
+    // Shell work that ends in a bound keeps the bound, so the tip can name
+    // head_lines / tail_lines instead of going silent.
+    {
+        const auto d = analyze_detour("make -j8 2>&1 | tail -20");
+        CHECK_FALSE(d.substitutable());
+        CHECK((d.bound && d.bound->limit == 20 && d.bound->from_tail));
+        CHECK(bash_tool_suggestion("make -j8 2>&1 | tail -20").find("tail_lines: 20")
+              != std::string::npos);
+        CHECK(bash_tool_suggestion("cd build && ctest | tail -5").find("tail_lines: 5")
+              != std::string::npos);
+    }
+    // A parse that isn't clean gets no advice at all.
+    CHECK_FALSE(nudges("cat 'unterminated"));
+    CHECK_FALSE(nudges("grep -rn x src | "));
+
     CHECK(g_failures == 0);
 }

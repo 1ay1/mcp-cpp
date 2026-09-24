@@ -404,27 +404,12 @@ ExecResult run_bash(const BashArgs& a) {
             << "]";
 
     std::string body = out.str();
-    // Out-of-the-box nudge: if this call was pure file inspection a native
-    // tool answers (every step typed by shellx), name the EXACT call that
-    // replaces it. NEVER blocks — the command already ran; this teaches the
-    // model to reach for read/grep/list_dir next time. Otherwise fall back
-    // to the older pipe-bound tip (`| head` → head_lines).
-    {
-        const auto pl = util::shellx::plan(util::shellx::analyze(a.command));
-        std::string calls;
-        if (pl.pure_inspection()) {
-            for (const auto& st : pl.steps) {
-                const std::string c = util::shellx::native_call(st);
-                if (c.empty()) { calls.clear(); break; }
-                calls += (calls.empty() ? "" : "; ") + c;
-            }
-        }
-        if (!calls.empty())
-            body = "tip: a native tool does this directly (faster, and the user "
-                   "sees a proper card): " + calls + "\n\n" + body;
-        else if (auto tip = util::bash_tool_suggestion(a.command); !tip.empty())
-            body = tip + "\n\n" + body;
-    }
+    // Advisory only: the command already ran. The tip names the PARAMETER
+    // that replaces the shell idiom (limit:20, offset:-50, head_lines), not
+    // a whole native call. Naming the tool is the advice models already
+    // ignore; naming the parameter fixes the belief behind the pipe.
+    if (auto tip = util::bash_tool_suggestion(a.command); !tip.empty())
+        body = tip + "\n\n" + body;
     if (!a.display_description.empty())
         body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};

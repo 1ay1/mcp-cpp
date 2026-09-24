@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <mcp/tools/util/bash_validate.hpp>
+#include <mcp/tools/util/shellx.hpp>
 
 #include <optional>
 #include <string>
@@ -298,123 +299,106 @@ std::string validate_bash_command(std::string_view cmd) {
 
 // ── Native-tool detour detection ────────────────────────────────────────
 //
-// The rewrite of a heuristic that a probe caught missing 6 of 10 real
-// shell-outs. See the header for the measurement; the two structural fixes
-// are (1) parse the pipeline instead of bailing on the first `|`, and
-// (2) decide READ vs WRITE before saying anything.
+// Built on the tree-sitter parse (shellx::analyze), not a byte scanner. The
+// old scanner had to guess what a quote, a `$`, a `<` or a `>` meant; the
+// parse knows. So `grep '$HOME' src` is a literal search, `cat $HOME/f` is
+// an expansion, `cat <<EOF > f` is a write, and `echo "grep x"` runs echo.
+//
+// Advisory only. Nothing here runs anything in place of the shell: the
+// verdict feeds a tip, and substitutable() is the ONE read/write gate for
+// any caller that ever wants to act on it.
 
 namespace {
 
-// Strip one layer of surrounding quotes, and tell whether a byte at index i
-// sits inside quotes. Needed because `echo "grep foo"` and a path like
-// "my grep dir/f" must not read as commands.
-bool in_quotes(std::string_view s, size_t idx) noexcept {
-    bool sq = false, dq = false;
-    for (size_t i = 0; i < idx && i < s.size(); ++i) {
-        if (s[i] == '\\') { ++i; continue; }
-        if (s[i] == '\'' && !dq) sq = !sq;
-        else if (s[i] == '"' && !sq) dq = !dq;
-    }
-    return sq || dq;
+namespace sx = shellx;
+
+std::string_view base_name(std::string_view p) noexcept {
+    if (auto s = p.find_last_of('/'); s != std::string_view::npos) p.remove_prefix(s + 1);
+    return p;
 }
 
-// Split a pipeline on unquoted `|`. The whole point of the rewrite: the old
-// code treated any `|` as "bash is doing real work" and went silent, which
-// is where most of its misses came from.
-std::vector<std::string_view> pipeline_stages(std::string_view cmd) {
-    std::vector<std::string_view> out;
-    size_t start = 0;
-    for (size_t i = 0; i < cmd.size(); ++i) {
-        if (cmd[i] == '\\') { ++i; continue; }
-        if (cmd[i] != '|' || in_quotes(cmd, i)) continue;
-        if (i + 1 < cmd.size() && cmd[i + 1] == '|') { ++i; continue; } // `||`
-        out.push_back(cmd.substr(start, i - start));
-        start = i + 1;
-    }
-    out.push_back(cmd.substr(start));
-    return out;
+// `2>/dev/null` and `2>&1` are noise control, not work. The model adds them
+// because a missing path makes the shell shout; a native tool just says
+// "no matches". Every other redirect is either a write or an input the
+// native tool can't take.
+bool noise_redirect(const sx::Redirect& r) noexcept {
+    if (r.kind == sx::Redirect::Kind::DupFd) return true;
+    const std::string* t = sx::lit(r.target);
+    return t && *t == "/dev/null" && r.kind != sx::Redirect::Kind::In;
 }
 
-// Trim ASCII whitespace.
-std::string_view trim(std::string_view s) noexcept {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\n'))
-        s.remove_prefix(1);
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\n'))
-        s.remove_suffix(1);
-    return s;
-}
-
-// `2>/dev/null` (and `2>&1`) is NOISE SUPPRESSION, not a redirect to a file:
-// the model adds it because a missing path makes the shell shout. A native
-// tool simply reports "no matches" instead, so this must not be read as
-// "the shell is doing real work" — it was one of the two dominant misses.
-bool only_discards_stderr(std::string_view s) noexcept {
-    return s == "2>/dev/null" || s == "2>&1" || s == "2>nul"
-        || s == "2>/dev/null 2>&1";
-}
-
-// Remove every trailing stderr-discard from ONE stage. Per-stage rather than
-// once over the whole command, because the model writes it mid-pipeline too
-// (`ls a b 2>/dev/null | head -20`), and a `>` left anywhere reads as a
-// write and silences the verdict.
-std::string_view strip_stderr_discard(std::string_view s) noexcept {
-    for (;;) {
-        s = trim(s);
-        size_t r = s.rfind("2>");
-        if (r == std::string_view::npos) return s;
-        if (!only_discards_stderr(trim(s.substr(r)))) return s;
-        s = s.substr(0, r);
-    }
-}
-
-// A bounded tail stage is a RESULT LIMIT, which every native tool takes as a
-// parameter — not shell work. Returns the N from `head -N` / `tail -N`.
-std::optional<Bound> as_bound(std::string_view stage) {
-    stage = trim(stage);
-    auto tok = first_token(stage);
-    if (tok != "head" && tok != "tail") return std::nullopt;
-    const bool tail = tok == "tail";
-    auto rest = trim(stage.substr(stage.find(tok) + tok.size()));
-    // Accept `-N`, `-n N`, `-n5`; anything else (a file argument, `-f`,
-    // `-c`) means this is not a plain limit and the shell is doing more.
-    int n = 0;
-    for (size_t i = 0; i < rest.size(); ++i) {
-        if (rest[i] == '-') {
-            size_t j = i + 1;
-            if (j < rest.size() && rest[j] == 'n') ++j;
-            while (j < rest.size() && rest[j] == ' ') ++j;
-            size_t d = j;
-            while (d < rest.size() && rest[d] >= '0' && rest[d] <= '9') {
-                n = n * 10 + (rest[d] - '0');
-                ++d;
-            }
-            if (d == j) return std::nullopt;   // a flag, not a count
-            i = d - 1;
-            continue;
+// Does this command WRITE? Checked on every command in the script, nested
+// ones included, before anything else. The one mistake that can't be
+// undone is calling a write a read.
+bool writes(const sx::Command& c) {
+    for (const auto& r : c.redirects)
+        if (r.writes_file()) return true;
+    const auto p = base_name(c.program());
+    if (p == "tee" || p == "truncate" || p == "dd" || p == "sponge") return true;
+    auto arg_is = [&](auto pred) {
+        for (std::size_t i = 1; i < c.argv.size(); ++i) {
+            const std::string_view a = sx::spelling(c.argv[i]);
+            if (a == "--") break;
+            if (pred(a)) return true;
         }
-        if (rest[i] == ' ' || rest[i] == '\t') continue;
-        return std::nullopt;   // a file argument — reading a FILE, not limiting
+        return false;
+    };
+    // sed/perl/ruby -i, -i.bak, -pi, -ni, --in-place: a short-flag cluster
+    // (letters up to the first non-letter) that contains `i`.
+    auto inplace = [](std::string_view a) {
+        if (a.starts_with("--in-place")) return true;
+        if (a.size() < 2 || a[0] != '-' || a[1] == '-') return false;
+        for (std::size_t k = 1; k < a.size(); ++k) {
+            const char ch = a[k];
+            if (ch == 'i') return true;
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'))) break;
+        }
+        return false;
+    };
+    if (p == "sed" || p == "perl" || p == "ruby" || p == "gsed")
+        return arg_is(inplace);
+    if (p == "awk" || p == "gawk")
+        return arg_is([](std::string_view a) { return a == "-i" || a == "inplace"; });
+    if (p == "sort")
+        return arg_is([](std::string_view a) { return a == "-o" || a.starts_with("--output"); });
+    return false;
+}
+
+// A pipe stage that only BOUNDS the output: `head -N`, `head -n N`, `tail -N`.
+// No file argument, no other flag. That is a result limit, which every
+// native tool takes as a parameter; the model pipes because it doesn't
+// know that.
+std::optional<Bound> as_bound(const sx::Command& c) {
+    const auto p = base_name(c.program());
+    if (p != "head" && p != "tail") return std::nullopt;
+    if (!c.redirects.empty() || !c.env.empty()) return std::nullopt;
+    int n = 0;
+    for (std::size_t i = 1; i < c.argv.size(); ++i) {
+        const std::string* a = sx::lit(c.argv[i]);
+        if (!a) return std::nullopt;
+        std::string_view v = *a;
+        if (v == "-n" && i + 1 < c.argv.size()) {
+            const std::string* nx = sx::lit(c.argv[++i]);
+            if (!nx) return std::nullopt;
+            v = *nx;
+        } else if (v.starts_with("-n")) v.remove_prefix(2);
+        else if (v.starts_with("-")) v.remove_prefix(1);
+        else return std::nullopt;          // a file: reading, not bounding
+        if (v.empty() || v.find_first_not_of("0123456789") != std::string_view::npos)
+            return std::nullopt;           // -f, -c, +K …: not a plain limit
+        n = 0;
+        for (char ch : v) n = n * 10 + (ch - '0');
     }
     if (n <= 0) return std::nullopt;
-    return Bound{n, tail};
+    return Bound{n, p == "tail"};
 }
 
-// Does this stage WRITE? The safety gate: `sed -i`, `cat > f`, a heredoc and
-// `tee` all used to match a READ suggestion, which is the one mistake that
-// cannot be recovered from if a caller ever acts on the verdict.
-bool writes(std::string_view stage) noexcept {
-    for (size_t i = 0; i < stage.size(); ++i) {
-        if (stage[i] == '\\') { ++i; continue; }
-        if (in_quotes(stage, i)) continue;
-        // `>` or `>>` to anything (but `2>/dev/null` is handled by the caller)
-        if (stage[i] == '>') return true;
-    }
-    auto tok = first_token(stage);
-    if (tok == "tee" || tok == "truncate" || tok == "dd") return true;
-    // `sed -i` / `sed --in-place` edits the file in place.
-    if (tok == "sed" || tok == "perl" || tok == "awk") {
-        if (stage.find(" -i") != std::string_view::npos
-            || stage.find("--in-place") != std::string_view::npos)
+bool has_flag(const sx::Command& c, std::string_view shortf, std::string_view longf) {
+    for (std::size_t i = 1; i < c.argv.size(); ++i) {
+        const std::string_view a = sx::spelling(c.argv[i]);
+        if (a == "--") break;
+        if (!longf.empty() && a == longf) return true;
+        if (a.size() > 1 && a[0] == '-' && a[1] != '-' && a.find(shortf) != std::string_view::npos)
             return true;
     }
     return false;
@@ -424,89 +408,78 @@ bool writes(std::string_view stage) noexcept {
 
 Detour analyze_detour(std::string_view cmd) {
     Detour d;
+    const sx::Script s = sx::analyze(cmd);
 
-    // `2>/dev/null` is NOISE SUPPRESSION, not a redirect to a file — the
-    // model appends it because a missing path makes the shell shout, and a
-    // native tool just reports "no matches". Stripped per stage BEFORE the
-    // redirect scan below, because otherwise its `>` reads as a write and
-    // silences the whole verdict. This was one of the two dominant misses.
-    //
-    // Split first, strip each stage, then rejoin the analysis — the discard
-    // can sit on any stage, not just the last.
-    std::vector<std::string_view> stages;
-    for (auto s : pipeline_stages(cmd))
-        stages.push_back(strip_stderr_discard(s));
-
-    // Command substitution and chaining genuinely need the shell.
-    for (auto stage : stages) {
-        for (size_t i = 0; i < stage.size(); ++i) {
-            if (stage[i] == '\\') { ++i; continue; }
-            if (in_quotes(stage, i)) continue;
-            if (stage[i] == '`' || stage[i] == ';' || stage[i] == '\n'
-                || stage[i] == '&') { d.needs_shell = true; break; }
-            // `$` unquoted is parameter expansion, arithmetic, or command
-            // substitution — all three produce a value only the shell knows,
-            // so no native tool can stand in. `cat $HOME/f` used to slip
-            // through because only the `$(` spelling was checked; a native
-            // `read` would look for a literal "$HOME" directory.
-            //
-            // Single-quoted `$` is literal text and stays substitutable,
-            // which is why this is checked outside quotes only (the same
-            // Safe-vs-Unsafe split brush_parser makes between
-            // SingleQuotedText and ParameterExpansion).
-            if (stage[i] == '$') { d.needs_shell = true; break; }
-            if (stage[i] == '<') { d.needs_shell = true; break; } // heredoc
-        }
-        if (d.needs_shell) break;
-    }
-
-    // A WRITE anywhere disqualifies the whole command from any read
-    // substitution — and is reported as Write so a caller can tell the
-    // difference between "no better tool" and "actively dangerous to swap".
-    for (auto s : stages) {
-        if (writes(s)) {
+    // Writes first, over EVERY command (nested, substituted, conditional).
+    for (const auto& c : s.commands)
+        if (writes(c)) {
             d.intent = Intent::Write;
             d.needs_shell = true;
             return d;
         }
+    // A parse we can't fully trust gets no advice. Silence is always safe.
+    if (!s.clean || s.truncated || s.commands.empty()) { d.needs_shell = true; return d; }
+
+    // One pipeline, no chaining, no nesting: `a && b`, `a; b`, `$(…)`,
+    // loops, subshells and `&` are shell work. Shell work can still end in
+    // `| tail -20`, and that bound has a native answer (head_lines /
+    // tail_lines), so recover it before going quiet.
+    const auto tops = s.top_level();
+    auto shell_work = [&]() -> Detour& {
+        d.needs_shell = true;
+        if (!tops.empty() && tops.back()->stage > 0)
+            if (auto b = as_bound(*tops.back())) d.bound = *b;
+        return d;
+    };
+    if (tops.size() != s.commands.size()) return shell_work();
+    for (const auto* c : tops)
+        if (c->pipeline != tops.front()->pipeline
+            || (c->ctx != sx::Ctx::None && c->ctx != sx::Ctx::Piped)
+            || c->join == sx::Join::PipeErr)
+            return shell_work();
+
+    const sx::Command& head = *tops.front();
+    // Expansion ($X, $(…), ~, globs in the program) is a value only the
+    // shell knows. A quoted `$` is a Lit, so `grep '$HOME' src` passes.
+    // Globs in ARGUMENTS are fine for ls/find (they describe a pattern the
+    // native tools also take); anything else Dyn bails.
+    for (const auto* c : tops) {
+        if (!c->env.empty()) { d.needs_shell = true; return d; }
+        for (std::size_t i = 0; i < c->argv.size(); ++i)
+            if (const auto* dy = std::get_if<sx::Dyn>(&c->argv[i])) {
+                const bool glob = dy->why == sx::Dyn::Why::Glob || dy->why == sx::Dyn::Why::Brace;
+                if (!(glob && i > 0 && c == &head)) { d.needs_shell = true; return d; }
+            }
+        for (const auto& r : c->redirects)
+            if (!noise_redirect(r)) { d.needs_shell = true; return d; }   // `< f`, heredoc
     }
-    if (d.needs_shell) return d;
 
-    // Fold trailing stages that are merely LIMITS into a bound. What remains
-    // must be a single real command.
-    std::string_view head_stage = trim(stages.front());
-    for (size_t i = 1; i < stages.size(); ++i) {
-        auto s = trim(stages[i]);
-        if (auto b = as_bound(s)) { d.bound = *b; continue; }
-        d.needs_shell = true;   // a genuine transform: sort, uniq, xargs, awk…
+    // Trailing stages that only bound become a Bound; any real transform
+    // (sort, uniq, awk, a second grep) is a two-tool composition: silent.
+    for (std::size_t i = 1; i < tops.size(); ++i) {
+        auto b = as_bound(*tops[i]);
+        if (!b) { d.needs_shell = true; return d; }
+        d.bound = *b;
     }
-    if (d.needs_shell) return d;
 
-    const auto tok = first_token(head_stage);
+    const auto p = base_name(head.program());
+    const bool grep_like = p == "grep" || p == "rg" || p == "egrep" || p == "fgrep";
 
-    // `wc -l` and `grep -c` are COUNTS, not reads — a different parameter,
-    // so they get their own intent rather than a read suggestion.
-    const bool counts =
-        tok == "wc"
-        || ((tok == "grep" || tok == "rg")
-            && (head_stage.find(" -c") != std::string_view::npos
-                || head_stage.find("--count") != std::string_view::npos));
-
-    if (counts) {
+    // Counts are their own intent: a different parameter, not a read.
+    if (p == "wc" || (grep_like && has_flag(head, "c", "--count"))) {
         d.intent = Intent::CountOnly;
         d.tool   = "grep";
         d.reason = "`grep` with output:\"count\" returns per-file match counts "
                    "directly \u2014 no shell-out, and it skips generated trees.";
         return d;
     }
-    if (tok == "cat" || tok == "head" || tok == "tail") {
+    if (p == "cat" || p == "head" || p == "tail") {
+        if (head.argv.size() < 2) { d.needs_shell = true; return d; }   // reads stdin
+        if (p == "tail" && has_flag(head, "f", "--follow")) { d.needs_shell = true; return d; }
         d.intent = Intent::ReadFile;
         d.tool   = "read";
-        // `tail -N file` has an exact native counterpart the model rarely
-        // knows about, so name it rather than describing offset/limit in
-        // the abstract: a tip that names the PARAMETER gets used, a tip
-        // that names the tool gets ignored.
-        if (tok == "tail")
+        // Name the PARAMETER: a tip that names the tool gets ignored.
+        if (p == "tail")
             d.reason = "`read` with offset:-N returns the LAST N lines (like "
                        "`tail -n N`) \u2014 ideal for logs, and no need to know "
                        "the file length.";
@@ -517,18 +490,18 @@ Detour analyze_detour(std::string_view cmd) {
                        "chunk.";
         return d;
     }
-    if (tok == "sed") {
-        // Only `sed -n Np` style printing is a read; everything else is a
-        // transform the shell should keep.
-        if (head_stage.find("-n") == std::string_view::npos) return d;
+    if (p == "sed") {
+        // Only `sed -n …p` prints; anything else is a transform.
+        if (!has_flag(head, "n", "--quiet")) { d.needs_shell = true; return d; }
         d.intent = Intent::ReadFile;
         d.tool   = "read";
-        d.reason = "to read a line range use `read` with offset+limit; to read "
-                   "one function/type's body use `read` with symbol=\"name\" "
+        d.reason = "to read a line range use `read` with start_line/end_line; to "
+                   "read one function/type's body use `read` with symbol=\"name\" "
                    "\u2014 no line arithmetic.";
         return d;
     }
-    if (tok == "grep" || tok == "rg") {
+    if (grep_like) {
+        if (head.argv.size() < 3 && p != "rg") { d.needs_shell = true; return d; }   // grep on stdin
         d.intent = Intent::Search;
         d.tool   = "grep";
         d.reason = "the `grep` tool is ripgrep-backed, skips build/vendor "
@@ -536,14 +509,23 @@ Detour analyze_detour(std::string_view cmd) {
                    "word=true / context:\"block\".";
         return d;
     }
-    if (tok == "find") {
+    if (p == "find") {
+        // find with an action runs things; only a pure name search is a glob.
+        for (std::size_t i = 1; i < head.argv.size(); ++i) {
+            const auto a = sx::spelling(head.argv[i]);
+            if (a == "-exec" || a == "-execdir" || a == "-delete" || a == "-ok"
+                || a == "-okdir" || a == "-fprint" || a == "-fprintf" || a == "-fls") {
+                d.needs_shell = true;
+                return d;
+            }
+        }
         d.intent = Intent::FindFiles;
         d.tool   = "glob";
         d.reason = "the `glob` tool finds files by pattern (e.g. '**/*.ts') "
                    "without crawling generated trees.";
         return d;
     }
-    if (tok == "ls") {
+    if (p == "ls") {
         d.intent = Intent::ListDir;
         d.tool   = "list_dir";
         d.reason = "the `list_dir` tool gives a structured listing (type, "
@@ -551,6 +533,7 @@ Detour analyze_detour(std::string_view cmd) {
                    "generated trees.";
         return d;
     }
+    d.needs_shell = true;
     return d;
 }
 
