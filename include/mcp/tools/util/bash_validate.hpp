@@ -60,8 +60,29 @@ struct Bound {
     bool from_tail = false;  // it was `tail`, so the LAST N
 };
 
+// Why a call got no native-tool advice. Every silent verdict carries one, so
+// coverage is measurable: count these over real calls and the biggest bucket
+// is the next thing to support (or a proof it should stay shell).
+enum class Silence : std::uint8_t {
+    None,          // not silent: a detour, or a Write
+    Unparsed,      // parse not clean / truncated / empty
+    Nested,        // $(…), loop, if, subshell, function, `&`
+    PipeErr,       // `|&`
+    Work,          // a program no native tool replaces (make, python, rm …)
+    Filter,        // `| grep`, `| sort`, `| awk` … after an inspection
+    Expansion,     // $VAR, ~, env prefix in an inspection
+    Redirect,      // `< f`, heredoc input
+    Stdin,         // cat/grep/wc with no file: reads stdin
+    Flag,          // a flag the native tool can't express (-f, -c, -t, -p …)
+    SedProgram,    // sed that isn't one `-n Np` range on one file
+    FindAction,    // find with -exec/-delete/-mtime …
+    GitShape,      // git subcommand/flags git_* can't produce, or a git write
+    Scaffold,      // only cd/echo/pwd: nothing to say
+};
+
 struct Detour {
     Intent intent = Intent::Other;
+    Silence silence = Silence::None;
     // The native tool that does this job ("read", "grep", "glob",
     // "list_dir"), or empty when there is no better tool.
     std::string_view tool;

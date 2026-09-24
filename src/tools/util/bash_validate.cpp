@@ -2,6 +2,7 @@
 #include <mcp/tools/util/bash_validate.hpp>
 #include <mcp/tools/util/shellx.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <initializer_list>
 #include <optional>
@@ -438,6 +439,7 @@ struct PipeVerdict {
     std::string param;
     std::optional<Bound> bound;
     bool shell = false;       // needs the shell (not inspection)
+    Silence why = Silence::None;
 };
 
 bool is_int(std::string_view v) {
@@ -528,28 +530,96 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
     const sx::Command& head = *stages.front();
 
     // Formatting tails. `| head -N` / `| tail -N` bound; `| wc -l` counts.
+    // A real filter makes the pipeline a composition, but only call it a
+    // Filter if the head is something we'd otherwise advise on; `make |
+    // grep err` is Work, not a missed detour.
+    static constexpr std::string_view kInspect[] = {
+        "cat", "head", "tail", "nl", "sed", "grep", "rg", "egrep", "fgrep",
+        "wc", "find", "ls", "tree", "git"};
+    const auto hp = base_name(head.program());
+    const bool inspect_head = std::find(std::begin(kInspect), std::end(kInspect), hp) != std::end(kInspect);
     bool counted = false;
+    std::string exclude;       // `| grep -v PAT` after a search → grep exclude:
+    if (!inspect_head) { v.shell = true; v.why = Silence::Work; return v; }
+    const bool search_head = hp == "grep" || hp == "rg" || hp == "egrep" || hp == "fgrep";
     for (std::size_t i = 1; i < stages.size(); ++i) {
         const sx::Command& st = *stages[i];
         if (auto b = as_bound(st)) { v.bound = *b; continue; }
         const auto sp = base_name(st.program());
         if (sp == "wc" && st.argv.size() == 2 && sx::spelling(st.argv[1]) == "-l"
             && i + 1 == stages.size()) { counted = true; continue; }
-        v.shell = true;          // sort, uniq, awk, grep -v …: a composition
+        // `| grep -v PAT` / `-vE PAT`: exactly the native exclude. Anything
+        // else on that grep (-i, -F, -w, -x, two patterns) changes meaning,
+        // so it stays a composition. BRE `\|` is rewritten to ERE `|` only
+        // when there are no other BRE metachars that differ.
+        if (search_head && exclude.empty() && (sp == "grep" || sp == "egrep") && st.redirects.empty()
+            && st.env.empty()) {
+            bool v_flag = false, ere = sp == "egrep", ok = true;
+            std::optional<std::string> pat;
+            for (std::size_t k = 1; k < st.argv.size(); ++k) {
+                const std::string* w = sx::lit(st.argv[k]);
+                if (!w) { ok = false; break; }
+                std::string_view x = *w;
+                if (x.size() > 1 && x[0] == '-' && !pat) {
+                    for (char f : x.substr(1)) {
+                        if (f == 'v') v_flag = true;
+                        else if (f == 'E') ere = true;
+                        else { ok = false; break; }
+                    }
+                    if (!ok) break;
+                } else if (!pat) {
+                    pat = std::string{x};
+                } else { ok = false; break; }
+            }
+            if (ok && v_flag && pat && !pat->empty()) {
+                std::string p2 = *pat;
+                if (!ere) {
+                    // BRE → ERE: `\|` alternation becomes `|`; bail on any
+                    // other escaped/grouping construct whose meaning flips.
+                    const bool risky = p2.find("\\(") != std::string::npos || p2.find("\\{") != std::string::npos
+                                    || p2.find("\\+") != std::string::npos || p2.find("\\?") != std::string::npos
+                                    || p2.find_first_of("(){}+?|") != std::string::npos;
+                    if (!risky) {
+                        std::string out;
+                        for (std::size_t q = 0; q < p2.size(); ++q) {
+                            if (p2[q] == '\\' && q + 1 < p2.size() && p2[q + 1] == '|') { out += '|'; ++q; }
+                            else out += p2[q];
+                        }
+                        p2 = std::move(out);
+                    } else if (p2.find("\\(") != std::string::npos || p2.find("\\{") != std::string::npos
+                               || p2.find("\\+") != std::string::npos || p2.find("\\?") != std::string::npos) {
+                        p2.clear();
+                    } else {
+                        // unescaped ( ) { } + ? | are LITERAL in BRE: escape them.
+                        std::string out;
+                        for (std::size_t q = 0; q < p2.size(); ++q) {
+                            const char ch = p2[q];
+                            if (ch == '\\' && q + 1 < p2.size() && p2[q + 1] == '|') { out += '|'; ++q; continue; }
+                            if (std::string_view{"(){}+?|"}.find(ch) != std::string_view::npos) out += '\\';
+                            out += ch;
+                        }
+                        p2 = std::move(out);
+                    }
+                }
+                if (!p2.empty() && p2.find('"') == std::string::npos) { exclude = std::move(p2); continue; }
+            }
+        }
+        v.shell = true;
+        v.why = Silence::Filter;   // sort, uniq, awk, grep -i …: a composition
         return v;
     }
 
     // Values only the shell knows. A quoted `$` is a Lit, so `grep '$x' f`
     // passes; globs in arguments are patterns the native tools also take.
     for (const auto* c : stages) {
-        if (!c->env.empty()) { v.shell = true; return v; }
+        if (!c->env.empty()) { v.shell = true; v.why = Silence::Expansion; return v; }
         for (std::size_t i = 0; i < c->argv.size(); ++i)
             if (const auto* dy = std::get_if<sx::Dyn>(&c->argv[i])) {
                 const bool glob = dy->why == sx::Dyn::Why::Glob || dy->why == sx::Dyn::Why::Brace;
-                if (!(glob && i > 0 && c == &head)) { v.shell = true; return v; }
+                if (!(glob && i > 0 && c == &head)) { v.shell = true; v.why = Silence::Expansion; return v; }
             }
         for (const auto& r : c->redirects)
-            if (!noise_redirect(r)) { v.shell = true; return v; }
+            if (!noise_redirect(r)) { v.shell = true; v.why = Silence::Redirect; return v; }
     }
 
     const auto p = base_name(head.program());
@@ -560,17 +630,26 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
         auto ops = operands(head, {"-e", "-f", "-A", "-B", "-C", "-m", "--include",
                                    "--exclude", "--exclude-dir", "-g", "--glob", "-t",
                                    "--type", "--max-count", "--context"});
-        if (!ops) { v.shell = true; return v; }
+        if (!ops) { v.shell = true; v.why = Silence::Expansion; return v; }
         const bool has_e = has_flag(head, "e", "--regexp");
         const std::size_t need = has_e ? 1 : 2;
-        if (p != "rg" && ops->size() < need) { v.shell = true; return v; }
-        if (has_flag(head, "f", "--file")) { v.shell = true; return v; }
+        if (p != "rg" && ops->size() < need) { v.shell = true; v.why = Silence::Stdin; return v; }
+        if (has_flag(head, "f", "--file")) { v.shell = true; v.why = Silence::Flag; return v; }
+        // A search that is itself inverted (-v), prints only-matching (-o),
+        // or uses PCRE (-P) has no native shape.
+        if (has_flag(head, "v", "--invert-match") || has_flag(head, "o", "--only-matching")
+            || has_flag(head, "P", "--perl-regexp")) { v.shell = true; v.why = Silence::Flag; return v; }
         v.tool = "grep";
         if (counted || has_flag(head, "c", "--count")) {
             v.intent = Intent::CountOnly;
             v.reason = "`grep` with output:\"count\" returns per-file match counts "
                        "directly \u2014 no shell-out, and it skips generated trees.";
             v.param = "output: \"count\"";
+            if (!exclude.empty()) {
+                std::string e;
+                for (char ch : exclude) { if (ch == '\\') e += "\\\\"; else e += ch; }
+                v.param += ", exclude: \"" + e + "\"";
+            }
             return v;
         }
         v.intent = Intent::Search;
@@ -600,6 +679,12 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
             else if (a.starts_with("--glob=")) glob = std::string{a.substr(7)};
         }
         if (ctx >= 0) ps.push_back("context: \"" + std::to_string(std::min(ctx, 60)) + "\"");
+        if (!exclude.empty()) {
+            // JSON-string-safe: escape backslashes for the tip's literal.
+            std::string e;
+            for (char ch : exclude) { if (ch == '\\') e += "\\\\"; else e += ch; }
+            ps.push_back("exclude: \"" + e + "\"");
+        }
         if (!glob.empty() && glob.find('"') == std::string::npos) ps.push_back("glob: \"" + glob + "\"");
         for (auto& s : ps) v.param += (v.param.empty() ? "" : ", ") + s;
         // GNU grep's BRE `\|` is alternation; ripgrep (the native tool)
@@ -615,7 +700,7 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
                 }
         return v;
     }
-    if (counted) { v.shell = true; return v; }   // `ls | wc -l` etc.
+    if (counted) { v.shell = true; v.why = Silence::Filter; return v; }   // `ls | wc -l` etc.
 
     if (p == "wc") {
         v.intent = Intent::CountOnly;
@@ -624,15 +709,15 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
                    "directly \u2014 no shell-out, and it skips generated trees.";
         v.param  = "output: \"count\"";
         auto ops = operands(head, {});
-        if (!ops || ops->empty()) { v.shell = true; }   // wc on stdin
+        if (!ops || ops->empty()) { v.shell = true; v.why = Silence::Stdin; }   // wc on stdin
         return v;
     }
     if (p == "cat" || p == "head" || p == "tail" || p == "nl") {
         auto ops = operands(head, {"-n", "-c", "--lines", "--bytes"});
-        if (!ops || ops->empty()) { v.shell = true; return v; }   // stdin
-        if (ops->size() > 1 && p != "cat") { v.shell = true; return v; }
-        if (has_flag(head, "f", "--follow") || has_flag(head, "F", "")) { v.shell = true; return v; }
-        if (has_flag(head, "c", "--bytes")) { v.shell = true; return v; }
+        if (!ops || ops->empty()) { v.shell = true; v.why = Silence::Stdin; return v; }   // stdin
+        if (ops->size() > 1 && p != "cat") { v.shell = true; v.why = Silence::Flag; return v; }
+        if (has_flag(head, "f", "--follow") || has_flag(head, "F", "")) { v.shell = true; v.why = Silence::Flag; return v; }
+        if (has_flag(head, "c", "--bytes")) { v.shell = true; v.why = Silence::Flag; return v; }
         v.intent = Intent::ReadFile;
         v.tool   = "read";
         const int n = count_flag(head);
@@ -658,14 +743,14 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
     }
     if (p == "sed") {
         if (!has_flag(head, "n", "--quiet") && !has_flag(head, "n", "--silent")) {
-            v.shell = true;
+            v.shell = true; v.why = Silence::SedProgram;
             return v;
         }
         auto r = sed_range(head);
         auto ops = operands(head, {"-e", "--expression"});
         const bool has_e = has_flag(head, "e", "--expression");
         // exactly one file: `sed -n 5p a b` concatenates, read can't.
-        if (!r || !ops || ops->size() != (has_e ? 1u : 2u)) { v.shell = true; return v; }
+        if (!r || !ops || ops->size() != (has_e ? 1u : 2u)) { v.shell = true; v.why = Silence::SedProgram; return v; }
         v.intent = Intent::ReadFile;
         v.tool   = "read";
         v.reason = "to read one function/type's body use `read` with "
@@ -682,7 +767,7 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
                 || a == "-okdir" || a == "-fprint" || a == "-fprintf" || a == "-fls"
                 || a == "-fprint0" || a == "-printf" || a == "-newer" || a == "-mtime"
                 || a == "-mmin" || a == "-size" || a == "-perm" || a == "-user") {
-                v.shell = true;     // an action, or a predicate glob can't express
+                v.shell = true; v.why = Silence::FindAction;     // an action, or a predicate glob can't express
                 return v;
             }
         }
@@ -694,7 +779,7 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
     }
     if (p == "ls" || p == "tree") {
         if (has_flag(head, "t", "") || has_flag(head, "S", "") || has_flag(head, "r", "")) {
-            v.shell = true;         // sorted by time/size: list_dir can't order
+            v.shell = true; v.why = Silence::Flag;         // sorted by time/size: list_dir can't order
             return v;
         }
         v.intent = Intent::ListDir;
@@ -713,12 +798,12 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
         std::vector<std::string_view> a;
         for (std::size_t i = 1; i < head.argv.size(); ++i) {
             const std::string* w = sx::lit(head.argv[i]);
-            if (!w) { v.shell = true; return v; }
+            if (!w) { v.shell = true; v.why = Silence::Expansion; return v; }
             a.push_back(*w);
         }
         std::string dir;
         if (a.size() >= 2 && a[0] == "-C") { dir = std::string{a[1]}; a.erase(a.begin(), a.begin() + 2); }
-        if (a.empty() || a[0].starts_with("-")) { v.shell = true; return v; }
+        if (a.empty() || a[0].starts_with("-")) { v.shell = true; v.why = Silence::GitShape; return v; }
         const std::string_view sub = a[0];
         std::vector<std::string_view> flags, pos;
         bool after_dd = false;
@@ -754,7 +839,7 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
         v.intent = Intent::GitRead;
         if (sub == "status") {
             if (!only({"-s", "--short", "-sb", "-b", "--branch", "--porcelain"}) || !pos.empty()) {
-                v.shell = true;
+                v.shell = true; v.why = Silence::GitShape;
                 return v;
             }
             v.tool = "git_status";
@@ -765,7 +850,7 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
                 if (!(f == "--oneline" || f == "-n" || f.starts_with("--max-count=")
                       || f == "--no-merges" || f == "--first-parent" || f == "--no-decorate"
                       || count_flag_ok(f))) {
-                    v.shell = true;
+                    v.shell = true; v.why = Silence::GitShape;
                     return v;
                 }
             v.tool = "git_log";
@@ -775,22 +860,22 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
                 if (f.starts_with("--max-count=") && is_int(f.substr(12))) n = to_int(f.substr(12));
             }
             if (has("-n")) {                         // `-n 5`: value is the next word
-                if (pos.empty() || !is_int(pos.front())) { v.shell = true; return v; }
+                if (pos.empty() || !is_int(pos.front())) { v.shell = true; v.why = Silence::GitShape; return v; }
                 n = to_int(pos.front());
                 pos.erase(pos.begin());
             }
             if (n > 0) ps.push_back("count: " + std::to_string(n));
             if (has("--oneline")) ps.push_back("oneline: true");
-            if (pos.size() > 2) { v.shell = true; return v; }
+            if (pos.size() > 2) { v.shell = true; v.why = Silence::GitShape; return v; }
             for (auto x : pos) ps.push_back(as_arg(x));
         } else if (sub == "diff") {
             for (auto f : flags)
                 if (!(f == "--stat" || f == "--staged" || f == "--cached" || f == "--no-color"
                       || (f.starts_with("-U") && is_int(f.substr(2))))) {
-                    v.shell = true;
+                    v.shell = true; v.why = Silence::GitShape;
                     return v;
                 }
-            if (pos.size() > 2) { v.shell = true; return v; }
+            if (pos.size() > 2) { v.shell = true; v.why = Silence::GitShape; return v; }
             v.tool = "git_diff";
             if (has("--staged") || has("--cached")) ps.push_back("staged: true");
             if (has("--stat")) ps.push_back("stat_only: true");
@@ -801,7 +886,7 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
         } else if (sub == "show") {
             // git_show gives metadata + patch, or a file at a rev. --stat
             // and custom formats are shapes it doesn't have.
-            if (!only({"--no-color"}) || pos.size() > 1) { v.shell = true; return v; }
+            if (!only({"--no-color"}) || pos.size() > 1) { v.shell = true; v.why = Silence::GitShape; return v; }
             v.tool = "git_show";
             if (!pos.empty()) {
                 const std::string_view x = pos.front();
@@ -814,22 +899,22 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
                 }
             }
         } else if (sub == "blame") {
-            if (pos.empty() || pos.size() > 2) { v.shell = true; return v; }
+            if (pos.empty() || pos.size() > 2) { v.shell = true; v.why = Silence::GitShape; return v; }
             int lo = 0, hi = 0;
             for (std::size_t i = 0; i < flags.size(); ++i) {
                 std::string_view f = flags[i];
-                if (f == "-L") { v.shell = true; return v; }   // value was split off; rare
+                if (f == "-L") { v.shell = true; v.why = Silence::GitShape; return v; }   // value was split off; rare
                 if (f.starts_with("-L")) {
                     f.remove_prefix(2);
                     const auto c = f.find(',');
                     if (c == std::string_view::npos || !is_int(f.substr(0, c)) || !is_int(f.substr(c + 1))) {
-                        v.shell = true;
+                        v.shell = true; v.why = Silence::GitShape;
                         return v;
                     }
                     lo = to_int(f.substr(0, c));
                     hi = to_int(f.substr(c + 1));
                 } else if (f != "--no-color") {
-                    v.shell = true;
+                    v.shell = true; v.why = Silence::GitShape;
                     return v;
                 }
             }
@@ -841,7 +926,7 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
                 ps.push_back("end_line: " + std::to_string(hi));
             }
         } else {
-            v.shell = true;        // add, push, commit, checkout, stash …
+            v.shell = true; v.why = Silence::Work;            // add, push, commit, checkout, stash …: git work
             return v;
         }
         v.reason = "it returns structured output, keeps the pager out, and the "
@@ -849,7 +934,7 @@ PipeVerdict judge(const std::vector<const sx::Command*>& stages) {
         for (auto& s : ps) v.param += (v.param.empty() ? "" : ", ") + s;
         return v;
     }
-    v.shell = true;
+    v.shell = true; v.why = Silence::Work;
     return v;
 }
 
@@ -869,6 +954,15 @@ bool scaffolding(const sx::Command& c) {
 
 Detour analyze_detour(std::string_view cmd) {
     Detour d;
+    // Advice is for commands a model types by hand. On 11.5k real calls the
+    // longest one that got a tip was 7 KB; parse cost is linear (~0.2 us/B)
+    // and past this it is a pasted script, not a detour. Silence is safe.
+    constexpr std::size_t kMaxAdvice = 16 * 1024;
+    if (cmd.size() > kMaxAdvice) {
+        d.needs_shell = true;
+        d.silence = Silence::Unparsed;
+        return d;
+    }
     const sx::Script s = sx::analyze(cmd);
 
     // Writes first, over EVERY command (nested, substituted, conditional).
@@ -879,13 +973,18 @@ Detour analyze_detour(std::string_view cmd) {
             return d;
         }
     // A parse we can't fully trust gets no advice. Silence is always safe.
-    if (!s.clean || s.truncated || s.commands.empty()) { d.needs_shell = true; return d; }
+    if (!s.clean || s.truncated || s.commands.empty()) {
+        d.needs_shell = true;
+        d.silence = Silence::Unparsed;
+        return d;
+    }
 
     // Anything nested ($(…), loops, if, subshells, functions, `&`) is shell
     // work, but a bound on its last top-level stage still has an answer.
     const auto tops = s.top_level();
-    auto shell_work = [&]() -> Detour& {
+    auto shell_work = [&](Silence why) -> Detour& {
         d.needs_shell = true;
+        d.silence = why;
         d.intent = Intent::Other;
         d.tool = {};
         d.reason.clear();
@@ -896,12 +995,12 @@ Detour analyze_detour(std::string_view cmd) {
             if (auto b = as_bound(*tops.back())) d.bound = *b;
         return d;
     };
-    if (tops.size() != s.commands.size()) return shell_work();
+    if (tops.size() != s.commands.size()) return shell_work(Silence::Nested);
 
     // Group into pipelines; `|&` (stderr into the pipe) is shell plumbing.
     std::vector<std::vector<const sx::Command*>> pipes;
     for (const auto* c : tops) {
-        if (c->join == sx::Join::PipeErr) return shell_work();
+        if (c->join == sx::Join::PipeErr) return shell_work(Silence::PipeErr);
         if (pipes.empty() || c->stage == 0) pipes.emplace_back();
         pipes.back().push_back(c);
     }
@@ -927,7 +1026,7 @@ Detour analyze_detour(std::string_view cmd) {
         }
         if (pl.size() == 1 && scaffolding(*pl.front())) continue;
         PipeVerdict v = judge(pl);
-        if (v.shell) return shell_work();
+        if (v.shell) return shell_work(v.why);
         {
             std::string st{v.tool};
             if (!v.param.empty()) st += " " + v.param;
@@ -957,7 +1056,7 @@ Detour analyze_detour(std::string_view cmd) {
             if (!v.bound || !d.bound || v.bound->limit != d.bound->limit) d.bound.reset();
         }
     }
-    if (!any) return shell_work();       // only cd/echo: nothing to say
+    if (!any) return shell_work(Silence::Scaffold);   // only cd/echo: nothing to say
     return d;
 }
 

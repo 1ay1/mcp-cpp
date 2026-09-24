@@ -380,6 +380,9 @@ struct GrepArgs {
     // kMaxPage) instead of piping to `| head -N`, which is what the prompt
     // and the shell tip tell the model to do.
     int         per_page = kPerPage;
+    // Drop hits whose line matches this regex (like `| grep -v PAT`). The
+    // line stays as context, so the block around a kept hit is unchanged.
+    std::string exclude;
     // Output mode: Content (default) renders matching lines w/ context;
     // FilesOnly renders one path + match-count per line (rg -l — the survey
     // shape: "which files touch X" without the line noise); Count renders
@@ -425,6 +428,18 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
         if (o == "files") mode = GrepArgs::Mode::FilesOnly;
         else if (o == "count") mode = GrepArgs::Mode::Count;
     }
+    // A bad exclude regex is a caller error, not a silent no-op.
+    if (auto ex = ar.str("exclude", ""); !ex.empty()) {
+        if (util::has_nested_quantifier(ex))
+            return std::unexpected(ToolError::invalid_args(
+                "exclude has a nested unbounded quantifier (e.g. (a+)+) that "
+                "can cause catastrophic backtracking; rewrite it."));
+        try { std::regex probe{ex}; (void)probe; }
+        catch (const std::regex_error&) {
+            return std::unexpected(ToolError::invalid_args(
+                "exclude is not a valid regex (ECMAScript): " + ex));
+        }
+    }
     GrepArgs g{
         std::move(pat),
         ar.str("path", "."),
@@ -435,6 +450,7 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
         ctx_lines,
         offset,
         per_page,
+        ar.str("exclude", ""),
         mode,
         ar.str("display_description", ""),
     };
@@ -945,6 +961,8 @@ ExecResult run_ripgrep(const GrepArgs& a) {
             "rg exited " + std::to_string(r.exit_code) + ":\n"
             + r.output.substr(0, 1024)));
 
+    std::optional<std::regex> exclude_re;
+    if (!a.exclude.empty()) exclude_re.emplace(a.exclude, std::regex::ECMAScript | std::regex::optimize);
     struct LineRow { int line_no; std::string text; bool is_match; };
     struct FileRows { std::string path; std::vector<LineRow> rows; int matches = 0; };
     std::vector<FileRows> files;
@@ -971,6 +989,10 @@ ExecResult run_ripgrep(const GrepArgs& a) {
                 while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
                     text.pop_back();
                 bool is_match = (type == "match");
+                // exclude: the hit is dropped but its line stays as context,
+                // so `| grep -v` semantics without losing the surroundings.
+                if (is_match && exclude_re && std::regex_search(text, *exclude_re))
+                    is_match = false;
                 files.back().rows.push_back({ln, std::move(text), is_match});
                 if (is_match) {
                     ++files.back().matches;
@@ -1171,6 +1193,8 @@ ExecResult run_builtin(const GrepArgs& a) {
     std::vector<FileHit>  hits(candidates.size());
     std::atomic<std::size_t> next{0};
     std::atomic<int>      total_matches{0};
+    std::optional<std::regex> exclude_re;
+    if (!a.exclude.empty()) exclude_re.emplace(a.exclude, std::regex::ECMAScript | std::regex::optimize);
 
     auto worker = [&] {
         while (true) {
@@ -1198,6 +1222,20 @@ ExecResult run_builtin(const GrepArgs& a) {
                                  offsets, total_matches);
                 } else {
                     scan_regex(content, re, offsets, total_matches);
+                }
+                // exclude: drop hits whose line matches (like `| grep -v`).
+                if (exclude_re && !offsets.empty()) {
+                    std::vector<std::size_t> kept;
+                    kept.reserve(offsets.size());
+                    for (auto off : offsets) {
+                        const auto ls = content.rfind('\n', off == 0 ? 0 : off - 1);
+                        const std::size_t b0 = (off == 0 || ls == std::string::npos) ? 0 : ls + 1;
+                        auto le = content.find('\n', off);
+                        if (le == std::string::npos) le = content.size();
+                        const std::string_view line{content.data() + b0, le - b0};
+                        if (!std::regex_search(line.begin(), line.end(), *exclude_re)) kept.push_back(off);
+                    }
+                    offsets.swap(kept);
                 }
                 if (offsets.empty()) continue;
                 hits[i].path = path;
@@ -1437,6 +1475,7 @@ json grep_schema() {
             {"output",         {{"type","string"}, {"enum", {"content","files","count"}}, {"description","`content` (default) = matching lines with context. `files` = one path + match-count per line, no line bodies (the survey view: WHICH files touch X). `count` = per-file match counts only (the cheapest probe: HOW WIDESPREAD is X — run this before a bulk rewrite)."}}},
             {"offset",         {{"type","integer"}, {"description","Skip this many matches (for pagination)"}}},
             {"limit",          {{"type","integer"}, {"description","Matches per page (default 20, max 200). Use this instead of piping to `head`."}}},
+            {"exclude",        {{"type","string"},  {"description","Drop hits whose line matches this regex (ECMAScript). Use this instead of piping to `grep -v`."}}},
         }},
     };
 }

@@ -369,6 +369,21 @@ TEST_CASE("bash_validate") {
     CHECK(tip("grep -rni foo src").find("case_sensitive") == std::string::npos);
     CHECK(tip("grep -n -C3 foo f").find("context: \"3\"") != std::string::npos);
     CHECK(tip("grep -n -B60 foo f").find("context: \"60\"") != std::string::npos);
+    // ── `| grep -v PAT` after a search folds into exclude ─────────────────
+    CHECK(tip("grep -rn foo src | grep -v test").find("exclude: \"test\"") != std::string::npos);
+    CHECK(tip("grep -rn foo src | grep -v 'a\\|b' | head -5").find("exclude: \"a|b\"") != std::string::npos);
+    CHECK(tip("grep -rn foo src | grep -vE 'build/|vendor/'").find("exclude: \"build/|vendor/\"") != std::string::npos);
+    // BRE literal ( ) become escaped in the ERE the native tool takes.
+    CHECK(tip("grep -rn foo src | grep -v 'f(x)'").find("exclude: \"f\\\\(x\\\\)\"") != std::string::npos);
+    CHECK(tip("grep -rn foo src | grep -v x | wc -l").find("output: \"count\", exclude: \"x\"") != std::string::npos);
+    // Flags that change meaning, BRE groups, or two filters: silent.
+    for (const char* s : {"grep -rn foo src | grep -vi test", "grep -rn foo src | grep -vF x",
+                          "grep -rn foo src | grep -v 'a\\(b\\)'", "grep -rn foo src | grep -v a | grep -v b",
+                          "grep -rn foo src | grep bar", "grep -rnv foo src", "grep -rno foo src",
+                          "grep -rnP 'a(?=b)' src", "cat f | grep -v x", "grep -rn foo src | grep -v \"$X\""}) {
+        INFO(s);
+        CHECK_FALSE(analyze_detour(s).substitutable());
+    }
     // BRE `\|` is a literal pipe to ripgrep: the tip must say so.
     CHECK(tip("grep -rn 'a\\|b' src").find("`a|b`") != std::string::npos);
     CHECK(tip("grep -rnE 'a|b' src").find("`a|b`") == std::string::npos);

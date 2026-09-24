@@ -100,6 +100,28 @@ TEST_CASE("search_tools") {
         std::puts("grep: limit + wide context ok");
     }
 
+    // ── grep exclude: replaces `| grep -v PAT` ─────────────────────────────
+    {
+        write_file(root / "ex.txt", "EXCL keep one\nfiller\nfiller\nEXCL drop test\nfiller\nfiller\nEXCL keep two\n");
+        auto args = obj();
+        args["pattern"] = "EXCL"; args["path"] = root.string(); args["context"] = "0";
+        args["exclude"] = "drop|nothing";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("keep one") != std::string::npos);
+        assert(r.text.find("keep two") != std::string::npos);
+        assert(r.text.find("drop test") == std::string::npos);
+        assert(r.text.find("2 matches") != std::string::npos);
+        args["exclude"] = "(a+)+";                         // backtracking bomb refused
+        r = call(*provider, "grep", args);
+        assert(r.is_error);
+        args["exclude"] = "[unclosed";                     // bad regex refused, not ignored
+        r = call(*provider, "grep", args);
+        assert(r.is_error);
+        fs::remove(root / "ex.txt");
+        std::puts("grep: exclude ok");
+    }
+
     // ── grep with file glob narrows to .cpp ──────────────────────────────
     {
         auto args = obj();
