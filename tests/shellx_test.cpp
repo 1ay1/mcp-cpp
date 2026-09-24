@@ -17,10 +17,7 @@
 #include <mcp/tools/util/shellx.hpp>
 
 #include <algorithm>
-#include <filesystem>
-#include <fstream>
 #include <string>
-#include <unistd.h>
 #include <string_view>
 #include <variant>
 #include <vector>
@@ -350,54 +347,4 @@ TEST_CASE("shellx plan: other, none, mixed") {
         REQUIRE(p.steps.size() == 1);
         CHECK(std::holds_alternative<sx::OtherAction>(p.steps[0].action));
     }
-}
-
-// ── native_run: exact in-process answers, pinned to coreutils bytes ─────────────
-TEST_CASE("shellx native_run matches coreutils bytes") {
-    namespace fs = std::filesystem;
-    const fs::path d = fs::temp_directory_path() / ("shellx_native_" + std::to_string(::getpid()));
-    fs::remove_all(d);
-    fs::create_directories(d);
-    auto put = [&](const char* n, std::string_view b) { std::ofstream(d / n, std::ios::binary) << b; };
-    put("nl", "a\nb\nc\n");
-    put("nonl", "a\nb\nc");
-    put("empty", "");
-    put("crlf", "x\r\ny\r\n");
-    put("bin", std::string_view{"a\0b\n", 4});
-    fs::create_directories(d / "dir");
-    const std::string cwd = d.string();
-    auto run = [&](const char* c) { return sx::native_run(c, cwd); };
-    // Expected bytes captured from GNU coreutils / sed.
-    const std::pair<const char*, std::string_view> exact[] = {
-        {"cat nl", "a\nb\nc\n"},          {"cat nonl", "a\nb\nc"},
-        {"cat empty", ""},                 {"head -2 nonl", "a\nb\n"},
-        {"head -0 nl", ""},                {"tail -2 nonl", "b\nc"},
-        {"tail -0 nl", ""},                {"tail -n +2 nonl", "b\nc"},
-        {"tail -n +9 nl", ""},             {"sed -n '2,3p' nonl", "b\nc"},
-        {"sed -n '3,2p' nl", "c\n"},       {"sed -n '2,$p' nl", "b\nc\n"},
-        {"sed -n '5,9p' nl", ""},          {"sed -n '2,+1p' nl", "b\nc\n"},
-        {"sed -n '2p' crlf", "y\r\n"},     {"cat nonl | wc -l", "2\n"},
-        {"cat empty | wc -l", "0\n"},      {"cat nonl | tail -1", "c"},
-        {"cat nonl | tail -2 | head -1", "b\n"},
-        {"head -1 nl && tail -1 nl", "a\nc\n"},
-        {"cat nl 2>/dev/null", "a\nb\nc\n"},
-    };
-    for (auto [cmd, want] : exact) {
-        INFO(cmd);
-        auto r = run(cmd);
-        REQUIRE(r.has_value());
-        CHECK(r->output == want);
-        CHECK(r->exit_code == 0);
-    }
-    // Anything it can't reproduce exactly must decline, never guess.
-    for (const char* cmd : {
-             "cat missing", "cat dir", "cat bin", "head -1 nl || echo no",
-             "cat -A nl", "cat nl nl", "cat nl > out", "cat $HOME/x", "cat *.txt",
-             "sed -n 1p nl | sort", "head -1 nl &", "cat nl | grep a",
-             "x=$(cat nl)", "if true; then cat nl; fi", "bash -c 'cat nl'",
-             "cat nl |& head -1", "sed -i 's/a/b/' nl", "FOO=1 cat nl", "echo hi"}) {
-        INFO(cmd);
-        CHECK_FALSE(run(cmd).has_value());
-    }
-    fs::remove_all(d);
 }

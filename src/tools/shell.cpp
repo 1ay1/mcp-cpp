@@ -12,7 +12,6 @@
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/bash_validate.hpp>
 #include <mcp/tools/util/shellx.hpp>
-#include <mcp/tools/util/utf8.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/sandbox.hpp>
 #include <mcp/tools/util/subprocess.hpp>
@@ -258,32 +257,7 @@ ExecResult run_bash(const BashArgs& a) {
     constexpr std::size_t kModelPreviewBytes = 30000;
     constexpr std::size_t kSpillPreviewHead = 2000;   // first 2 KB
     constexpr std::size_t kSpillPreviewTail = 1000;   // last 1 KB
-    // Exact file inspection (`sed -n A,Bp f`, `cat f | head -20`, `tail -50
-    // log`, …) is answered in-process: same bytes, no fork/exec. Declines
-    // anything it can't reproduce exactly, and never runs under a sandbox —
-    // there the shell's file access is confined and reading directly would
-    // bypass that.
-    std::optional<util::SubprocessResult> native;
-    static const bool native_off = [] {
-        const char* e = std::getenv("MCP_SHELL_NO_NATIVE");
-        return e && *e && *e != '0';
-    }();
-    if (!native_off && !util::sandbox::is_active() && a.env.empty()) {
-        // Same cwd the child would get: the given dir, else this process's.
-        std::error_code cec;
-        const std::string here = cwd.empty() ? std::filesystem::current_path(cec).string() : cwd;
-        if (auto n = util::shellx::native_run(effective, here);
-            !cec && n && n->output.size() <= kCaptureCap) {
-            util::SubprocessResult nr;
-            // The subprocess path cleans every capture (control bytes out,
-            // invalid UTF-8 replaced); do the same so both paths agree.
-            nr.output = util::to_valid_utf8(util::strip_terminal_controls(n->output));
-            nr.exit_code = n->exit_code;
-            native = std::move(nr);
-        }
-    }
-    auto r = native ? std::move(*native)
-                    : util::sandbox::run_shell_command(effective, kCaptureCap,
+    auto r = util::sandbox::run_shell_command(effective, kCaptureCap,
                                               std::chrono::seconds{tmo_s},
                                               cwd, child_env);
     // NOTE: r.output is already ANSI-stripped + UTF-8-scrubbed by the
