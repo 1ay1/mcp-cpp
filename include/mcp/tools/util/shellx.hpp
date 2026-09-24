@@ -245,4 +245,33 @@ struct NativeResult {
 [[nodiscard]] std::optional<NativeResult> native_run(std::string_view command,
                                                      std::string_view cwd);
 
+// ── Translation to native tool calls ──────────────────────────────────────────
+//
+// A shell call that is pure file inspection, rewritten as the native tool
+// invocations that answer it (read / grep / list_dir / glob), with args as
+// JSON the tool's schema accepts. Unlike native_run this is NOT byte-exact:
+// the model gets the native tools' output (grouped matches, paging hints),
+// which is what it should have asked for. Only translates when every step
+// maps with no loss of meaning:
+//   * literal argv (globs only as grep paths), no redirect that writes, top
+//     level only, no `||`;
+//   * grep patterns are converted BRE→ERE (GNU grep's `\|`, `\+`, `\(` … mean
+//     the opposite in ripgrep's dialect — passed through, `a\|b` would
+//     silently match nothing); a pattern that won't convert declines;
+//   * pipe tails fold into the call (| head -N → limit) or are dropped only
+//     when they merely shorten (head/tail/wc of the result); anything that
+//     transforms output (sort, filter, awk) declines.
+struct NativeCall {
+    std::string tool;            // "read" | "grep" | "list_dir" | "glob"
+    std::string args_json;       // JSON object for the tool
+    std::string shell_fragment;  // the source text this call replaces
+};
+[[nodiscard]] std::optional<std::vector<NativeCall>>
+to_native_calls(std::string_view command, std::string_view cwd);
+
+// BRE (GNU grep default) → ERE / Rust-regex spelling, or nullopt if the
+// pattern uses a construct with no faithful equivalent (backrefs, `\<`,
+// bracket classes with `[:x:]` are kept; `\1` declines).
+[[nodiscard]] std::optional<std::string> bre_to_ere(std::string_view bre);
+
 } // namespace mcp::tools::util::shellx

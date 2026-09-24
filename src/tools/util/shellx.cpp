@@ -2372,4 +2372,211 @@ std::optional<NativeResult> native_run(std::string_view command, std::string_vie
     return out;
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+//  8. Translation to native tool calls
+// ═════════════════════════════════════════════════════════════════════════
+
+// GNU BRE → ERE (== ripgrep's Rust-regex spelling for these constructs).
+// In BRE, `| + ? ( ) { }` are LITERAL and their backslashed forms are the
+// operators; in ERE it is the other way round. `\<`/`\>` become `\b`.
+// Backreferences (\1..\9) have no Rust-regex equivalent → decline.
+std::optional<std::string> bre_to_ere(std::string_view p) {
+    std::string o;
+    o.reserve(p.size() + 8);
+    bool in_class = false;
+    for (std::size_t i = 0; i < p.size(); ++i) {
+        const char c = p[i];
+        if (in_class) {                                  // [ ... ] passes through
+            o += c;
+            if (c == '[' && i + 1 < p.size() && (p[i + 1] == ':' || p[i + 1] == '.' || p[i + 1] == '=')) {
+                const auto e = p.find(std::string{p[i + 1]} + "]", i + 2);
+                if (e == std::string_view::npos) return std::nullopt;
+                o.append(p.substr(i + 1, e + 2 - (i + 1)));
+                i = e + 1;
+                continue;
+            }
+            if (c == ']') in_class = false;
+            continue;
+        }
+        if (c == '[') {
+            in_class = true;
+            o += c;
+            // `[]x]` and `[^]x]`: a leading ] is literal
+            if (i + 1 < p.size() && p[i + 1] == '^') { o += '^'; ++i; }
+            if (i + 1 < p.size() && p[i + 1] == ']') { o += ']'; ++i; }
+            continue;
+        }
+        if (c == '\\') {
+            if (i + 1 >= p.size()) return std::nullopt;
+            const char n = p[++i];
+            switch (n) {
+                case '|': case '+': case '?': case '(': case ')': case '{': case '}':
+                    o += n; break;                       // BRE operator → ERE operator
+                case '<': case '>': o += "\\b"; break;
+                case '1': case '2': case '3': case '4': case '5':
+                case '6': case '7': case '8': case '9':
+                    return std::nullopt;                 // backreference
+                default:
+                    o += '\\'; o += n; break;            // \. \* \b \w \s … unchanged
+            }
+            continue;
+        }
+        // BRE-literal chars that are ERE operators: escape them.
+        if (c == '|' || c == '+' || c == '?' || c == '(' || c == ')' || c == '{' || c == '}') {
+            o += '\\'; o += c; continue;
+        }
+        // A leading `*` in BRE is literal.
+        if (c == '*' && (o.empty() || o == "^")) { o += "\\*"; continue; }
+        o += c;
+    }
+    if (in_class) return std::nullopt;
+    return o;
+}
+
+namespace {
+
+std::string json_str(std::string_view s) {
+    std::string o = "\"";
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n"; break;
+            case '\t': o += "\\t"; break;
+            case '\r': o += "\\r"; break;
+            default:
+                if (c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); o += b; }
+                else o += static_cast<char>(c);
+        }
+    }
+    return o + "\"";
+}
+
+std::string resolve(std::string_view cwd, const std::string& p) {
+    if (p.empty() || p.front() == '/' || cwd.empty()) return p;
+    std::string o{cwd};
+    if (o.back() != '/') o += '/';
+    return o + (p.starts_with("./") ? p.substr(2) : p);
+}
+
+} // namespace
+
+std::optional<std::vector<NativeCall>> to_native_calls(std::string_view command, std::string_view cwd) {
+    const Script s = analyze(command);
+    if (!s.clean || s.truncated) return std::nullopt;
+    for (const auto& c : s.commands) {
+        if ((static_cast<std::uint16_t>(c.ctx) & ~static_cast<std::uint16_t>(Ctx::Piped)) != 0)
+            return std::nullopt;                          // nested / conditional / backgrounded
+        if (c.join == Join::Or || c.join == Join::PipeErr) return std::nullopt;
+        for (const auto& r : c.redirects)
+            if (!(r.kind == Redirect::Kind::Out && r.fd == 2 && lit(r.target) && *lit(r.target) == "/dev/null")
+                && !(r.kind == Redirect::Kind::DupFd))
+                return std::nullopt;                      // only 2>/dev/null / 2>&1
+        if (!c.env.empty()) return std::nullopt;
+    }
+    const Plan p = plan(s);
+    if (p.steps.empty() || !p.pure_inspection()) return std::nullopt;
+    // Every top-level command must be a step: an `echo` in the middle
+    // would print, and a translation that drops it hides output.
+    std::size_t heads = 0;
+    for (const auto& c : s.commands) if (c.stage == 0 && c.program() != "cd") ++heads;
+    if (heads != p.steps.size()) return std::nullopt;
+
+    std::vector<NativeCall> out;
+    for (const auto& st : p.steps) {
+        // Pipe tails: a leading head/tail folds into the call; a trailing
+        // head/tail/wc only shortens and is dropped (the native tool pages
+        // itself); any transforming stage (sort/uniq/filter/opaque) declines.
+        std::optional<std::int64_t> head, tail;
+        for (std::size_t k = 0; k < st.shapes.size(); ++k) {
+            const auto& sh = st.shapes[k];
+            if (sh.kind == Shape::Kind::Head && k == 0) head = sh.n;
+            else if (sh.kind == Shape::Kind::Tail && k == 0) tail = sh.n;
+            else if (sh.kind == Shape::Kind::Head || sh.kind == Shape::Kind::Tail
+                     || sh.kind == Shape::Kind::CountLines) {}
+            else return std::nullopt;
+        }
+        NativeCall nc;
+        nc.shell_fragment = std::string{s.source.substr(st.begin, st.end - st.begin)};
+        const bool ok = std::visit([&](const auto& a) -> bool {
+            using A = std::decay_t<decltype(a)>;
+            if constexpr (std::is_same_v<A, ReadAction>) {
+                nc.tool = "read";
+                std::string j = "{\"path\":" + json_str(resolve(cwd, a.path));
+                const auto& r = a.range;
+                if (r.from_end && r.first) j += ",\"offset\":-" + std::to_string(*r.first);
+                else if (tail) j += ",\"offset\":-" + std::to_string(*tail);
+                else {
+                    // read's range is start_line/end_line (inclusive)
+                    const std::int64_t first = r.first.value_or(1);
+                    std::optional<std::int64_t> last = r.last;
+                    if (r.clamp_inverted && last && *last < first) last = first;
+                    if (head) last = last ? std::min(*last, first + *head - 1) : first + *head - 1;
+                    if (last && *last < first) return false;          // head -0 / empty
+                    if (first > 1 || last) j += ",\"start_line\":" + std::to_string(first);
+                    if (last) j += ",\"end_line\":" + std::to_string(*last);
+                }
+                // An unrecognised range (sed '/re/,/re/p', $(…) address) is typed
+                // as a Read with no range: reading the whole file would answer
+                // a DIFFERENT question. Decline.
+                if (!r.first && !r.last && !r.from_end && !head && !tail) {
+                    // plain `cat f` is fine; a sed with an address we couldn't
+                    // parse also lands here — tell them apart by the program
+                    if (!nc.shell_fragment.starts_with("cat") && nc.shell_fragment.find("/cat ") == std::string::npos)
+                        return false;
+                }
+                nc.args_json = j + "}";
+                return true;
+            } else if constexpr (std::is_same_v<A, SearchAction>) {
+                if (a.paths.size() > 1 || a.files_only || a.count) return false;   // one root; content mode
+                std::string pat = a.pattern;
+                if (!a.fixed && !a.extended) {
+                    auto e = bre_to_ere(pat);
+                    if (!e) return false;
+                    pat = *e;
+                }
+                // grep without -r on a directory errors; with -r (or rg) it recurses.
+                const std::string root = a.paths.empty() ? std::string{"."} : a.paths[0];
+                if (root.find_first_of("*?[") != std::string::npos) return false;  // globbed path set
+                nc.tool = "grep";
+                std::string j = "{\"pattern\":" + json_str(a.fixed ? pat : pat) + ",\"path\":" + json_str(resolve(cwd, root));
+                // shell grep is case-sensitive unless -i; the native tool defaults insensitive
+                j += a.ignore_case ? ",\"case_sensitive\":false" : ",\"case_sensitive\":true";
+                if (a.word) j += ",\"word\":true";
+                if (!a.include_globs.empty()) j += ",\"glob\":" + json_str(a.include_globs.front());
+                if (a.context_before || a.context_after)
+                    j += ",\"context\":" + std::to_string(std::min(10, std::max(a.context_before, a.context_after)));
+                else
+                    j += ",\"context\":0";
+                if (a.fixed && pat.find_first_of(".^$*+?()[]{}|\\") != std::string::npos) {
+                    // -F literal with regex metachars: escape for the regex engine
+                    std::string esc;
+                    for (char ch : pat) { if (std::strchr(".^$*+?()[]{}|\\", ch)) esc += '\\'; esc += ch; }
+                    j = "{\"pattern\":" + json_str(esc) + j.substr(j.find(",\"path\""));
+                }
+                nc.args_json = j + "}";
+                return true;
+            } else if constexpr (std::is_same_v<A, ListAction>) {
+                if (a.path.find(' ') != std::string::npos) return false;          // several paths
+                if (a.recursive && a.name_glob) {
+                    nc.tool = "glob";
+                    const std::string base = resolve(cwd, a.path);
+                    nc.args_json = "{\"pattern\":" + json_str(*a.name_glob) + ",\"path\":" + json_str(base) + "}";
+                    return true;
+                }
+                if (a.recursive) return false;                                   // bare find/ls -R: no bounded native twin
+                if (a.long_format && nc.shell_fragment.starts_with("wc")) return false;  // wc -l: a count, not a listing
+                nc.tool = "list_dir";
+                nc.args_json = "{\"path\":" + json_str(resolve(cwd, a.path)) + "}";
+                return true;
+            } else {
+                return false;                                                    // git: native git_* take other args
+            }
+        }, st.action);
+        if (!ok) return std::nullopt;
+        out.push_back(std::move(nc));
+    }
+    return out;
+}
+
 } // namespace mcp::tools::util::shellx
