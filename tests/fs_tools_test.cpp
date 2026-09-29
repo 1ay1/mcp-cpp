@@ -166,6 +166,80 @@ TEST_CASE("fs_tools") {
         std::puts("read: stale-read sentinel ok");
     }
 
+    // ── paging must never deadlock against the sentinel ─────────────────
+    //
+    // THE BUG: the cache used to key on (path, offset, limit) and refuse any
+    // repeat of a range it had served. That is only safe if every earlier
+    // result is still in the caller's context — and on agentty it is not:
+    // wire::superseded_read_ids keeps only the MOST RECENT read of a file and
+    // replaces the rest with "refer to the more recent tool result".
+    //
+    // So the two sentinels pointed at each other. Read a file at range A,
+    // then range B, then ask for A again: the transcript no longer has A's
+    // bytes, and the cache refuses to re-send them. There is no way out
+    // except to stop using `read` — which is what was observed in the wild,
+    // models falling back to `sed`/`cat` or rewriting a file they never
+    // managed to see.
+    //
+    // Reproduced against a real 600-line file at offsets 1 / 310 / 1 / 251.
+    {
+        const auto paged = root / "paged.txt";
+        {
+            auto args = obj();
+            args["file_path"] = paged.string();
+            std::string body;
+            for (int i = 1; i <= 600; ++i)
+                body += "line " + std::to_string(i) + "\n";
+            args["content"] = body;
+            auto wr = call(*provider, "write", args);
+            assert(!wr.is_error);
+        }
+        const std::string pp = paged.string();
+        auto at = [&](int off) {
+            auto args = obj(); args["path"] = pp; args["offset"] = off;
+            return call(*provider, "read", args);
+        };
+        auto served = [](const auto& r) {
+            return r.text.find("File unchanged since last read")
+                   == std::string::npos;
+        };
+
+        auto a1 = at(1);     assert(!a1.is_error && served(a1));
+        auto b  = at(310);   assert(!b.is_error  && served(b));
+        // The one that used to deadlock: its bytes were collapsed out of the
+        // transcript by the newer read, so refusing here strands the caller.
+        auto a2 = at(1);
+        assert(!a2.is_error);
+        assert(served(a2) && "a range the newest read does not cover must be served");
+        assert(a2.text.find("line 1\n") != std::string::npos);
+        // A fresh range is likewise never a repeat.
+        auto c = at(251);
+        assert(!c.is_error && served(c));
+        assert(c.text.find("line 251") != std::string::npos);
+
+        // The dedup still has to WORK, or this is just a revert: asking for
+        // exactly what the live entry holds is still refused.
+        auto c_again = at(251);
+        assert(!c_again.is_error && !served(c_again));
+
+        // A sub-range of the live entry is covered too — those bytes really
+        // are in the caller's context.
+        {
+            auto args = obj(); args["path"] = pp;
+            args["offset"] = 260; args["limit"] = 10;   // inside [251,500]
+            auto sub = call(*provider, "read", args);
+            assert(!sub.is_error && !served(sub));
+        }
+        // ... but one that runs past its end is not.
+        {
+            auto args = obj(); args["path"] = pp;
+            args["offset"] = 495; args["limit"] = 50;   // spills past 500
+            auto over = call(*provider, "read", args);
+            assert(!over.is_error && served(over));
+        }
+        std::puts("read: paging does not deadlock against the sentinel ok");
+    }
+
     // ── read past EOF gives a clear message, not a broken range ──────────
     {
         auto args = obj(); args["path"] = wpath;

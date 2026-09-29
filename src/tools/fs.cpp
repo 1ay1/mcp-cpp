@@ -57,27 +57,90 @@ struct ReadCacheKey {
     // refusals for files it had never seen. Observed in the wild: a coder
     // subagent burned all 23 of its turns re-requesting overlapping ranges of
     // one file, receiving the sentinel every time, and made zero edits. The
-    // dedup is a context-economy optimisation; starving a reader is strictly
-    // worse than re-sending bytes, so it must never fire across contexts.
+    // dedup is a context-economy optimisation; starving a fresh agent of the
+    // file it was sent to edit is not a trade worth making.
     std::string context_id;
     std::string canonical_path;
-    int offset = 1;
-    int limit  = 2000;
+
+    // NOTE deliberately NO offset/limit — see the comment on ReadCache::seen.
+    // One entry per (context, file), holding the range that is actually
+    // still in the caller's context.
     bool operator==(const ReadCacheKey&) const noexcept = default;
 };
 struct ReadCacheKeyHash {
     [[nodiscard]] std::size_t operator()(const ReadCacheKey& k) const noexcept {
         std::size_t h = std::hash<std::string>{}(k.context_id);
         h = h * 31u + std::hash<std::string>{}(k.canonical_path);
-        h = h * 31u + static_cast<std::size_t>(k.offset);
-        h = h * 31u + static_cast<std::size_t>(k.limit);
         return h;
     }
 };
+// What the caller still HAS, per file. mtime alone is not enough: the
+// sentinel says "refer to the earlier tool_result", which is a lie unless
+// that result is still in the conversation AND covered the range now being
+// asked for.
+//
+// It stopped being true for two reasons at once, and the two point at each
+// other:
+//
+//   * agentty collapses every read of a file EXCEPT the most recent one
+//     (wire::superseded_read_ids) — older ones are replaced on the wire by
+//     "refer to the more recent tool result".
+//   * this cache used to key on (path, offset, limit) and refuse ANY repeat
+//     of a range it had ever served.
+//
+// So: read a file at two ranges, and the older result is gone from context
+// while the cache still refuses to re-send it. Both sentinels then point at
+// each other and the bytes exist nowhere. Reproduced with reads at offsets
+// 1 / 310 / 1 / 251 / 310 — the last one is refused with its content absent.
+// The caller's only escape is to stop using `read`, which is exactly what
+// was observed: models fall back to `sed`/`cat`, or rewrite the whole file
+// blind rather than read it.
+//
+// So mirror supersession instead of fighting it: ONE live range per file,
+// overwritten on every read. A repeat is refused only when it asks for the
+// same mtime AND a range the live entry actually covers.
+struct ReadCacheEntry {
+    fs::file_time_type mtime{};
+    int offset = 1;      // first line of the range still in context
+    int limit  = 0;      // line count; 0 = whole file
+    int total  = 0;      // the file's length when we read it; 0 = unknown
+};
 struct ReadCache {
     std::mutex mu;
-    std::unordered_map<ReadCacheKey, fs::file_time_type, ReadCacheKeyHash> seen;
+    std::unordered_map<ReadCacheKey, ReadCacheEntry, ReadCacheKeyHash> seen;
 };
+
+// Does the range still in context contain the range being asked for?
+//
+// Conservative on purpose: anything we cannot prove is covered gets served.
+// A wrong "yes" is unrecoverable (the caller is told to look at bytes that
+// do not exist), a wrong "no" costs one re-read. That asymmetry decides
+// every ambiguous case here.
+//
+// A NEGATIVE offset is a tail request ("last N lines"), which resolves
+// against the line count and cannot be compared without reading the file.
+// Never refuse one.
+//
+// `total_lines` is the file's real length, used for one case the range
+// arithmetic alone gets wrong: a request starting past EOF. The earlier
+// whole-file read technically "covers" line 1000 of a 3-line file, but the
+// caller asking for it has made a mistake and needs the diagnostic
+// ("offset 1000 is past the end of the file, which has 3 lines"), not a
+// pointer back to a result that cannot answer them. Pass 0 when unknown.
+[[nodiscard]] inline bool covers(const ReadCacheEntry& e,
+                                int want_offset, int want_limit,
+                                int total_lines = 0) noexcept {
+    if (want_offset < 0 || e.offset < 0) return false;   // tail: always serve
+    if (total_lines > 0 && want_offset > total_lines)
+        return false;                                    // past EOF: diagnose
+    if (e.limit <= 0) return true;                       // held the whole file
+    if (want_limit <= 0) return false;                   // wants whole, held part
+    const long long have_lo = e.offset;
+    const long long have_hi = have_lo + e.limit - 1;
+    const long long want_lo = want_offset;
+    const long long want_hi = want_lo + want_limit - 1;
+    return want_lo >= have_lo && want_hi <= have_hi;
+}
 [[nodiscard]] ReadCache& read_cache() {
     static ReadCache c;
     return c;
@@ -752,11 +815,19 @@ ExecResult run_read(const ReadArgs& a) {
             std::error_code canon_ec;
             auto canon = fs::weakly_canonical(p, canon_ec);
             if (!canon_ec) {
-                ReadCacheKey key{util::read_context(), canon.string(),
-                                 a.offset, a.limit};
+                ReadCacheKey key{util::read_context(), canon.string()};
                 std::lock_guard lk{read_cache().mu};
                 auto it = read_cache().seen.find(key);
-                if (it != read_cache().seen.end() && it->second == current_mtime) {
+                // Refuse ONLY when the live entry still covers what is being
+                // asked for. Same file, same mtime, but a range the earlier
+                // result did not include means those bytes are nowhere in
+                // the caller's context, and the sentinel would be a lie that
+                // no retry can get past. Coverage is computed against the
+                // RAW args, before symbol/tail resolution, because that is
+                // what the caller can see and reason about.
+                if (it != read_cache().seen.end()
+                    && it->second.mtime == current_mtime
+                    && covers(it->second, a.offset, a.limit, it->second.total)) {
                     return ToolOutput{
                         "File unchanged since last read. The content from the "
                         "earlier Read tool_result in this conversation is still "
@@ -986,10 +1057,15 @@ ExecResult run_read(const ReadArgs& a) {
             std::error_code canon_ec;
             auto canon = fs::weakly_canonical(p, canon_ec);
             if (!canon_ec) {
-                ReadCacheKey key{util::read_context(), canon.string(),
-                                 a.offset, a.limit};
+                ReadCacheKey key{util::read_context(), canon.string()};
                 std::lock_guard lk{read_cache().mu};
-                read_cache().seen[std::move(key)] = current_mtime;
+                // The OUTLINE path: the caller got a symbol map of the whole
+                // file, not its text. Record it as covering nothing, so any
+                // later request for actual lines is served. Refusing one
+                // with "you already read this" would be answering a request
+                // for content with a table of contents.
+                read_cache().seen[std::move(key)] =
+                    ReadCacheEntry{current_mtime, 1, 1};
             }
         }
         util::record_file_seen(p, current_mtime,
@@ -1084,10 +1160,20 @@ ExecResult run_read(const ReadArgs& a) {
         std::error_code canon_ec;
         auto canon = fs::weakly_canonical(p, canon_ec);
         if (!canon_ec) {
-            ReadCacheKey key{util::read_context(), canon.string(),
-                             eff_offset, eff_limit};
+            ReadCacheKey key{util::read_context(), canon.string()};
             std::lock_guard lk{read_cache().mu};
-            read_cache().seen[std::move(key)] = current_mtime;
+            // OVERWRITE, never accumulate. This mirrors what the host does
+            // to the transcript: agentty keeps only the most recent read of
+            // a file and collapses the rest, so the newest range is the only
+            // one the caller still has. Keeping a union here would refuse
+            // ranges whose bytes have already been collapsed away.
+            //
+            // Stored as the RAW request (a.offset/a.limit), not the resolved
+            // eff_* — a symbol= read resolves to line numbers the caller
+            // never asked for and cannot ask for again, so recording those
+            // would refuse an unrelated later range that happens to overlap.
+            read_cache().seen[std::move(key)] =
+                ReadCacheEntry{current_mtime, a.offset, a.limit, total_lines};
         }
     }
     util::record_file_seen(p, current_mtime,
