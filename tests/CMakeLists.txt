@@ -81,6 +81,21 @@ endif()
 add_executable(mcp_eval_server eval_server.cpp)
 target_link_libraries(mcp_eval_server PRIVATE mcp::tools Threads::Threads)
 
+# ── tool_bench ────────────────────────────────────────────────────
+# Times the real tool bodies against a real tree. Deliberately NOT a ctest:
+# it asserts nothing and its numbers depend on the machine and the corpus,
+# so a CI lane could only make it flaky. Build and run it by hand when
+# touching a tool's hot path:
+#
+#     cmake --build <dir> --target mcp_tool_bench
+#     ./tests/mcp_tool_bench /path/to/a/repo
+#
+# It earned its place: every win in the read/outline path (whole-file scan
+# for a windowed read, file-sized reserve, a content hash nothing reads) was
+# invisible to code review and obvious the moment a number was measured.
+add_executable(mcp_tool_bench tool_bench.cpp)
+target_link_libraries(mcp_tool_bench PRIVATE mcp::tools Threads::Threads)
+
 find_program(PYTHON3_EXECUTABLE NAMES python3 python)
 if(PYTHON3_EXECUTABLE)
     add_test(NAME tool_evals

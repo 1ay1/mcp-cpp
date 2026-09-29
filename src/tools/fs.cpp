@@ -946,9 +946,16 @@ ExecResult run_read(const ReadArgs& a) {
     // Tail semantics: offset:-N = the last N lines (limit is ignored — the
     // request IS the window). Count lines once, then convert to a normal
     // forward range.
+    //
+    // std::count, not a hand-rolled loop and not memchr: this one needs ONLY
+    // a count (no line_start to carry), which is exactly the shape the
+    // library can vectorise best — 0.15 ms vs 0.24 for memchr and 0.46 for
+    // a byte loop that also tracks a position, over an 889 KiB span.
+    // Contrast the count phase further down, which does need the position
+    // and therefore uses memchr.
     if (eff_offset < 0) {
-        int total = 0;
-        for (char c : content) if (c == '\n') ++total;
+        int total = static_cast<int>(
+            std::count(content.begin(), content.end(), '\n'));
         if (!content.empty() && content.back() != '\n') ++total;
         int want = -eff_offset;
         if (want > total) want = total;
@@ -1171,29 +1178,39 @@ ExecResult run_read(const ReadArgs& a) {
         }
     }
     // ── Count phase ─────────────────────────────────────────────────────
-    // Past the window every remaining line only contributes to total_lines,
-    // so let memchr (vectorised) find the newlines instead of stepping bytes.
-    // Same answer, ~100x less work on the tail of a large file.
+    // Past the window every remaining line only contributes to total_lines
+    // (and to line_start, for the trailing-line handler below), so this half
+    // does no formatting and no appending.
     //
-    // The NUL scan above still has to happen — a file can be text for 250
-    // lines and binary after — so memchr for '\0' over the SAME span, and
-    // report binary exactly as the byte loop would have.
+    // memchr, measured 0.24 ms vs 0.46 ms for a byte loop over an 889 KiB
+    // tail. Worth stating how that number was nearly got wrong: an isolated
+    // microbenchmark said the byte loop was 3x FASTER, because it dropped
+    // the line_start bookkeeping and the compiler then vectorised the whole
+    // loop into something this code cannot use. Benchmark the work the
+    // function actually does, not a simplified version of it.
+    //
+    // (std::count is faster still at 0.15 ms, but it only returns a count
+    // and cannot report where the last newline was.)
+    //
+    // The NUL scan covers the same span — a file can be text for 250 lines
+    // and binary after — and NULs are genuinely sparse there, which is the
+    // case memchr is best at.
     if (i < N) {
         const char* base = content.data();
-        const char* s = base + i;
-        const char* e = base + N;
-        if (std::memchr(s, '\0', static_cast<size_t>(e - s)) != nullptr) {
+        if (std::memchr(base + i, '\0', N - i) != nullptr) {
             return std::unexpected(ToolError::binary(std::format(
                 "cannot read binary file: {} ({} bytes). "
                 "Use the bash tool with `file`, `hexdump`, or similar "
                 "if you need to inspect it.",
                 a.path.string(), N)));
         }
+        const char* s = base + i;
+        const char* e = base + N;
         while (const char* nl = static_cast<const char*>(
-                   std::memchr(s, '\n', static_cast<size_t>(e - s)))) {
+                   std::memchr(s, '\n', static_cast<std::size_t>(e - s)))) {
             ++total_lines;
             s = nl + 1;
-            line_start = static_cast<size_t>(s - base);
+            line_start = static_cast<std::size_t>(s - base);
         }
     }
     if (line_start < N) {

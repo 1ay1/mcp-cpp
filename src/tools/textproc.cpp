@@ -331,21 +331,37 @@ ExecResult run_extract(const ExtractArgs& a) {
     // and rg's DFA beats N threads of it with one process. `grep`/
     // `find_definition` in search.cpp already shell out to rg for exactly
     // this reason (see rg_available there); the textproc tools never got
-    // the same treatment. `-o` with `-r $1` is literally this tool's
+    // the same treatment. `-o` with `-r $N` is literally this tool's
     // projection semantics, so the mapping is direct.
     //
-    // NOT done here yet, and the reason is that it cannot be a swap:
-    //   * rg is Rust regex, this is ECMAScript. rg REJECTS lookbehind,
-    //     lookahead and backreferences that std::regex accepts (verified:
-    //     `(?<=foo)bar`, `(?=foo)\w+`, `\b(\w+)::\1\b` are all parse
-    //     errors). So rg has to be a fast PATH with this loop as the
-    //     fallback, keyed on rg's parse-error exit, not a replacement.
-    //   * ordering, `unique` first-seen order, per-file caps and the
-    //     kMaxScanned budget below are all observable, and a second
-    //     implementation has to reproduce them exactly or results shift
-    //     under users who cannot see why.
-    // Worth doing — it is a 4x on the tool's headline case — but it needs
-    // a differential over both engines, not a quick edit.
+    // A differential over 12 patterns (plain, capture-group, alternation,
+    // POSIX class, anchors, word boundaries) says the ENGINES agree: with
+    // the corpora aligned, every value either side produced matched, and
+    // the only survivors were
+    //   * rg finding MORE, because this scan stops at kMaxScanned (5000)
+    //     and rg does not, and
+    //   * file-set skew from the harness's own rg globs.
+    // Neither is a semantic difference. Notably `(?i)error` is the reverse
+    // of what I assumed: std::regex REJECTS inline flags ("Invalid '(?...)'
+    // zero-width assertion") and rg accepts them, so rg is a superset
+    // there.
+    //
+    // So the fast path is viable, but it is NOT a swap, and the reasons are
+    // the fiddly ones a rewrite gets wrong:
+    //   * rg is Rust regex: it REJECTS lookbehind/lookahead/backreferences
+    //     that std::regex accepts (`(?<=foo)bar`, `(?=foo)\w+`,
+    //     `\b(\w+)::\1\b` are all parse errors, exit 2). rg must be a PATH
+    //     keyed on that exit, with this loop as the fallback.
+    //   * the corpora must be made identical or results move for reasons no
+    //     user can see: collect_files() walks dotfile DIRECTORIES (.github
+    //     is in scope) and ignores .gitignore, so rg needs --hidden
+    //     --no-ignore plus the same skip-dir globs and the same size/binary
+    //     filters.
+    //   * `unique` first-seen ORDER, per-file caps and kMaxScanned are all
+    //     observable, and rg streams in a different order than this
+    //     file-parallel loop.
+    // Worth doing — 4x on the headline case — but it needs that alignment
+    // written and tested, not a quick edit.
 
     std::vector<std::vector<Projection>> per_file(files.size());
     std::atomic<std::size_t> next{0};
