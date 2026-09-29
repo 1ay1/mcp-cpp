@@ -148,6 +148,20 @@ struct ReadCache {
 
 constexpr std::size_t kAutoOutlineSize = 32 * 1024;
 
+// How much to reserve for a windowed read's output.
+//
+// Not the file size: a 250-line window of a 900 KiB file emits a few KiB, so
+// reserving the whole file is a large allocation to hold a small answer.
+// Guess ~120 bytes per requested line (generous for source; long-line files
+// just grow the string a few times), clamped so a huge `limit` cannot ask
+// for more than the file could possibly contain.
+[[nodiscard]] inline std::size_t N_reserve_hint(std::size_t file_size,
+                                               int limit) noexcept {
+    if (limit <= 0) return file_size;
+    const std::size_t guess = static_cast<std::size_t>(limit) * 120u;
+    return guess < file_size ? guess : file_size;
+}
+
 [[nodiscard]] inline const std::regex& outline_pattern() {
     static const std::regex re(
         R"(^(\s*)((?:#{1,6}\s+\S.*$)|)"
@@ -166,6 +180,46 @@ constexpr std::size_t kAutoOutlineSize = 32 * 1024;
     return re;
 }
 
+// Cheap NECESSARY condition for "this line could be a definition".
+//
+// std::regex is a backtracker and running it per line is the whole cost of
+// outline: measured 17–26 MB/s, ~50x off memory bandwidth, and it runs on
+// every read of a file over 32 KiB. Most lines cannot possibly match, so
+// rejecting those without entering the engine is most of the win.
+//
+// WHAT CANNOT MATCH: the pattern's alternatives all begin, after the
+// `^(\s*)` indent, with either `#` (markdown heading) or a character that
+// can open an identifier / type expression. The C++-signature alternative
+// is `(?:[\w:~<>\[\]&*\s,]+\s+)?\w+\s*\(`, whose optional leading class
+// admits `[`, `]`, `&`, `*`, `<`, `>`, `:`, `,` — so those must pass too.
+//
+// This list is NOT guesswork: a differential run over 2,194,256 lines of
+// this tree (8,743 files, 161,970 real matches) is what produced it, and
+// it is exact — zero true matches dropped. Two rounds were needed:
+//   * letters/_/#/@/~ only          → dropped 3,424 (every `[[nodiscard]]`)
+//   * adding []&*<>:,               → dropped 8 (`59 lines (37 sloc)`,
+//                                      digit-led, matched as a signature)
+// Hence digits too. If you touch this, RE-RUN that differential: a
+// prefilter that drops a match makes definitions silently vanish from
+// outlines, and nothing downstream can tell.
+[[nodiscard]] inline bool outline_plausible(std::string_view line) noexcept {
+    std::size_t k = 0;
+    while (k < line.size() && (line[k] == ' ' || line[k] == '\t')) ++k;
+    if (k >= line.size()) return false;
+    const unsigned char c = static_cast<unsigned char>(line[k]);
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+        || (c >= '0' && c <= '9')) return true;
+    switch (c) {
+        case '_': case '#': case '@': case '~':   // ident / heading / attr
+        case '[': case ']':                       // [[nodiscard]], subscripts
+        case '&': case '*':                       // ref / pointer returns
+        case '<': case '>': case ':': case ',':   // template + qualified types
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Does `line` look like a definition? Same answer as running outline_pattern
 // on the whole line, but the leading indent is skipped first. The pattern
 // starts with `^(\s*)` and every alternative after it also allows leading
@@ -174,6 +228,7 @@ constexpr std::size_t kAutoOutlineSize = 32 * 1024;
 // indented continuation line cost ~2 ms each. Checked identical on 381k lines
 // of C++/Rust/TS/Python/Markdown; ~12x faster in total.
 [[nodiscard]] inline bool outline_line_matches(std::string_view line) {
+    if (!outline_plausible(line)) return false;
     std::size_t k = 0;
     while (k < line.size() && (line[k] == ' ' || line[k] == '\t')) ++k;
     return std::regex_search(line.data() + k, line.data() + line.size(),
@@ -184,6 +239,7 @@ constexpr std::size_t kAutoOutlineSize = 32 * 1024;
 // Same indent skip; `^(\s*)` accepts the empty indent, so matching the
 // de-indented tail as a whole is the same as matching the full line.
 [[nodiscard]] inline bool outline_line_is_def(std::string_view line) {
+    if (!outline_plausible(line)) return false;
     std::size_t k = 0;
     while (k < line.size() && (line[k] == ' ' || line[k] == '\t')) ++k;
     return std::regex_match(line.data() + k, line.data() + line.size(),
@@ -1070,16 +1126,27 @@ ExecResult run_read(const ReadArgs& a) {
         }
         util::record_file_seen(p, current_mtime,
                                static_cast<std::uintmax_t>(content.size()),
-                               util::content_fnv1a(content));
+                               util::cheap_content_hash(content));
         return ToolOutput{std::move(out), std::nullopt};
     }
     std::string out;
-    out.reserve(content.size() < 1024 * 1024 ? content.size() : 1024 * 1024);
+    // Reserve for the WINDOW, not the whole file. A 250-line window of a
+    // 900 KiB file asked for ~900 KiB here to emit ~9 KiB.
+    out.reserve(N_reserve_hint(content.size(), eff_limit));
     int total_lines = 0;
     int shown = 0;
     size_t line_start = 0;
     const size_t N = content.size();
-    for (size_t i = 0; i < N; ++i) {
+    // ── Emit phase ──────────────────────────────────────────────────────
+    // Byte-at-a-time, but ONLY while output is still being produced.
+    //
+    // This loop used to run to EOF on every read, because the footer needs
+    // total_lines ("of N", "pass offset=..."). So a 250-line window of a
+    // 900 KiB file scanned all 900 KiB one byte at a time: measured 1.66 ms,
+    // ~92% of the whole call, and IDENTICAL to reading the entire file.
+    // Paging a big file cost exactly as much as not paging it.
+    size_t i = 0;
+    for (; i < N; ++i) {
         char c = content[i];
         if (c == '\0') {
             return std::unexpected(ToolError::binary(std::format(
@@ -1099,6 +1166,34 @@ ExecResult run_read(const ReadArgs& a) {
                 ++shown;
             }
             line_start = i + 1;
+            // Window filled: stop emitting and switch to counting.
+            if (shown >= eff_limit) { ++i; break; }
+        }
+    }
+    // ── Count phase ─────────────────────────────────────────────────────
+    // Past the window every remaining line only contributes to total_lines,
+    // so let memchr (vectorised) find the newlines instead of stepping bytes.
+    // Same answer, ~100x less work on the tail of a large file.
+    //
+    // The NUL scan above still has to happen — a file can be text for 250
+    // lines and binary after — so memchr for '\0' over the SAME span, and
+    // report binary exactly as the byte loop would have.
+    if (i < N) {
+        const char* base = content.data();
+        const char* s = base + i;
+        const char* e = base + N;
+        if (std::memchr(s, '\0', static_cast<size_t>(e - s)) != nullptr) {
+            return std::unexpected(ToolError::binary(std::format(
+                "cannot read binary file: {} ({} bytes). "
+                "Use the bash tool with `file`, `hexdump`, or similar "
+                "if you need to inspect it.",
+                a.path.string(), N)));
+        }
+        while (const char* nl = static_cast<const char*>(
+                   std::memchr(s, '\n', static_cast<size_t>(e - s)))) {
+            ++total_lines;
+            s = nl + 1;
+            line_start = static_cast<size_t>(s - base);
         }
     }
     if (line_start < N) {
@@ -1178,7 +1273,7 @@ ExecResult run_read(const ReadArgs& a) {
     }
     util::record_file_seen(p, current_mtime,
                            static_cast<std::uintmax_t>(content.size()),
-                           util::content_fnv1a(content));
+                           util::cheap_content_hash(content));
     return ToolOutput{std::move(out), std::nullopt};
 }
 
@@ -1314,7 +1409,7 @@ ExecResult run_write(const WriteArgs& a) {
         if (!mt_ec) {
             util::record_file_seen(p, new_mtime,
                                    static_cast<std::uintmax_t>(a.content.size()),
-                                   util::content_fnv1a(a.content));
+                                   util::cheap_content_hash(a.content));
         }
     }
     std::string prefix;

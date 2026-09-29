@@ -886,7 +886,7 @@ ExecResult run_edit(const EditArgs& a) {
         if (!mt_ec) {
             util::record_file_seen(p, new_mtime,
                                    static_cast<std::uintmax_t>(updated.size()),
-                                   util::content_fnv1a(updated));
+                                   util::cheap_content_hash(updated));
         }
     }
 
@@ -1247,7 +1247,7 @@ ExecResult run_apply_patch(const ApplyPatchArgs& a) {
     { std::error_code mt; auto nm = fs::last_write_time(p, mt);
       if (!mt) util::record_file_seen(p, nm,
                    static_cast<std::uintmax_t>(updated.size()),
-                   util::content_fnv1a(updated)); }
+                   util::cheap_content_hash(updated)); }
 
     std::string unified = diff::render_unified(d);
     // Live line locator: first changed line of each hunk (skip leading context).

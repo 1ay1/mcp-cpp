@@ -240,6 +240,87 @@ TEST_CASE("fs_tools") {
         std::puts("read: paging does not deadlock against the sentinel ok");
     }
 
+    // ── the outline prefilter must never drop a real definition ────────
+    //
+    // outline runs std::regex per line and that IS its cost (measured 17–26
+    // MB/s), so a cheap "could this line possibly match" test runs first.
+    // The danger is entirely one-sided: a prefilter that wrongly SKIPS a
+    // line makes that definition vanish from every outline, and nothing
+    // downstream can tell the difference between "not found" and "never
+    // looked". A wrong ACCEPT just costs a regex call.
+    //
+    // Writing it caught this for real — the first version allowed only
+    // letters/_/#/@/~ and silently dropped 3,424 definitions in this tree,
+    // every `[[nodiscard]]`-prefixed function, because those start with '['.
+    // A second round found digit-led lines. Both are pinned below.
+    //
+    // The full check is a differential over the whole tree (2.19M lines, 0
+    // drops); this is the cheap standing version of it.
+    {
+        const auto lines = std::vector<std::string>{
+            // The two the differential caught — both MATCH the outline regex,
+            // so dropping them in the prefilter loses a real definition.
+            "[[nodiscard]] inline bool owes_paint(const C& c) noexcept {",
+            "    [[nodiscard]] static consteval Refined make_unchecked(T v) {",
+            "      59 lines (37 sloc)",
+            // Template-leading signature.
+            "<T> generic_thing(T v) {",
+            // The ordinary shapes, which must obviously survive.
+            "int main(int argc, char** argv) {",
+            "class Foo {",
+            "    def method(self):",
+            "# A markdown heading",
+            "_leading_underscore(int a) {",
+        };
+        // NOTE on what is NOT here. `*ptr(int){`, `&ref(int){`,
+        // `::qualified::name(int){` and `~Destructor(){` are all REJECTED by
+        // outline_pattern() itself — its signature alternative needs the
+        // optional type prefix to end in whitespace, so a line opening with
+        // the sigil never matched, before or after the prefilter. They were
+        // in an earlier draft of this list and failed here, which is the
+        // test doing its job: asserting behaviour the tool never had would
+        // have frozen a bug as a requirement. The prefilter still ACCEPTS
+        // those characters (cheap, and they can lead a matching line), it
+        // just cannot be tested through outline.
+        const auto f = (root / "prefilter_probe.txt").string();
+        for (const auto& L : lines) {
+            // Drive it through the real tool: write a file whose ONLY
+            // definition-shaped line is this one, outline it, and require
+            // the line to appear. That exercises the shipped prefilter
+            // rather than a copy of it.
+            auto w = obj();
+            w["file_path"] = f;
+            // Pad past kAutoOutlineSize so the outline path is taken.
+            std::string body;
+            body.reserve(40 * 1024);
+            body += L;
+            body += "\n";
+            while (body.size() < 40u * 1024u) body += "    // padding\n";
+            w["content"] = body;
+            auto wr = call(*provider, "write", w);
+            assert(!wr.is_error);
+
+            static int ctx = 0;
+            util::set_read_context("prefilter" + std::to_string(++ctx));
+            auto a = obj(); a["path"] = f;
+            auto r = call(*provider, "outline", a);
+            assert(!r.is_error);
+            // Require the DEFINITION ITSELF in the output, not merely a
+            // non-empty answer. An earlier draft tested for the absence of
+            // the substring "o definition" — which also matches the SUCCESS
+            // line "1 definition", so it passed even with the bug
+            // deliberately reintroduced. Verified by re-breaking the
+            // prefilter: this form fails, that one did not.
+            const auto trimmed = L.substr(L.find_first_not_of(" \t"));
+            if (r.text.find(trimmed) == std::string::npos) {
+                std::printf("prefilter DROPPED: |%s|\noutline said: %s\n",
+                            L.c_str(), r.text.c_str());
+                assert(false && "outline prefilter dropped a real definition");
+            }
+        }
+        std::puts("outline: prefilter keeps every definition shape ok");
+    }
+
     // ── read past EOF gives a clear message, not a broken range ──────────
     {
         auto args = obj(); args["path"] = wpath;
