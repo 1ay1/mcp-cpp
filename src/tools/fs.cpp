@@ -788,11 +788,30 @@ struct ReadArgs {
     bool                no_explicit_range = true;
 };
 
+// Defined further down with the write-arg helpers. Declared here because both
+// read and write want it in their "path required" message, and a caller who
+// cannot see which keys arrived has no way to tell a typo from a dropped
+// argument object.
+std::string describe_keys(const json& j);
+
 std::expected<ReadArgs, ToolError> parse_read_args(const json& j) {
     util::ArgReader ar(j);
     auto path_opt = ar.require_str("path");
     if (!path_opt)
-        return std::unexpected(ToolError::invalid_args("path required"));
+        // Name the keys we DID receive, the way parse_write_args does.
+        //
+        // A bare "path required" tells the caller nothing about why: a typo in
+        // the key, a path nested one level too deep, a null, or an argument
+        // object that got dropped entirely all produce the identical message.
+        // A model that cannot see the difference retries the same broken call,
+        // which is exactly what happened -- three identical failures in a row
+        // before the loop-breaker stepped in.
+        //
+        // The received-keys list makes the two common cases self-evident:
+        // an empty list means the arguments never arrived, and a list
+        // containing `file`/`filename`/`file_path` means the key was wrong.
+        return std::unexpected(ToolError::invalid_args(
+            std::format("path required (received keys: {})", describe_keys(j))));
     auto wp = util::make_readable_path_checked(*path_opt, "read");
     if (!wp) return std::unexpected(std::move(wp.error()));
     int offset = ar.integer("offset", 1);
