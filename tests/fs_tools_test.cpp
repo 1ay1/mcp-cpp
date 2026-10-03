@@ -157,13 +157,28 @@ TEST_CASE("fs_tools") {
         std::puts("read: ok");
     }
 
-    // ── read again (unchanged) returns the stale-read sentinel ───────────
+    // ── read again (unchanged) SERVES the cached content ────────────────
+    //
+    // It used to answer with a bare "File unchanged since last read" and no
+    // bytes -- a pointer into the caller's context. That is only sound while
+    // the thing it points at is still there, and compaction, a host-side
+    // read-collapse and subagent boundaries all break that. When it breaks the
+    // caller is told to consult content that exists nowhere and cannot
+    // recover, so it falls back to `cat`.
+    //
+    // Now the entry holds the text it served and replays it under a tag. The
+    // token saving is intact (no file re-read, no second line scan) and the
+    // answer is unconditional.
     {
         auto args = obj(); args["path"] = wpath;
         auto rd2 = call(*provider, "read", args);
         assert(!rd2.is_error);
-        assert(rd2.text.find("File unchanged since last read") != std::string::npos);
-        std::puts("read: stale-read sentinel ok");
+        // Tagged, so a careful model knows not to re-reason over it...
+        assert(rd2.text.find("[cached") != std::string::npos);
+        // ...and carrying the real content, so a confused one still gets it.
+        assert(rd2.text.find("line1") != std::string::npos);
+        assert(rd2.text.find("line3") != std::string::npos);
+        std::puts("read: cache hit serves content ok");
     }
 
     // ── paging must never deadlock against the sentinel ─────────────────
@@ -199,28 +214,39 @@ TEST_CASE("fs_tools") {
             auto args = obj(); args["path"] = pp; args["offset"] = off;
             return call(*provider, "read", args);
         };
-        auto served = [](const auto& r) {
-            return r.text.find("File unchanged since last read")
-                   == std::string::npos;
+        // A cache HIT now carries the content too, so "did I get bytes" no
+        // longer distinguishes the two paths -- the tag does. `fresh` means
+        // the file was actually read; `cached` means the entry was replayed.
+        // Both deliver content, which is the whole point of the change; what
+        // the dedup still has to get right is WHICH of the two happens.
+        auto cached = [](const auto& r) {
+            return r.text.find("[cached") != std::string::npos;
         };
+        auto fresh = [&](const auto& r) { return !cached(r); };
 
-        auto a1 = at(1);     assert(!a1.is_error && served(a1));
-        auto b  = at(310);   assert(!b.is_error  && served(b));
+        auto a1 = at(1);     assert(!a1.is_error && fresh(a1));
+        auto b  = at(310);   assert(!b.is_error  && fresh(b));
         // The one that used to deadlock: its bytes were collapsed out of the
-        // transcript by the newer read, so refusing here strands the caller.
+        // transcript by the newer read, and the cache refused to re-send them.
+        // It must be read from disk again, because the live entry covers a
+        // different range.
         auto a2 = at(1);
         assert(!a2.is_error);
-        assert(served(a2) && "a range the newest read does not cover must be served");
+        assert(fresh(a2) && "a range the newest read does not cover must be re-read");
         assert(a2.text.find("line 1\n") != std::string::npos);
         // A fresh range is likewise never a repeat.
         auto c = at(251);
-        assert(!c.is_error && served(c));
+        assert(!c.is_error && fresh(c));
         assert(c.text.find("line 251") != std::string::npos);
 
         // The dedup still has to WORK, or this is just a revert: asking for
-        // exactly what the live entry holds is still refused.
+        // exactly what the live entry holds is served FROM CACHE, tagged, and
+        // without touching the disk.
         auto c_again = at(251);
-        assert(!c_again.is_error && !served(c_again));
+        assert(!c_again.is_error && cached(c_again));
+        // ...and it is the real text, not a pointer to it. This is the
+        // property whose absence sent models to `cat`.
+        assert(c_again.text.find("line 251") != std::string::npos);
 
         // A sub-range of the live entry is covered too — those bytes really
         // are in the caller's context.
@@ -228,16 +254,16 @@ TEST_CASE("fs_tools") {
             auto args = obj(); args["path"] = pp;
             args["offset"] = 260; args["limit"] = 10;   // inside [251,500]
             auto sub = call(*provider, "read", args);
-            assert(!sub.is_error && !served(sub));
+            assert(!sub.is_error && cached(sub));
         }
         // ... but one that runs past its end is not.
         {
             auto args = obj(); args["path"] = pp;
             args["offset"] = 495; args["limit"] = 50;   // spills past 500
             auto over = call(*provider, "read", args);
-            assert(!over.is_error && served(over));
+            assert(!over.is_error && fresh(over));
         }
-        std::puts("read: paging does not deadlock against the sentinel ok");
+        std::puts("read: paging serves every range, cached or fresh ok");
     }
 
     // ── the outline prefilter must never drop a real definition ────────

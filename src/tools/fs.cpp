@@ -104,6 +104,24 @@ struct ReadCacheEntry {
     int offset = 1;      // first line of the range still in context
     int limit  = 0;      // line count; 0 = whole file
     int total  = 0;      // the file's length when we read it; 0 = unknown
+    // The bytes we served. THE point of keeping them: a repeat read can be
+    // ANSWERED instead of refused.
+    //
+    // The old entry was metadata only, and the sentinel it produced ("refer to
+    // the earlier tool_result") is a POINTER into the caller's context. That
+    // pointer is only sound while the thing it points at is still there, and a
+    // host has several ways to make it dangle: context compaction drops older
+    // turns, a wire-level read-collapse replaces an earlier read with its own
+    // pointer, a subagent starts from a fresh transcript. When it dangles the
+    // caller is told to look at bytes that exist nowhere, cannot recover, and
+    // reaches for `cat` -- which is the read-loop every agent harness with
+    // this design eventually reports.
+    //
+    // Holding the content costs memory bounded by kMaxBytes per live path and
+    // removes the failure mode entirely: the answer is always available, so
+    // "unchanged" becomes an ANNOTATION on real content rather than a refusal
+    // to produce any.
+    std::string content;
 };
 struct ReadCache {
     std::mutex mu;
@@ -902,11 +920,30 @@ ExecResult run_read(const ReadArgs& a) {
                 // what the caller can see and reason about.
                 if (it != read_cache().seen.end()
                     && it->second.mtime == current_mtime
-                    && covers(it->second, a.offset, a.limit, it->second.total)) {
+                    && covers(it->second, a.offset, a.limit, it->second.total)
+                    && !it->second.content.empty()) {
+                    // SERVE, don't refuse.
+                    //
+                    // This used to return a bare "refer to the earlier
+                    // tool_result instead" and nothing else, which is a
+                    // pointer into the caller's context -- sound only while
+                    // that result is still there. Compaction, a wire-level
+                    // read-collapse and subagent boundaries all break that
+                    // assumption, and when it breaks the caller is told to
+                    // consult bytes that exist nowhere. Measured outcome: the
+                    // model falls back to `cat`, which is the read-loop
+                    // KhazAkar reported and the same failure Claude Code has
+                    // open as issues #53578 and #60684.
+                    //
+                    // Annotating rather than refusing keeps the token saving
+                    // that motivated the cache (no re-read of the file, no
+                    // second line scan) while making the answer unconditional.
+                    // The tag is for the MODEL: it says "you have seen this,
+                    // it has not changed" so a careful one does not re-reason
+                    // over it, and a confused one still gets the content.
                     return ToolOutput{
-                        "File unchanged since last read. The content from the "
-                        "earlier Read tool_result in this conversation is still "
-                        "current \xe2\x80\x94 refer to that instead of re-reading.",
+                        "[cached \xe2\x80\x94 unchanged since your last read of this "
+                        "file]\n" + it->second.content,
                         std::nullopt};
                 }
             }
@@ -1303,8 +1340,15 @@ ExecResult run_read(const ReadArgs& a) {
             // eff_* — a symbol= read resolves to line numbers the caller
             // never asked for and cannot ask for again, so recording those
             // would refuse an unrelated later range that happens to overlap.
+            //
+            // `out` is exactly what the caller receives, headers and all, so
+            // a cache hit replays the identical answer under a [cached] tag
+            // rather than pointing at a tool_result that may be gone. Bounded
+            // by kMaxBytes per live path, and OVERWRITE means one entry per
+            // file, not a growing set.
             read_cache().seen[std::move(key)] =
-                ReadCacheEntry{current_mtime, a.offset, a.limit, total_lines};
+                ReadCacheEntry{current_mtime, a.offset, a.limit, total_lines,
+                               out};
         }
     }
     util::record_file_seen(p, current_mtime,
