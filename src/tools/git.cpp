@@ -9,6 +9,7 @@
 
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
+#include <mcp/tools/util/sandbox.hpp>   // run_argv — git EXECUTES hooks
 #include <mcp/tools/util/subprocess.hpp>
 #include <mcp/tools/util/error.hpp>
 
@@ -90,6 +91,32 @@ hardened_git_argv(const std::vector<std::string>& argv) {
     return hardened;
 }
 
+// Run git under the host sandbox when one is active.
+//
+// Every git spawn in this file goes through here, and that is the point: git
+// EXECUTES CODE on the user's behalf. A commit runs pre-commit/commit-msg
+// hooks, a checkout runs post-checkout, a config'd credential helper or
+// core.fsmonitor is an arbitrary command, and all of it comes from the
+// repository -- which may have arrived by `git clone`.
+//
+// The call sites here used to use util::run_argv_s, which is the UNSANDBOXED
+// runner. Measured on agentty: a pre-commit hook invoked through the git_commit
+// tool wrote to $HOME, outside the workspace, while the identical write through
+// the shell tool was refused. The shell tool was confined and the git tools
+// were not, which is backwards -- a git hook is strictly more dangerous than an
+// `echo`, because the user did not type it and may never read it.
+//
+// util::sandbox::run_argv is the argv-form wrapper (no `sh -c`, so commit
+// messages with quotes and $vars survive exactly), and it falls through to the
+// plain runner when no backend is active -- so this is a no-op where the
+// sandbox is off rather than a new failure mode.
+[[nodiscard]] util::SubprocessResult run_git_argv(
+        const std::vector<std::string>& argv,
+        std::size_t max_bytes = 30'000,
+        std::chrono::seconds timeout = std::chrono::seconds{120}) {
+    return util::sandbox::run_argv(argv, max_bytes, timeout);
+}
+
 std::expected<std::string, ToolError>
 run_git(const std::vector<std::string>& argv, std::string_view op,
         std::size_t max_bytes = 30'000) {
@@ -103,7 +130,7 @@ run_git(const std::vector<std::string>& argv, std::string_view op,
     //   core.askPass=/GIT_TERMINAL_PROMPT — covered structurally: no tty
     //     means prompts already fail fast rather than hang, so we leave
     //     credential config alone (a helper may still work non-interactively).
-    auto r = util::run_argv_s(hardened_git_argv(argv), max_bytes);
+    auto r = run_git_argv(hardened_git_argv(argv), max_bytes);
     if (!r.started || r.timed_out || r.exit_code != 0)
         return std::unexpected(classify_git_failure(r, op));
     std::string out = std::move(r.output);
@@ -177,7 +204,7 @@ resolve_git_dir(std::string_view checked) {
         dir = start.parent_path();
     if (dir.empty()) dir = default_git_start();
 
-    auto r = util::run_argv_s(
+    auto r = run_git_argv(
         {"git", "-C", dir.string(), "rev-parse", "--show-toplevel"}, 4096);
     if (r.started && !r.timed_out && r.exit_code == 0) {
         std::string top = std::move(r.output);
@@ -224,7 +251,7 @@ std::vector<std::string> dirty_submodules(const std::string& git_dir) {
                  std::vector<std::string>{"git", "-C", git_dir, "config",
                      "-f", (fs::path{git_dir} / ".gitmodules").string(),
                      "--get-regexp", "^submodule\\..*\\.ignore$"}}) {
-            auto c = util::run_argv_s(hardened_git_argv(argv), 4096);
+            auto c = run_git_argv(hardened_git_argv(argv), 4096);
             if (c.started && c.exit_code == 0 && !c.output.empty()) return true;
         }
         return false;
@@ -239,7 +266,7 @@ std::vector<std::string> dirty_submodules(const std::string& git_dir) {
         // spawning a shell + 3 git processes for every submodule.
         std::function<void(const fs::path&, const std::string&)> scan =
             [&](const fs::path& dir, const std::string& prefix) {
-                auto st = util::run_argv_s(hardened_git_argv(
+                auto st = run_git_argv(hardened_git_argv(
                     {"git", "-c", "core.quotePath=false", "-C", dir.string(),
                      "status", "--porcelain=v2",
                      "--ignore-submodules=none"}), 200'000);
@@ -306,7 +333,7 @@ std::vector<std::string> dirty_submodules(const std::string& git_dir) {
     // a plain `?`/`M` against the submodule dir; `--porcelain` alone can't
     // tell us it's a submodule. So ask git directly for the submodule paths
     // that are not clean.
-    auto r = util::run_argv_s(
+    auto r = run_git_argv(
         {"git", "-C", git_dir, "submodule", "--quiet", "foreach",
          "--recursive",
          // Print the submodule's display path when its own working tree is
@@ -744,7 +771,7 @@ ExecResult run_git_commit(const GitCommitArgs& a) {
             return std::unexpected(std::move(r.error()));
     }
 
-    auto r = util::run_argv_s(
+    auto r = run_git_argv(
         hardened_git_argv([&] {
             std::vector<std::string> argv{"git", "-C", *git_dir, "commit"};
             if (a.amend) {
@@ -771,13 +798,13 @@ ExecResult run_git_commit(const GitCommitArgs& a) {
     // "<shorthash> <subject>  (N files changed, +A/-D)" on the current branch.
     std::string output;
     {
-        auto hash = util::run_argv_s(
+        auto hash = run_git_argv(
             {"git", "-C", *git_dir, "rev-parse", "--short", "HEAD"}, 256);
-        auto subj = util::run_argv_s(
+        auto subj = run_git_argv(
             {"git", "-C", *git_dir, "log", "-1", "--format=%s"}, 4096);
-        auto brch = util::run_argv_s(
+        auto brch = run_git_argv(
             {"git", "-C", *git_dir, "rev-parse", "--abbrev-ref", "HEAD"}, 256);
-        auto stat = util::run_argv_s(
+        auto stat = run_git_argv(
             {"git", "-C", *git_dir, "show", "--stat", "--format=", "HEAD"},
             8192);
         auto trim = [](std::string s) {
@@ -980,7 +1007,7 @@ ExecResult run_git_branch(const GitBranchArgs& a) {
         std::vector<std::string> argv{"git", "-C", d, "switch"};
         bool exists = false;
         {
-            auto chk = util::run_argv_s(
+            auto chk = run_git_argv(
                 {"git", "-C", d, "rev-parse", "--verify", "--quiet",
                  "refs/heads/" + a.name}, 128);
             exists = chk.started && chk.exit_code == 0;
@@ -1002,7 +1029,7 @@ ExecResult run_git_branch(const GitBranchArgs& a) {
     // delete
     std::vector<std::string> argv{"git", "-C", d, "branch",
                                   a.force ? "-D" : "-d", a.name};
-    auto r = util::run_argv_s(argv);
+    auto r = run_git_argv(argv);
     if (!r.started || r.timed_out || r.exit_code != 0) {
         std::string_view o = r.output;
         if (o.find("not fully merged") != std::string_view::npos)
@@ -1098,7 +1125,7 @@ ExecResult run_git_stash(const GitStashArgs& a) {
         std::vector<std::string> argv{"git", "-C", d, "stash", "push"};
         if (a.include_untracked) argv.push_back("--include-untracked");
         if (!a.message.empty()) { argv.push_back("-m"); argv.push_back(a.message); }
-        auto r = util::run_argv_s(argv);
+        auto r = run_git_argv(argv);
         if (!r.started || r.timed_out || r.exit_code != 0)
             return std::unexpected(classify_git_failure(r, "git_stash (push)"));
         std::string_view o = r.output;
@@ -1122,7 +1149,7 @@ ExecResult run_git_stash(const GitStashArgs& a) {
     // pop | apply | drop
     std::vector<std::string> argv{"git", "-C", d, "stash", a.action};
     if (!a.ref.empty()) argv.push_back(a.ref);
-    auto r = util::run_argv_s(argv, 50'000);
+    auto r = run_git_argv(argv, 50'000);
     if (!r.started || r.timed_out || r.exit_code != 0) {
         std::string_view o = r.output;
         // pop/apply can hit merge conflicts; the stash is preserved on pop
@@ -1199,7 +1226,7 @@ ExecResult run_git_rebase(const GitRebaseArgs& a) {
     } else {
         argv.push_back("--" + a.action);   // --continue / --abort / --skip
     }
-    auto r = util::run_argv_s(hardened_git_argv(argv), 50'000);
+    auto r = run_git_argv(hardened_git_argv(argv), 50'000);
     if (!r.started || r.timed_out || r.exit_code != 0) {
         // continue with unresolved conflicts, or a fresh conflict during onto.
         std::string_view o = r.output;
@@ -1287,7 +1314,7 @@ ExecResult run_git_cherry_pick(const GitCherryPickArgs& a) {
     } else {
         argv.push_back("--" + a.action);
     }
-    auto r = util::run_argv_s(hardened_git_argv(argv), 50'000);
+    auto r = run_git_argv(hardened_git_argv(argv), 50'000);
     if (!r.started || r.timed_out || r.exit_code != 0) {
         std::string_view o = r.output;
         if (o.find("no cherry-pick") != std::string_view::npos
