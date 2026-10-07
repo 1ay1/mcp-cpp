@@ -54,7 +54,8 @@ enum class Mode : std::uint8_t {
 
 enum class Backend : std::uint8_t {
     None,         // no backend detected / sandbox disabled
-    Bwrap,        // Linux bubblewrap
+    // No Linux backend of its own: the embedding host supplies one via
+    // set_host_sandbox, and that is the only boundary mcp-cpp ever applies.
     SandboxExec,  // macOS sandbox-exec
 };
 

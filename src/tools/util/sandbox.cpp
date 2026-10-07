@@ -147,7 +147,6 @@ void annotate_sandbox_denial(SubprocessResult& r) {
     std::string note =
         "\n\n[sandbox] This command ran inside agentty's sandbox (";
     switch (detected_backend()) {
-        case Backend::Bwrap:       note += "bwrap";        break;
         case Backend::SandboxExec: note += "sandbox-exec"; break;
         case Backend::None:        note += "none";         break;
     }
@@ -177,187 +176,15 @@ void annotate_sandbox_denial(SubprocessResult& r) {
 // /bin/true and require it to actually start AND exit 0. If it can't build the
 // namespace here, it can't build it for the shell either, and we report no
 // backend so Auto degrades to unsandboxed and On surfaces a clear error.
-[[nodiscard]] bool bwrap_can_sandbox() {
-    if (!can_invoke("bwrap")) return false;
-    const std::vector<std::string> argv = {
-        "bwrap",
-        "--unshare-user", "--unshare-pid",
-        "--ro-bind", "/usr", "/usr",
-        "--ro-bind-try", "/bin", "/bin",
-        "--ro-bind-try", "/lib", "/lib",
-        "--ro-bind-try", "/lib64", "/lib64",
-        "--proc", "/proc",
-        "--dev", "/dev",
-        "--die-with-parent",
-        "--", "/bin/true",
-    };
-    auto r = run_argv_s(argv, /*max_bytes=*/4096, std::chrono::seconds{5});
-    return r.started && !r.timed_out && r.exit_code == 0;
-}
-
 [[nodiscard]] Backend probe() {
-    return bwrap_can_sandbox() ? Backend::Bwrap : Backend::None;
-}
-
-// Build the bwrap argv prefix. Workspace gets read-write bound to
-// itself; system dirs are bound read-only so the shell can find
-// /bin/sh, libc, /etc/resolv.conf, etc.; /tmp is a fresh tmpfs (no
-// leakage into / from the host /tmp); /proc and /dev are minimal;
-// network namespace is shared (so `git push` / `npm install` / `curl`
-// keep working — sandboxing those would break legitimate agent flows
-// users expect to work).
-//
-// The intent is "bash can do anything WITHIN your workspace, plus
-// network, plus read system libs — but it cannot mutate /etc,
-// /home/<other-projects>, ~/.ssh, /opt, etc." That's the threat model
-// we're actually defending against: a compromised or sloppy model
-// running `rm -rf ~` or `cat ~/.ssh/id_rsa` after one user approval.
-//
-// `--die-with-parent` ensures the sandbox dies if agentty dies — no
-// detached zombies. `--unshare-pid` gives the child a clean PID
-// namespace so kills work cleanly. `--new-session` so the child can't
-// steal the controlling tty.
-[[nodiscard]] std::vector<std::string> build_bwrap_argv(std::string_view shell_cmd) {
-    std::string ws = workspace_root().string();
-    std::vector<std::string> argv = {"bwrap"};
-
-    auto push = [&](const char* a) { argv.emplace_back(a); };
-    auto push_pair = [&](const char* k, std::string v) {
-        argv.emplace_back(k);
-        argv.emplace_back(std::move(v));
-    };
-    auto push_bind = [&](const char* k, const char* p) {
-        argv.emplace_back(k);
-        argv.emplace_back(p);
-        argv.emplace_back(p);
-    };
-
-    // System dirs first: read-only. `--ro-bind-try` skips silently if
-    // the path doesn't exist on this distro (e.g. /lib64 on Alpine).
-    push_bind("--ro-bind",     "/usr");
-    push_bind("--ro-bind",     "/bin");
-
-    // /etc: bind ONLY the files a shell + toolchain + name resolution
-    // actually need, not the whole tree. Binding all of /etc exposed
-    // host secrets (/etc/shadow if readable, krb5 keytabs, corporate
-    // config) to an "approved" bash call that also has --share-net —
-    // a read+exfiltrate path the sandbox is supposed to close.
-    // --ro-bind-try so a missing file on a given distro is skipped.
-    {
-        static constexpr const char* kEtcAllow[] = {
-            "/etc/resolv.conf",   // DNS
-            "/etc/hosts",
-            "/etc/nsswitch.conf", // NSS resolution order
-            "/etc/host.conf",
-            "/etc/passwd",        // uid->name (git, shells)
-            "/etc/group",
-            "/etc/localtime",     // timestamps
-            "/etc/ssl",           // TLS trust store (curl/git over https)
-            "/etc/pki",           // RHEL/Fedora trust store
-            "/etc/ca-certificates",
-            "/etc/ca-certificates.conf",
-            "/etc/gitconfig",     // system git config
-            "/etc/profile",
-            "/etc/alternatives",  // Debian toolchain symlinks
-        };
-        for (const char* f : kEtcAllow) {
-            argv.emplace_back("--ro-bind-try");
-            argv.emplace_back(f);
-            argv.emplace_back(f);
-        }
-    }
-
-    argv.emplace_back("--ro-bind-try");
-    argv.emplace_back("/lib"); argv.emplace_back("/lib");
-    argv.emplace_back("--ro-bind-try");
-    argv.emplace_back("/lib64"); argv.emplace_back("/lib64");
-    argv.emplace_back("--ro-bind-try");
-    argv.emplace_back("/sbin"); argv.emplace_back("/sbin");
-    argv.emplace_back("--ro-bind-try");
-    argv.emplace_back("/opt"); argv.emplace_back("/opt");
-
-    // User-local toolchains (GitHub issue #21). Many toolchains install OUTSIDE
-    // /usr — webinstall.dev drops go/gofmt/node under ~/.local/opt and links
-    // them into ~/.local/bin; rustup/cargo, go, nvm, pyenv, rbenv, asdf, bun,
-    // and deno all live under $HOME. Without these binds an "approved" bash
-    // call couldn't find the very tools the user asked the agent to run. Bind
-    // them READ-ONLY via --ro-bind-try so a missing dir is skipped. Deliberately
-    // narrow (named tool roots), NOT all of $HOME — that would re-expose
-    // ~/.ssh / ~/.aws / ~/.config secrets the sandbox exists to protect.
-    if (const char* home = std::getenv("HOME"); home && *home) {
-        const std::string h = home;
-        // Narrow, tool-only roots. Deliberately EXCLUDES broad dirs that mix in
-        // secrets/app-data: ~/.local/share (app data), ~/.npm (may cache an
-        // _auth token), ~/.config (creds), ~/.local/state (logs/history).
-        static constexpr const char* kToolSubdirs[] = {
-            "/.local/bin", "/.local/opt", "/.local/lib", // webinstall.dev etc.
-            "/.cargo/bin", "/.rustup",   // Rust (bin only from .cargo)
-            "/go/bin", "/.go",           // Go (GOPATH bin + webinstall)
-            "/.nvm",                     // Node version manager
-            "/.pyenv", "/.rbenv", "/.asdf", // version managers
-            "/.bun/bin", "/.deno/bin",   // Bun / Deno
-            "/.dotnet", "/.sdkman/candidates", // .NET / JVM
-        };
-        for (const char* sub : kToolSubdirs) {
-            std::string p = h + sub;
-            argv.emplace_back("--ro-bind-try");
-            argv.emplace_back(p);
-            argv.emplace_back(std::move(p));
-        }
-    }
-
-    // Pseudo-fs
-    push_pair("--proc", "/proc");
-    push_pair("--dev",  "/dev");
-
-    // Fresh /tmp inside the sandbox. MUST come before the workspace
-    // bind: when workspace lives under /tmp (common in test setups),
-    // bwrap applies args in order and a later --tmpfs would wipe the
-    // workspace overlay. Bind workspace LAST so it always wins.
-    push_pair("--tmpfs", "/tmp");
-
-    // Workspace: read-write. Bound LAST so it overlays any earlier
-    // --tmpfs / --ro-bind that touches the same prefix.
-    //
-    // NOTE: with --workspace / the rw bind covers the entire host
-    // filesystem, which defeats the point of the sandbox. We still
-    // wrap (process/pid/session hardening + fresh /tmp/proc/dev keep
-    // some value) but describe_state() reports the degraded posture so
-    // the user isn't told they're "active (bwrap)" when they're not.
-    argv.emplace_back("--bind");
-    argv.emplace_back(ws);
-    argv.emplace_back(ws);
-
-    // Network: keep it. Removing this breaks git push / package
-    // installs / curl — flows users explicitly want to work.
-    push("--share-net");
-
-    // Process / namespace / privilege hardening. Each --unshare severs a
-    // kernel namespace so a command inside the sandbox can't observe or touch
-    // the host's view of it (user/pid/ipc/uts/cgroup). --new-session detaches
-    // the controlling tty (blocks TIOCSTI injection); --die-with-parent avoids
-    // detached zombies. bwrap runs the payload with no ambient caps and
-    // no_new_privs inside the userns, so a setuid binary can't escalate. Net is
-    // kept (--share-net) so git/npm/curl work (accepted residual).
-    push("--unshare-user");
-    push("--unshare-pid");
-    push("--unshare-ipc");
-    push("--unshare-uts");
-    push("--unshare-cgroup-try");
-    push("--new-session");
-    push("--die-with-parent");
-
-    // Pass through the workspace-relative cwd so the shell starts where
-    // the user expects. Default cwd would be / inside the sandbox.
-    argv.emplace_back("--chdir");
-    argv.emplace_back(ws);
-
-    // The actual shell command
-    argv.emplace_back("--");
-    argv.emplace_back("/bin/sh");
-    argv.emplace_back("-c");
-    argv.emplace_back(std::string{shell_cmd});
-    return argv;
+    // mcp-cpp has no Linux backend of its own. It used to carry a bwrap
+    // path, which made it a SECOND sandbox implementation beside the host's
+    // -- two boundaries to keep in agreement, and the host's is the one that
+    // actually ran (set_host_sandbox takes precedence whenever it is
+    // installed). So this reports None and is_active() reduces to
+    // has_host_sandbox(): mcp-cpp is confined exactly when its host confined
+    // it, which is both the truth and the whole design.
+    return Backend::None;
 }
 
 [[nodiscard]] SubprocessResult run_wrapped(std::string_view cmd,
@@ -365,49 +192,24 @@ void annotate_sandbox_denial(SubprocessResult& r) {
                                            std::chrono::seconds timeout,
                                            std::string_view cwd,
                                            const std::vector<std::pair<std::string, std::string>>& env) {
-    SubprocessOptions opts;
-    opts.argv = build_bwrap_argv(cmd);
-    opts.max_bytes = max_bytes;
-    opts.timeout = timeout;
-    opts.cwd = std::string{cwd};
-    opts.env = env;
-    opts.on_progress = [](std::string_view snap) { progress::emit(snap); };
-    auto r = Subprocess::run(std::move(opts));
-    annotate_sandbox_denial(r);
+    // Unreachable: with no local backend, is_active() is true only when a
+    // host sandbox is installed, and run_shell_command hands those off
+    // before reaching here. Refuse rather than run unconfined -- a command
+    // approved on the understanding it would be boxed must not escape it.
+    (void)cmd; (void)max_bytes; (void)timeout; (void)cwd; (void)env;
+    SubprocessResult r;
+    r.started = false;
+    r.start_error = "sandbox active but no host sandbox installed";
     return r;
 }
 
-// argv-form: wrap with the same bwrap prefix as the shell form, then
-// append the user's argv after the `--` separator. No `sh -c`
-// indirection — the args reach the child process exactly as given.
 [[nodiscard]] SubprocessResult run_wrapped_argv(const std::vector<std::string>& user_argv,
                                                 std::size_t max_bytes,
                                                 std::chrono::seconds timeout) {
-    if (user_argv.empty()) {
-        SubprocessResult r;
-        r.started = false; r.start_error = "empty argv";
-        return r;
-    }
-    // Build prefix with no shell command, then splice the user's argv.
-    // Same prefix the shell form uses. The builder ends with four elements
-    // ("--", "/bin/sh", "-c", cmd), so the pop below matches its tail — but
-    // assert the shape rather than trusting it, because a builder that
-    // changed its tail would otherwise silently splice the user's argv into
-    // the wrong position.
-    auto wrapped = build_bwrap_argv("");
-    // Pop the trailing 4 elements added by the builder ("--",
-    // "/bin/sh", "-c", ""), then append user argv directly.
-    if (wrapped.size() >= 4) wrapped.resize(wrapped.size() - 4);
-    wrapped.emplace_back("--");
-    for (const auto& a : user_argv) wrapped.push_back(a);
-
-    SubprocessOptions opts;
-    opts.argv = std::move(wrapped);
-    opts.max_bytes = max_bytes;
-    opts.timeout = timeout;
-    opts.on_progress = [](std::string_view snap) { progress::emit(snap); };
-    auto r = Subprocess::run(std::move(opts));
-    annotate_sandbox_denial(r);
+    (void)user_argv; (void)max_bytes; (void)timeout;
+    SubprocessResult r;
+    r.started = false;
+    r.start_error = "sandbox active but no host sandbox installed";
     return r;
 }
 
@@ -550,7 +352,6 @@ std::string describe_state() {
         return "sandbox: active (" + host_sandbox().label + ")";
     const char* tag = nullptr;
     switch (b) {
-        case Backend::Bwrap:       tag = "bwrap";        break;
         case Backend::SandboxExec: tag = "sandbox-exec"; break;
         case Backend::None:        tag = nullptr;        break;
     }
@@ -568,12 +369,8 @@ std::string describe_state() {
     if (m == Mode::On)
         return "sandbox: requested but no backend "
 #if defined(__linux__)
-               + std::string{can_invoke("bwrap")
-                   ? "(bubblewrap present but unprivileged user namespaces are "
-                     "blocked \xe2\x80\x94 e.g. Ubuntu 24.04 AppArmor userns "
-                     "restriction or kernel.unprivileged_userns_clone=0; "
-                     "allow userns or run with --sandbox off)"
-                   : "(install bubblewrap)"};
+               "(no host sandbox was installed \xe2\x80\x94 the embedding "
+               "application supplies the boundary on this platform)";
 #elif defined(__APPLE__)
                "(sandbox-exec missing \xe2\x80\x94 system integrity issue)";
 #else
@@ -582,10 +379,7 @@ std::string describe_state() {
     // Mode::Auto + no backend → falling through unsandboxed
     return "sandbox: unavailable, running unsandboxed "
 #if defined(__linux__)
-           + std::string{can_invoke("bwrap")
-               ? "(bubblewrap present but user namespaces are blocked \xe2\x80\x94 "
-                 "allow unprivileged userns to enable containment)"
-               : "(install bubblewrap to enable)"};
+           "(no host sandbox was installed)";
 #elif defined(__APPLE__)
            "(sandbox-exec missing)";
 #else
@@ -615,7 +409,7 @@ SubprocessResult run_shell_command(std::string_view cmd,
 std::vector<std::string> prepare_shell_argv(std::string_view cmd) {
     if (is_active()) {
 #if defined(__linux__)
-        return build_bwrap_argv(cmd);
+        return {};   // no local backend; the host wraps, or nothing does
 #elif defined(__APPLE__)
         return {"sandbox-exec", "-p", build_profile(workspace_root().string()),
                 "/bin/sh", "-c", std::string{cmd}};
