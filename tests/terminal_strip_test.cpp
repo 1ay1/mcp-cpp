@@ -14,7 +14,6 @@
 
 #include "agtest.hpp"
 
-#include <mcp/tools/util/subprocess.hpp>
 #include <mcp/tools/util/utf8.hpp>
 
 #include <cstdio>

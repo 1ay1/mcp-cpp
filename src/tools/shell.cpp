@@ -14,7 +14,6 @@
 #include <mcp/tools/util/shellx.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/sandbox.hpp>
-#include <mcp/tools/util/subprocess.hpp>
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/utf8.hpp>
 

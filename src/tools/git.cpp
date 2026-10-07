@@ -10,7 +10,6 @@
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/utf8.hpp>
-#include <mcp/tools/util/subprocess.hpp>
 #include <mcp/tools/util/error.hpp>
 
 #include <algorithm>
@@ -35,7 +34,7 @@ using util::ExecResult;
 
 namespace {
 
-ToolError classify_git_failure(const util::SubprocessResult& r,
+ToolError classify_git_failure(const RunResult& r,
                                std::string_view op) {
     if (!r.started)
         return ToolError::spawn(std::string{op} + ": " + r.start_error
@@ -110,7 +109,7 @@ hardened_git_argv(const std::vector<std::string>& argv) {
 // messages with quotes and $vars survive exactly), and it falls through to the
 // plain runner when no backend is active -- so this is a no-op where the
 // sandbox is off rather than a new failure mode.
-[[nodiscard]] util::SubprocessResult run_git_argv(
+[[nodiscard]] RunResult run_git_argv(
         Exec& exec,
         const std::vector<std::string>& argv,
         std::size_t max_bytes = 30'000,
@@ -124,7 +123,7 @@ hardened_git_argv(const std::vector<std::string>& argv) {
 
     // Adapted to the shape the thirty call sites below already read, so
     // changing the runner did not become a rewrite of every git tool.
-    util::SubprocessResult out;
+    RunResult out;
     out.output    = util::strip_terminal_controls(res.output);
     out.truncated = res.truncated;
     std::visit([&]<class T>(const T& o) {
@@ -1072,7 +1071,7 @@ ExecResult run_git_branch(const GitBranchArgs& a, Exec& exec) {
 // actionable message naming the exact follow-up actions rather than a raw
 // "exit 1" dump. `op` is the tool name, `cont`/`abrt` the action words to
 // suggest (e.g. "continue"/"abort").
-ToolError sequencer_conflict(const util::SubprocessResult& r,
+ToolError sequencer_conflict(const RunResult& r,
                              std::string_view op,
                              std::string_view verb) {
     std::string_view o = r.output;

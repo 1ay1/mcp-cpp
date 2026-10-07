@@ -16,7 +16,6 @@
 // The unlinked case is the sharp one: no path exists, no sandbox rule can
 // name it, and the child still reads the bytes if the descriptor survives.
 
-#include <mcp/tools/util/subprocess.hpp>
 
 #include <chrono>
 #include <cstdio>

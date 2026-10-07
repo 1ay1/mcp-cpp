@@ -42,7 +42,6 @@
 #include <string_view>
 #include <vector>
 
-#include <mcp/tools/util/subprocess.hpp>
 
 namespace mcp::tools::util::sandbox {
 
@@ -76,17 +75,14 @@ enum class Backend : std::uint8_t {
 //
 // `label` is what describe_state() reports, so the banner names whatever the
 // host actually installed rather than guessing.
+// It no longer carries a run function. It used to, so mcp-cpp could hand a
+// command to the host's sandbox and fall back to its own; there is no own
+// any more, and every tool reaches the host through HostServices::exec. What
+// is left is the only thing this library still needs to know: whether it is
+// confined, and by what, so describe_state() can say so.
 struct HostSandbox {
-    std::string label;
-    // Runs argv under the host's sandbox. Returning nullopt means "I could
-    // not take this one" and mcp-cpp falls back to its own backend, so a
-    // host need not reimplement every path to install the hook.
-    std::function<std::optional<SubprocessResult>(
-        const std::vector<std::string>& argv,
-        std::size_t max_bytes,
-        std::chrono::seconds timeout,
-        std::string_view cwd,
-        const std::vector<std::pair<std::string, std::string>>& env)> run;
+    std::string label;      ///< what describe_state() reports
+    bool        active = false;
 };
 
 // Install (or clear, with a default-constructed value) the host sandbox.
@@ -116,32 +112,5 @@ void set_host_sandbox(HostSandbox hs);
 //   "sandbox: off"
 //   "sandbox: requested but no backend (install bubblewrap)"
 [[nodiscard]] std::string describe_state();
-
-// Run a shell command, wrapping it in the active sandbox when one
-// exists. Same shape as util::run_command_s — drop-in replacement for
-// the bash tool. When sandbox is Off / unavailable, falls through to
-// the normal subprocess runner so behavior is preserved.
-[[nodiscard]] SubprocessResult run_shell_command(
-    std::string_view cmd,
-    std::size_t max_bytes,
-    std::chrono::seconds timeout,
-    std::string_view cwd = {},
-    const std::vector<std::pair<std::string, std::string>>& env = {});
-
-// argv-form variant for callers that already build a typed argv (e.g.
-// `diagnostics` invoking `cmake --build build`). Same wrap policy as
-// the shell variant: bwrap / sandbox-exec prepended when active, no-op
-// otherwise. Wraps without going through `sh -c`, preserving exact
-// argv semantics that matter for things like commit messages with
-// quotes / `$vars`.
-// Prepare the argv used to launch a shell command without running it. This is
-// the persistent-process counterpart to run_shell_command: process_start uses
-// it so dev servers receive the identical bwrap/sandbox-exec policy.
-[[nodiscard]] std::vector<std::string> prepare_shell_argv(std::string_view cmd);
-
-[[nodiscard]] SubprocessResult run_argv(
-    const std::vector<std::string>& argv,
-    std::size_t max_bytes,
-    std::chrono::seconds timeout);
 
 } // namespace mcp::tools::util::sandbox

@@ -10,7 +10,6 @@
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/utf8.hpp>
-#include <mcp/tools/util/subprocess.hpp>
 #include <mcp/tools/util/error.hpp>
 
 #include <algorithm>
@@ -77,7 +76,7 @@ std::expected<DiagnosticsArgs, ToolError> parse_diagnostics_args(const json& j) 
 
 // One shape for "run this and give me the bytes", whether the caller has an
 // argv or a command line. The shell is just another program you name.
-[[nodiscard]] util::SubprocessResult run_via(
+[[nodiscard]] RunResult run_via(
         Exec& exec, const std::vector<std::string>& argv,
         std::string_view shell_cmd, std::size_t max_bytes,
         std::chrono::seconds timeout) {
@@ -94,7 +93,7 @@ std::expected<DiagnosticsArgs, ToolError> parse_diagnostics_args(const json& j) 
     req.max_output_bytes = max_bytes;
     const auto res = exec.run(req);
 
-    util::SubprocessResult out;
+    RunResult out;
     out.output    = util::strip_terminal_controls(res.output);
     out.truncated = res.truncated;
     std::visit([&]<class T>(const T& o) {
@@ -121,7 +120,7 @@ ExecResult run_diagnostics(const DiagnosticsArgs& a, Exec& exec) {
     }
     auto sub = run_via(exec, auto_argv, a.command, /*max_bytes*/100'000,
                        std::chrono::seconds{120});
-    auto output = util::legacy_format(sub, std::chrono::seconds{120});
+    auto output = format_run(sub, std::chrono::seconds{120});
     if (output.empty()) return ToolOutput{"no diagnostics (clean build)", std::nullopt};
 
     int errors = 0, warnings = 0;
@@ -273,7 +272,7 @@ ExecResult run_tests(const TestArgs& a, Exec& exec) {
     const bool native_repeat = (bs == BuildSystem::CMake || bs == BuildSystem::Go);
     const int loops = (a.repeat > 1 && !native_repeat) ? a.repeat : 1;
 
-    util::SubprocessResult sub;
+    RunResult sub;
     int run_no = 0;
     for (; run_no < loops; ++run_no) {
         sub = run_via(exec, a.command.empty() ? argv : std::vector<std::string>{},
@@ -282,7 +281,7 @@ ExecResult run_tests(const TestArgs& a, Exec& exec) {
     }
     const int runs_done = std::min(run_no + 1, loops);
 
-    std::string output = util::legacy_format(sub, timeout);
+    std::string output = format_run(sub, timeout);
     std::ostringstream summary;
     summary << (sub.exit_code == 0 && !sub.timed_out ? "PASS" : "FAIL")
             << " exit=" << sub.exit_code;

@@ -12,12 +12,53 @@
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace mcp::tools::detail {
+
+// What a tool gets back from the host's Exec, in the shape its formatting
+// code wants.
+//
+// This used to be util::SubprocessResult, borrowed from the runner this
+// library no longer has. Keeping the borrow would have kept the header, and
+// with it the implication that a tool might still spawn something itself.
+struct RunResult {
+    std::string output;
+    int         exit_code     = 0;
+    bool        started       = true;
+    std::string start_error;
+    bool        truncated     = false;
+    bool        timed_out     = false;
+    bool        hit_wall      = false;   // WHICH clock, when timed_out
+    bool        stopped_early = false;   // the caller had enough
+};
+
+/// Render a run for a model to read. The timeout line names the clock,
+/// because "timed out" alone sends the reader hunting for a hang when the
+/// command was fine and simply needed longer.
+[[nodiscard]] inline std::string format_run(const RunResult& r,
+                                            std::chrono::seconds idle) {
+    if (!r.started) return "[" + r.start_error + "]";
+    std::string o = r.output;
+    if (r.truncated) o += "\n[output truncated]";
+    if (r.timed_out) {
+        o += r.hit_wall
+            ? "\n[stopped at the wall-clock ceiling while still producing "
+              "output \xe2\x80\x94 it was not stuck; re-run with a larger "
+              "`timeout`, or start it with `process_start`]"
+            : "\n[no output for " + std::to_string(idle.count())
+              + "s, so it was stopped \xe2\x80\x94 the clock measures "
+                "SILENCE, not total runtime]";
+    } else if (r.exit_code != 0) {
+        o += "\n[exit code " + std::to_string(r.exit_code) + "]";
+    }
+    return o;
+}
+
 
 using mcp::Json;
 

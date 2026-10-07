@@ -52,10 +52,6 @@ doctest_discover_tests(mcp_tests)
 # spawns `sh -c` children. Their process isolation is load-bearing, so they
 # must not share a binary with the in-process unit tests.
 if(NOT WIN32)
-    add_executable(mcp_subprocess_tty_test subprocess_tty_test.cpp)
-    target_link_libraries(mcp_subprocess_tty_test PRIVATE mcp::tools)
-    add_test(NAME mcp_subprocess_tty_test COMMAND mcp_subprocess_tty_test)
-
     add_executable(mcp_process_tools_test process_tools_test.cpp)
     target_link_libraries(mcp_process_tools_test PRIVATE mcp::tools Threads::Threads)
     add_test(NAME mcp_process_tools_test COMMAND mcp_process_tools_test)

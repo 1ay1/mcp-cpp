@@ -11,7 +11,6 @@
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/glob.hpp>
-#include <mcp/tools/util/subprocess.hpp>
 #include <mcp/tools/util/utf8.hpp>
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/regex_guard.hpp>
@@ -209,7 +208,7 @@ std::expected<FindDefinitionArgs, ToolError> parse_find_definition_args(const js
 // Run a program through the host. Shaped like SubprocessResult so the
 // parsing below is untouched; `stop_when` is forwarded because only this
 // file knows when it has seen enough matches.
-[[nodiscard]] util::SubprocessResult run_prog(
+[[nodiscard]] RunResult run_prog(
         Exec& exec, std::vector<std::string> argv,
         std::chrono::seconds timeout, std::size_t max_bytes,
         std::function<bool(std::string_view)> stop_when = {}) {
@@ -221,7 +220,7 @@ std::expected<FindDefinitionArgs, ToolError> parse_find_definition_args(const js
     req.stop_when        = std::move(stop_when);
     const auto res = exec.run(req);
 
-    util::SubprocessResult out;
+    RunResult out;
     out.output    = res.output;
     out.truncated = res.truncated;
     std::visit([&]<class T>(const T& o) {
