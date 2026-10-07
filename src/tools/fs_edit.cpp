@@ -639,6 +639,26 @@ int apply_one(std::string& buf, const OneEdit& e,
 
     auto m = util::fuzzy_find(buf, e.old_text, e.new_text, e.line_hint);
     if (!m.ok) {
+        if (m.far_from_hint_line) {
+            // We DID find something; we declined to trust it. Saying "no
+            // match" here would be a lie that costs the caller a blind
+            // retry, so name the line and let them decide.
+            err = std::format(
+                "old_text has no exact match, and the closest approximate one "
+                "is at line {} \xe2\x80\x94 far from the line {} you gave. A fuzzy "
+                "match that far from where you said to look is usually a "
+                "different region that reads similarly, so it was not "
+                "applied.{}\n\nIf line {} is right, re-send with line: {}. "
+                "Otherwise re-read {} and copy old_text exactly.",
+                m.far_from_hint_line, e.line_hint + 1,
+                render_context_window(buf, static_cast<int>(m.far_from_hint_line))
+                    .empty()
+                    ? std::string{}
+                    : "\n\n" + render_context_window(
+                          buf, static_cast<int>(m.far_from_hint_line)),
+                m.far_from_hint_line, m.far_from_hint_line, path_str);
+            return 0;
+        }
         if (m.count >= 2) {
             auto lines = hit_lines(buf, e.old_text, 5);
             std::string at;
@@ -1238,9 +1258,19 @@ ExecResult run_apply_patch(const ApplyPatchArgs& a) {
         if (!fm.ok) {
             if (fm.count > 1)
                 return std::unexpected(ToolError::ambiguous(std::format(
-                    "hunk #{} matched {} locations \u2014 its context isn't "
+                    "hunk #{} matched {} locations \xe2\x80\x94 its context isn't "
                     "unique. Widen the context lines in that hunk.",
                     h.index, fm.count)));
+            if (fm.far_from_hint_line)
+                return std::unexpected(ToolError::no_match(std::format(
+                    "hunk #{} says it belongs near line {}, but the only "
+                    "approximate match is at line {} \xe2\x80\x94 too far to trust. "
+                    "Either the patch is stale or that is a different region "
+                    "that happens to look similar. Re-read {} and regenerate "
+                    "the diff; if line {} really is the target, say so with an "
+                    "accurate @@ header.",
+                    h.index, h.old_start, fm.far_from_hint_line,
+                    a.path.string(), fm.far_from_hint_line)));
             return std::unexpected(ToolError::no_match(std::format(
                 "hunk #{} did not match the file (context/removed lines not "
                 "found, even fuzzily). The file may have moved on from the "

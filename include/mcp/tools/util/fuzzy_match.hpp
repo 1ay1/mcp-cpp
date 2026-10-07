@@ -19,6 +19,13 @@ struct FuzzyMatch {
     int         count;   // total matches seen (1 on ok; >1 means ambiguous)
     std::string adjusted_new_text;  // re-indented replacement, or empty
     int         strategy = 0;       // 0=none, 1=exact, 2=DP (diagnostics)
+
+    // Set (1-based) when the ONLY candidate was a fuzzy one sitting further
+    // than LINE_HINT_TOLERANCE from an explicit `line:` hint, so ok==false.
+    // Carries the line it was found at, because "no match" is unhelpful when
+    // we did find something and chose not to trust it -- the caller can name
+    // the spot and let the caller confirm or correct.
+    std::uint32_t far_from_hint_line = 0;
 };
 
 FuzzyMatch fuzzy_find(std::string_view file, std::string_view needle);

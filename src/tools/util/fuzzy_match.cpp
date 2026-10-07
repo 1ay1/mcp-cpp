@@ -765,6 +765,40 @@ FuzzyMatch fuzzy_find(std::string_view file,
         return {false, 0, 0, static_cast<int>(matches.size()), {}, 0};
     }
 
+    // ── The hint binds only where we are ALREADY guessing ────────────────
+    //
+    // `line:` is documented as a disambiguator, and as a filter it would do
+    // harm: line numbers go stale constantly (the region moved because an
+    // earlier edit grew the file), and refusing a correct edit over a stale
+    // number is worse than ignoring the number. That is why an EXACT unique
+    // match returns long before this point and never consults the hint at
+    // all.
+    //
+    // But a FUZZY match is a guess by construction, and a guess that also
+    // lands far from where the caller said to look is weak on two axes at
+    // once. That conjunction is where a silently-wrong edit lives: the only
+    // candidate is approximate AND it is somewhere the caller never
+    // mentioned, and before this the single-candidate branch applied it
+    // without a word.
+    //
+    // So: exact anywhere, fine. Fuzzy near the hint, fine. Fuzzy with no
+    // hint, fine (nothing was claimed). Fuzzy far from an explicit hint --
+    // say so, and name the line, so the caller can confirm with a corrected
+    // `line:` or a faithful `old_text` instead of discovering it in a diff.
+    if (pick->cost != 0
+        && line_hint != std::numeric_limits<std::uint32_t>::max()) {
+        const auto row = static_cast<std::uint32_t>(pick->row_start);
+        const std::uint32_t dist = (row > line_hint) ? (row - line_hint)
+                                                     : (line_hint - row);
+        if (dist > LINE_HINT_TOLERANCE) {
+            FuzzyMatch far{};
+            far.ok = false;
+            far.count = 0;
+            far.far_from_hint_line = row + 1;   // report 1-based
+            return far;
+        }
+    }
+
     // Compute the byte range. The match spans buffer rows [row_start, row_end].
     // If the needle ended without a trailing newline, drop the trailing '\n'
     // from the file range so the splice length stays consistent.
