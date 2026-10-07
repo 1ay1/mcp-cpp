@@ -123,7 +123,29 @@ std::string read_file(const fs::path& p) {
 }
 
 std::string write_file(const fs::path& p, std::string_view content) {
-    auto parent = p.parent_path();
+    // Follow a symlink to what it points AT before writing anything.
+    //
+    // The publish step below is rename(), which replaces the name it is given
+    // -- and for a symlink that means replacing the LINK. Without this, an
+    // edit through a symlink silently did three wrong things at once: the
+    // link became a regular file, the real target kept its old contents, and
+    // the tool reported success with a diff of a change that went to a brand
+    // new inode nobody was looking at. Dotfiles repos and generated-file
+    // symlinks (compile_commands.json) hit this immediately.
+    //
+    // Confinement is unaffected: is_within_workspace canonicalises before we
+    // are ever called, so a link pointing outside the workspace root was
+    // already refused. Resolving here can only land inside it.
+    fs::path real = p;
+    {
+        std::error_code ec;
+        if (fs::is_symlink(real, ec) && !ec) {
+            auto resolved = fs::weakly_canonical(real, ec);
+            if (!ec && !resolved.empty()) real = std::move(resolved);
+        }
+    }
+
+    auto parent = real.parent_path();
     if (!parent.empty()) {
         std::error_code ec;
         fs::create_directories(parent, ec);
@@ -143,7 +165,7 @@ std::string write_file(const fs::path& p, std::string_view content) {
 #else
     const unsigned long pid = static_cast<unsigned long>(::getpid());
 #endif
-    fs::path tmp = p;
+    fs::path tmp = real;
     tmp += fs::path(".agentty-tmp-" + std::to_string(pid) + "-" + std::to_string(n));
 
     // Preserve existing mode on POSIX so the rename doesn't regress perms.
@@ -152,7 +174,7 @@ std::string write_file(const fs::path& p, std::string_view content) {
     bool   had_mode    = false;
     {
         struct stat st{};
-        if (::stat(p.c_str(), &st) == 0) {
+        if (::stat(real.c_str(), &st) == 0) {
             target_mode = st.st_mode & 07777;
             had_mode    = true;
         }
@@ -236,7 +258,7 @@ std::string write_file(const fs::path& p, std::string_view content) {
     // POSIX rename() is atomic by spec when src/dst are on the same FS.
 #ifdef _WIN32
     auto tmp_w = tmp.wstring();
-    auto dst_w = p.wstring();
+    auto dst_w = real.wstring();
     if (!::MoveFileExW(tmp_w.c_str(), dst_w.c_str(),
                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         DWORD e = ::GetLastError();
@@ -244,7 +266,7 @@ std::string write_file(const fs::path& p, std::string_view content) {
         return "atomic rename to '" + p.string() + "' failed (GLE=" + std::to_string(e) + ")";
     }
 #else
-    if (::rename(tmp.c_str(), p.c_str()) != 0) {
+    if (::rename(tmp.c_str(), real.c_str()) != 0) {
         std::string err = std::string("atomic rename to '") + p.string()
             + "' failed: " + explain_errno(errno);
         cleanup_tmp();
