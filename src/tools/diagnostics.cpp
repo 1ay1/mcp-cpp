@@ -9,7 +9,7 @@
 
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
-#include <mcp/tools/util/sandbox.hpp>
+#include <mcp/tools/util/utf8.hpp>
 #include <mcp/tools/util/subprocess.hpp>
 #include <mcp/tools/util/error.hpp>
 
@@ -75,18 +75,52 @@ std::expected<DiagnosticsArgs, ToolError> parse_diagnostics_args(const json& j) 
     };
 }
 
-ExecResult run_diagnostics(const DiagnosticsArgs& a) {
+// One shape for "run this and give me the bytes", whether the caller has an
+// argv or a command line. The shell is just another program you name.
+[[nodiscard]] util::SubprocessResult run_via(
+        Exec& exec, const std::vector<std::string>& argv,
+        std::string_view shell_cmd, std::size_t max_bytes,
+        std::chrono::seconds timeout) {
+    ExecRequest req;
+    if (!argv.empty())
+        req.program = {argv.front(), {argv.begin() + 1, argv.end()}};
+    else
+#ifdef _WIN32
+        req.program = {"cmd.exe", {"/c", std::string{shell_cmd}}};
+#else
+        req.program = {"/bin/sh", {"-c", std::string{shell_cmd}}};
+#endif
+    req.budgets.idle     = timeout;
+    req.max_output_bytes = max_bytes;
+    const auto res = exec.run(req);
+
+    util::SubprocessResult out;
+    out.output    = util::strip_terminal_controls(res.output);
+    out.truncated = res.truncated;
+    std::visit([&]<class T>(const T& o) {
+        if constexpr (std::is_same_v<T, Exited>)         out.exit_code = o.code;
+        else if constexpr (std::is_same_v<T, Signalled>) out.exit_code = 128 + o.signal;
+        else if constexpr (std::is_same_v<T, StartFailed>) {
+            out.started = false; out.start_error = o.reason;
+        } else if constexpr (std::is_same_v<T, Cancelled>) out.exit_code = 130;
+        else if constexpr (std::is_same_v<T, StoppedEarly>) { /* enough */ }
+        else {
+            static_assert(std::is_same_v<T, TimedOut>, "unhandled ExecOutcome arm");
+            out.timed_out = true;
+        }
+    }, res.outcome);
+    return out;
+}
+
+ExecResult run_diagnostics(const DiagnosticsArgs& a, Exec& exec) {
     std::vector<std::string> auto_argv;
     if (a.command.empty()) {
         auto_argv = build_argv_for(detect_build_system());
         if (auto_argv.empty())
             return std::unexpected(ToolError::not_found("no build system detected; pass a command"));
     }
-    auto sub = auto_argv.empty()
-        ? util::sandbox::run_shell_command(a.command, /*max_bytes*/100'000,
-                                           std::chrono::seconds{120})
-        : util::sandbox::run_argv(auto_argv, /*max_bytes*/100'000,
-                                  std::chrono::seconds{120});
+    auto sub = run_via(exec, auto_argv, a.command, /*max_bytes*/100'000,
+                       std::chrono::seconds{120});
     auto output = util::legacy_format(sub, std::chrono::seconds{120});
     if (output.empty()) return ToolOutput{"no diagnostics (clean build)", std::nullopt};
 
@@ -222,7 +256,7 @@ std::vector<std::string> failing_test_lines(std::string_view output,
     return out;
 }
 
-ExecResult run_tests(const TestArgs& a) {
+ExecResult run_tests(const TestArgs& a, Exec& exec) {
     const auto bs = a.command.empty() ? detect_build_system() : BuildSystem::None;
     auto argv = a.command.empty() ? test_argv_for(bs, a)
                                   : std::vector<std::string>{};
@@ -242,9 +276,8 @@ ExecResult run_tests(const TestArgs& a) {
     util::SubprocessResult sub;
     int run_no = 0;
     for (; run_no < loops; ++run_no) {
-        sub = a.command.empty()
-            ? util::sandbox::run_argv(argv, 200'000, timeout)
-            : util::sandbox::run_shell_command(a.command, 200'000, timeout);
+        sub = run_via(exec, a.command.empty() ? argv : std::vector<std::string>{},
+                      a.command, 200'000, timeout);
         if (sub.exit_code != 0 || sub.timed_out) break;
     }
     const int runs_done = std::min(run_no + 1, loops);
@@ -297,20 +330,24 @@ json diagnostics_schema() {
 
 } // namespace
 
-void register_diagnostics_tool(Shells& sh) {
+void register_diagnostics_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
+    if (!exec) return;
+
     sh.add("diagnostics",
         "Run the project's build or lint command and return errors/warnings. "
         "Auto-detects build system (CMake, cargo, go, npm, make).",
         diagnostics_schema(), EffectSet{Effect::Exec},
-        body<DiagnosticsArgs>(run_diagnostics, parse_diagnostics_args), 30'000);
+        body_with<DiagnosticsArgs>([exec](const DiagnosticsArgs& a) { return run_diagnostics(a, *exec); }, parse_diagnostics_args), 30'000);
 }
 
-void register_test_tool(Shells& sh) {
+void register_test_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
+    if (!exec) return;
+
     sh.add("test",
         "Run focused project tests with structured pass/fail status, live output, filtering, repetition, and timeout. "
         "Auto-detects CTest, Cargo, Go, npm, or Make; pass command for custom runners.",
         test_schema(), EffectSet{Effect::Exec},
-        body<TestArgs>(run_tests, parse_test_args), 40'000);
+        body_with<TestArgs>([exec](const TestArgs& a) { return run_tests(a, *exec); }, parse_test_args), 40'000);
 }
 
 } // namespace mcp::tools::detail

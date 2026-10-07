@@ -75,7 +75,7 @@ void register_task_tool(Shells&, const std::shared_ptr<SubagentRunner>&);
 void register_fs_tools(Shells&);       // read, write, edit, list_dir
 void register_shell_tools(Shells&, const std::shared_ptr<Exec>&);  // shell
 void register_process_tools(Shells&);  // process_start/poll/stop
-void register_search_tools(Shells&);   // grep, glob, find_definition
+void register_search_tools(Shells&, const std::shared_ptr<Exec>&);   // grep, glob, find_definition
 void register_structural_tools(Shells&,
     const std::shared_ptr<DocRetriever>& = nullptr); // search_structural
     // (AST-shape search; optional retriever adds verified semantic leads on
@@ -83,9 +83,9 @@ void register_structural_tools(Shells&,
 void register_repo_map_tool(Shells&);  // repo_map (PageRank codebase skeleton)
 void register_textproc_tools(Shells&); // extract / aggregate / replace / read_filter
 void register_data_tools(Shells&);     // json_query (jq-lite for structured data)
-void register_diagnostics_tool(Shells&);
-void register_test_tool(Shells&);
-void register_git_tools(Shells&);
+void register_diagnostics_tool(Shells&, const std::shared_ptr<Exec>&);
+void register_test_tool(Shells&, const std::shared_ptr<Exec>&);
+void register_git_tools(Shells&, const std::shared_ptr<Exec>&);
 void register_web_tools(Shells&, const std::shared_ptr<HttpClient>&);
 
 } // namespace mcp::tools::detail

@@ -392,7 +392,10 @@ ExecResult run_bash(const BashArgs& a, Exec& exec) {
             r.started = false; r.start_error = o.reason;
         } else if constexpr (std::is_same_v<T, Cancelled>) {
             r.exit_code = 130;   // the shell's convention for an interrupt
+        } else if constexpr (std::is_same_v<T, StoppedEarly>) {
+            // Got what it asked for; not a failure.
         } else {
+            static_assert(std::is_same_v<T, TimedOut>, "unhandled ExecOutcome arm");
             r.timed_out = true;
             r.hit_wall  = o.which == TimedOut::budget::wall;
         }

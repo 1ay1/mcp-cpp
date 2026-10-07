@@ -206,7 +206,40 @@ std::expected<FindDefinitionArgs, ToolError> parse_find_definition_args(const js
     };
 }
 
-ExecResult run_find_definition(const FindDefinitionArgs& a) {
+// Run a program through the host. Shaped like SubprocessResult so the
+// parsing below is untouched; `stop_when` is forwarded because only this
+// file knows when it has seen enough matches.
+[[nodiscard]] util::SubprocessResult run_prog(
+        Exec& exec, std::vector<std::string> argv,
+        std::chrono::seconds timeout, std::size_t max_bytes,
+        std::function<bool(std::string_view)> stop_when = {}) {
+    ExecRequest req;
+    if (!argv.empty())
+        req.program = {argv.front(), {argv.begin() + 1, argv.end()}};
+    req.budgets.idle     = timeout;
+    req.max_output_bytes = max_bytes;
+    req.stop_when        = std::move(stop_when);
+    const auto res = exec.run(req);
+
+    util::SubprocessResult out;
+    out.output    = res.output;
+    out.truncated = res.truncated;
+    std::visit([&]<class T>(const T& o) {
+        if constexpr (std::is_same_v<T, Exited>)         out.exit_code = o.code;
+        else if constexpr (std::is_same_v<T, Signalled>) out.exit_code = 128 + o.signal;
+        else if constexpr (std::is_same_v<T, StartFailed>) {
+            out.started = false; out.start_error = o.reason;
+        } else if constexpr (std::is_same_v<T, Cancelled>) out.exit_code = 130;
+        else if constexpr (std::is_same_v<T, StoppedEarly>) out.stopped_early = true;
+        else {
+            static_assert(std::is_same_v<T, TimedOut>, "unhandled ExecOutcome arm");
+            out.timed_out = true;
+        }
+    }, res.outcome);
+    return out;
+}
+
+ExecResult run_find_definition(const FindDefinitionArgs& a, Exec& exec) {
     auto wp = util::make_workspace_path_checked(a.root, "find_definition");
     if (!wp) return std::unexpected(std::move(wp.error()));
 
@@ -230,11 +263,8 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
 
     static int rg_available = -1;
     if (rg_available < 0) {
-        auto probe = util::Subprocess::run(util::SubprocessOptions{
-            .argv      = std::vector<std::string>{"rg", "--version"},
-            .timeout   = std::chrono::seconds(2),
-            .max_bytes = 1024,
-        });
+        auto probe = run_prog(exec, {"rg", "--version"},
+                              std::chrono::seconds(2), 1024);
         rg_available = (probe.started && probe.exit_code == 0) ? 1 : 0;
     }
 
@@ -251,11 +281,7 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
         };
         // Prune build / vendor / _deps so rg doesn't crawl generated trees.
         for (const auto& g : util::skip_dir_rg_globs()) argv.push_back(g);
-        auto r = util::Subprocess::run(util::SubprocessOptions{
-            .argv      = std::move(argv),
-            .timeout   = std::chrono::seconds(30),
-            .max_bytes = 100000,
-        });
+        auto r = run_prog(exec, std::move(argv), std::chrono::seconds(30), 100000);
         if (r.started && (r.exit_code == 0 || r.exit_code == 1)) {
             if (r.output.empty() || r.exit_code == 1) {
                 return ToolOutput{"no definitions found for '" + a.symbol + "'", std::nullopt};
@@ -646,13 +672,11 @@ struct FileHit {
 
 enum class Backend { Ripgrep, BuiltIn };
 
-[[nodiscard]] Backend detect_backend() {
-    static const Backend cached = []{
-        auto r = util::Subprocess::run(util::SubprocessOptions{
-            .argv     = std::vector<std::string>{"rg", "--version"},
-            .timeout  = std::chrono::seconds(3),
-            .max_bytes = 1024,
-        });
+[[nodiscard]] Backend detect_backend(Exec& exec) {
+    // Cached: "is rg on PATH" does not change under us, and probing per
+    // grep would cost a spawn on every call.
+    static const Backend cached = [&]{
+        auto r = run_prog(exec, {"rg", "--version"}, std::chrono::seconds(3), 1024);
         return (r.started && r.exit_code == 0)
                 ? Backend::Ripgrep : Backend::BuiltIn;
     }();
@@ -906,7 +930,7 @@ std::string grep_no_match_hint(const GrepArgs& a) {
     return h;
 }
 
-ExecResult run_ripgrep(const GrepArgs& a) {
+ExecResult run_ripgrep(const GrepArgs& a, Exec& exec) {
     std::vector<std::string> argv = {"rg", "--json", "--no-config"};
     if (!a.case_sensitive) argv.push_back("-i");
     if (a.word) argv.push_back("-w");           // whole-word match
@@ -945,12 +969,8 @@ ExecResult run_ripgrep(const GrepArgs& a) {
         if (cap.size() > kMark.size()) seen_upto = std::max(seen_upto, cap.size() - kMark.size());
         return false;
     };
-    auto r = util::Subprocess::run(util::SubprocessOptions{
-        .argv      = std::move(argv),
-        .timeout   = std::chrono::seconds(60),
-        .max_bytes = 8 * 1024 * 1024,
-        .stop_when = enough,
-    });
+    auto r = run_prog(exec, std::move(argv), std::chrono::seconds(60),
+                      8 * 1024 * 1024, enough);
     if (!r.started)
         return std::unexpected(ToolError::spawn(
             "rg failed to start: " + r.start_error));
@@ -1416,7 +1436,7 @@ ExecResult run_builtin(const GrepArgs& a) {
     return ToolOutput{std::move(body), std::nullopt};
 }
 
-ExecResult run_grep(const GrepArgs& a) {
+ExecResult run_grep(const GrepArgs& a, Exec& exec) {
     auto wp = util::make_workspace_path_checked(a.root, "grep");
     if (!wp) return std::unexpected(std::move(wp.error()));
     GrepArgs gated = a;
@@ -1425,8 +1445,8 @@ ExecResult run_grep(const GrepArgs& a) {
     // Block mode (context:"block") needs the file content in hand to expand a
     // hit to its enclosing brace scope — the builtin scanner always has it, so
     // force that path (ripgrep's --json gives only ±C fixed context).
-    const bool use_builtin = a.block || detect_backend() != Backend::Ripgrep;
-    auto r = use_builtin ? run_builtin(gated) : run_ripgrep(gated);
+    const bool use_builtin = a.block || detect_backend(exec) != Backend::Ripgrep;
+    auto r = use_builtin ? run_builtin(gated) : run_ripgrep(gated, exec);
     if (r.has_value()) r->text = util::to_valid_utf8(std::move(r->text));
     return r;
 }
@@ -1482,7 +1502,7 @@ json grep_schema() {
 
 } // namespace
 
-void register_search_tools(Shells& sh) {
+void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
     sh.add("grep",
         "Search for a regex pattern across files. Returns matches grouped by "
         "file with 2 lines of context, each block headed by the enclosing "
@@ -1490,7 +1510,7 @@ void register_search_tools(Shells& sh) {
         "Paginated 20 results per page (`limit` changes that). Case-insensitive by default; pass "
         "case_sensitive=true for exact case. Use offset for subsequent pages.",
         grep_schema(), EffectSet{Effect::ReadFs},
-        body<GrepArgs>(run_grep, parse_grep_args), 30'000);
+        body_with<GrepArgs>([exec](const GrepArgs& a) { return run_grep(a, *exec); }, parse_grep_args), 30'000);
 
     sh.add("glob",
         "Find files by glob pattern. Supports `*` (any run), `?` (one char), "
@@ -1509,7 +1529,7 @@ void register_search_tools(Shells& sh) {
         "To find USES of a symbol, use `grep` with word=true; for calls with a "
         "specific shape use `search_structural`.",
         find_definition_schema(), EffectSet{Effect::ReadFs},
-        body<FindDefinitionArgs>(run_find_definition, parse_find_definition_args), 25'000);
+        body_with<FindDefinitionArgs>([exec](const FindDefinitionArgs& a) { return run_find_definition(a, *exec); }, parse_find_definition_args), 25'000);
 }
 
 } // namespace mcp::tools::detail

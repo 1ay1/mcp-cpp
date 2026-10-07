@@ -69,7 +69,7 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
         detail::register_shell_tools(shells, svc.exec);
         detail::register_process_tools(shells);
     }
-    if (cfg.search)      detail::register_search_tools(shells);
+    if (cfg.search)      detail::register_search_tools(shells, svc.exec);
     if (cfg.search)      detail::register_structural_tools(shells, svc.code_retriever);
     if (cfg.search)      detail::register_repo_map_tool(shells);
     // Transform / aggregate / structured-data family — its own toggle so a
@@ -78,10 +78,10 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
     if (cfg.search && cfg.transforms)      detail::register_textproc_tools(shells);
     if (cfg.filesystem && cfg.transforms)  detail::register_data_tools(shells);
     if (cfg.diagnostics) {
-        detail::register_diagnostics_tool(shells);
-        detail::register_test_tool(shells);
+        detail::register_diagnostics_tool(shells, svc.exec);
+        detail::register_test_tool(shells, svc.exec);
     }
-    if (cfg.git)         detail::register_git_tools(shells);
+    if (cfg.git)         detail::register_git_tools(shells, svc.exec);
     if (cfg.web)         detail::register_web_tools(shells, svc.http);
 
     auto provider = std::make_shared<mcp::cap::LocalProvider>(std::move(origin));

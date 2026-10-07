@@ -316,6 +316,20 @@ struct ExecRequest {
     // undefined behaviour, which is a trap for a field that is empty in the
     // common case. The request is pure data; the host wires its own plumbing
     // on its own side of the call.
+
+    /// Stop once the output so far is enough. Called with everything
+    /// captured to that point; true means stop.
+    ///
+    /// This IS a callback, and the distinction from the two above is the
+    /// whole reason it is allowed: the host cannot know when enough is
+    /// enough, because "enough" is a property of what the caller asked for.
+    /// `grep` wanting its first N matches out of a repo-wide ripgrep is the
+    /// case -- bounding bytes would not do it, since the predicate is about
+    /// content, and waiting for exit throws away the latency win entirely.
+    ///
+    /// Empty is the common case and means "run to completion". The host
+    /// checks before calling.
+    std::function<bool(std::string_view)> stop_when;
 };
 
 // ── how it ended ────────────────────────────────────────────────────────
@@ -334,6 +348,11 @@ struct Signalled   { int signal = 0; };          ///< killed by the OS
 struct StartFailed { std::string reason; };      ///< never ran at all
 struct Cancelled   {};                           ///< the host asked to stop
 
+/// `stop_when` fired: the caller had what it needed and the rest was stopped.
+/// A success, not a failure -- distinct from Signalled, which would be true
+/// of the mechanism and misleading about the meaning.
+struct StoppedEarly {};
+
 /// Stopped by a budget. WHICH one matters: idle means "it hung, go look at
 /// why", wall means "it was working fine and wants longer or a background
 /// run". A single `timed_out` flag forces the caller to guess, and the two
@@ -344,7 +363,8 @@ struct TimedOut {
 };
 
 using ExecOutcome =
-    std::variant<Exited, Signalled, StartFailed, TimedOut, Cancelled>;
+    std::variant<Exited, Signalled, StartFailed, TimedOut, Cancelled,
+                 StoppedEarly>;
 
 struct ExecResult {
     std::string output;        ///< stdout+stderr interleaved, UTF-8 valid
