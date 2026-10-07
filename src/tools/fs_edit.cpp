@@ -543,14 +543,32 @@ int apply_one(std::string& buf, const OneEdit& e,
         return out;
     };
 
+    // "Already applied": old_text is gone and new_text is here, so a retry of
+    // an edit that already landed reports success instead of a confusing
+    // no-match. Worth having -- but it has to be a real signal.
+    //
+    // Presence ANYWHERE used to be enough, which laundered a MISTYPED
+    // old_text into a success: any new_text of 8+ bytes that happens to be a
+    // common line (`return false;`, `    });`, `#include <string>`) is
+    // already somewhere in the file, so the tool answered "identical content
+    // (file unchanged on disk)" and the model carried on believing its edit
+    // had landed. Nothing was written and nothing said so.
+    //
+    // Requiring new_text to occur EXACTLY ONCE keeps the case this is for --
+    // a distinctive replacement, present once, because it was applied -- and
+    // drops the coincidence.
     if (!e.new_text.empty()
         && e.new_text.size() >= 8
         && e.new_text != e.old_text
-        && buf.find(e.new_text) != std::string::npos
         && buf.find(e.old_text) == std::string::npos)
     {
-        err.clear();
-        return kIdempotentNoOp;
+        const auto first = buf.find(e.new_text);
+        if (first != std::string::npos
+            && buf.find(e.new_text, first + 1) == std::string::npos)
+        {
+            err.clear();
+            return kIdempotentNoOp;
+        }
     }
 
     if (e.replace_all) {
@@ -848,10 +866,19 @@ ExecResult run_edit(const EditArgs& a) {
             "unchanged.", staleness_warning, a.edits.size()), std::nullopt};
     }
     if (applied == 0 && idempotent > 0 && failed == 0) {
+        // Report the OBSERVATION, not a conclusion. This branch is a
+        // heuristic -- old_text absent, new_text present exactly once -- and
+        // a mistyped old_text whose new_text happens to be in the file
+        // produces the identical signal. "The desired state is already in
+        // place; move on" told the model to carry on building on a change
+        // that may never have happened, which is the one outcome worse than
+        // a plain failure.
         return ToolOutput{std::format(
-            "{}No write needed — all {} edit(s) were already present in "
-            "the file (new_text matched the on-disk bytes, old_text was "
-            "absent). The desired state is already in place; move on.",
+            "{}No write needed \xe2\x80\x94 for all {} edit(s) the old_text was "
+            "NOT found and the new_text is already present, so the edit looks "
+            "already applied. Nothing was written. If you expected a change, "
+            "read the file back and check: a mistyped or stale old_text gives "
+            "this same answer.",
             staleness_warning, idempotent), std::nullopt};
     }
     if (applied == 0 && failed > 0) {
@@ -874,8 +901,11 @@ ExecResult run_edit(const EditArgs& a) {
     }
     if (original == updated)
         return ToolOutput{staleness_warning
-            + "No edits were made — all old_text / new_text pairs "
-              "produced identical content (file unchanged on disk).", std::nullopt};
+            + "No edits were made \xe2\x80\x94 every old_text / new_text pair "
+              "produced identical content (file unchanged on disk). If you "
+              "expected a change, read the file back before continuing: the "
+              "usual cause is an old_text that no longer matches what is "
+              "there.", std::nullopt};
 
     auto d = diff::compute(a.path.string(), original, updated);
     if (auto werr = util::write_file(a.path, updated); !werr.empty())
