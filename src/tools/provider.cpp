@@ -62,8 +62,11 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
     // Self-contained Tier-1 tools land here, gated on cfg.* toggles, once the
     // bodies are ported:
     if (cfg.filesystem)  detail::register_fs_tools(shells);
+    // Exec-dependent families. Null exec ⇒ not advertised at all, the same
+    // rule register_web_tools follows for a null HttpClient: a tool the host
+    // cannot serve should be absent, not present-and-failing.
     if (cfg.shell) {
-        detail::register_shell_tools(shells);
+        detail::register_shell_tools(shells, svc.exec);
         detail::register_process_tools(shells);
     }
     if (cfg.search)      detail::register_search_tools(shells);

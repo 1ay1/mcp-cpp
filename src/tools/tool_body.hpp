@@ -82,6 +82,21 @@ body(util::ExecResult (*run)(const Args&),
     };
 }
 
+// Same, for a runner that needs a host capability. `body` takes a plain
+// function pointer, which is right for a tool that only needs its arguments;
+// a tool that needs the host to DO something takes the capability by value
+// here instead of reaching for a global. That difference is the whole point
+// of the HostServices seam.
+template <class Args, class Run>
+[[nodiscard]] auto body_with(Run run,
+     std::expected<Args, util::ToolError> (*parse)(const Json&)) {
+    return [run = std::move(run), parse](const Json& j) -> mcp::cap::Result {
+        auto parsed = parse(j);
+        if (!parsed) return mcp::cap::Result::error(parsed.error().render());
+        return lower(run(*parsed));
+    };
+}
+
 // ── Line-count diff (added/removed) ─────────────────────────────────────────
 // Uses the internal Myers diff engine (diff.hpp) for added/removed totals that
 // match a real unified diff exactly.

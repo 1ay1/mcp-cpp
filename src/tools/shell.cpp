@@ -16,6 +16,7 @@
 #include <mcp/tools/util/sandbox.hpp>
 #include <mcp/tools/util/subprocess.hpp>
 #include <mcp/tools/util/error.hpp>
+#include <mcp/tools/util/utf8.hpp>
 
 #include <chrono>
 #include <cstdio>
@@ -296,7 +297,25 @@ std::string explain_exit_code(int code) {
     }
 }
 
-ExecResult run_bash(const BashArgs& a) {
+// The shell this platform means by "run a command line". Named rather than
+// inlined so the two spellings sit together instead of being spread across
+// an #ifdef at the call site.
+[[nodiscard]] constexpr const char* shell_program() {
+#ifdef _WIN32
+    return "cmd.exe";
+#else
+    return "/bin/sh";
+#endif
+}
+[[nodiscard]] constexpr const char* shell_flag() {
+#ifdef _WIN32
+    return "/c";
+#else
+    return "-c";
+#endif
+}
+
+ExecResult run_bash(const BashArgs& a, Exec& exec) {
     auto t0 = std::chrono::steady_clock::now();
     const std::string& cmd_str = a.command;
     const int           tmo_s   = a.timeout;
@@ -330,14 +349,54 @@ ExecResult run_bash(const BashArgs& a) {
     constexpr std::size_t kModelPreviewBytes = 30000;
     constexpr std::size_t kSpillPreviewHead = 2000;   // first 2 KB
     constexpr std::size_t kSpillPreviewTail = 1000;   // last 1 KB
-    auto r = util::sandbox::run_shell_command(effective, kCaptureCap,
-                                              std::chrono::seconds{tmo_s},
-                                              cwd, child_env);
-    // NOTE: r.output is already ANSI-stripped + UTF-8-scrubbed by the
-    // subprocess layer's clean_capture(). The NO_COLOR/TERM=dumb env above
-    // suppresses colour at the SOURCE (cleaner than post-stripping, and it
-    // also disables progress-bar cursor thrash), so by the time we get here
-    // the bytes are already clean.
+
+    // Ask the host to run it. We no longer own a poll loop, a deadline, a
+    // pipe or a signal: the embedding application does, over whatever
+    // platform layer it has, and it is the same one it uses for its own
+    // work. `timeout` is the IDLE budget -- the clock output resets -- and
+    // the wall ceiling is the host's to set, because only it knows what a
+    // runaway costs on this machine.
+    ExecRequest ereq;
+    ereq.program          = {shell_program(), {shell_flag(), effective}};
+    if (!cwd.empty()) ereq.cwd = cwd;
+    ereq.env              = child_env;
+    ereq.budgets.idle     = std::chrono::seconds{tmo_s};
+    ereq.max_output_bytes = kCaptureCap;
+
+    const auto res = exec.run(ereq);
+
+    // Shaped like what the rest of this function already reads, so changing
+    // the runner underneath did not turn into a rewrite of the formatting.
+    struct Captured {
+        std::string output;
+        int  exit_code   = 0;
+        bool started     = true;
+        bool truncated   = false;
+        bool timed_out   = false;
+        bool hit_wall    = false;   // WHICH clock, see below
+        std::string start_error;
+    } r;
+    // Strip cursor moves, colour and the rest. The env above (NO_COLOR,
+    // TERM=dumb) suppresses most of it at the SOURCE, which is cleaner than
+    // post-stripping and also kills progress-bar cursor thrash -- but a
+    // program that writes escapes unconditionally still gets through, and
+    // the model should not be reading them. Presentation, so it belongs to
+    // the tool rather than to the exec capability, which only promises
+    // valid UTF-8.
+    r.output    = util::strip_terminal_controls(res.output);
+    r.truncated = res.truncated;
+    std::visit([&]<class T>(const T& o) {
+        if constexpr (std::is_same_v<T, Exited>)        r.exit_code = o.code;
+        else if constexpr (std::is_same_v<T, Signalled>) r.exit_code = 128 + o.signal;
+        else if constexpr (std::is_same_v<T, StartFailed>) {
+            r.started = false; r.start_error = o.reason;
+        } else if constexpr (std::is_same_v<T, Cancelled>) {
+            r.exit_code = 130;   // the shell's convention for an interrupt
+        } else {
+            r.timed_out = true;
+            r.hit_wall  = o.which == TimedOut::budget::wall;
+        }
+    }, res.outcome);
 
     std::string spill_path;
     std::size_t spill_total = 0;
@@ -531,7 +590,9 @@ json bash_schema() {
 
 } // namespace
 
-void register_shell_tools(Shells& sh) {
+void register_shell_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
+    if (!exec) return;   // no way to run anything → no shell tool
+
     sh.add("shell",
 #ifdef _WIN32
         "Executes a shell command and returns its combined output. "
@@ -550,7 +611,8 @@ void register_shell_tools(Shells& sh) {
         "instead (no cat/echo/sed/heredoc to create or modify files).",
 #endif
         bash_schema(), EffectSet{Effect::Exec},
-        body<BashArgs>(run_bash, parse_bash_args), 30'000);
+        body_with<BashArgs>([exec](const BashArgs& a) { return run_bash(a, *exec); },
+                            parse_bash_args), 30'000);
 }
 
 } // namespace mcp::tools::detail
