@@ -137,10 +137,73 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j) {
 
     // Optional env overrides: {"env": {"CI": "1", "RUST_LOG": "debug"}}.
     // Values are stringified defensively (a model may pass a number/bool).
+    //
+    // Refused keys: a denylist floor over the variables that make some OTHER
+    // program run code of the caller's choosing. These defeat command
+    // validation entirely -- the command string stays `git status` and passes
+    // every check, while GIT_SSH_COMMAND or LD_PRELOAD is what actually
+    // executes. That is a known agent-tool break (CVE-2026-55743 is the
+    // env-prefix form of the same trick), and the host's consent card shows
+    // the command, so the payload rides along unseen.
+    //
+    // A denylist cannot be complete -- GOFLAGS=-toolexec=, RUSTC_WRAPPER and
+    // friends keep arriving -- so this is a floor, not a boundary. The
+    // boundary is the sandbox. What it buys is that the easy, well-known
+    // forms stop working silently.
+    static constexpr std::string_view kRefusedEnv[] = {
+        // dynamic loader
+        "LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "LD_DEBUG_OUTPUT",
+        "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+        // shell startup + word splitting
+        "BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "IFS", "SHELLOPTS",
+        "BASH_FUNC_",            // exported-function smuggling (shellshock shape)
+        // what git runs on your behalf
+        "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS", "GIT_EDITOR",
+        "GIT_PAGER", "GIT_EXTERNAL_DIFF", "GIT_PROXY_COMMAND",
+        "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_COUNT", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        // interpreters and toolchains that take a hook from the environment
+        "PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME", "PERL5OPT", "PERL5LIB",
+        "RUBYOPT", "RUBYLIB", "NODE_OPTIONS", "NODE_REPL_EXTERNAL_MODULE",
+        "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+        "GOFLAGS", "RUSTC_WRAPPER", "RUSTC", "CARGO_BUILD_RUSTC",
+        "MAKEFLAGS", "EDITOR", "VISUAL", "PAGER_COMMAND",
+        // and PATH itself: repoint it and every bare command is yours
+        "PATH",
+    };
+    const auto refused = [](std::string_view k) {
+        for (std::string_view bad : kRefusedEnv) {
+            if (bad.back() == '_') {          // prefix entry
+                if (k.size() >= bad.size()
+                    && std::equal(bad.begin(), bad.end(), k.begin(),
+                                  [](char a, char b) {
+                                      return std::toupper((unsigned char)a)
+                                           == std::toupper((unsigned char)b);
+                                  }))
+                    return true;
+                continue;
+            }
+            if (k.size() == bad.size()
+                && std::equal(bad.begin(), bad.end(), k.begin(),
+                              [](char a, char b) {
+                                  return std::toupper((unsigned char)a)
+                                       == std::toupper((unsigned char)b);
+                              }))
+                return true;
+        }
+        return false;
+    };
+
     std::vector<std::pair<std::string, std::string>> env;
     if (const json* e = ar.raw("env"); e && e->is_object()) {
+        std::string bad_keys;
         for (auto it = e->begin(); it != e->end(); ++it) {
             if (it.key().empty()) continue;
+            if (refused(it.key())) {
+                if (!bad_keys.empty()) bad_keys += ", ";
+                bad_keys += it.key();
+                continue;
+            }
             std::string val;
             if (it.value().is_string())        val = it.value().get<std::string>();
             else if (it.value().is_number_integer()) val = std::to_string(it.value().get<long long>());
@@ -148,6 +211,16 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j) {
             else if (!it.value().is_null())    val = it.value().dump();
             env.emplace_back(it.key(), std::move(val));
         }
+        // Refuse the call rather than running it with the key dropped: a
+        // command written to depend on one of these would otherwise do
+        // something subtly different from what was asked, which is worse
+        // than a clear no.
+        if (!bad_keys.empty())
+            return std::unexpected(ToolError::invalid_args(
+                "env key(s) refused: " + bad_keys +
+                ". These make another program execute code of your choosing, "
+                "so they would bypass command validation and the approval the "
+                "user gave. Put what you need IN the command instead."));
     }
 
     // Clamped: a model asking for 100k lines wants "all of it", and the
