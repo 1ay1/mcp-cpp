@@ -35,12 +35,14 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace mcp::tools {
@@ -243,6 +245,139 @@ public:
 //  search/git) need no host service and are always available (subject to
 //  ToolsetConfig toggles). The web tools need an HttpClient.
 // ─────────────────────────────────────────────────────────────────────────
+// ── Exec: running another program ───────────────────────────────────────
+//
+// mcp-cpp does not run processes. It asks.
+//
+// This is the same decision already made for HttpClient one field below:
+// web_fetch does not own a socket, a TLS stack or a redirect policy, it
+// states what it wants and the host does it. Exec is the same shape for the
+// same reason, and the reason is worth writing down because the library got
+// it wrong for exec first.
+//
+// Owning the exec path meant owning a poll loop, deadline arithmetic, pipe
+// draining, signal escalation and fd lifetime -- in a library that also has
+// a host doing all of that for its own purposes. Two implementations of one
+// thing, and they drifted exactly as you would expect: one grew an absolute
+// wall-clock ceiling and the other kept only an idle one, so a command that
+// never stopped printing was never reaped in the configuration that shipped.
+// The bug was not in either loop. It was in there being two.
+//
+// So: no loop here, no threads, no file descriptors, no OS headers. A tool
+// says what to run and what it is willing to wait for; the host runs it on
+// whatever its platform layer is (for agentty, jaal's reactor, clock and
+// process capability) and hands back the bytes.
+//
+// NO DEFAULT, AND NO FALLBACK. A default implementation is a second
+// implementation, which is the thing being removed. When `exec` is null the
+// tools that need it (shell, diagnostics, git_*, process_*) are simply NOT
+// ADVERTISED -- the same rule `code_retriever` already follows. That failure
+// mode is the honest one: today a host that installs no sandbox still gets a
+// working `shell`, it just runs unconfined. Absence you can see beats a
+// capability that quietly degrades.
+// A program to run. `exe` is separate from `args` so "argv is non-empty" is
+// a property of the TYPE: there is no way to construct a request with no
+// program, and so no boundary check to forget. argv[0] is synthesised from
+// `exe` by the host.
+struct Program {
+    std::string              exe;
+    std::vector<std::string> args;
+};
+
+// What a tool is willing to wait for.
+//
+// Two clocks, because they answer different questions and a caller almost
+// always wants both. `idle` bounds SILENCE: a build that keeps printing is
+// never cut off, however long it runs. `wall` bounds total elapsed time and
+// never resets, which is the only thing that catches a runaway that stays
+// chatty. nullopt is "host's default", not zero -- a budget of zero seconds
+// is a meaningful thing to ask for and must not collide with "unset".
+//
+// Named fields rather than two positional `seconds`, because the one bug
+// this shape invites is passing them the other way round.
+struct Budgets {
+    std::optional<std::chrono::seconds> idle;
+    std::optional<std::chrono::seconds> wall;
+};
+
+struct ExecRequest {
+    Program                  program;
+    std::optional<std::string> cwd;        // nullopt ⇒ the host's choice
+    std::vector<std::pair<std::string, std::string>> env;   // layered on top
+    Budgets                  budgets;
+    std::optional<std::size_t> max_output_bytes;
+
+    // Deliberately NO progress sink and NO cancellation probe.
+    //
+    // Both describe things the HOST already knows: where this tool call's
+    // output should be shown, and whether its user asked to stop. Passing
+    // them down means the library carries a std::function it must remember
+    // to null-check before calling -- and an empty std::function invoked is
+    // undefined behaviour, which is a trap for a field that is empty in the
+    // common case. The request is pure data; the host wires its own plumbing
+    // on its own side of the call.
+};
+
+// ── how it ended ────────────────────────────────────────────────────────
+//
+// A sum, not a bag of flags. The previous shape had five independent bools
+// and an exit code that was present even when nothing had run: thirty-two
+// representable states for five real ones, and the nonsense combinations
+// ("never started, but hit the wall clock") were reachable by a typo.
+//
+// Each arm carries exactly what that outcome means and nothing else, so
+// reading an exit code off a program that never started is not a mistake you
+// can make -- it is a case you did not handle, and the compiler says so.
+
+struct Exited      { int code = 0; };            ///< ran, returned this
+struct Signalled   { int signal = 0; };          ///< killed by the OS
+struct StartFailed { std::string reason; };      ///< never ran at all
+struct Cancelled   {};                           ///< the host asked to stop
+
+/// Stopped by a budget. WHICH one matters: idle means "it hung, go look at
+/// why", wall means "it was working fine and wants longer or a background
+/// run". A single `timed_out` flag forces the caller to guess, and the two
+/// deserve opposite advice.
+struct TimedOut {
+    enum class budget : std::uint8_t { idle, wall };
+    budget which = budget::idle;
+};
+
+using ExecOutcome =
+    std::variant<Exited, Signalled, StartFailed, TimedOut, Cancelled>;
+
+struct ExecResult {
+    std::string output;        ///< stdout+stderr interleaved, UTF-8 valid
+    ExecOutcome outcome;
+
+    /// Beside the outcome, not inside it: truncation is ORTHOGONAL. A
+    /// command can fill the cap and then exit 0, or fill it and then be
+    /// killed. That it does not belong to any one arm is exactly why it is
+    /// a field and the rest are cases.
+    bool truncated = false;
+
+    [[nodiscard]] bool ok() const noexcept {
+        const auto* e = std::get_if<Exited>(&outcome);
+        return e && e->code == 0;
+    }
+};
+
+/// Run one program to completion. Blocking from the caller's point of view;
+/// how the host achieves that is the host's business.
+struct Exec {
+    Exec()                       = default;
+    Exec(const Exec&)            = delete;
+    Exec& operator=(const Exec&) = delete;
+    virtual ~Exec()              = default;
+
+    [[nodiscard]] virtual ExecResult run(const ExecRequest&) = 0;
+
+    /// Can the host stop a whole process tree, or only the leader? A tool
+    /// that reports what confinement is in force needs to ask rather than
+    /// assume. (A descendant that calls setsid() escapes a process group.)
+    [[nodiscard]] virtual bool stops_whole_tree() const noexcept = 0;
+};
+
 struct HostServices {
     std::shared_ptr<MemoryStore>    memory;     // remember / forget / wipe
     std::shared_ptr<TodoSink>       todo;       // todo
@@ -256,6 +391,8 @@ struct HostServices {
     std::shared_ptr<DocRetriever>   code_retriever;  // search_code
     std::shared_ptr<SubagentRunner> subagent;   // task
     std::shared_ptr<HttpClient>     http;       // web_fetch / web_search
+    // Null ⇒ no shell / diagnostics / git_* / process_* tools. See Exec.
+    std::shared_ptr<Exec>           exec;
 };
 
 } // namespace mcp::tools
