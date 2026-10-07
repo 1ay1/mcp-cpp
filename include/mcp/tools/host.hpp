@@ -37,6 +37,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -382,6 +383,34 @@ struct ExecResult {
     }
 };
 
+/// A program that outlives the call which started it: a dev server, a file
+/// watcher, a log tail.
+///
+/// The tool layer used to own these -- a thread per session draining a pipe
+/// into a buffer, two mutexes guarding it, and a global map of them. That is
+/// concurrency, which is the host's, and it was the last of it in here.
+struct Session {
+    virtual ~Session() = default;
+
+    struct Update {
+        /// Produced since the previous poll. Empty is normal and means
+        /// "nothing new", not "finished" -- check `running` for that.
+        std::string output;
+        bool        running   = true;
+        bool        truncated = false;
+        /// Set exactly once, on the poll that observes the end.
+        std::optional<ExecOutcome> outcome;
+    };
+
+    /// Wait up to `wait` for new output, then return whatever there is.
+    /// Blocking only for that long: a tool call must not hang on a server
+    /// that has gone quiet, because quiet is the normal state of a server.
+    [[nodiscard]] virtual Update poll(std::chrono::milliseconds wait) = 0;
+
+    /// Ask it to stop, then insist. Idempotent.
+    virtual void stop() = 0;
+};
+
 /// Run one program to completion. Blocking from the caller's point of view;
 /// how the host achieves that is the host's business.
 struct Exec {
@@ -391,6 +420,13 @@ struct Exec {
     virtual ~Exec()              = default;
 
     [[nodiscard]] virtual ExecResult run(const ExecRequest&) = 0;
+
+    /// Start one and come back for it later. Same request type, because it
+    /// is the same question asked with a different lifetime -- budgets still
+    /// apply, and a session that goes silent past its idle budget is as dead
+    /// as a command that does.
+    [[nodiscard]] virtual std::expected<std::shared_ptr<Session>, std::string>
+    start(const ExecRequest&) = 0;
 
     /// Can the host stop a whole process tree, or only the leader? A tool
     /// that reports what confinement is in force needs to ask rather than

@@ -67,7 +67,7 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
     // cannot serve should be absent, not present-and-failing.
     if (cfg.shell) {
         detail::register_shell_tools(shells, svc.exec);
-        detail::register_process_tools(shells);
+        detail::register_process_tools(shells, svc.exec);
     }
     if (cfg.search)      detail::register_search_tools(shells, svc.exec);
     if (cfg.search)      detail::register_structural_tools(shells, svc.code_retriever);

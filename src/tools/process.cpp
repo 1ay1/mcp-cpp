@@ -15,6 +15,8 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -35,8 +37,10 @@ constexpr std::size_t kRollingBytes = 128 * 1024;
 struct Session {
     std::string id;
     std::string command;
-    std::unique_ptr<mcp::cap::ChildProcess> child;
-    std::thread reader;
+    // The host's. It owns the process, the pipe and the thread that keeps
+    // the pipe from filling; this layer owns the rolling buffer and the
+    // bookkeeping of what a caller has already been shown.
+    std::shared_ptr<::mcp::tools::Session> proc;
     std::mutex output_mu;
     std::mutex stop_mu;
     std::string output;
@@ -47,6 +51,7 @@ struct Session {
     std::chrono::steady_clock::time_point started_at =
         std::chrono::steady_clock::now();
     bool stopped = false;
+    bool running_ = true;
     // Set by the reader thread when it consumes EOF on the output pipe.
     // Distinguishes "child exited AND every byte is in the buffer" from
     // "child exited but the pipe is still open" — either the reader hasn't
@@ -91,7 +96,7 @@ struct Session {
 
     bool running() {
         std::lock_guard<std::mutex> lock(stop_mu);
-        return !stopped && child && child->alive();
+        return !stopped && running_;
     }
 
     // Exit code once the child has been reaped (running() observed false).
@@ -99,8 +104,30 @@ struct Session {
     // it survives stop() tearing the child down (child.reset()).
     std::optional<int> exit_code() {
         std::lock_guard<std::mutex> lock(stop_mu);
-        if (!cached_exit_ && child) cached_exit_ = child->exit_code();
         return cached_exit_;
+    }
+
+    // Pull whatever the host has for us and fold it into the rolling
+    // buffer. This is the only place the two layers meet.
+    void ingest(std::chrono::milliseconds wait) {
+        auto proc_handle = [&] {
+            std::lock_guard<std::mutex> lock(stop_mu);
+            return proc;
+        }();
+        if (!proc_handle) return;
+        auto u = proc_handle->poll(wait);
+        if (!u.output.empty()) append(u.output);
+        std::lock_guard<std::mutex> lock(stop_mu);
+        running_ = u.running;
+        if (u.outcome && !cached_exit_) {
+            std::visit([&]<class T>(const T& o) {
+                if constexpr (std::is_same_v<T, Exited>)         cached_exit_ = o.code;
+                else if constexpr (std::is_same_v<T, Signalled>) cached_exit_ = 128 + o.signal;
+                else if constexpr (std::is_same_v<T, StartFailed>) cached_exit_ = 127;
+                else cached_exit_ = 0;
+            }, *u.outcome);
+        }
+        if (!u.running) reader_eof.store(true, std::memory_order_release);
     }
 
     std::chrono::seconds age() const {
@@ -116,20 +143,18 @@ struct Session {
     }
 
     void stop() noexcept {
-        std::lock_guard<std::mutex> lock(stop_mu);
-        if (stopped) return;
-        stopped = true;
-        if (child) {
-            child->terminate();
-            if (!cached_exit_) cached_exit_ = child->exit_code();
-            // A failed session/group setup or unrelated inherited descriptor
-            // must not leave process_stop blocked forever in stream.get().
-            // POSIX fd_streambuf uses a wake pipe, so this does not close an
-            // FD underneath the reader thread.
-            child->interrupt_output();
+        std::shared_ptr<::mcp::tools::Session> handle;
+        {
+            std::lock_guard<std::mutex> lock(stop_mu);
+            if (stopped) return;
+            stopped = true;
+            running_ = false;
+            handle = std::exchange(proc, nullptr);
         }
-        if (reader.joinable()) reader.join();
-        child.reset();
+        // Outside the lock: the host's stop() waits for its drain thread,
+        // and holding our mutex across that invites a deadlock with a
+        // concurrent poll.
+        if (handle) handle->stop();
     }
 
     ~Session() { stop(); }
@@ -166,7 +191,7 @@ std::expected<StartArgs, ToolError> parse_start(const json& args) {
     return StartArgs{*command, checked->string()};
 }
 
-ExecResult run_start(const StartArgs& args) {
+ExecResult run_start(const StartArgs& args, Exec& exec) {
     auto& manager = ProcessManager::instance();
     {
         std::lock_guard<std::mutex> lock(manager.mu);
@@ -186,78 +211,48 @@ ExecResult run_start(const StartArgs& args) {
                 "process_stop on one before starting another"));
     }
 
+    // The cwd is DATA, not a shell prefix.
+    //
+    // This used to build `cd -- '<cwd>' && exec /bin/sh -c '<cmd>'`, plus a
+    // cmd.exe equivalent whose quoting had already caused one "volume label
+    // syntax is incorrect" bug. Under a sandbox the prefix is also a path
+    // the boundary must permit, and when it did not the session died with
+    // "cd: Operation not permitted" before the command ran at all.
+    //
+    // As req.cwd it is a real chdir in the child: nothing to re-parse, and
+    // the sandbox applies it as a workdir rather than as an access to allow.
+    const std::string& command = args.command;
+    // Name the shell; the host decides what to wrap it in.
 #ifdef _WIN32
-    // Build the payload for `cmd.exe /d /s /c "<payload>"`.
-    //
-    // cmd.exe does NOT understand backslash-escaped quotes: the previous
-    // `cd /d \"<cwd>\"` produced a literal backslash in the path and every
-    // process_start died with "The filename, directory name, or volume
-    // label syntax is incorrect." With /s, cmd strips exactly the first
-    // and last quote of the payload and runs the rest VERBATIM, so the
-    // inner quotes around the path must be plain, unescaped quotes.
-    //
-    // A cwd containing a quote can't be expressed this way at all (cmd has
-    // no escape for it) — but such a path also can't exist on Windows,
-    // where " is an illegal filename character. Reject it explicitly
-    // instead of emitting a command line that would re-parse into
-    // something else.
-    if (args.cwd.find('"') != std::string::npos)
-        return std::unexpected(ToolError::invalid_args(
-            "cwd contains a quote character, which cmd.exe cannot escape"));
-    const std::string command = "cd /d \"" + args.cwd + "\" && " + args.command;
+    const std::vector<std::string> argv{"cmd.exe", "/c", command};
 #else
-    auto quote = [](std::string_view value) {
-        std::string out{"'"};
-        for (char c : value) {
-            if (c == '\'') out += "'\\''";
-            else out.push_back(c);
-        }
-        out.push_back('\'');
-        return out;
-    };
-    const std::string command = "cd -- " + quote(args.cwd)
-        + " && exec /bin/sh -c " + quote(args.command);
+    const std::vector<std::string> argv{"/bin/sh", "-c", command};
 #endif
-    auto argv = util::sandbox::prepare_shell_argv(command);
-    if (argv.empty())
-        return std::unexpected(ToolError::spawn("sandbox produced an empty process argv"));
-
-    mcp::cap::ChildProcess::Spawn spawn;
-    spawn.command = argv.front();
-    spawn.args.assign(argv.begin() + 1, argv.end());
-    spawn.cwd = args.cwd;
-    spawn.merge_stderr = true;
 
     auto session = std::make_shared<Session>();
     session->id = "proc-" + std::to_string(manager.sequence.fetch_add(1));
     session->command = args.command;
-    try {
-        session->child = std::make_unique<mcp::cap::ChildProcess>(spawn);
-    } catch (const std::exception& error) {
-        return std::unexpected(ToolError::spawn(error.what()));
-    }
 
-    Session* raw = session.get();
-    raw->reader = std::thread([raw] {
-        auto& stream = raw->child->out();
-        char buffer[4096];
-        while (stream.good()) {
-            const int first = stream.get(); // blocks until one byte or EOF
-            if (first == std::char_traits<char>::eof()) break;
-            const char byte = static_cast<char>(first);
-            raw->append(std::string_view{&byte, 1});
-            const auto available = stream.rdbuf()->in_avail();
-            if (available > 0) {
-                const auto count = stream.rdbuf()->sgetn(
-                    buffer, std::min<std::streamsize>(available, sizeof(buffer)));
-                if (count > 0) raw->append(std::string_view{buffer, static_cast<std::size_t>(count)});
-            }
-        }
-        raw->reader_eof.store(true, std::memory_order_release);
-    });
+    // The host starts it, inside whatever boundary it applies to everything
+    // else it runs. This used to spawn directly through cap::ChildProcess
+    // and wrap the argv itself, which meant a background process was
+    // confined by a different code path from a foreground one -- and after
+    // the bwrap removal, by nothing at all on linux.
+    ExecRequest req;
+    req.program          = {argv.front(), {argv.begin() + 1, argv.end()}};
+    if (!args.cwd.empty()) req.cwd = args.cwd;
+    req.max_output_bytes = kRollingBytes;
+    auto started = exec.start(req);
+    if (!started) return std::unexpected(ToolError::spawn(started.error()));
+    session->proc = std::move(*started);
+
     {
         std::lock_guard<std::mutex> lock(manager.mu);
         manager.sessions.emplace(session->id, session);
+        if (std::getenv("MCP_PROC_TRACE"))
+            std::fprintf(stderr, "[proc] inserted %s, map=%zu mgr=%p\n",
+                         session->id.c_str(), manager.sessions.size(),
+                         (void*)&manager);
     }
 
     // Give the child a beat to either start producing output or crash on the
@@ -267,15 +262,11 @@ ExecResult run_start(const StartArgs& args) {
     // code and whatever it printed — turns a two-call surprise into one clear
     // answer.
     constexpr auto kSettleWindow = std::chrono::milliseconds{300};
-    const auto settle_deadline = std::chrono::steady_clock::now() + kSettleWindow;
-    while (std::chrono::steady_clock::now() < settle_deadline) {
-        if (!session->running()) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
-    }
+    session->ingest(kSettleWindow);
 
     const std::string head =
-        "Started " + session->id + " (pid "
-        + std::to_string(session->child->pid()) + "): " + args.command;
+        "Started " + session->id + " ("
+        + session->id + "): " + args.command;
 
     if (!session->running()) {
         // Exited within the settle window — almost always a failure. Stop()
@@ -345,6 +336,9 @@ std::string live_session_hint() {
 
 // Same, for callers that already hold manager.mu.
 std::string live_session_hint_locked(ProcessManager& manager) {
+    if (std::getenv("MCP_PROC_TRACE"))
+        std::fprintf(stderr, "[proc] lookup: map=%zu mgr=%p\n",
+                     manager.sessions.size(), (void*)&manager);
     if (manager.sessions.empty()) return " (no live sessions)";
     std::string s = " (live sessions:";
     for (const auto& [id, _] : manager.sessions) s += " " + id;
@@ -352,7 +346,7 @@ std::string live_session_hint_locked(ProcessManager& manager) {
     return s;
 }
 
-ExecResult run_poll(const PollArgs& args) {
+ExecResult run_poll(const PollArgs& args, Exec&) {
     auto session = find_session(args.id);
     if (!session)
         return std::unexpected(ToolError::not_found(
@@ -370,6 +364,7 @@ ExecResult run_poll(const PollArgs& args) {
     long sleep_ms = 10;
     do {
         running = session->running();
+        session->ingest(std::chrono::milliseconds{0});
         output = session->take_new(static_cast<std::size_t>(args.max_chars), &dropped);
         if (!output.empty()) break;
         // Honour cooperative cancellation (user interrupt): a long wait_ms must
@@ -434,7 +429,7 @@ std::expected<StopArgs, ToolError> parse_stop(const json& args) {
     return StopArgs{*id};
 }
 
-ExecResult run_stop(const StopArgs& args) {
+ExecResult run_stop(const StopArgs& args, Exec&) {
     auto& manager = ProcessManager::instance();
     std::shared_ptr<Session> session;
     {
@@ -450,6 +445,7 @@ ExecResult run_stop(const StopArgs& args) {
     const bool was_running = session->running();
     session->stop();
     std::size_t dropped = 0;
+    session->ingest(std::chrono::milliseconds{0});
     auto output = session->take_new(30000, &dropped);
     std::string text = (was_running ? "Stopped " : "Reaped ") + args.id;
     if (auto code = session->exit_code())
@@ -492,7 +488,9 @@ json stop_schema() {
 
 } // namespace
 
-void register_process_tools(Shells& shells) {
+void register_process_tools(Shells& shells, const std::shared_ptr<Exec>& exec) {
+    if (!exec) return;
+
     shells.add("process_start",
         "Start a long-running background process (dev server, watcher, log tail) "
         "and return a session id. Waits ~300ms so an immediate crash is reported "
@@ -500,19 +498,19 @@ void register_process_tools(Shells& shells) {
         "process_poll (incremental output) and process_stop (cleanup). Use bash "
         "for commands that finish on their own.",
         start_schema(), EffectSet{Effect::Exec},
-        body<StartArgs>(run_start, parse_start), 4000);
+        body_with<StartArgs>([exec](const StartArgs& a) { return run_start(a, *exec); }, parse_start), 4000);
     shells.add("process_poll",
         "Fetch output produced by a background session SINCE THE LAST POLL, plus "
         "its status (running + uptime, or exited + exit code). Blocks briefly for "
         "new output. Reports if any output scrolled past the rolling buffer.",
         poll_schema(), EffectSet{Effect::Exec},
-        body<PollArgs>(run_poll, parse_poll), 30000);
+        body_with<PollArgs>([exec](const PollArgs& a) { return run_poll(a, *exec); }, parse_poll), 30000);
     shells.add("process_stop",
         "Terminate (SIGTERM→SIGKILL) and reap a background session, returning its "
         "exit code and any final output not yet delivered by process_poll. Always "
         "call this to clean up a session you started.",
         stop_schema(), EffectSet{Effect::Exec},
-        body<StopArgs>(run_stop, parse_stop), 30000);
+        body_with<StopArgs>([exec](const StopArgs& a) { return run_stop(a, *exec); }, parse_stop), 30000);
 }
 
 } // namespace mcp::tools::detail

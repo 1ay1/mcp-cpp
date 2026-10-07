@@ -74,7 +74,7 @@ void register_task_tool(Shells&, const std::shared_ptr<SubagentRunner>&);
 // Tier-1 (self-contained) tool families, gated on ToolsetConfig toggles:
 void register_fs_tools(Shells&);       // read, write, edit, list_dir
 void register_shell_tools(Shells&, const std::shared_ptr<Exec>&);  // shell
-void register_process_tools(Shells&);  // process_start/poll/stop
+void register_process_tools(Shells&, const std::shared_ptr<Exec>&);  // process_start/poll/stop
 void register_search_tools(Shells&, const std::shared_ptr<Exec>&);   // grep, glob, find_definition
 void register_structural_tools(Shells&,
     const std::shared_ptr<DocRetriever>& = nullptr); // search_structural
