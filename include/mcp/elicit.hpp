@@ -344,16 +344,9 @@ template <> struct CodecOf<PrimitiveSchema> {
 };
 
 //  The elicitation result value: string | number | boolean | string[].
+//  It's made only of std types, so ADL can't find mcp's table for it; its
+//  codec is specialised in jsonrpc's table below.
 using ElicitValue = Sum<std::string, double, bool, List<std::string>>;
-template <> struct CodecOf<ElicitValue> {
-    static Codec<ElicitValue> get() {
-        return variant_codec<ElicitValue>(
-            codec<bool>(),               // bool before number (json bool isn't number)
-            codec<double>(),
-            codec<List<std::string>>(),
-            codec<std::string>());
-    }
-};
 
 enum class ElicitAction { Accept, Decline, Cancel };
 template <> struct CodecOf<ElicitAction> {
@@ -366,3 +359,13 @@ template <> struct CodecOf<ElicitAction> {
 };
 
 } // namespace mcp
+
+template <> struct jsonrpc::CodecOf<mcp::ElicitValue> {
+    static Codec<mcp::ElicitValue> get() {
+        return variant_codec<mcp::ElicitValue>(
+            codec<bool>(),               // bool before number (json bool isn't number)
+            codec<double>(),
+            codec<List<std::string>>(),
+            codec<std::string>());
+    }
+};

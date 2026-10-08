@@ -33,6 +33,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
+# The engine and codec algebra. As an agentty subproject the parent already
+# added it; built alone, fetch it.
+if(NOT TARGET jsonrpc::jsonrpc)
+    FetchContent_Declare(jsonrpc_cpp
+        GIT_REPOSITORY https://github.com/1ay1/jsonrpc-cpp.git
+        GIT_TAG        master
+        GIT_SHALLOW    TRUE)
+    FetchContent_MakeAvailable(jsonrpc_cpp)
+endif()
 # Mark third-party headers SYSTEM so their warnings stay out of our build.
 if(TARGET nlohmann_json)
     get_target_property(_nj_iface nlohmann_json INTERFACE_INCLUDE_DIRECTORIES)
@@ -48,7 +57,7 @@ add_library(mcp::mcp ALIAS mcp)
 target_include_directories(mcp INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_link_libraries(mcp INTERFACE nlohmann_json::nlohmann_json)
+target_link_libraries(mcp INTERFACE jsonrpc::jsonrpc nlohmann_json::nlohmann_json)
 target_compile_features(mcp INTERFACE cxx_std_23)
 
 # ── The batteries-included toolset: a COMPILED add-on (libmcp_tools) ────────
