@@ -411,6 +411,25 @@ struct Session {
     virtual void stop() = 0;
 };
 
+/// Run work in parallel. mcp-cpp owns no threads: the scan tools (grep,
+/// structural search, repo map, extract/aggregate) split a file list into
+/// shares and hand them here; the host decides what threads run them.
+struct Executor {
+    Executor()                           = default;
+    Executor(const Executor&)            = delete;
+    Executor& operator=(const Executor&) = delete;
+    virtual ~Executor()                  = default;
+
+    /// Run fn(i) for every i in [0, n) and return when all have finished.
+    /// Calls may run concurrently. A host with no threads to spare may run
+    /// them inline; the tools are correct either way.
+    virtual void parallel_for(std::size_t n,
+                              const std::function<void(std::size_t)>& fn) = 0;
+
+    /// How many shares are worth making. 1 means "run inline".
+    [[nodiscard]] virtual std::size_t width() const noexcept = 0;
+};
+
 /// Run one program to completion. Blocking from the caller's point of view;
 /// how the host achieves that is the host's business.
 struct Exec {
@@ -449,6 +468,13 @@ struct HostServices {
     std::shared_ptr<HttpClient>     http;       // web_fetch / web_search
     // Null ⇒ no shell / diagnostics / git_* / process_* tools. See Exec.
     std::shared_ptr<Exec>           exec;
+    // Null ⇒ the scan tools run single-threaded. See Executor.
+    std::shared_ptr<Executor>       executor;
 };
+
+/// The scan tools' way into the host's executor (installed from
+/// HostServices::executor by make_provider). Inline when none is installed.
+void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn);
+[[nodiscard]] std::size_t parallel_width() noexcept;
 
 } // namespace mcp::tools

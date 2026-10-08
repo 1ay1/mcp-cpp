@@ -388,10 +388,9 @@ const RepoGraph& build_graph(const fs::path& root) {
         std::atomic<std::size_t> next_idx{0};
         std::atomic<bool>        past_deadline{false};
 
-        unsigned nthreads = std::thread::hardware_concurrency();
-        if (nthreads == 0) nthreads = 2;
-        nthreads = std::min<unsigned>(nthreads, 16);
-        // Small trees don't benefit from the thread spin-up; run inline.
+        // The host's executor decides the threads; we only choose how many
+        // shares. Small trees don't benefit from fanning out; run inline.
+        std::size_t nthreads = std::min<std::size_t>(parallel_width(), 16);
         if (cands.size() < 32) nthreads = 1;
 
         auto worker = [&] {
@@ -411,14 +410,8 @@ const RepoGraph& build_graph(const fs::path& root) {
             }
         };
 
-        if (nthreads <= 1) {
-            worker();
-        } else {
-            std::vector<std::thread> pool;
-            pool.reserve(nthreads);
-            for (unsigned t = 0; t < nthreads; ++t) pool.emplace_back(worker);
-            for (auto& th : pool) th.join();
-        }
+        if (nthreads <= 1) worker();
+        else parallel_for(nthreads, [&](std::size_t) { worker(); });
 
         // Merge in index order — deterministic regardless of which thread got
         // which file.

@@ -1266,15 +1266,10 @@ ExecResult run_builtin(const GrepArgs& a) {
         }
     };
 
-    unsigned nthreads = std::thread::hardware_concurrency();
-    if (nthreads == 0) nthreads = 2;
-    nthreads = std::min(nthreads, kMaxWorkers);
-    nthreads = std::min(nthreads, static_cast<unsigned>(candidates.size()));
-    {
-        std::vector<std::jthread> pool;
-        pool.reserve(nthreads);
-        for (unsigned t = 0; t < nthreads; ++t) pool.emplace_back(worker);
-    }
+    // Shares, not threads: the host's executor runs them.
+    std::size_t nthreads = std::min<std::size_t>(parallel_width(), kMaxWorkers);
+    nthreads = std::max<std::size_t>(1, std::min(nthreads, candidates.size()));
+    parallel_for(nthreads, [&](std::size_t) { worker(); });
 
     int total = total_matches.load();
     if (total == 0)

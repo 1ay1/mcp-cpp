@@ -428,11 +428,10 @@ ExecResult run_extract(const ExtractArgs& a) {
         }
     };
 
-    unsigned nthreads = std::min<unsigned>(
-        std::max(2u, std::thread::hardware_concurrency()),
-        std::min<unsigned>(kMaxWorkers, (unsigned)files.size()));
-    { std::vector<std::jthread> pool;
-      for (unsigned t = 0; t < nthreads; ++t) pool.emplace_back(worker); }
+    // Shares, not threads: the host's executor runs them.
+    const std::size_t nthreads = std::max<std::size_t>(1, std::min<std::size_t>(
+        parallel_width(), std::min<std::size_t>(kMaxWorkers, files.size())));
+    parallel_for(nthreads, [&](std::size_t) { worker(); });
 
     // Flatten in file order (deterministic).
     std::vector<Projection> all;
@@ -620,11 +619,10 @@ ExecResult run_aggregate(const AggregateArgs& a) {
         }
     };
 
-    unsigned nthreads = std::min<unsigned>(
-        std::max(2u, std::thread::hardware_concurrency()),
-        std::min<unsigned>(kMaxWorkers, (unsigned)files.size()));
-    { std::vector<std::jthread> pool;
-      for (unsigned t = 0; t < nthreads; ++t) pool.emplace_back(worker); }
+    // Shares, not threads: the host's executor runs them.
+    const std::size_t nthreads = std::max<std::size_t>(1, std::min<std::size_t>(
+        parallel_width(), std::min<std::size_t>(kMaxWorkers, files.size())));
+    parallel_for(nthreads, [&](std::size_t) { worker(); });
 
     if (buckets.empty())
         return ToolOutput{"No matches to aggregate.", std::nullopt};

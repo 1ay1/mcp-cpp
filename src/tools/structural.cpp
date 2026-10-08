@@ -91,10 +91,9 @@ constexpr std::size_t kMaxMatches    = 200;               // result cap
 constexpr std::size_t kMaxOutBytes   = 24u * 1024;        // output budget
 constexpr int         kContext       = 1;                 // ± lines of context
 
+// Shares to split a scan into; the host's executor owns the threads.
 std::size_t worker_count() {
-    unsigned hc = std::thread::hardware_concurrency();
-    if (hc == 0) hc = 4;
-    return std::min<std::size_t>(hc, 16);
+    return std::min<std::size_t>(parallel_width(), 16);
 }
 
 // Language families we tokenize. The extension decides comment/string rules;
@@ -1211,10 +1210,7 @@ ExecResult run_structural(const StructArgs& a, DocRetriever* sem) {
 
     {
         const std::size_t nw = std::min(worker_count(), files.size());
-        std::vector<std::thread> pool;
-        pool.reserve(nw);
-        for (std::size_t w = 0; w < nw; ++w) pool.emplace_back(worker);
-        for (auto& t : pool) t.join();
+        parallel_for(nw, [&](std::size_t) { worker(); });
     }
 
     // ── Render ───────────────────────────────────────────────────────────

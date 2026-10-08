@@ -6,6 +6,7 @@
 // per-tool output budget and (2) attaches effect + file-change meta onto the
 // Result — uniformly, so individual tool modules never touch the carry layer.
 
+#include <algorithm>
 #include "tool_shell.hpp"
 
 #include <mcp/tools/toolset.hpp>
@@ -47,9 +48,29 @@ std::string apply_budget(std::string text, int budget) {
 
 } // namespace
 
+namespace {
+// The host's executor, installed by make_provider. Startup configuration:
+// set before any tool runs, like the sandbox and the workspace root.
+std::shared_ptr<Executor>& host_executor() {
+    static std::shared_ptr<Executor> e;
+    return e;
+}
+}  // namespace
+
+void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn) {
+    if (const auto& e = host_executor()) { e->parallel_for(n, fn); return; }
+    for (std::size_t i = 0; i < n; ++i) fn(i);   // no host executor: inline
+}
+
+std::size_t parallel_width() noexcept {
+    const auto& e = host_executor();
+    return e ? std::max<std::size_t>(1, e->width()) : 1;
+}
+
 std::shared_ptr<mcp::cap::CapabilityProvider>
 make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
     detail::Shells shells(cfg);
+    host_executor() = svc.executor;
 
     // Host-coupled tools — registered only when their backend is present.
     detail::register_memory_tools(shells, svc.memory);
