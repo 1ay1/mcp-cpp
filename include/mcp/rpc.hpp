@@ -25,6 +25,7 @@
 #pragma once
 
 #include <mcp/codec.hpp>
+#include <mcp/runtime.hpp>
 
 
 #include <atomic>
@@ -36,12 +37,13 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace mcp {
 
@@ -357,7 +359,6 @@ public:
         }
         if (!p.is_null()) env["params"] = std::move(p);
         write_line(env.dump());
-        if (has_deadline) timer_cv_.notify_all();
         return fut;
     }
     // Typed request : Params → future<Result>.
@@ -573,54 +574,78 @@ private:
         if (e) { try { e(code, msg); } catch (...) {} }
     }
 
-    // Start the deadline-monitor thread once, on the first timed request.
+public:
+    // ------------------------------------------------------------- deadlines
+    //
+    //   The engine owns no clock thread. Timed-out requests are failed by
+    //   expire(now); next_deadline() says when that is next worth calling.
+    //   A host with its own loop calls these itself. Otherwise the engine
+    //   starts one job on the installed mcp::Runtime (mcp/runtime.hpp) that
+    //   does exactly that, woken early whenever a nearer deadline arrives.
+
+    // Fail every waiter whose deadline is at or before `now`.
+    void expire(std::chrono::steady_clock::time_point now) {
+        std::vector<std::shared_ptr<std::promise<Json>>> late;
+        {
+            std::lock_guard lk(mu_);
+            for (auto it = waiters_.begin(); it != waiters_.end(); ) {
+                auto& w = it->second;
+                if (w.has_deadline && w.deadline <= now) {
+                    if (w.promise) late.push_back(std::move(w.promise));
+                    it = waiters_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& p : late) {
+            try {
+                p->set_exception(std::make_exception_ptr(
+                    RpcError(errc::Timeout, "request timed out")));
+            } catch (...) {}
+        }
+    }
+
+    // The nearest pending deadline, or nullopt when none is pending.
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point>
+    next_deadline() {
+        std::lock_guard lk(mu_);
+        std::optional<std::chrono::steady_clock::time_point> next;
+        for (const auto& [_, w] : waiters_)
+            if (w.has_deadline && (!next || w.deadline < *next)) next = w.deadline;
+        return next;
+    }
+
+private:
+    // Start the deadline job once, on the first timed request; poke it on
+    // every later one so a nearer deadline is honoured.
     void ensure_timer() {
         bool expected = false;
-        if (!timer_started_.compare_exchange_strong(expected, true,
-                                                    std::memory_order_acq_rel))
-            return;   // already started
-        timer_running_.store(true, std::memory_order_release);
-        timer_thread_ = std::thread([this] { timer_loop(); });
+        if (timer_started_.compare_exchange_strong(expected, true,
+                                                   std::memory_order_acq_rel)) {
+            timer_job_ = runtime().spawn("mcp.rpc.deadlines",
+                [this](std::stop_token st) { timer_loop(st); });
+            return;
+        }
+        { std::lock_guard lk(wake_mu_); wake_ = true; }
+        wake_cv_.notify_all();
     }
 
     void stop_timer() {
         if (!timer_started_.load(std::memory_order_acquire)) return;
-        timer_running_.store(false, std::memory_order_release);
-        timer_cv_.notify_all();
-        if (timer_thread_.joinable() &&
-            timer_thread_.get_id() != std::this_thread::get_id())
-            timer_thread_.join();
+        if (timer_job_) timer_job_->stop();   // requests stop, waits
+        timer_job_.reset();
     }
 
-    // Wakes on the nearest deadline; fails any waiter whose deadline passed.
-    void timer_loop() {
-        std::unique_lock lk(mu_);
-        while (timer_running_.load(std::memory_order_acquire)) {
-            auto now = std::chrono::steady_clock::now();
-            auto next = std::chrono::steady_clock::time_point::max();
-            bool any = false;
-
-            for (auto it = waiters_.begin(); it != waiters_.end(); ) {
-                auto& w = it->second;
-                if (!w.has_deadline) { ++it; continue; }
-                if (w.deadline <= now) {
-                    auto p = std::move(w.promise);
-                    it = waiters_.erase(it);
-                    if (p) {
-                        try {
-                            p->set_exception(std::make_exception_ptr(
-                                RpcError(errc::Timeout, "request timed out")));
-                        } catch (...) {}
-                    }
-                } else {
-                    any = true;
-                    if (w.deadline < next) next = w.deadline;
-                    ++it;
-                }
-            }
-
-            if (any) timer_cv_.wait_until(lk, next);
-            else     timer_cv_.wait(lk);
+    // Sleep until the nearest deadline (or a poke, or stop), then expire().
+    void timer_loop(std::stop_token st) {
+        while (!st.stop_requested()) {
+            expire(std::chrono::steady_clock::now());
+            const auto next = next_deadline();
+            std::unique_lock lk(wake_mu_);
+            if (next) wake_cv_.wait_until(lk, st, *next, [&] { return wake_; });
+            else      wake_cv_.wait(lk, st, [&] { return wake_; });
+            wake_ = false;
         }
     }
 
@@ -650,12 +675,13 @@ private:
     // (guarded by mu_). Empty object == legacy mode (send nothing extra).
     Json request_meta_ = Json::object();
 
-    // Deadline monitor — a lazily-started background thread that fails any
-    // waiter whose deadline has passed. Started on the first timed request.
-    std::thread             timer_thread_;
-    std::condition_variable timer_cv_;
-    std::atomic<bool>       timer_running_{false};
-    std::atomic<bool>       timer_started_{false};
+    // The deadline job (see expire / next_deadline), started lazily on the
+    // installed Runtime. wake_ is poked when a new deadline might be nearer.
+    std::mutex                       wake_mu_;
+    std::condition_variable_any      wake_cv_;
+    bool                             wake_ = false;
+    std::atomic<bool>                timer_started_{false};
+    std::unique_ptr<Runtime::Job>    timer_job_;
 };
 
 } // namespace mcp

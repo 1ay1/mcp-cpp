@@ -18,11 +18,9 @@
 //     • Task<T>                            — a coroutine return type that is
 //                                            itself awaitable, so tasks compose
 //
-//   The awaiter blocks a detached helper thread on the future and resumes the
-//   coroutine when the value arrives. That keeps this header self-contained
-//   (no scheduler, no executor dependency) while giving real suspension: the
-//   awaiting thread is freed, not spun. For a single-threaded event loop you
-//   can swap in your own awaiter; this is the batteries-included default.
+//   The awaiter waits for the future on a job of the installed mcp::Runtime
+//   and resumes the coroutine when the value arrives, so the awaiting thread
+//   is freed, not spun, and this header starts no thread of its own.
 //
 //   Blocking bridge: Task::get() does NOT busy-spin on the coroutine state
 //   (that races the resuming thread). It blocks on a completion flag that the
@@ -34,14 +32,16 @@
 //
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
 #include <future>
 #include <memory>
 #include <mutex>
-#include <thread>
+#include <mcp/runtime.hpp>
 #include <utility>
+#include <vector>
 
 // NOTE: the coroutine machinery lives in `mcp::co` because the protocol has a
 // `mcp::Task` struct (a durable-request record). `mcp::co::Task<T>` is the
@@ -50,45 +50,67 @@ namespace mcp::co {
 
 //==============================================================================
 //  FutureAwaiter — makes std::future<T> co_await-able.
+//
+//  A std::future can only be waited on by blocking, so something has to block
+//  for it. That is a job on the installed mcp::Runtime (mcp/runtime.hpp), not
+//  a thread this header starts: the host decides where waiting happens. The
+//  job resumes the coroutine when the value arrives.
+//
+//  The resumed coroutine runs ON the job and may finish and free the awaiter,
+//  so the job's handle can't live in the awaiter (it would be joined from its
+//  own thread). It is kept in a small registry instead and reaped the next
+//  time something awaits, once its body has returned.
 //==============================================================================
-template <class T>
-struct FutureAwaiter {
-    std::future<T> fut;
+namespace detail {
+// Await jobs whose bodies have finished, kept until the next await reaps them.
+struct AwaitJobs {
+    struct Entry {
+        std::unique_ptr<Runtime::Job>      job;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::mutex         mu;
+    std::vector<Entry> live;
 
-    bool await_ready() const noexcept {
-        // Treat an already-resolved future as ready so we don't spawn a thread.
-        return fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    void add(std::unique_ptr<Runtime::Job> j, std::shared_ptr<std::atomic<bool>> d) {
+        std::vector<Entry> finished;
+        {
+            std::lock_guard lk(mu);
+            for (auto it = live.begin(); it != live.end(); )
+                if (it->done->load(std::memory_order_acquire)) {
+                    finished.push_back(std::move(*it));
+                    it = live.erase(it);
+                } else ++it;
+            live.push_back({std::move(j), std::move(d)});
+        }
+        // `finished` joins here, outside the lock: each body already returned.
     }
-    void await_suspend(std::coroutine_handle<> h) {
-        std::thread([f = std::move(fut), h]() mutable {
-            f.wait();
-            // Stash the resolved future back where await_resume can read it.
-            // (We move it into a heap cell the handle owns via the awaiter; but
-            //  since the awaiter object outlives suspension, just re-assign.)
-            h.resume();
-        }).detach();
-    }
-    T await_resume() { return fut.get(); }
 };
+inline AwaitJobs& await_jobs() { static AwaitJobs j; return j; }
+} // namespace detail
 
-// Because await_suspend moves `fut` out, keep the awaiter alive across the
-// suspension by NOT moving — instead block in a helper that holds a shared_ptr
-// to the future. Simpler: specialise the operator below to wrap in shared_ptr.
 template <class T>
 struct SharedFutureAwaiter {
     std::shared_ptr<std::future<T>> fut;
+
     bool await_ready() const noexcept {
+        // An already-resolved future needs no waiter at all.
         return fut->wait_for(std::chrono::seconds(0)) == std::future_status::ready;
     }
     void await_suspend(std::coroutine_handle<> h) {
-        auto f = fut;
-        std::thread([f, h]() mutable { f->wait(); h.resume(); }).detach();
+        auto f    = fut;
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        auto job  = runtime().spawn("mcp.co.await",
+            [f, h, done](std::stop_token) mutable {
+                f->wait();
+                h.resume();   // may run the rest of the coroutine, and free us
+                done->store(true, std::memory_order_release);
+            });
+        detail::await_jobs().add(std::move(job), std::move(done));
     }
     T await_resume() { return fut->get(); }
 };
 
-// operator co_await for any std::future<T>. Wraps in a shared cell so the
-// future outlives the suspension regardless of awaiter lifetime.
+// operator co_await for any std::future<T>.
 template <class T>
 SharedFutureAwaiter<T> operator co_await(std::future<T>&& f) {
     return SharedFutureAwaiter<T>{std::make_shared<std::future<T>>(std::move(f))};

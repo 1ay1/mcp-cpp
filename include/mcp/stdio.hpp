@@ -10,7 +10,8 @@
 //
 //   StdioTransport owns:
 //     • a write-side mutex (so multiple threads may call the Transport)
-//     • a dedicated reader thread that pumps lines into the engine
+//     • a reader job, run on the installed mcp::Runtime, that pumps lines
+//       into the engine
 //
 //   The reader stops when the input descriptor returns EOF.
 //
@@ -26,7 +27,6 @@
 #include <mutex>
 #include <ostream>
 #include <string>
-#include <thread>
 #include <utility>
 
 namespace mcp {
@@ -68,82 +68,65 @@ public:
         out_ptr_.store(nullptr, std::memory_order_release);
     }
 
-    // Run the read pump on a dedicated thread. The pump terminates on EOF or
-    // when stop() is called. On natural EOF (peer closed) the engine's
-    // on_transport_closed() fires, failing all in-flight requests with
+    // Run the read pump as a job on the installed mcp::Runtime. The pump
+    // ends on EOF or stop(). On natural EOF (peer closed) the engine's
+    // on_transport_closed() fires, failing in-flight requests with
     // errc::ConnectionLost and invoking its error callback.
     void start(RpcEngine& engine) {
         engine_ = &engine;
         running_.store(true, std::memory_order_release);
+        // The job holds SHARED guards, never `this` past a stop request: if
+        // stop() has to give up a reader wedged in getline (the peer never
+        // closed the stream), the straggler must not touch a destroyed
+        // transport or engine. `alive_` goes false in stop().
         alive_ = std::make_shared<std::atomic<bool>>(true);
-        reader_done_ = std::make_shared<std::atomic<bool>>(false);
-        // Capture SHARED guards, not `this`: if stop() has to detach a reader
-        // wedged in a blocking getline (peer never closed the stream), the
-        // detached thread must NOT touch a destroyed transport/engine. `alive_`
-        // is flipped false in stop()/dtor, so any late feed_line/close is
-        // suppressed; `reader_done_` lets stop() observe a natural exit.
         auto alive = alive_;
-        auto done  = reader_done_;
-        reader_ = std::thread([this, &engine, alive, done]{
-            std::string line;
-            while (running_.load(std::memory_order_acquire)) {
-                if (!std::getline(in_, line)) break;        // EOF or error
-                if (!alive->load(std::memory_order_acquire)) break;  // detached
-                if (!line.empty()) {
-                    try { engine.feed_line(line); }
-                    catch (...) { /* never let one frame kill the pump */ }
+        // `in_` is the caller's stream; it outlives the transport by contract
+        // (see the constructor), so the reader may keep reading it.
+        std::istream* in = &in_;
+        reader_ = runtime().spawn("mcp.stdio.reader",
+            [this, in, &engine, alive](std::stop_token st) {
+                std::string line;
+                while (!st.stop_requested()) {
+                    if (!std::getline(*in, line)) break;            // EOF/error
+                    if (!alive->load(std::memory_order_acquire)) return;
+                    if (!line.empty()) {
+                        try { engine.feed_line(line); }
+                        catch (...) { /* never let one frame kill the pump */ }
+                    }
                 }
-            }
-            const bool was_running = running_.exchange(false, std::memory_order_acq_rel);
-            // Only surface a transport-closed event if we stopped because the
-            // stream ended, not because stop() was called deliberately — and
-            // only if the transport is still alive (not a detached straggler).
-            if (was_running && alive->load(std::memory_order_acquire))
-                engine.on_transport_closed("eof");
-            done->store(true, std::memory_order_release);
-        });
+                // Past here `this` is touched, so only while still alive: a
+                // given-up straggler returns before reaching it.
+                if (!alive->load(std::memory_order_acquire)) return;
+                // Report a closed stream only if it closed on its own, not
+                // because stop() asked.
+                if (running_.exchange(false, std::memory_order_acq_rel)
+                    && !st.stop_requested())
+                    engine.on_transport_closed("eof");
+            });
     }
 
-    // Wait until the reader thread exits.
+    // Wait until the reader has finished on its own (EOF).
     void join() {
-        if (reader_.joinable()) reader_.join();
+        if (reader_) reader_->wait();
+        reader_.reset();
     }
 
     void stop() {
         running_.store(false, std::memory_order_release);
-        if (!reader_.joinable()) return;
-
-        // The reader may be blocked in std::getline, which no flag can
-        // interrupt — it only wakes when the peer closes the stream (well-
-        // behaved callers close_stdin()/terminate() the child first, which is
-        // the fast path here). If it hasn't exited within a short grace window,
-        // sever the reader from this transport (alive_=false, so a late
-        // feed_line/on_transport_closed is a no-op) and DETACH it rather than
-        // block teardown forever. A detached thread parked on a dead stream is
-        // harmless; the process reclaims it at exit. Same deadline-then-detach
-        // discipline the HTTP prewarm-dial teardown uses.
-        constexpr auto kGrace = std::chrono::milliseconds(500);
-        const auto deadline = std::chrono::steady_clock::now() + kGrace;
-        while (reader_done_ && !reader_done_->load(std::memory_order_acquire)
-               && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-        if (reader_done_ && reader_done_->load(std::memory_order_acquire)) {
-            reader_.join();
-        } else {
-            // The reader is still wedged in getline after the grace window —
-            // the peer stream was never closed. This is a CALLER BUG: a stdio
-            // transport must have its child terminated (close_stdin + kill, as
-            // cap/stdio_server.hpp's stop_reader_ does) before stop(), so the
-            // reader wakes on EOF. We sever + detach so teardown never hangs;
-            // warn so the misuse is visible rather than a silent leak.
+        if (!reader_) return;
+        // The reader may be blocked in std::getline, which no token can
+        // interrupt; it only wakes when the peer closes the stream. Callers
+        // close/terminate the peer first (cap/stdio_server.hpp does), which is
+        // the fast path. If it is still wedged after a short grace, sever it
+        // (alive_ = false: any late callback is a no-op) and let the runtime
+        // give it up rather than hang teardown.
+        if (alive_) alive_->store(false, std::memory_order_release);
+        if (!reader_->stop(std::chrono::milliseconds(500)))
             std::fprintf(stderr,
-                "mcp: StdioTransport::stop() detached a reader still blocked in "
-                "getline — close/terminate the peer before stop() to avoid a "
-                "leaked thread.\n");
-            if (alive_) alive_->store(false, std::memory_order_release);
-            reader_.detach();
-        }
+                "mcp: StdioTransport::stop() gave up a reader still blocked in "
+                "getline. Close or terminate the peer before stop().\n");
+        reader_.reset();
     }
 
     bool running() const noexcept { return running_.load(std::memory_order_acquire); }
@@ -153,14 +136,12 @@ private:
     std::ostream& out_;
     std::atomic<std::ostream*> out_ptr_;
     std::mutex    write_mu_;
-    std::thread   reader_;
+    std::unique_ptr<Runtime::Job> reader_;
     std::atomic<bool> running_{false};
     RpcEngine*    engine_{nullptr};
-    // Shared with the reader thread so a DETACHED straggler (wedged in
-    // getline) can be severed safely: `alive_` false suppresses its late
-    // callbacks, `reader_done_` lets stop() see a natural exit vs a wedge.
+    // Shared with the reader job so a given-up straggler (wedged in getline)
+    // is severed: `alive_` false suppresses any late callback.
     std::shared_ptr<std::atomic<bool>> alive_;
-    std::shared_ptr<std::atomic<bool>> reader_done_;
 };
 
 } // namespace mcp

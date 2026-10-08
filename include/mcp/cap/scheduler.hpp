@@ -35,7 +35,7 @@
 //     4. a Write with NO extractable path — unknown blast radius; conflicts
 //        with every other fs-touching call. (Net-only peers still parallelise.)
 //
-//   This is a PURE planner (plan_waves) plus a thin std::async executor
+//   This is a PURE planner (plan_waves) plus a thin executor on mcp::Runtime
 //   (run / run_on). The planner has no I/O and is unit-testable in isolation;
 //   the executor is opt-in and lives behind the same one-call surface a host
 //   already uses (Registry::dispatch), so adopting it is a one-line change.
@@ -48,13 +48,13 @@
 //
 #pragma once
 
+#include <mcp/runtime.hpp>
 #include <mcp/cap/capability.hpp>
 #include <mcp/cap/registry.hpp>
 #include <mcp/types.hpp>
 
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -255,8 +255,8 @@ struct Plan {
 }
 
 // ── The executor ────────────────────────────────────────────────────────────
-// Run a batch against any dispatcher, parallelising within each wave via
-// std::async. `dispatch` MUST be safe to call concurrently from multiple
+// Run a batch against any dispatcher, parallelising within each wave on the
+// installed mcp::Runtime (mcp/runtime.hpp). `dispatch` MUST be safe to call concurrently from multiple
 // threads for the calls the planner placed in the same wave — which, by the
 // conflict model, never touch overlapping fs state and never exec. Returns
 // results 1:1 with `batch` (original order), so the caller treats it exactly
@@ -278,13 +278,12 @@ run_plan(const std::vector<Request>& batch, const Plan& plan,
             out[i] = dispatch(batch[i]);
             continue;
         }
-        std::vector<std::future<Result>> futs;
-        futs.reserve(wave.size());
-        for (std::size_t i : wave)
-            futs.push_back(std::async(std::launch::async,
-                [&dispatch, &batch, i] { return dispatch(batch[i]); }));
-        for (std::size_t k = 0; k < wave.size(); ++k)
-            out[wave[k]] = futs[k].get();
+        // Each call in the wave runs on the installed mcp::Runtime; all are
+        // finished before the next wave starts.
+        runtime().parallel_for(wave.size(), [&](std::size_t k) {
+            const std::size_t i = wave[k];
+            out[i] = dispatch(batch[i]);
+        });
     }
     return out;
 }

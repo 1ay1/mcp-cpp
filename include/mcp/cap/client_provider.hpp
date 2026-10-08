@@ -21,6 +21,7 @@
 //
 #pragma once
 
+#include <mcp/runtime.hpp>
 #include <mcp/cap/capability.hpp>
 #include <mcp/client.hpp>
 
@@ -129,17 +130,24 @@ public:
             if (!req.cancelled)
                 return result_from_call(client_->call_tool_interactive(req.tool, req.args));
 
-            auto pending = std::async(std::launch::async, [this, tool = req.tool, args = req.args] {
-                return client_->call_tool_interactive(tool, args);
-            });
-            using namespace std::chrono_literals;
-            while (pending.wait_for(20ms) != std::future_status::ready) {
-                if (!req.cancelled()) continue;
-                poisoned_.store(true, std::memory_order_release);
-                client_->engine().on_transport_closed("tool call cancelled");
-                break;
-            }
-            return result_from_call(pending.get());
+            // Cancellable: the call runs right here, and a watcher job on the
+            // installed mcp::Runtime polls `cancelled`. If it fires, the
+            // watcher closes the transport, which fails the pending request,
+            // so the call below returns. The connection is then poisoned: a
+            // server mid-call can't be trusted to be in a clean state.
+            auto watcher = runtime().spawn("mcp.call.cancel_watch",
+                [this, cancelled = req.cancelled](std::stop_token st) {
+                    using namespace std::chrono_literals;
+                    while (!runtime().sleep_for(st, 20ms)) {
+                        if (!cancelled()) continue;
+                        poisoned_.store(true, std::memory_order_release);
+                        client_->engine().on_transport_closed("tool call cancelled");
+                        return;
+                    }
+                });
+            auto result = client_->call_tool_interactive(req.tool, req.args);
+            watcher->stop();   // joined before `this` can be touched again
+            return result_from_call(std::move(result));
         } catch (const std::exception& e) {
             return Result::error(std::string{"mcp call failed: "} + e.what());
         } catch (...) {
