@@ -30,7 +30,6 @@
 #include <mcp/tools/util/utf8.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -364,14 +363,18 @@ ExecResult run_extract(const ExtractArgs& a) {
     // written and tested, not a quick edit.
 
     std::vector<std::vector<Projection>> per_file(files.size());
-    std::atomic<std::size_t> next{0};
-    std::atomic<int>         total{0};
 
-    auto worker = [&] {
-        while (true) {
-            if (total.load(std::memory_order_relaxed) >= kMaxScanned) return;
-            std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-            if (i >= files.size()) return;
+    // Shares, not threads: the host's executor runs them. Share k scans files
+    // k, k+n, … and counts into its own slot, so nothing is shared while they
+    // run. Each share stops at its slice of the match cap.
+    const std::size_t nshares = std::max<std::size_t>(1, std::min<std::size_t>(
+        parallel_width(), std::min<std::size_t>(kMaxWorkers, files.size())));
+    const int share_cap = std::max<int>(1, static_cast<int>(kMaxScanned / static_cast<int>(nshares)));
+    std::vector<int> counted(nshares, 0);
+
+    auto worker = [&](std::size_t k) {
+        int& total = counted[k];
+        for (std::size_t i = k; i < files.size() && total < share_cap; i += nshares) {
             std::string content;
             try { content = util::read_file(files[i]); } catch (...) { continue; }
             if (content.empty()) continue;
@@ -389,7 +392,7 @@ ExecResult run_extract(const ExtractArgs& a) {
                         for (auto& c : needle) c = (char)std::tolower((unsigned char)c);
                     }
                     while ((pos = hay.find(needle, pos)) != std::string::npos) {
-                        if (total.fetch_add(1, std::memory_order_relaxed) >= kMaxScanned) break;
+                        if (total++ >= share_cap) break;
                         Projection pr;
                         pr.line = line_of(content, pos);
                         if (field_mode) {
@@ -408,7 +411,7 @@ ExecResult run_extract(const ExtractArgs& a) {
                     auto begin = std::sregex_iterator(content.begin(), content.end(), re);
                     auto end   = std::sregex_iterator();
                     for (auto it = begin; it != end; ++it) {
-                        if (total.fetch_add(1, std::memory_order_relaxed) >= kMaxScanned) break;
+                        if (total++ >= share_cap) break;
                         const std::smatch& m = *it;
                         Projection pr;
                         auto off = static_cast<std::size_t>(m.position(0));
@@ -427,11 +430,7 @@ ExecResult run_extract(const ExtractArgs& a) {
             } catch (...) { /* regex blow-up on this file — skip */ }
         }
     };
-
-    // Shares, not threads: the host's executor runs them.
-    const std::size_t nthreads = std::max<std::size_t>(1, std::min<std::size_t>(
-        parallel_width(), std::min<std::size_t>(kMaxWorkers, files.size())));
-    parallel_for(nthreads, [&](std::size_t) { worker(); });
+    parallel_for(nshares, worker);
 
     // Flatten in file order (deterministic).
     std::vector<Projection> all;
@@ -443,8 +442,9 @@ ExecResult run_extract(const ExtractArgs& a) {
                           "or widen `glob`.", std::nullopt};
 
     std::ostringstream out;
-    const int scanned = total.load();
-    const bool capped = scanned >= kMaxScanned;
+    int scanned = 0;
+    bool capped = false;
+    for (int c : counted) { scanned += c; capped = capped || c >= share_cap; }
 
     // ── count mode: value → occurrences, desc ─────────────────────────────
     if (a.count) {
@@ -554,16 +554,21 @@ ExecResult run_aggregate(const AggregateArgs& a) {
     // key → (count, sum, sample lines)
     struct Bucket { long long count = 0; double sum = 0; std::vector<std::string> samples; };
     std::map<std::string, Bucket> buckets;   // ordered for stable output
-    std::mutex mu;
-    std::atomic<std::size_t> next{0};
-    std::atomic<int> total{0};
 
-    auto worker = [&] {
-        std::map<std::string, Bucket> local;
-        while (true) {
-            if (total.load(std::memory_order_relaxed) >= kMaxScanned) break;
-            std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-            if (i >= files.size()) break;
+    // Shares, not threads: the host's executor runs them. Share k scans files
+    // k, k+n, k+2n, … into its own slot, and the slots are merged after, so
+    // nothing is shared while they run. Each share stops at its slice of the
+    // match cap.
+    const std::size_t nshares = std::max<std::size_t>(1, std::min<std::size_t>(
+        parallel_width(), std::min<std::size_t>(kMaxWorkers, files.size())));
+    const int share_cap = std::max<int>(1, static_cast<int>(kMaxScanned / static_cast<int>(nshares)));
+    std::vector<std::map<std::string, Bucket>> slots(nshares);
+    std::vector<int> counted(nshares, 0);
+
+    auto worker = [&](std::size_t k) {
+        std::map<std::string, Bucket>& local = slots[k];
+        int& total = counted[k];
+        for (std::size_t i = k; i < files.size() && total < share_cap; i += nshares) {
             std::string content;
             try { content = util::read_file(files[i]); } catch (...) { continue; }
             if (content.empty()) continue;
@@ -588,7 +593,7 @@ ExecResult run_aggregate(const AggregateArgs& a) {
                     }
                     std::size_t pos = 0;
                     while ((pos = hay.find(needle, pos)) != std::string::npos) {
-                        if (total.fetch_add(1, std::memory_order_relaxed) >= kMaxScanned) break;
+                        if (total++ >= share_cap) break;
                         std::string_view ln = line_at(content, pos);
                         std::string key = (a.by == "file") ? rp : std::string{ln};
                         emit(key, ln);
@@ -598,7 +603,7 @@ ExecResult run_aggregate(const AggregateArgs& a) {
                     const std::regex& re = **compiled;
                     auto b = std::sregex_iterator(content.begin(), content.end(), re);
                     for (auto it = b; it != std::sregex_iterator(); ++it) {
-                        if (total.fetch_add(1, std::memory_order_relaxed) >= kMaxScanned) break;
+                        if (total++ >= share_cap) break;
                         const std::smatch& m = *it;
                         auto off = static_cast<std::size_t>(m.position(0));
                         std::string_view ln = line_at(content, off);
@@ -611,18 +616,14 @@ ExecResult run_aggregate(const AggregateArgs& a) {
                 }
             } catch (...) { /* skip file */ }
         }
-        std::lock_guard<std::mutex> lk(mu);
-        for (auto& [k, v] : local) {
-            Bucket& g = buckets[k];
-            g.count += v.count; g.sum += v.sum;
-            for (auto& s : v.samples) if (g.samples.size() < 5) g.samples.push_back(s);
-        }
     };
-
-    // Shares, not threads: the host's executor runs them.
-    const std::size_t nthreads = std::max<std::size_t>(1, std::min<std::size_t>(
-        parallel_width(), std::min<std::size_t>(kMaxWorkers, files.size())));
-    parallel_for(nthreads, [&](std::size_t) { worker(); });
+    parallel_for(nshares, worker);
+    for (auto& local : slots)
+        for (auto& [key, v] : local) {
+            Bucket& g = buckets[key];
+            g.count += v.count; g.sum += v.sum;
+            for (auto& smp : v.samples) if (g.samples.size() < 5) g.samples.push_back(std::move(smp));
+        }
 
     if (buckets.empty())
         return ToolOutput{"No matches to aggregate.", std::nullopt};
@@ -638,9 +639,11 @@ ExecResult run_aggregate(const AggregateArgs& a) {
     });
 
     std::ostringstream out;
-    const bool capped = total.load() >= kMaxScanned;
-    out << "Aggregated " << total.load() << (capped?"+":"") << " match"
-        << (total.load()==1?"":"es") << " by " << a.by
+    int scanned = 0;
+    bool capped = false;
+    for (int c : counted) { scanned += c; capped = capped || c >= share_cap; }
+    out << "Aggregated " << scanned << (capped?"+":"") << " match"
+        << (scanned==1?"":"es") << " by " << a.by
         << " \xe2\x86\x92 " << rows.size() << " group"
         << (rows.size()==1?"":"s") << " (op=" << a.op << ").\n\n";
 

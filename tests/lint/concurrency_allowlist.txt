@@ -7,13 +7,11 @@
 # cursor); they are being moved out to the caller one by one.
 
 include/mcp/cap/process.hpp: atomic
-include/mcp/cap/registry.hpp: mutex
 src/tools/fs.cpp: mutex
 src/tools/process.cpp: mutex atomic
 src/tools/repomap.cpp: mutex atomic const_cast
 src/tools/search.cpp: atomic
 src/tools/structural.cpp: atomic
-src/tools/textproc.cpp: mutex atomic
 src/tools/util/fs_helpers.cpp: mutex atomic thread_local
 src/tools/util/sandbox.cpp: atomic
 src/tools/util/shellx.cpp: thread_local
