@@ -10,8 +10,6 @@ include/mcp/cap/process.hpp: atomic
 src/tools/fs.cpp: mutex
 src/tools/process.cpp: mutex atomic
 src/tools/repomap.cpp: mutex atomic const_cast
-src/tools/search.cpp: atomic
-src/tools/structural.cpp: atomic
 src/tools/util/fs_helpers.cpp: mutex atomic thread_local
 src/tools/util/sandbox.cpp: atomic
 src/tools/util/shellx.cpp: thread_local

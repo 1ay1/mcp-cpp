@@ -16,7 +16,6 @@
 #include <mcp/tools/util/regex_guard.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -548,11 +547,11 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
 
 void scan_literal(std::string_view content, std::string_view needle,
                   bool case_insensitive, std::vector<std::size_t>& out,
-                  std::atomic<int>& total) {
+                  int& total, int cap) {
     if (needle.empty()) return;
     auto record = [&](std::size_t pos) -> bool {
         out.push_back(pos);
-        return total.fetch_add(1, std::memory_order_relaxed) + 1 < kMaxScanned;
+        return ++total < cap;
     };
     if (!case_insensitive) {
         std::size_t pos = 0;
@@ -622,14 +621,13 @@ void scan_literal(std::string_view content, std::string_view needle,
 }
 
 void scan_regex(std::string_view content, const std::regex& re,
-                std::vector<std::size_t>& out, std::atomic<int>& total) {
+                std::vector<std::size_t>& out, int& total, int cap) {
     auto begin = std::cregex_iterator(content.data(),
                                        content.data() + content.size(), re);
     auto end = std::cregex_iterator();
     for (auto it = begin; it != end; ++it) {
         out.push_back(static_cast<std::size_t>(it->position(0)));
-        if (total.fetch_add(1, std::memory_order_relaxed) + 1 >= kMaxScanned)
-            return;
+        if (++total >= cap) return;
     }
 }
 
@@ -1149,7 +1147,7 @@ ExecResult run_builtin(const GrepArgs& a) {
     if (!literal) {
         // std::regex is an uninterruptible backtracker; a nested unbounded
         // quantifier (e.g. `(a+)+`) against a long non-matching line hangs for
-        // seconds–minutes, and the per-file jthread exception wall below does
+        // seconds–minutes, and the per-file exception wall below does
         // NOT catch it (catastrophic backtracking hangs, it doesn't throw).
         // Refuse the structural cause up front — same guard as textproc /
         // extract — so this backend (used when ripgrep is absent) can't be
@@ -1210,22 +1208,25 @@ ExecResult run_builtin(const GrepArgs& a) {
     }
 
     std::vector<FileHit>  hits(candidates.size());
-    std::atomic<std::size_t> next{0};
-    std::atomic<int>      total_matches{0};
     std::optional<std::regex> exclude_re;
     if (!a.exclude.empty()) exclude_re.emplace(a.exclude, std::regex::ECMAScript | std::regex::optimize);
 
-    auto worker = [&] {
-        while (true) {
-            if (total_matches.load(std::memory_order_relaxed) >= kMaxScanned)
-                return;
-            std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-            if (i >= candidates.size()) return;
+    // Shares, not threads: the host's executor runs them. Share k scans
+    // candidates k, k+n, … and counts its own matches against its slice of
+    // the cap, so the shares share nothing while they run.
+    std::size_t nshares = std::min<std::size_t>(parallel_width(), kMaxWorkers);
+    nshares = std::max<std::size_t>(1, std::min(nshares, candidates.size()));
+    const int share_cap = std::max<int>(1, kMaxScanned / static_cast<int>(nshares));
+    std::vector<int> counted(nshares, 0);
+
+    auto worker = [&](std::size_t k) {
+        int& total_matches = counted[k];
+        for (std::size_t i = k; i < candidates.size() && total_matches < share_cap; i += nshares) {
             const auto& path = candidates[i];
 
             // EXCEPTION WALL. std::regex throws error_complexity/error_stack
             // AT MATCH TIME on catastrophic backtracking (e.g. `(a+)+b`
-            // against a large file) — and an exception escaping a jthread is
+            // against a large file) — and an exception escaping a share is
             // std::terminate: one bad model-supplied pattern would kill the
             // whole process. A file that blows the matcher is skipped, the
             // rest of the scan completes.
@@ -1238,9 +1239,9 @@ ExecResult run_builtin(const GrepArgs& a) {
                 std::vector<std::size_t> offsets;
                 if (literal) {
                     scan_literal(content, a.pattern, !a.case_sensitive,
-                                 offsets, total_matches);
+                                 offsets, total_matches, share_cap);
                 } else {
-                    scan_regex(content, re, offsets, total_matches);
+                    scan_regex(content, re, offsets, total_matches, share_cap);
                 }
                 // exclude: drop hits whose line matches (like `| grep -v`).
                 if (exclude_re && !offsets.empty()) {
@@ -1266,12 +1267,11 @@ ExecResult run_builtin(const GrepArgs& a) {
         }
     };
 
-    // Shares, not threads: the host's executor runs them.
-    std::size_t nthreads = std::min<std::size_t>(parallel_width(), kMaxWorkers);
-    nthreads = std::max<std::size_t>(1, std::min(nthreads, candidates.size()));
-    parallel_for(nthreads, [&](std::size_t) { worker(); });
+    parallel_for(nshares, worker);
 
-    int total = total_matches.load();
+    int total = 0;
+    bool share_capped = false;
+    for (int c : counted) { total += c; share_capped = share_capped || c >= share_cap; }
     if (total == 0)
         // Same actionable hint the ripgrep backend emits (names the pattern +
         // prioritised next steps incl. `search_code`) so grep's zero-match
@@ -1290,7 +1290,7 @@ ExecResult run_builtin(const GrepArgs& a) {
     if (a.mode != GrepArgs::Mode::Content) {
         std::ostringstream out;
         out << "Found " << total << " match" << (total == 1 ? "" : "es")
-            << (total >= kMaxScanned ? "+" : "")
+            << (share_capped ? "+" : "")
             << " across " << files_with_hits
             << " file" << (files_with_hits == 1 ? "" : "s") << ".\n\n";
         std::size_t listed = 0;
@@ -1316,7 +1316,7 @@ ExecResult run_builtin(const GrepArgs& a) {
 
     std::ostringstream out;
     out << "Found " << total << " match" << (total == 1 ? "" : "es")
-        << (total >= kMaxScanned ? "+" : "")
+        << (share_capped ? "+" : "")
         << " across " << files_with_hits
         << " file" << (files_with_hits == 1 ? "" : "s") << ".\n\n";
 
@@ -1413,7 +1413,7 @@ ExecResult run_builtin(const GrepArgs& a) {
     if (remaining > 0) {
         out << "Showing matches " << (a.offset + 1) << "-"
             << (a.offset + shown) << " of " << total
-            << (total >= kMaxScanned ? "+ (scan limit reached)" : "")
+            << (share_capped ? "+ (scan limit reached)" : "")
             << ". Use offset: " << (a.offset + a.per_page)
             << " to see the next page.";
     } else if (shown == 0) {

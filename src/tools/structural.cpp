@@ -46,7 +46,6 @@
 // agent spends tokens on answers, not noise.
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -1164,18 +1163,19 @@ ExecResult run_structural(const StructArgs& a, DocRetriever* sem) {
         (void)pat_for(l);
 
     // ── Parallel scan ────────────────────────────────────────────────────
+    // Share k scans files k, k+n, … and counts its own hits against its slice
+    // of the cap, so the shares share nothing while they run.
     std::vector<FileMatch> results(files.size());
-    std::atomic<std::size_t> next{0};
-    std::atomic<std::size_t> total_hits{0};
+    const std::size_t nshares = std::max<std::size_t>(1, std::min(worker_count(), files.size()));
+    const std::size_t share_cap = std::max<std::size_t>(1, kMaxMatches / nshares);
+    std::vector<std::size_t> counted(nshares, 0);
 
-    auto worker = [&] {
-        for (;;) {
-            std::size_t idx = next.fetch_add(1, std::memory_order_relaxed);
-            if (idx >= files.size()) return;
-            if (total_hits.load(std::memory_order_relaxed) >= kMaxMatches) return;
+    auto worker = [&](std::size_t k) {
+        std::size_t& total_hits = counted[k];
+        for (std::size_t idx = k; idx < files.size() && total_hits < share_cap; idx += nshares) {
             const fs::path& p = files[idx];
 
-            // Exception wall: an escape from a jthread is std::terminate.
+            // Exception wall: an escape from a share is std::terminate.
             // A file that trips anything (I/O race, allocation, matcher
             // corner) is skipped; the scan completes.
             try {
@@ -1203,15 +1203,14 @@ ExecResult run_structural(const StructArgs& a, DocRetriever* sem) {
                     rec ? p.string() : rel.generic_string(),
                     std::move(hits),
                 };
-                total_hits.fetch_add(results[idx].hits.size(), std::memory_order_relaxed);
+                total_hits += results[idx].hits.size();
             } catch (...) { /* skip this file */ }
         }
     };
 
-    {
-        const std::size_t nw = std::min(worker_count(), files.size());
-        parallel_for(nw, [&](std::size_t) { worker(); });
-    }
+    if (!files.empty()) parallel_for(nshares, worker);
+    bool capped = false;
+    for (auto c : counted) capped = capped || c >= share_cap;
 
     // ── Render ───────────────────────────────────────────────────────────
     std::size_t match_count = 0, file_count = 0;
@@ -1230,7 +1229,7 @@ ExecResult run_structural(const StructArgs& a, DocRetriever* sem) {
     // More matches than the output budget renders → semantic proximity picks
     // WHICH files render first. The hit set itself is untouched (soundness);
     // only presentation order changes, and only when truncation is possible.
-    if (match_count > 20 || total_hits.load(std::memory_order_relaxed) >= kMaxMatches)
+    if (match_count > 20 || capped)
         semantic_order(sem, a, probe_pat, results);
 
     std::ostringstream out;
