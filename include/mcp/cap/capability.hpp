@@ -26,6 +26,7 @@
 #include <mcp/codec.hpp>     // to_json
 
 #include <functional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -41,6 +42,9 @@ struct Request {
     Json        args = Json::object();
     std::function<void(std::string_view)> progress = nullptr;
     std::function<bool()> cancelled = nullptr;
+    // The same cancel as an event, when the caller has one. Lets a provider
+    // react the moment it fires instead of polling `cancelled`.
+    std::stop_token stop = {};
 };
 
 // The outcome of executing a capability. `text` is the human/model-facing

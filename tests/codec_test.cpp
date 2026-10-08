@@ -359,16 +359,19 @@ TEST_CASE("codec cache uses non-destructible storage") {
     // A function-local static of POINTER type registers no destructor.
     // A by-value `static const Codec<T>` registers one with atexit, and a
     // thread still running at exit can then read freed std::functions.
+    // The cache lives in jsonrpc-cpp now; mcp re-exports it. Look for the
+    // sibling checkout (agentty's third_party/) and skip when it isn't there.
     const std::filesystem::path header =
-        std::filesystem::path(__FILE__).parent_path() / ".." / "include"
-                                       / "mcp" / "codec.hpp";
+        std::filesystem::path(__FILE__).parent_path() / ".." / ".." / "jsonrpc-cpp"
+                                       / "include" / "jsonrpc" / "codec.hpp";
+    if (!std::filesystem::exists(header)) return;
     std::ifstream in(header);
     REQUIRE(in.good());
     const std::string src((std::istreambuf_iterator<char>(in)),
                           std::istreambuf_iterator<char>());
 
     // Find the accessor's body and look at the static it declares.
-    const auto at = src.find("inline const Codec<T>& codec()");
+    const auto at = src.find("const Codec<T>& codec() {");
     REQUIRE(at != std::string::npos);
     const auto body = src.substr(at, 240);
 

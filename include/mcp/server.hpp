@@ -1,333 +1,195 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// mcp/server.hpp — the server-side peer surface.
+// mcp/server.hpp — what an MCP server answers, as a table.
 //
-//   In MCP a *server* exposes context & capabilities (tools, resources,
-//   prompts, logging, completion) and may call BACK to the client for
-//   sampling, roots, and elicitation.
+//   A Server holds the server's identity (info, capabilities, instructions)
+//   and its registrations: tools, resources and prompts, each a spec plus a
+//   function. handle(call) answers one of the client's calls from them,
+//   synchronously, as the reply frame; handle(note) takes a notification.
 //
-//        ┌────────────────────────────────────────────────────┐
-//        │  Server                                            │
-//        │                                                    │
-//        │   handlers = ServerHandlers{...}      ◄── Client   │  requests
-//        │   on_initialize / list_tools / call_tool / ...     │
-//        │                                                    │
-//        │   .create_message(...)                ──► Client   │  outbound
-//        │   .list_roots() / .elicit(...)        ──► Client   │
-//        │   .log(...) / .notify_*_changed()     ──► Client   │  notifications
-//        └────────────────────────────────────────────────────┘
+//       Server s{Implementation{"my-server", "1.0"}};
+//       s.register_tool(spec, [](const Json& args) { return CallToolResult{…}; });
 //
-//   Beyond the low-level ServerHandlers, the class offers an ergonomic
-//   *registry* (register_tool / register_resource / register_prompt) that
-//   auto-wires list + dispatch so a typical server is a few lines.
+//       // the host's read loop:
+//       Effects fx = step(engine, Received{line});
+//       for (auto& call : fx.calls) if (auto f = s.handle(call)) write(*f);
+//       for (auto& note : fx.notifications) s.handle(note);
 //
+//   It has no engine, transport or thread. Calls TO the client (sampling,
+//   roots, elicitation) and notifications (logging, list_changed) are
+//   ordinary requests the host sends on its own engine with the method types
+//   in protocol.hpp. Registration happens before serving; handle() is const.
 #pragma once
 
-#include <mcp/rpc.hpp>
+#include <mcp/protocol.hpp>
 #include <mcp/server_stateless.hpp>
 
 #include <algorithm>
-#include <unordered_map>
+#include <functional>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace mcp {
 
-//==============================================================================
-//  ServerHandlers — raw client→server entry points. Set only what you serve;
-//  unset handlers reply MethodNotFound. Capabilities should mirror this set.
-//==============================================================================
-struct ServerHandlers {
-    std::function<InitializeResult            (const InitializeParams&)>            on_initialize;
-    std::function<void                        ()>                                  on_initialized;
-
-    std::function<ListToolsResult             (const ListToolsParams&)>            on_list_tools;
-    std::function<CallToolResult              (const CallToolParams&)>             on_call_tool;
-    // Async tools/call — for durable/long-running calls that must not block the
-    // reader thread (the handler hands the Responder to a worker).
-    std::function<void (const CallToolParams&, RpcEngine::Responder<CallToolResult>)> on_call_tool_async;
-
-    std::function<ListResourcesResult         (const ListResourcesParams&)>        on_list_resources;
-    std::function<ListResourceTemplatesResult (const ListResourceTemplatesParams&)> on_list_resource_templates;
-    std::function<ReadResourceResult          (const ReadResourceParams&)>         on_read_resource;
-    std::function<Unit                        (const SubscribeParams&)>            on_subscribe;
-    std::function<Unit                        (const UnsubscribeParams&)>          on_unsubscribe;
-
-    std::function<ListPromptsResult           (const ListPromptsParams&)>          on_list_prompts;
-    std::function<GetPromptResult             (const GetPromptParams&)>            on_get_prompt;
-
-    std::function<CompleteResult              (const CompleteParams&)>             on_complete;
-    std::function<Unit                        (const SetLevelParams&)>             on_set_level;
-
-    // Tasks (durable requests).
-    std::function<GetTaskResult               (const TaskIdParams&)>               on_get_task;
-    std::function<GetTaskPayloadResult        (const TaskIdParams&)>               on_get_task_payload;
-    std::function<CancelTaskResult            (const TaskIdParams&)>               on_cancel_task;
-    std::function<ListTasksResult             (const PaginatedParams&)>            on_list_tasks;
-    // Tasks extension (2026-07-28, SEP-2663): mutate a task + opt-in stream.
-    std::function<UpdateTaskResult            (const UpdateTaskParams&)>           on_update_task;
-    std::function<void (const SubscriptionsListenParams&)>                        on_subscriptions_listen;
-};
-
-//==============================================================================
-//  A registered tool — schema + an invocation lambda.
-//==============================================================================
 struct ToolEntry {
-    Tool                                              spec;
+    Tool                                                 spec;
     std::function<CallToolResult(const Json& arguments)> invoke;
 };
 struct ResourceEntry {
-    Resource                                              spec;
+    Resource                                                  spec;
     std::function<ReadResourceResult(const std::string& uri)> read;
 };
 struct PromptEntry {
-    Prompt                                                                       spec;
-    std::function<GetPromptResult(const std::vector<std::pair<std::string,std::string>>&)> get;
+    Prompt                                                                                  spec;
+    std::function<GetPromptResult(const std::vector<std::pair<std::string, std::string>>&)> get;
 };
 
-//==============================================================================
-//  Server — the server-side connection handle.
-//==============================================================================
 class Server {
 public:
-    explicit Server(Transport sink, Implementation info = {})
-        : engine_(std::move(sink)), info_(std::move(info)) {
-        install_default_handlers();
-    }
+    explicit Server(Implementation info = {}) : info_(std::move(info)), router_(make_router()) {}
 
-    RpcEngine& engine() noexcept { return engine_; }
+    // ── identity ─────────────────────────────────────────────────────────
+    void set_info(Implementation info)          { info_ = std::move(info); }
+    void set_capabilities(ServerCapabilities c) { caps_ = std::move(c); }
+    void set_instructions(std::string s)        { instructions_ = std::move(s); }
+    [[nodiscard]] const ServerCapabilities& capabilities() const noexcept { return caps_; }
 
-    void set_wire_trace(WireTrace t)         { engine_.set_wire_trace(std::move(t)); }
-    void set_error_callback(ErrorCallback e) { engine_.set_error_callback(std::move(e)); }
-    void set_default_timeout(std::chrono::milliseconds d) { engine_.set_default_timeout(d); }
+    // Sign the opaque `requestState` carried across MRTR rounds. A handler
+    // seals its resume context with state_codec().seal(json); the client
+    // echoes it back verbatim.
+    void set_state_secret(std::string secret) { state_codec_ = RequestStateCodec{std::move(secret)}; }
+    [[nodiscard]] const RequestStateCodec& state_codec() const noexcept { return state_codec_; }
 
-    void set_info(Implementation info)         { info_ = std::move(info); }
-    void set_capabilities(ServerCapabilities c){ caps_ = std::move(c); }
-    void set_instructions(std::string s)       { instructions_ = std::move(s); }
-
-    // ---------------------------------------------------- stateless (2026-07-28)
-    // Secret used to sign the opaque `requestState` blob carried across MRTR
-    // rounds. Set once at startup; a handler seals its resume-context with
-    // state_codec().seal(json) and the peer echoes it back verbatim.
-    void set_state_secret(std::string secret) {
-        state_codec_ = RequestStateCodec{std::move(secret)};
-    }
-    const RequestStateCodec& state_codec() const noexcept { return state_codec_; }
-
-    // Cache hint advertised on `server/discover` (and available to list
-    // handlers via discover_cache()). ttl_ms == 0 ⇒ not cacheable.
+    // Cache hint advertised on server/discover and the list results.
+    // ttl_ms == 0 means not cacheable.
     void set_discover_cache(CacheHint h) { discover_cache_ = h; }
-    const CacheHint& discover_cache() const noexcept { return discover_cache_; }
+    [[nodiscard]] const CacheHint& discover_cache() const noexcept { return discover_cache_; }
 
-    // ------------------------------------------------------- handler override
-    // Install raw handlers (advanced). Overrides anything the registry set up.
-    void set_handlers(ServerHandlers h) { install_handlers(std::move(h)); }
+    // Replace the default initialize answer, or observe `initialized`.
+    void on_initialize(std::function<InitializeResult(const InitializeParams&)> f) { on_initialize_ = std::move(f); }
+    void on_initialized(std::function<void()> f) { on_initialized_ = std::move(f); }
 
-    // ------------------------------------------------------- registry sugar
-    //
-    //   register_tool wires both `tools/list` (the spec) and `tools/call`
-    //   dispatch (the invoke). Likewise for resources & prompts. The relevant
-    //   ServerCapabilities flag is set automatically.
+    // ── registrations ────────────────────────────────────────────────────
+    // Each also sets the matching capability flag.
     void register_tool(Tool spec, std::function<CallToolResult(const Json&)> invoke) {
         const std::string name = spec.name;
         tools_[name] = ToolEntry{std::move(spec), std::move(invoke)};
         if (!caps_.tools) caps_.tools = ToolsCapability{};
-        wire_tool_registry();
     }
-
-    void register_resource(Resource spec,
-                           std::function<ReadResourceResult(const std::string&)> read) {
+    void register_resource(Resource spec, std::function<ReadResourceResult(const std::string&)> read) {
         const std::string uri = spec.uri;
         resources_[uri] = ResourceEntry{std::move(spec), std::move(read)};
         if (!caps_.resources) caps_.resources = ResourcesCapability{};
-        wire_resource_registry();
     }
-
     void register_prompt(
         Prompt spec,
-        std::function<GetPromptResult(const std::vector<std::pair<std::string,std::string>>&)> get) {
+        std::function<GetPromptResult(const std::vector<std::pair<std::string, std::string>>&)> get) {
         const std::string name = spec.name;
         prompts_[name] = PromptEntry{std::move(spec), std::move(get)};
         if (!caps_.prompts) caps_.prompts = PromptsCapability{};
-        wire_prompt_registry();
     }
 
-    // ------------------------------------------------------- outbound: client
-    [[nodiscard]] std::future<CreateMessageResult> create_message(const CreateMessageParams& p) {
-        return engine_.request<CreateMessageResult>(method::CreateMessage, p);
-    }
-    [[nodiscard]] std::future<ListRootsResult> list_roots() {
-        return engine_.request<ListRootsResult>(method::ListRoots, Unit{});
-    }
-    [[nodiscard]] std::future<ElicitResult> elicit(const ElicitParams& p) {
-        return engine_.request<ElicitResult>(method::Elicit, p);
-    }
-    [[nodiscard]] std::future<Unit> ping() {
-        return engine_.request<Unit>(method::Ping, Unit{});
+    // Answer `method` with a raw handler instead (params in, result out),
+    // e.g. a tools/call that drives MRTR by hand with input_required().
+    void on_raw(std::string method, std::function<Json(const Json& params)> f) {
+        router_.on_raw(std::move(method), [f = std::move(f)](const Server&, const Json& p) { return f(p); });
     }
 
-    // ------------------------------------------------------- outbound: notify
-    void log(LoggingLevel level, Json data, Maybe<std::string> logger = Nothing) {
-        engine_.notify(method::LoggingMessage,
-                       LoggingMessageParams{level, std::move(data), std::move(logger), Json::object()});
+    // ── serving ──────────────────────────────────────────────────────────
+    // The reply frame for one of the client's calls (MethodNotFound for a
+    // method this server doesn't answer).
+    [[nodiscard]] std::string handle(const Call& c) const {
+        if (auto frame = router_.handle(*this, c)) return *frame;
+        return reply(c.id, std::unexpected(RpcError(errc::InternalError, "deferred method has no handler")));
     }
-    void progress(const ProgressParams& p) { engine_.notify(method::Progress, p); }
-    void notify_tools_changed()      { engine_.notify_raw(method::ToolsListChanged, Json::object()); }
-    void notify_resources_changed()  { engine_.notify_raw(method::ResourcesListChanged, Json::object()); }
-    void notify_prompts_changed()    { engine_.notify_raw(method::PromptsListChanged, Json::object()); }
-    void notify_resource_updated(std::string uri) {
-        engine_.notify(method::ResourceUpdated, ResourceUpdatedParams{std::move(uri), Json::object()});
+    void handle(const Notification& n) const {
+        if (n.method == to_server::Initialized::name && on_initialized_) on_initialized_();
     }
-    void notify_task_status(const Task& t) { engine_.notify(method::TaskStatus, t); }
-
-    const ServerCapabilities& capabilities() const noexcept { return caps_; }
 
 private:
-    void install_default_handlers() {
-        // initialize: answer with our identity + accumulated capabilities.
-        engine_.on_request(std::string(method::Initialize),
-            [this](const RpcId&, const Json& j) -> Maybe<Json> {
-                InitializeParams p = from_json<InitializeParams>(j);
-                InitializeResult r;
-                // Negotiate: echo the client's version if we understand it, else ours.
-                r.protocolVersion = p.protocolVersion.empty()
-                                    ? std::string(kProtocolVersion) : p.protocolVersion;
-                r.capabilities = caps_;
-                r.serverInfo   = info_;
-                if (!instructions_.empty()) r.instructions = instructions_;
-                if (on_initialize_) r = on_initialize_(p);
-                return Just<Json>(to_json(r));
-            });
-        engine_.on_notification(std::string(method::Initialized),
-            [this](const Json&) { if (on_initialized_) on_initialized_(); });
-        // ping: spec requires an empty-object reply.
-        engine_.on_request(std::string(method::Ping),
-            [](const RpcId&, const Json&) -> Maybe<Json> { return Just<Json>(Json::object()); });
-        // server/discover: the stateless (2026-07-28) alternative to initialize.
-        // A client can learn our supported versions, capabilities, identity and
-        // instructions in ONE round-trip with no session state — then send any
-        // RPC inline with per-request `_meta`. The reply is cacheable when a
-        // discover-cache hint has been configured.
-        engine_.on_request(std::string(method::Discover),
-            [this](const RpcId&, const Json&) -> Maybe<Json> {
-                DiscoverResult r;
-                r.resultType = "complete";
-                for (auto v : kSupportedProtocolVersions)
-                    r.supportedVersions.push_back(std::string(v));
-                r.capabilities = caps_;
-                if (!instructions_.empty()) r.instructions = instructions_;
-                if (discover_cache_.ttl_ms > 0) {
-                    // Clamp: the schema says `minimum: 0` and int64_t
-                    // cannot express it, so enforce at the boundary.
-                    r.ttlMs      = std::max<std::int64_t>(0, discover_cache_.ttl_ms);
-                    r.cacheScope = discover_cache_.scope.empty()
-                                 ? std::string{"private"} : discover_cache_.scope;
-                }
-                r.meta = Json::object();
-                r.meta[std::string(meta_key::ServerInfo)] = to_json(info_);
-                return Just<Json>(to_json(r));
-            });
+    // Built once. Handlers look registrations up at call time, so tools
+    // registered later are served too.
+    [[nodiscard]] static Router<const Server> make_router() {
+        Router<const Server> r;
+        r.on<to_server::Initialize>([](const Server& s, const InitializeParams& p) {
+            if (s.on_initialize_) return s.on_initialize_(p);
+            InitializeResult out;
+            out.protocolVersion = p.protocolVersion.empty() ? std::string(kProtocolVersion)
+                                                            : p.protocolVersion;
+            out.capabilities = s.caps_;
+            out.serverInfo   = s.info_;
+            if (!s.instructions_.empty()) out.instructions = s.instructions_;
+            return out;
+        });
+        r.on<to_server::Ping>([](const Server&, const Unit&) { return EmptyResult{}; });
+        r.on<to_server::Discover>([](const Server& s, const DiscoverParams&) {
+            DiscoverResult out;
+            out.resultType = "complete";
+            for (auto v : kSupportedProtocolVersions) out.supportedVersions.push_back(std::string(v));
+            out.capabilities = s.caps_;
+            if (!s.instructions_.empty()) out.instructions = s.instructions_;
+            s.stamp_cache(out.ttlMs, out.cacheScope);
+            out.meta = Json::object();
+            out.meta[std::string(meta_key::ServerInfo)] = to_json(s.info_);
+            return out;
+        });
+        r.on<to_server::ListTools>([](const Server& s, const ListToolsParams&) {
+            served(!s.tools_.empty(), to_server::ListTools::name);
+            ListToolsResult out;
+            for (const auto& [_, e] : s.tools_) out.tools.push_back(e.spec);
+            std::sort(out.tools.begin(), out.tools.end(),
+                      [](const Tool& a, const Tool& b) { return a.name < b.name; });
+            s.stamp_cache(out.ttlMs, out.cacheScope);
+            return out;
+        });
+        r.on<to_server::CallTool>([](const Server& s, const CallToolParams& p) {
+            served(!s.tools_.empty(), to_server::CallTool::name);
+            auto it = s.tools_.find(p.name);
+            if (it == s.tools_.end()) throw RpcError(errc::InvalidParams, "unknown tool: " + p.name);
+            return it->second.invoke(p.arguments);
+        });
+        r.on<to_server::ListResources>([](const Server& s, const ListResourcesParams&) {
+            served(!s.resources_.empty(), to_server::ListResources::name);
+            ListResourcesResult out;
+            for (const auto& [_, e] : s.resources_) out.resources.push_back(e.spec);
+            return out;
+        });
+        r.on<to_server::ReadResource>([](const Server& s, const ReadResourceParams& p) {
+            served(!s.resources_.empty(), to_server::ReadResource::name);
+            auto it = s.resources_.find(p.uri);
+            if (it == s.resources_.end()) throw RpcError(errc::InvalidParams, "unknown resource: " + p.uri);
+            return it->second.read(p.uri);
+        });
+        r.on<to_server::ListPrompts>([](const Server& s, const ListPromptsParams&) {
+            served(!s.prompts_.empty(), to_server::ListPrompts::name);
+            ListPromptsResult out;
+            for (const auto& [_, e] : s.prompts_) out.prompts.push_back(e.spec);
+            return out;
+        });
+        r.on<to_server::GetPrompt>([](const Server& s, const GetPromptParams& p) {
+            served(!s.prompts_.empty(), to_server::GetPrompt::name);
+            auto it = s.prompts_.find(p.name);
+            if (it == s.prompts_.end()) throw RpcError(errc::InvalidParams, "unknown prompt: " + p.name);
+            std::vector<std::pair<std::string, std::string>> args;
+            if (p.arguments) args = *p.arguments;
+            return it->second.get(args);
+        });
+        return r;
     }
 
-    template <class Params, class Result, class F>
-    void bind(std::string_view m, F& slot) {
-        if (!slot) return;
-        engine_.on<Params, Result>(std::string(m), slot);
+    // A kind with nothing registered isn't served, as if the route were absent.
+    static void served(bool any, std::string_view method) {
+        if (!any) throw RpcError(errc::MethodNotFound, "Method not found: " + std::string(method));
     }
 
-    void install_handlers(ServerHandlers h) {
-        on_initialize_  = h.on_initialize;
-        on_initialized_ = h.on_initialized;
-
-        if (h.on_list_tools)              engine_.on<ListToolsParams, ListToolsResult>(std::string(method::ListTools), h.on_list_tools);
-        if (h.on_call_tool_async)
-            engine_.on_async<CallToolParams, CallToolResult>(std::string(method::CallTool), h.on_call_tool_async);
-        else if (h.on_call_tool)
-            engine_.on<CallToolParams, CallToolResult>(std::string(method::CallTool), h.on_call_tool);
-
-        if (h.on_list_resources)          engine_.on<ListResourcesParams, ListResourcesResult>(std::string(method::ListResources), h.on_list_resources);
-        if (h.on_list_resource_templates) engine_.on<ListResourceTemplatesParams, ListResourceTemplatesResult>(std::string(method::ListResourceTemplates), h.on_list_resource_templates);
-        if (h.on_read_resource)           engine_.on<ReadResourceParams, ReadResourceResult>(std::string(method::ReadResource), h.on_read_resource);
-        if (h.on_subscribe)               engine_.on<SubscribeParams, Unit>(std::string(method::Subscribe), h.on_subscribe);
-        if (h.on_unsubscribe)             engine_.on<UnsubscribeParams, Unit>(std::string(method::Unsubscribe), h.on_unsubscribe);
-
-        if (h.on_list_prompts)            engine_.on<ListPromptsParams, ListPromptsResult>(std::string(method::ListPrompts), h.on_list_prompts);
-        if (h.on_get_prompt)              engine_.on<GetPromptParams, GetPromptResult>(std::string(method::GetPrompt), h.on_get_prompt);
-
-        if (h.on_complete)                engine_.on<CompleteParams, CompleteResult>(std::string(method::Complete), h.on_complete);
-        if (h.on_set_level)               engine_.on<SetLevelParams, Unit>(std::string(method::SetLevel), h.on_set_level);
-
-        if (h.on_get_task)                engine_.on<TaskIdParams, GetTaskResult>(std::string(method::GetTask), h.on_get_task);
-        if (h.on_get_task_payload)        engine_.on<TaskIdParams, GetTaskPayloadResult>(std::string(method::GetTaskPayload), h.on_get_task_payload);
-        if (h.on_cancel_task)             engine_.on<TaskIdParams, CancelTaskResult>(std::string(method::CancelTask), h.on_cancel_task);
-        if (h.on_list_tasks)              engine_.on<PaginatedParams, ListTasksResult>(std::string(method::ListTasks), h.on_list_tasks);
-        if (h.on_update_task)             engine_.on<UpdateTaskParams, UpdateTaskResult>(std::string(method::UpdateTask), h.on_update_task);
-        if (h.on_subscriptions_listen)
-            engine_.on<SubscriptionsListenParams, EmptyResult>(std::string(method::SubscriptionsListen),
-                [cb = h.on_subscriptions_listen](const SubscriptionsListenParams& p) -> EmptyResult {
-                    cb(p); return EmptyResult{};
-                });
+    void stamp_cache(std::int64_t& ttl, std::string& scope) const {
+        if (discover_cache_.ttl_ms <= 0) return;
+        ttl   = std::max<std::int64_t>(0, discover_cache_.ttl_ms);
+        scope = discover_cache_.scope.empty() ? std::string{"private"} : discover_cache_.scope;
     }
 
-    void wire_tool_registry() {
-        engine_.on_request(std::string(method::ListTools),
-            [this](const RpcId&, const Json&) -> Maybe<Json> {
-                ListToolsResult r;
-                for (const auto& [_, e] : tools_) r.tools.push_back(e.spec);
-                // Deterministic order (2026-07-28): a stable list keeps client
-                // caches + prompt caches consistent across reconnects.
-                std::sort(r.tools.begin(), r.tools.end(),
-                          [](const Tool& a, const Tool& b) { return a.name < b.name; });
-                if (discover_cache_.ttl_ms > 0) {
-                    r.ttlMs      = std::max<std::int64_t>(0, discover_cache_.ttl_ms);
-                    r.cacheScope = discover_cache_.scope.empty()
-                                 ? std::string{"private"} : discover_cache_.scope;
-                }
-                return Just<Json>(to_json(r));
-            });
-        engine_.on_request(std::string(method::CallTool),
-            [this](const RpcId&, const Json& j) -> Maybe<Json> {
-                CallToolParams p = from_json<CallToolParams>(j);
-                auto it = tools_.find(p.name);
-                if (it == tools_.end())
-                    throw RpcError(errc::InvalidParams, "unknown tool: " + p.name);
-                return Just<Json>(to_json(it->second.invoke(p.arguments)));
-            });
-    }
-    void wire_resource_registry() {
-        engine_.on_request(std::string(method::ListResources),
-            [this](const RpcId&, const Json&) -> Maybe<Json> {
-                ListResourcesResult r;
-                for (const auto& [_, e] : resources_) r.resources.push_back(e.spec);
-                return Just<Json>(to_json(r));
-            });
-        engine_.on_request(std::string(method::ReadResource),
-            [this](const RpcId&, const Json& j) -> Maybe<Json> {
-                ReadResourceParams p = from_json<ReadResourceParams>(j);
-                auto it = resources_.find(p.uri);
-                if (it == resources_.end())
-                    throw RpcError(errc::InvalidParams, "unknown resource: " + p.uri);
-                return Just<Json>(to_json(it->second.read(p.uri)));
-            });
-    }
-    void wire_prompt_registry() {
-        engine_.on_request(std::string(method::ListPrompts),
-            [this](const RpcId&, const Json&) -> Maybe<Json> {
-                ListPromptsResult r;
-                for (const auto& [_, e] : prompts_) r.prompts.push_back(e.spec);
-                return Just<Json>(to_json(r));
-            });
-        engine_.on_request(std::string(method::GetPrompt),
-            [this](const RpcId&, const Json& j) -> Maybe<Json> {
-                GetPromptParams p = from_json<GetPromptParams>(j);
-                auto it = prompts_.find(p.name);
-                if (it == prompts_.end())
-                    throw RpcError(errc::InvalidParams, "unknown prompt: " + p.name);
-                std::vector<std::pair<std::string,std::string>> args;
-                if (p.arguments) args = *p.arguments;
-                return Just<Json>(to_json(it->second.get(args)));
-            });
-    }
-
-    RpcEngine          engine_;
     Implementation     info_;
     ServerCapabilities caps_{};
     std::string        instructions_;
@@ -337,9 +199,11 @@ private:
     std::function<InitializeResult(const InitializeParams&)> on_initialize_;
     std::function<void()>                                    on_initialized_;
 
-    std::unordered_map<std::string, ToolEntry>     tools_;
-    std::unordered_map<std::string, ResourceEntry> resources_;
-    std::unordered_map<std::string, PromptEntry>   prompts_;
+    std::map<std::string, ToolEntry>     tools_;
+    std::map<std::string, ResourceEntry> resources_;
+    std::map<std::string, PromptEntry>   prompts_;
+
+    mutable Router<const Server> router_;   // fixed after construction
 };
 
-} // namespace mcp
+}  // namespace mcp

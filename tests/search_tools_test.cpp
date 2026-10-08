@@ -12,6 +12,7 @@
 #include <mcp/cap/local.hpp>
 
 #include "agtest.hpp"
+#include "test_exec.hpp"
 #include <cctype>
 #include <cstdio>
 #include <filesystem>
@@ -63,6 +64,9 @@ TEST_CASE("search_tools") {
     write_file(root / "sub" / "gamma.py", "def compute_total(x):\n    return x * 2\n");
 
     HostServices svc;
+#if !defined(_WIN32)
+    svc.exec = std::make_shared<mcp::test::PopenExec>();   // shell, git_*, find_definition run programs
+#endif
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     // ── grep finds the marker across files ───────────────────────────────

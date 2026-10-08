@@ -93,7 +93,7 @@ public:
         // Execute outside the registry lock. The shared_ptr pins the provider;
         // its own call mutex serializes only this server's transport.
         return provider->execute(Request{std::move(bare_name), req.args,
-                                         req.progress, req.cancelled});
+                                         req.progress, req.cancelled, req.stop});
     }
 
     // Convenience overload.

@@ -1430,7 +1430,9 @@ ExecResult run_builtin(const GrepArgs& a) {
     return ToolOutput{std::move(body), std::nullopt};
 }
 
-ExecResult run_grep(const GrepArgs& a, Exec& exec) {
+// `exec` may be null (a host that runs no programs): then the builtin
+// scanner does the search instead of ripgrep.
+ExecResult run_grep(const GrepArgs& a, Exec* exec) {
     auto wp = util::make_workspace_path_checked(a.root, "grep");
     if (!wp) return std::unexpected(std::move(wp.error()));
     GrepArgs gated = a;
@@ -1439,8 +1441,8 @@ ExecResult run_grep(const GrepArgs& a, Exec& exec) {
     // Block mode (context:"block") needs the file content in hand to expand a
     // hit to its enclosing brace scope — the builtin scanner always has it, so
     // force that path (ripgrep's --json gives only ±C fixed context).
-    const bool use_builtin = a.block || detect_backend(exec) != Backend::Ripgrep;
-    auto r = use_builtin ? run_builtin(gated) : run_ripgrep(gated, exec);
+    const bool use_builtin = a.block || !exec || detect_backend(*exec) != Backend::Ripgrep;
+    auto r = use_builtin ? run_builtin(gated) : run_ripgrep(gated, *exec);
     if (r.has_value()) r->text = util::to_valid_utf8(std::move(r->text));
     return r;
 }
@@ -1504,7 +1506,7 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "Paginated 20 results per page (`limit` changes that). Case-insensitive by default; pass "
         "case_sensitive=true for exact case. Use offset for subsequent pages.",
         grep_schema(), EffectSet{Effect::ReadFs},
-        body_with<GrepArgs>([exec](const GrepArgs& a) { return run_grep(a, *exec); }, parse_grep_args), 30'000);
+        body_with<GrepArgs>([exec](const GrepArgs& a) { return run_grep(a, exec.get()); }, parse_grep_args), 30'000);
 
     sh.add("glob",
         "Find files by glob pattern. Supports `*` (any run), `?` (one char), "
@@ -1515,6 +1517,7 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         glob_schema(), EffectSet{Effect::ReadFs},
         body<GlobArgs>(run_glob, parse_glob_args), 25'000);
 
+    if (!exec) return;   // find_definition runs ripgrep
     sh.add("find_definition",
         "Jump to where a symbol is DEFINED (function, class, struct, enum, "
         "type) across the codebase, using curated per-language definition "

@@ -34,8 +34,7 @@
 //
 #pragma once
 
-#include <mcp/rpc.hpp>
-#include <mcp/methods.hpp>
+#include <mcp/protocol.hpp>
 #include <mcp/ids.hpp>
 
 #include <array>

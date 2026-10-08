@@ -29,7 +29,8 @@ inline Codec<Scalar> scalar_codec() {
 using RequestId     = Scalar;
 using ProgressToken = Scalar;
 
-template <> struct CodecOf<Scalar> { static Codec<Scalar> get() { return scalar_codec(); } };
+// Scalar is all std types, so ADL can't find mcp's table for it; its codec
+// is specialised in jsonrpc's table at the end of this file.
 
 //==============================================================================
 //  Opaque string ids.
@@ -139,3 +140,7 @@ inline constexpr std::string_view Tasks              = "io.modelcontextprotocol/
 } // namespace meta_key
 
 } // namespace mcp
+
+template <> struct jsonrpc::CodecOf<mcp::Scalar> {
+    static Codec<mcp::Scalar> get() { return mcp::scalar_codec(); }
+};

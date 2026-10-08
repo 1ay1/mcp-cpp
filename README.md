@@ -3,8 +3,14 @@
 A modern, **type-theoretic** C++23 implementation of the
 [Model Context Protocol](https://modelcontextprotocol.io/specification/2026-07-28)
 (revision **2026-07-28** — the stateless core — with **dual-era** interop back
-to **2025-11-25**). Header-only, single dependency (nlohmann/json),
-no codegen.
+to **2025-11-25**). Header-only, built on
+[jsonrpc-cpp](https://github.com/1ay1/jsonrpc-cpp), no codegen.
+
+It has no runtime: no threads, transports, futures or clocks. The protocol is
+types (every method declared once, in `protocol.hpp`) and answer tables (a
+`Server` for what a server answers, `ClientHandlers` for the server's
+callbacks). The host drives a `jsonrpc::Engine` over whatever byte channel it
+has and decides what runs where.
 
 The protocol is encoded *in the type system*: every wire message is a closed
 expression in a small algebra of constructors, and (de)serialisation is a
@@ -50,9 +56,9 @@ template <> struct CodecOf<PrimitiveSchema> {
 };
 ```
 
-The architecture is borrowed from
-[`acp-cpp`](https://github.com/1ay1/acp-cpp) (the JSON-RPC kernel — `core`,
-`codec`, `coro`, `rpc`, `stdio`) and rebuilt for MCP's message set.
+The algebra, codecs and JSON-RPC engine are
+[jsonrpc-cpp](https://github.com/1ay1/jsonrpc-cpp)'s, shared with
+[acp-cpp](https://github.com/1ay1/acp-cpp).
 
 ## Coverage (2025-11-25)
 
@@ -82,17 +88,18 @@ legacy handshake peer both interoperate:
 
 - **Per-request `_meta`** — `protocolVersion` / `clientInfo` / `clientCapabilities`
   ride under reverse-DNS `_meta` keys on *every* request, replacing the
-  `initialize` session. `Client::enable_modern_metadata()` sets them once;
-  `IncomingRequest` reads them back server-side with no session.
+  `initialize` session. `modern_request_meta()` builds them for
+  `Engine::set_request_meta`; `IncomingRequest` reads them back server-side
+  with no session.
 - **`server/discover`** — the stateless replacement for the initialize
   handshake; `Server` answers it out of the box (supported versions,
-  capabilities, instructions, `serverInfo`, cache hint). `Client::discover()`.
+  capabilities, instructions, `serverInfo`, cache hint).
 - **MRTR** (Multi Round-Trip Requests) — a server answers a request with a
   non-final `input_required` result carrying an opaque, HMAC-signed
   `requestState`; the client fulfils the sampling / elicitation / roots
-  sub-requests locally and retries. `run_mrtr()` / `Client::call_tool_interactive()`
-  drive the client loop; `input_required()` + `RequestStateCodec` +
-  `IncomingRequest` build the server side. No sticky session anywhere.
+  sub-requests locally and retries. `mrtr_retry()` is one turn of that loop as
+  a pure function (the caller sends); `input_required()` + `RequestStateCodec`
+  + `IncomingRequest` build the server side. No sticky session anywhere.
 - **Cacheable lists** (SEP-2549) — `tools/list` / `prompts/list` /
   `resources/list` / `resources/read` carry `ttlMs` + `cacheScope`, emitted with
   a deterministic order so client + prompt caches stay stable across reconnects.
@@ -115,17 +122,13 @@ legacy handshake peer both interoperate:
   are marked deprecated (still fully functional); `is_deprecated_method()`
   answers for tooling that wants to steer new code off them.
 
-The schema's seven closing discriminated unions (`JSONRPCMessage`,
-`ClientRequest`, `ServerRequest`, `ClientNotification`, `ServerNotification`,
-`ClientResult`, `ServerResult`) are modelled as real `Sum` types. On top of
-them sits a **compile-time method dictionary**: each `dict::X` descriptor bakes
-its wire-method literal (as an NTTP), its `Params`, and its `Result` into one
-indivisible token, so
+Every method is a type: `to_server::CallTool`, `to_client::Elicit`, … each
+carries its wire name, params and result, so
 
 ```cpp
-auto fut = mcp::call<dict::CallTool>(engine, params);   // future<CallToolResult>
-mcp::handle<dict::CallTool>(engine, [](const CallToolParams& p){ … });
-mcp::send<dict::Progress>(engine, progressParams);
+auto [id, fx] = mcp::request<to_server::CallTool>(engine, params);
+auto res      = mcp::result<to_server::CallTool>(completed);   // expected<CallToolResult, RpcError>
+router.on<to_server::CallTool>([](Ctx&, const CallToolParams& p) { … });
 ```
 
 resolve the method string *and* the result type from a single name — a
@@ -250,20 +253,17 @@ exactly where it must.
 
 | Header               | Role                                                      |
 |----------------------|----------------------------------------------------------|
-| `mcp/core.hpp`       | the algebra: `Unit`, `Maybe`, `List`, `Sum`, `Newtype`   |
-| `mcp/codec.hpp`      | `Codec<T>`, `record`, `sum_tagged`, `variant_codec`, …    |
+| `mcp/core.hpp`       | the algebra: `Unit`, `Maybe`, `List`, `Sum`, `Newtype` (from jsonrpc-cpp) |
+| `mcp/codec.hpp`      | `Codec<T>`, `record`, `sum_tagged`, `variant_codec`, … (from jsonrpc-cpp) |
 | `mcp/ids.hpp`        | `RequestId`/`ProgressToken` unions, `Role`, enums         |
 | `mcp/content.hpp`    | content blocks, annotations, resource contents            |
 | `mcp/types.hpp`      | implementation, capabilities, tool, resource, prompt, task|
 | `mcp/elicit.hpp`     | elicitation primitive/enum schemas                        |
 | `mcp/methods.hpp`    | every request/result param record + `mcp::method::*`      |
-| `mcp/protocol.hpp`   | JSON-RPC envelope algebra, message-level sums, method dict |
-| `mcp/rpc.hpp`        | bidirectional JSON-RPC engine (sync + async + timeouts)   |
-| `mcp/stdio.hpp`      | line-delimited stdio transport                            |
-| `mcp/coro.hpp`       | optional `mcp::co::Task<T>` coroutine surface             |
-| `mcp/client.hpp`     | typed host-side `Client`                                  |
-| `mcp/server.hpp`     | typed `Server` with a tool/resource/prompt registry       |
-| `mcp/mrtr.hpp`       | MRTR client driver (`run_mrtr`, input_required fulfilment) |
+| `mcp/protocol.hpp`   | every method as a type (`to_server::`, `to_client::`), MCP error codes |
+| `mcp/client.hpp`     | `ClientHandlers`: what the client answers (sampling, roots, elicitation, notifications) |
+| `mcp/server.hpp`     | `Server`: what the server answers, with a tool/resource/prompt registry |
+| `mcp/mrtr.hpp`       | MRTR as pure steps (`mrtr_retry`, input_required fulfilment) |
 | `mcp/server_stateless.hpp` | stateless server tools (`IncomingRequest`, `RequestStateCodec`, `input_required`, cache hints) |
 | `mcp/auth.hpp`       | OAuth 2.1 + PKCE client flow, RFC 9207 iss validation (2026-07-28 hardening) |
 | `mcp/cap/cap.hpp`    | capability layer umbrella (`Registry`, `LocalProvider`, …) |
@@ -272,15 +272,14 @@ exactly where it must.
 | `mcp/tools/host.hpp` | `HostServices` IoC seam for host-coupled tool shells      |
 | `mcp/mcp.hpp`        | umbrella include (core protocol)                          |
 
-## Quick start — a server in ~10 lines
+## Quick start — a server
 
 ```cpp
 #include <mcp/mcp.hpp>
 using namespace mcp;
 
 int main() {
-    StdioTransport tx(std::cin, std::cout);
-    Server server(tx.sink(), Implementation{"my-server", "1.0"});
+    Server server(Implementation{"my-server", "1.0"});
 
     Tool add; add.name = "add";
     add.inputSchema.properties = Json{{"a",{{"type","integer"}}},{"b",{{"type","integer"}}}};
@@ -290,30 +289,25 @@ int main() {
         return r;
     });
 
-    tx.start(server.engine());
-    tx.join();
+    // The host loop: here, stdio on this thread.
+    Engine engine;
+    for (std::string line; std::getline(std::cin, line);) {
+        Effects fx = step(engine, Received{line});
+        for (auto& f : fx.send) std::cout << f << '\n';
+        for (auto& c : fx.calls) std::cout << server.handle(c) << '\n';
+        for (auto& n : fx.notifications) server.handle(n);
+        std::cout.flush();
+    }
 }
 ```
 
-## Quick start — a client (coroutines)
+## Quick start — a client
 
-```cpp
-#include <mcp/mcp.hpp>
-#include <mcp/coro.hpp>
-using namespace mcp;
-using mcp::co::Task; using mcp::co::operator co_await;
-
-Task<void> run(Client& c) {
-    auto init = co_await c.initialize(Implementation{"my-client","1.0"});
-    c.initialized();
-    auto tools = co_await c.list_tools();
-    auto res   = co_await c.call_tool("add", Json{{"a",17},{"b",25}});
-    co_return;
-}
-```
-
-Or block synchronously: every call returns `std::future<T>`, so
-`client.call_tool(...).get()` works without coroutines.
+A client is an engine plus `ClientHandlers` for the server's callbacks.
+`request<M>` gives a frame to send and an id; the matching `Completed` comes
+back out of `step()` when the reply arrives. `examples/client_example.cpp`
+waits for each one on a single thread; a real host (agentty) runs the engine
+on its own reader and writer tasks.
 
 ## Build
 
@@ -332,21 +326,19 @@ built by default; turn it off with `-DMCP_BUILD_TOOLS=OFF` if you only want the
 protocol + capability headers. Tests (`MCP_BUILD_TESTS`) and examples
 (`MCP_BUILD_EXAMPLES`) are also on by default.
 
-Requires a C++23 compiler (GCC 14+/Clang 17+). nlohmann/json v3.11.3 is fetched
-automatically by CMake.
+Requires a C++23 compiler (GCC 14+/Clang 17+). nlohmann/json and jsonrpc-cpp
+are fetched automatically by CMake when they aren't already targets.
 
 ## Design notes
 
 - **`std::expected`-free, exception-thin decode.** `CodecError` is thrown only on
   shape mismatch and is caught at the RPC boundary, mapped to `InvalidParams`.
-- **One codec per type, built once.** `codec<T>()` is a Meyers singleton; nested
+- **One codec per type, built once.** `codec<T>()` builds each once; nested
   codecs share cached nodes, so encode/decode are plain function-pointer calls.
 - **`Newtype<Tag, std::string>`** gives nominal typing for opaque ids at zero
   runtime cost — you cannot pass a `Cursor` where a `TaskId` is expected.
-- **Async handlers** (`on_*_async`) hand a one-shot `Responder` to a worker so a
-  slow tool call or sampling request never blocks the single reader thread.
-- The coroutine `Task<T>` lives in `mcp::co` to avoid colliding with the
-  protocol's `mcp::Task` (a durable-request record).
+- **No runtime.** Deferring a slow reply, running calls in parallel, timeouts
+  and cancellation are the host's: it owns the engine and the threads.
 - **MCP is one provider, not the center.** The capability layer (`cap/`) treats
   the wire protocol as a single `CapabilityProvider` implementation; a host
   programs against `Registry`, not against MCP. Swapping MCP for a local

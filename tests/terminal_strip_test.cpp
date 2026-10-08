@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // terminal_strip_test.cpp — proves strip_terminal_controls applies real
-// terminal line-discipline to captured subprocess output, and that the
-// bash/subprocess capture boundary delivers CLEAN bytes on both the live
-// progress path and the final output.
+// terminal line-discipline to captured subprocess output. (Running the
+// child is the host's Exec; this is the library's half.)
 //
 // This is the regression test for the reported UI corruption: a bash
 // child that thinks it owns a tty (cmake/ctest progress, ls --color,
 // top -b) emits CSI/OSC sequences; the LIVE progress snapshots used to
 // reach the tool card raw, so parameter bytes painted as literal glyphs
 // ("\x1b[1;24r" → stray "r" cells) and were committed to native
-// scrollback. Every path out of the runners must now be escape-free.
+// scrollback.
 
 #include "agtest.hpp"
 
@@ -82,35 +81,5 @@ TEST_CASE("backspace and c0") {
           "keep\ttabs\nand newlines", "tab + newline preserved");
 }
 
-#ifndef _WIN32
-TEST_CASE("live progress path is clean") {
-    // A child that emits SGR + CR progress + a DECSTBM probe. Both the
-    // live snapshots and the final output must be control-free.
-    SubprocessOptions opts;
-    opts.shell_command =
-        "printf 'step 1\\r'; printf 'step 2\\n'; "
-        "printf '\\033[1;32mgreen\\033[0m\\n'; "
-        "printf '\\033[3;24r'; printf 'after-region\\n'";
-    opts.timeout   = std::chrono::seconds{10};
-    opts.max_bytes = 1 << 20;
-    std::vector<std::string> snaps;
-    opts.on_progress = [&](std::string_view s) { snaps.emplace_back(s); };
 
-    auto r = Subprocess::run(std::move(opts));
-    CHECK(r.started, "child started");
-    CHECK(r.exit_code == 0, "child exited 0");
-    CHECK(!has_controls(r.output), "final output is control-free");
-    CHECK(r.output.find("green") != std::string::npos, "SGR text kept");
-    CHECK(r.output.find("after-region") != std::string::npos,
-          "post-DECSTBM text kept");
-    CHECK(r.output.find('r') == std::string::npos
-              || r.output.find("region") != std::string::npos,
-          "no stray 'r' outside real words");
-    CHECK(r.output.find("step 2") != std::string::npos, "CR overwrite kept final");
-    bool all_snaps_clean = true;
-    for (const auto& s : snaps)
-        if (has_controls(s)) all_snaps_clean = false;
-    CHECK(all_snaps_clean, "every live progress snapshot is control-free");
-}
-#endif
 

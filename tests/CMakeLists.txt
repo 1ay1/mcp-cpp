@@ -21,7 +21,6 @@ add_executable(mcp_tests
     test_main.cpp
     codec_test.cpp
     loopback_test.cpp
-    stdio_transport_test.cpp
     stateless_test.cpp
     server_stateless_test.cpp
     auth_test.cpp

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// mcp/mcp.hpp — the one header to include. Pulls in the full type system, the
-// JSON-RPC engine, transports, and the typed Client/Server peer surfaces.
+// mcp/mcp.hpp — the one header to include: the type system, every method as
+// a type, the client and server answer tables, and the capability layer.
 //
 #pragma once
 
@@ -13,12 +13,10 @@
 #include <mcp/types.hpp>
 #include <mcp/elicit.hpp>
 #include <mcp/methods.hpp>
-#include <mcp/rpc.hpp>
 #include <mcp/protocol.hpp>
 #include <mcp/mrtr.hpp>
 #include <mcp/server_stateless.hpp>
 #include <mcp/auth.hpp>
-#include <mcp/stdio.hpp>
 #include <mcp/client.hpp>
 #include <mcp/server.hpp>
 

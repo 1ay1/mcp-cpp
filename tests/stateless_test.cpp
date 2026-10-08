@@ -8,6 +8,7 @@
 //      elicitation, fulfilled transparently by call_tool_interactive().
 //
 #include "agtest.hpp"
+#include "wire.hpp"
 
 static int g_failures = 0;
 
@@ -20,87 +21,72 @@ using namespace mcp;
 
 
 TEST_CASE("stateless") {
-    // Loopback: two raw engines that cross-feed. The "server" is hand-rolled
-    // so we can inspect incoming _meta and craft input_required results the
-    // SDK Server doesn't emit yet.
-    RpcEngine* client_engine = nullptr;
-    RpcEngine* server_engine = nullptr;
-
-    Transport to_server = [&](std::string_view f) { server_engine->feed_line(f); };
-    Transport to_client = [&](std::string_view f) { client_engine->feed_line(f); };
-
-    RpcEngine server(to_client);
-    server_engine = &server;
-
-    // Capture the last _meta the server saw, per method.
+    // A hand-rolled server, so the test can inspect the incoming _meta and
+    // craft input_required results.
     Json last_meta = Json::object();
     std::string last_method;
 
-    // ── server/discover handler ──────────────────────────────────────────
-    server.on_request(std::string(method::Discover),
-        [&](const RpcId&, const Json& params) -> Maybe<Json> {
-            last_method = "server/discover";
-            last_meta = params.value("_meta", Json::object());
-            Json result = {
-                {"resultType", "complete"},
-                {"supportedVersions", {"2026-07-28", "2025-11-25"}},
-                {"capabilities", {{"tools", Json::object()}}},
-                {"instructions", "demo stateless server"},
-                {"ttlMs", 3600000},
-                {"cacheScope", "public"},
-                {"_meta", {{std::string(meta_key::ServerInfo),
-                            {{"name", "demo-server"}, {"version", "9.9"}}}}},
+    struct Srv {} srv;
+    Router<Srv> router;
+    router.on_raw(std::string(to_server::Discover::name), [&](Srv&, const Json& params) -> Json {
+        last_method = "server/discover";
+        last_meta = params.value("_meta", Json::object());
+        return Json{
+            {"resultType", "complete"},
+            {"supportedVersions", {"2026-07-28", "2025-11-25"}},
+            {"capabilities", {{"tools", Json::object()}}},
+            {"instructions", "demo stateless server"},
+            {"ttlMs", 3600000},
+            {"cacheScope", "public"},
+            {"_meta", {{std::string(meta_key::ServerInfo),
+                        {{"name", "demo-server"}, {"version", "9.9"}}}}},
+        };
+    });
+    // tools/call: MRTR. The first call returns input_required asking for an
+    // elicitation; the retry (carrying inputResponses) completes.
+    router.on_raw(std::string(to_server::CallTool::name), [&](Srv&, const Json& params) -> Json {
+        last_method = "tools/call";
+        last_meta = params.value("_meta", Json::object());
+        const Json meta = params.value("_meta", Json::object());
+        const std::string irk = std::string(meta_key::InputResponses);
+        if (!meta.contains(irk)) {
+            ElicitFormParams fp;
+            fp.message = "Your name?";
+            fp.properties.emplace_back("name",
+                PrimitiveSchema{StringSchema{std::string("Name"), Nothing,
+                                             Nothing, Nothing, Nothing, Nothing}});
+            return Json{
+                {"resultType", "input_required"},
+                {"requestState", "opaque-state-42"},
+                {"inputRequests", {
+                    {"need_name", {
+                        {"method", std::string(method::Elicit)},
+                        {"params", to_json(ElicitParams{fp})}}}}},
             };
-            return Just(result);
-        });
+        }
+        const Json& responses = meta[irk];
+        std::string name = "unknown";
+        if (responses.contains("need_name")) {
+            const Json& er = responses["need_name"];
+            if (er.contains("content") && er["content"].contains("name"))
+                name = er["content"]["name"].get<std::string>();
+        }
+        bool state_ok = meta.contains(std::string(meta_key::RequestState))
+            && meta[std::string(meta_key::RequestState)] == "opaque-state-42";
+        return Json{
+            {"content", Json::array({{{"type", "text"},
+                {"text", std::string("hello ") + name +
+                         (state_ok ? " [state-ok]" : " [state-BAD]")}}})}};
+    });
+    router.on_raw(std::string(to_server::Ping::name), [&](Srv&, const Json& params) -> Json {
+        last_meta = params.value("_meta", Json::object());
+        return Json::object();
+    });
 
-    // ── tools/call handler: MRTR — first call returns input_required asking
-    //    for an elicitation; the retry (carrying inputResponses) completes. ──
-    server.on_request(std::string(method::CallTool),
-        [&](const RpcId&, const Json& params) -> Maybe<Json> {
-            last_method = "tools/call";
-            last_meta = params.value("_meta", Json::object());
-            const Json meta = params.value("_meta", Json::object());
-            const std::string irk = std::string(meta_key::InputResponses);
-            if (!meta.contains(irk)) {
-                // Round 1: ask for a name via a (spec-valid) form elicitation.
-                ElicitFormParams fp;
-                fp.message = "Your name?";
-                fp.properties.emplace_back("name",
-                    PrimitiveSchema{StringSchema{std::string("Name"), Nothing,
-                                                 Nothing, Nothing, Nothing, Nothing}});
-                Json ir = {
-                    {"resultType", "input_required"},
-                    {"requestState", "opaque-state-42"},
-                    {"inputRequests", {
-                        {"need_name", {
-                            {"method", std::string(method::Elicit)},
-                            {"params", to_json(ElicitParams{fp})}}}}},
-                };
-                return Just(ir);
-            }
-            // Round 2: the client fulfilled it — echo what we got back.
-            const Json& responses = meta[irk];
-            std::string name = "unknown";
-            if (responses.contains("need_name")) {
-                const Json& er = responses["need_name"];
-                if (er.contains("content") && er["content"].contains("name"))
-                    name = er["content"]["name"].get<std::string>();
-            }
-            // Also assert the server got the echoed requestState.
-            bool state_ok = meta.contains(std::string(meta_key::RequestState))
-                && meta[std::string(meta_key::RequestState)] == "opaque-state-42";
-            Json result = {
-                {"content", Json::array({{{"type", "text"},
-                    {"text", std::string("hello ") + name +
-                             (state_ok ? " [state-ok]" : " [state-BAD]")}}})}};
-            return Just(result);
-        });
-
-    // ── Client with an elicitation handler (used by MRTR fulfilment) ──────
-    ClientHandlers ch;
+    test::Wire w;
+    w.answer = test::answer_with(router, srv);
     bool elicited = false;
-    ch.on_elicit = [&](const ElicitParams&) -> ElicitResult {
+    w.handlers.on_elicit = [&](const ElicitParams&) -> ElicitResult {
         elicited = true;
         ElicitResult r;
         r.action = ElicitAction::Accept;
@@ -108,26 +94,22 @@ TEST_CASE("stateless") {
             {"name", ElicitValue{std::string("Ada")}}};
         return r;
     };
-    // The client that drives the session (its engine feeds `server`).
-    Client c(to_server, std::move(ch));
-    client_engine = &c.engine();
 
-    // Modern metadata: attach protocolVersion + clientInfo + clientCapabilities
-    // to every request. NO initialize handshake.
-    c.enable_modern_metadata(
+    // Modern metadata on every request; no initialize handshake.
+    w.client.set_request_meta(modern_request_meta(
         Implementation{"demo-client", "1.0", Nothing, Nothing, Nothing, Nothing},
-        ClientCapabilities{});
+        ClientCapabilities{}));
 
     // 1. server/discover carries the modern _meta.
     {
-        auto d = c.discover().get();
-        CHECK(d.resultType == "complete");
-        CHECK(d.supportedVersions.size() == 2);
-        CHECK(d.supportedVersions[0] == "2026-07-28");
-        CHECK(d.instructions.has_value() && *d.instructions == "demo stateless server");
-        CHECK(d.ttlMs == 3600000);
-        CHECK(d.cacheScope == "public");
-        // The server saw our per-request protocol metadata.
+        auto d = w.call<to_server::Discover>(DiscoverParams{});
+        REQUIRE(d.has_value());
+        CHECK(d->resultType == "complete");
+        CHECK(d->supportedVersions.size() == 2);
+        CHECK(d->supportedVersions[0] == "2026-07-28");
+        CHECK(d->instructions.has_value() && *d->instructions == "demo stateless server");
+        CHECK(d->ttlMs == 3600000);
+        CHECK(d->cacheScope == "public");
         CHECK(last_method == "server/discover");
         CHECK(last_meta.contains(std::string(meta_key::ProtocolVersion)));
         CHECK(last_meta[std::string(meta_key::ProtocolVersion)] == "2026-07-28");
@@ -136,28 +118,24 @@ TEST_CASE("stateless") {
         CHECK(last_meta.contains(std::string(meta_key::ClientCapabilities)));
     }
 
-    // 2. MRTR: call_tool_interactive drives the input_required round.
+    // 2. MRTR drives the input_required round.
     {
-        CallToolResult r = c.call_tool_interactive("greet", Json::object());
+        auto r = w.call_mrtr(to_server::CallTool::name,
+                             to_json(CallToolParams{"greet", Json::object(), Nothing, Json::object()}));
+        REQUIRE(r.has_value());
+        auto res = from_json<CallToolResult>(*r);
         CHECK(elicited);
-        CHECK(r.content.size() == 1);
-        CHECK(std::holds_alternative<TextContent>(r.content[0]));
-        const std::string& txt = std::get<TextContent>(r.content[0]).text;
-        CHECK(txt == "hello Ada [state-ok]");
-        // The final (retry) request STILL carried the modern protocol metadata.
+        CHECK(res.content.size() == 1);
+        CHECK(std::get<TextContent>(res.content[0]).text == "hello Ada [state-ok]");
+        // The final (retry) request still carried the protocol metadata.
         CHECK(last_meta.contains(std::string(meta_key::ProtocolVersion)));
     }
 
-    // 3. disable_modern_metadata clears the per-request _meta.
+    // 3. Clearing the request meta stops sending it.
     {
-        c.disable_modern_metadata();
-        // A plain (non-interactive) call now carries no injected protocol meta.
-        server.on_request(std::string(method::Ping),
-            [&](const RpcId&, const Json& params) -> Maybe<Json> {
-                last_meta = params.value("_meta", Json::object());
-                return Just(Json::object());
-            });
-        c.ping().get();
+        w.client.set_request_meta(Json::object());
+        auto p = w.call<to_server::Ping>(Unit{});
+        CHECK(p.has_value());
         CHECK(!last_meta.contains(std::string(meta_key::ProtocolVersion)));
     }
     CHECK(g_failures == 0);

@@ -7,8 +7,10 @@
 //   source of "things the agent can do":
 //
 //       LocalProvider         in-process C++ closures (the host's own tools)
-//       StdioServerProvider   an external MCP server spawned over stdio
-//       (your provider here)  HTTP/SSE MCP, RPC, a database, …
+//       (your provider here)  an MCP server over stdio or HTTP, RPC, a database, …
+//
+//   Talking to a remote MCP server is the host's job: it owns the connection
+//   and implements CapabilityProvider over it.
 //
 //   Register them into a Registry; ask the Registry for tools() and call
 //   dispatch(). MCP becomes one implementation detail among many.
@@ -19,5 +21,3 @@
 #include <mcp/cap/local.hpp>
 #include <mcp/cap/registry.hpp>
 #include <mcp/cap/process.hpp>
-#include <mcp/cap/client_provider.hpp>
-#include <mcp/cap/stdio_server.hpp>

@@ -48,9 +48,7 @@ std::optional<long long> parse_ymd_to_days(const std::string& s) {
 } // namespace
 
 int main() {
-    StdioTransport transport(std::cin, std::cout);
-    Server server(transport.sink(),
-                  Implementation{"date", "1.0.0", std::string("Date & Time"),
+    Server server(Implementation{"date", "1.0.0", std::string("Date & Time"),
                                  Nothing, Nothing, Nothing});
     server.set_capabilities(ServerCapabilities{
         .tools = ToolsCapability{false},
@@ -125,7 +123,17 @@ int main() {
         });
     }
 
-    transport.start(server.engine());
-    transport.join();   // serve until agentty closes stdin
+    // Serve until agentty closes stdin: one line in, the engine stepped, the
+    // replies out. mcp-cpp has no transport of its own; this loop is it.
+    Engine engine;
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        Effects fx = step(engine, Received{line});
+        for (auto& f : fx.send) std::cout << f << '\n';
+        for (auto& c : fx.calls) std::cout << server.handle(c) << '\n';
+        for (auto& n : fx.notifications) server.handle(n);
+        std::cout.flush();
+    }
     return 0;
 }

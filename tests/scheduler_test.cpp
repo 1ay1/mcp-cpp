@@ -182,8 +182,14 @@ TEST_CASE("concurrent execution") {
         return CallFacts{Effects{Eff::ReadFs}, extract_paths("read", r.args)};
     };
 
+    // The host decides parallelism; here, one thread per call in a wave.
+    Splitter threads = [](std::size_t n, const std::function<void(std::size_t)>& f) {
+        std::vector<std::thread> ts;
+        for (std::size_t i = 0; i < n; ++i) ts.emplace_back([&f, i] { f(i); });
+        for (auto& t : ts) t.join();
+    };
     auto t0 = std::chrono::steady_clock::now();
-    auto results = run(reg, batch, fn);
+    auto results = run(reg, batch, fn, threads);
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
 

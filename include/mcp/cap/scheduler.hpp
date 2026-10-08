@@ -48,7 +48,6 @@
 //
 #pragma once
 
-#include <mcp/runtime.hpp>
 #include <mcp/cap/capability.hpp>
 #include <mcp/cap/registry.hpp>
 #include <mcp/types.hpp>
@@ -255,32 +254,34 @@ struct Plan {
 }
 
 // ── The executor ────────────────────────────────────────────────────────────
-// Run a batch against any dispatcher, parallelising within each wave on the
-// installed mcp::Runtime (mcp/runtime.hpp). `dispatch` MUST be safe to call concurrently from multiple
-// threads for the calls the planner placed in the same wave — which, by the
-// conflict model, never touch overlapping fs state and never exec. Returns
-// results 1:1 with `batch` (original order), so the caller treats it exactly
-// like a sequential run.
+// Run a batch against any dispatcher, one wave after another. Calls within a
+// wave go through `split`, which may run them in parallel: the planner has
+// made sure they never touch overlapping fs state and never exec, so
+// `dispatch` only has to be safe for those. Results come back 1:1 with
+// `batch`, in its order, so the caller treats it like a sequential run.
 //
-// `dispatch` is a std::function<Result(const Request&)> — typically
-// [&reg](const Request& r){ return reg.dispatch(r); }. Kept generic so a host
-// can wrap dispatch with its own per-call instrumentation / permission gate.
+// The library never decides parallelism itself; the default splitter runs
+// the wave in order on the caller's thread.
 using DispatchFn = std::function<Result(const Request&)>;
+using Splitter   = std::function<void(std::size_t n, const std::function<void(std::size_t)>& fn)>;
+
+[[nodiscard]] inline Splitter serial_splitter() {
+    return [](std::size_t n, const std::function<void(std::size_t)>& fn) {
+        for (std::size_t i = 0; i < n; ++i) fn(i);
+    };
+}
 
 [[nodiscard]] inline std::vector<Result>
 run_plan(const std::vector<Request>& batch, const Plan& plan,
-         const DispatchFn& dispatch) {
+         const DispatchFn& dispatch, const Splitter& split = serial_splitter()) {
     std::vector<Result> out(batch.size());
     for (const auto& wave : plan.waves) {
         if (wave.size() == 1) {
-            // Singleton wave: run inline, no thread spin-up cost.
             const std::size_t i = wave[0];
             out[i] = dispatch(batch[i]);
             continue;
         }
-        // Each call in the wave runs on the installed mcp::Runtime; all are
-        // finished before the next wave starts.
-        runtime().parallel_for(wave.size(), [&](std::size_t k) {
+        split(wave.size(), [&](std::size_t k) {
             const std::size_t i = wave[k];
             out[i] = dispatch(batch[i]);
         });
@@ -290,10 +291,11 @@ run_plan(const std::vector<Request>& batch, const Plan& plan,
 
 // One-call convenience: plan + run against a Registry with a given EffectFn.
 [[nodiscard]] inline std::vector<Result>
-run(Registry& reg, const std::vector<Request>& batch, const EffectFn& fn) {
+run(Registry& reg, const std::vector<Request>& batch, const EffectFn& fn,
+    const Splitter& split = serial_splitter()) {
     Plan plan = plan_waves(batch, fn);
     return run_plan(batch, plan,
-                    [&reg](const Request& r) { return reg.dispatch(r); });
+                    [&reg](const Request& r) { return reg.dispatch(r); }, split);
 }
 
 // Same, defaulting the EffectFn to the standard-annotation reader.

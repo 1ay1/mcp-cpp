@@ -1,24 +1,11 @@
 # mcp-cpp — concurrency allowlist (checked by agentty's concurrency_banlist_mcp).
 #
-# mcp-cpp starts no threads: background work, deadlines and parallel scans go
-# through mcp::Runtime / tools::Executor, which the host installs. Two kinds of
-# entry remain, and nothing else may appear:
-#
-#   1. runtime.hpp — the standalone fallback (std::jthread), the ONE place the
-#      library may name a thread. agentty replaces it at startup.
-#   2. locks and atomics that protect a structure's own state (the engine's
-#      waiter table, a transport's write side, a cache, a work cursor). They
-#      make a type safe to call from the host's threads; they run nothing.
-#
-# std::async(launch::deferred) in rpc.hpp starts no thread: it is the lazy
-# decode step of a typed request.
+# mcp-cpp starts no threads and has no connection: the protocol is types and
+# answer tables, and the host drives a jsonrpc engine. Parallel scans go
+# through tools::Executor, which the host installs. What remains below are
+# locks and atomics that protect a structure's own state (a cache, a work
+# cursor); they are being moved out to the caller one by one.
 
-include/mcp/runtime.hpp: thread detach mutex atomic
-include/mcp/rpc.hpp: async mutex atomic
-include/mcp/stdio.hpp: mutex atomic
-include/mcp/coro.hpp: mutex atomic
-include/mcp/cap/client_provider.hpp: mutex atomic
-include/mcp/cap/guarded.hpp: mutex
 include/mcp/cap/process.hpp: atomic
 include/mcp/cap/registry.hpp: mutex
 src/tools/fs.cpp: mutex

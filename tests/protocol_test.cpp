@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// protocol_test.cpp — exercise the JSON-RPC envelope algebra, the message-level
-// sums, the structured -32042 error, and the compile-time method dictionary.
+// protocol_test.cpp — the structured -32042 error, the method types, typed
+// dispatch over a wire, and the newer spec vocabulary. (The JSON-RPC
+// envelope itself is jsonrpc-cpp's, tested there.)
 //
 #include "agtest.hpp"
+#include "wire.hpp"
 
 static int g_failures = 0;
 
@@ -15,47 +17,6 @@ using namespace mcp;
 
 
 TEST_CASE("protocol") {
-    // ── JsonRpcMessage round-trips for each envelope shape ───────────────
-    {
-        JsonRpcMessage req = JsonRpcMessage{JsonRpcRequest{
-            id(1), "tools/call", Json{{"name", "x"}}}};
-        Json j = to_json(req);
-        CHECK(j["jsonrpc"] == "2.0");
-        CHECK(j["id"] == 1);
-        CHECK(j["method"] == "tools/call");
-        CHECK(j["params"]["name"] == "x");
-        auto back = from_json<JsonRpcMessage>(j);
-        CHECK(std::holds_alternative<JsonRpcRequest>(back));
-
-        JsonRpcMessage note = JsonRpcMessage{JsonRpcNotification{
-            "notifications/initialized", Json::object()}};
-        Json nj = to_json(note);
-        CHECK(nj["method"] == "notifications/initialized");
-        CHECK(!nj.contains("id"));
-        CHECK(std::holds_alternative<JsonRpcNotification>(from_json<JsonRpcMessage>(nj)));
-
-        JsonRpcMessage ok = JsonRpcMessage{
-            JsonRpcResponse{JsonRpcResult{id(2), Json{{"ok", true}}}}};
-        Json oj = to_json(ok);
-        CHECK(oj["result"]["ok"] == true);
-        CHECK(std::holds_alternative<JsonRpcResponse>(from_json<JsonRpcMessage>(oj)));
-
-        JsonRpcMessage err = JsonRpcMessage{
-            JsonRpcResponse{JsonRpcError{id(3), Error{-32601, "Method not found", Nothing}}}};
-        Json ej = to_json(err);
-        CHECK(ej["error"]["code"] == -32601);
-        CHECK(ej["error"]["message"] == "Method not found");
-    }
-
-    // ── string-id round-trips (RpcId = string | number) ──────────────────
-    {
-        JsonRpcRequest r{id("abc-1"), "ping", Json::object()};
-        Json j = to_json(r);
-        CHECK(j["id"] == "abc-1");
-        CHECK(!j.contains("params"));   // empty params omitted
-        CHECK(from_json<JsonRpcRequest>(j).id == id("abc-1"));
-    }
-
     // ── URLElicitationRequiredError data (-32042) ────────────────────────
     {
         UrlElicitationRequiredErrorData d;
@@ -67,60 +28,47 @@ TEST_CASE("protocol") {
         CHECK(back.elicitations.size() == 1);
         CHECK(back.elicitations[0].url == "https://x/auth");
 
-        Error e{kUrlElicitationRequired, "URL elicitation required", Just<Json>(data)};
+        RpcError e(kUrlElicitationRequired, "URL elicitation required", data);
         CHECK(to_json(e)["code"] == -32042);
+        CHECK(to_json(e)["data"]["elicitations"][0]["elicitationId"] == "el-9");
     }
 
-    // ── Error optional data omitted ──────────────────────────────────────
+    // ── method types ─────────────────────────────────────────────────────
     {
-        Error e{-32602, "Invalid params", Nothing};
-        Json j = to_json(e);
-        CHECK(!j.contains("data"));
-        CHECK(from_json<Error>(j).code == -32602);
-    }
-
-    // ── compile-time method dictionary ───────────────────────────────────
-    {
-        // The method literal is carried by the descriptor type itself.
-        static_assert(method_v<dict::CallTool>   == "tools/call");
-        static_assert(method_v<dict::Initialize> == "initialize");
-        static_assert(method_v<dict::Elicit>     == "elicitation/create");
-        static_assert(method_v<dict::GetTask>    == "tasks/get");
-        static_assert(method_v<dict::CancelTask> == "tasks/cancel");
-        static_assert(method_v<dict::LoggingMessage> == "notifications/message");
-        // The result type is paired with the params type at compile time.
-        static_assert(std::is_same_v<dict::CallTool::Result, CallToolResult>);
-        static_assert(std::is_same_v<dict::CallTool::Params, CallToolParams>);
-        static_assert(std::is_same_v<dict::ListRoots::Result, ListRootsResult>);
+        static_assert(to_server::CallTool::name   == "tools/call");
+        static_assert(to_server::Initialize::name == "initialize");
+        static_assert(to_client::Elicit::name     == "elicitation/create");
+        static_assert(to_server::GetTask::name    == "tasks/get");
+        static_assert(to_server::CancelTask::name == "tasks/cancel");
+        static_assert(to_client::LoggingMessage::name == "notifications/message");
+        static_assert(std::is_same_v<to_server::CallTool::result, CallToolResult>);
+        static_assert(std::is_same_v<to_server::CallTool::params, CallToolParams>);
+        static_assert(std::is_same_v<to_client::ListRoots::result, ListRootsResult>);
+        static_assert(jsonrpc::IsNote<to_client::LoggingMessage>);
+        static_assert(jsonrpc::IsMethod<to_server::CallTool>);
         CHECK(true);
     }
 
-    // ── typed dispatch over a loopback engine ────────────────────────────
+    // ── typed dispatch over a wire ───────────────────────────────────────
     {
-        RpcEngine* a_eng = nullptr;
-        RpcEngine* b_eng = nullptr;
-        RpcEngine a([&](std::string_view f) { b_eng->feed_line(f); });
-        RpcEngine b([&](std::string_view f) { a_eng->feed_line(f); });
-        a_eng = &a; b_eng = &b;
-
-        // b serves tools/call via the typed `handle<Desc>` helper.
-        handle<dict::CallTool>(b, [](const CallToolParams& p) -> CallToolResult {
+        struct B {} b;
+        Router<B> router;
+        router.on<to_server::CallTool>([](B&, const CallToolParams& p) {
             CallToolResult r;
             r.content = {text("called " + p.name)};
             return r;
         });
-        // a calls it via `call<Desc>` — result type deduced from the descriptor.
-        auto fut = call<dict::CallTool>(a, CallToolParams{"echo", Json::object(), Nothing, Json::object()});
-        CallToolResult res = fut.get();
-        CHECK(std::get<TextContent>(res.content[0]).text == "called echo");
+        test::Wire w;
+        w.answer = test::answer_with(router, b);
+        auto res = w.call<to_server::CallTool>(CallToolParams{"echo", Json::object(), Nothing, Json::object()});
+        REQUIRE(res.has_value());
+        CHECK(std::get<TextContent>(res->content[0]).text == "called echo");
 
-        // notification path: observe<Desc> / send<Desc>.
         bool logged = false;
-        observe<dict::LoggingMessage>(a, [&](const LoggingMessageParams& m) {
-            logged = (m.level == LoggingLevel::Warning);
-        });
-        send<dict::LoggingMessage>(b, LoggingMessageParams{
-            LoggingLevel::Warning, Json{{"msg", "hi"}}, Nothing, Json::object()});
+        w.handlers.on_log = [&](const LoggingMessageParams& m) { logged = (m.level == LoggingLevel::Warning); };
+        w.to_client.push_back(notify<to_client::LoggingMessage>(LoggingMessageParams{
+            LoggingLevel::Warning, Json{{"msg", "hi"}}, Nothing, Json::object()}));
+        w.pump();
         CHECK(logged);
     }
 
