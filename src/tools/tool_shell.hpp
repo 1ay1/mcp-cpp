@@ -11,8 +11,10 @@
 #include <mcp/cap/capability.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
+#include <mcp/tools/state.hpp>
 
 #include <chrono>
+#include <concepts>
 #include <functional>
 #include <memory>
 #include <string>
@@ -62,9 +64,12 @@ struct RunResult {
 
 using mcp::Json;
 
+// A tool body gets the call (state, reader, cancel) and its arguments.
+using Handler = std::function<mcp::cap::Result(const Call& call, const Json& args)>;
+
 struct Shell {
     mcp::Tool                                              tool;
-    std::function<mcp::cap::Result(const Json& args)>      handler;
+    Handler                                                handler;
     EffectSet                                             effects;
     int                                                   output_budget = 0;  // 0 ⇒ toolset default
 };
@@ -74,10 +79,12 @@ public:
     explicit Shells(const ToolsetConfig& cfg) : cfg_(cfg) {}
 
     // Register a tool from name + description + raw JSON schema + effects.
+    // `handler` takes (const Call&, const Json&), or just (const Json&) for
+    // a tool that needs nothing but its arguments.
+    template <class F>
+        requires std::invocable<F&, const Call&, const Json&> || std::invocable<F&, const Json&>
     void add(std::string name, std::string description, Json schema,
-             EffectSet effects,
-             std::function<mcp::cap::Result(const Json&)> handler,
-             int output_budget = 0) {
+             EffectSet effects, F handler, int output_budget = 0) {
         Shell s;
         s.tool.name = name;
         if (!description.empty()) s.tool.description = description;
@@ -93,7 +100,10 @@ public:
         s.tool.annotations  = ann;
         s.effects           = effects;
         s.output_budget     = output_budget;
-        s.handler           = std::move(handler);
+        if constexpr (std::invocable<F&, const Call&, const Json&>)
+            s.handler = Handler{std::move(handler)};
+        else
+            s.handler = Handler{[h = std::move(handler)](const Call&, const Json& j) mutable { return h(j); }};
         shells_.push_back(std::move(s));
     }
 

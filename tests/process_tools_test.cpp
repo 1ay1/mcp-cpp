@@ -10,6 +10,8 @@
 //
 // POSIX-only: uses `sh -c`, `sleep`, `echo`, and exit codes.
 
+#include "test_state.hpp"
+#include "test_exec.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
@@ -59,9 +61,13 @@ static std::string extract_id(const std::string& text) {
 int main() {
     auto root = fs::temp_directory_path() / ("mcp_proc_test_" + std::to_string(::getpid()));
     fs::create_directories(root);
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
 
     HostServices svc;
+
+    svc.state = ws_state;
+
+    svc.exec  = std::make_shared<mcp::test::PopenExec>();
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     // ── 1. immediate crash reported at START with exit code ──────────────

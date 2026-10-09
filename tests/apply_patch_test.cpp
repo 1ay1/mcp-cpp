@@ -13,6 +13,7 @@
 #include <mcp/cap/local.hpp>
 
 #include "agtest.hpp"
+#include "test_state.hpp"
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -49,11 +50,12 @@ TEST_CASE("apply_patch") {
     auto root = fs::temp_directory_path() / ("mcp_patch_test_" + std::to_string(mcp_getpid()));
     fs::remove_all(root);
     fs::create_directories(root);
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
     auto prev = fs::current_path();
     fs::current_path(root);
 
     HostServices svc;
+    svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     const std::string base =

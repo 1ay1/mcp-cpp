@@ -66,7 +66,7 @@ public:
         if (it == routes.end())
             return Result::error("capability not found: '" + req.tool + "'");
         return it->second.provider->execute(Request{it->second.bare_name, req.args,
-                                                    req.progress, req.cancelled, req.stop});
+                                                    req.progress, req.cancelled, req.stop, req.reader});
     }
 
     [[nodiscard]] Result dispatch(const std::string& tool, Json args = Json::object()) const {

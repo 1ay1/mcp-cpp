@@ -10,8 +10,11 @@
 
 #include <mcp/cap/capability.hpp>
 #include <mcp/tools/meta.hpp>
+#include <mcp/tools/state.hpp>
 #include <mcp/tools/util/error.hpp>
+#include <mcp/tools/util/fs_helpers.hpp>
 
+#include <concepts>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -69,32 +72,50 @@ inline mcp::cap::Result lower(util::ExecResult r) {
     return out;
 }
 
-// Wrap a (parse, run) pair into a Shells handler. Mirrors util::adapt but
-// targets cap::Result via lower().
+// Wrap a (parse, run) pair into a Shells handler. A runner takes the parsed
+// arguments, and the Call first when it needs one (state, reader, cancel):
+//     ExecResult run_x(const XArgs&)
+//     ExecResult run_x(const Call&, const XArgs&)
+template <class Args, class Run>
+[[nodiscard]] auto run_on(Run& run, const Call& call, const Args& a) {
+    if constexpr (std::invocable<Run&, const Call&, const Args&>) return run(call, a);
+    else return run(a);
+}
+
+// A parser takes the JSON, and the call's Bounds when it resolves paths:
+//     expected<XArgs, ToolError> parse_x(const Json&)
+//     expected<XArgs, ToolError> parse_x(const Json&, const util::Bounds&)
 template <class Args>
-inline std::function<mcp::cap::Result(const Json&)>
-body(util::ExecResult (*run)(const Args&),
-     std::expected<Args, util::ToolError> (*parse)(const Json&)) {
-    return [run, parse](const Json& j) -> mcp::cap::Result {
+using Parse = std::expected<Args, util::ToolError> (*)(const Json&);
+template <class Args>
+using ParseIn = std::expected<Args, util::ToolError> (*)(const Json&, const util::Bounds&);
+
+template <class Args, class Run>
+[[nodiscard]] auto body(Run run, Parse<Args> parse) {
+    return [run = std::move(run), parse](const Call& call, const Json& j) mutable -> mcp::cap::Result {
         auto parsed = parse(j);
         if (!parsed) return mcp::cap::Result::error(parsed.error().render());
-        return lower(run(*parsed));
+        return lower(run_on<Args>(run, call, *parsed));
     };
 }
 
-// Same, for a runner that needs a host capability. `body` takes a plain
-// function pointer, which is right for a tool that only needs its arguments;
-// a tool that needs the host to DO something takes the capability by value
-// here instead of reaching for a global. That difference is the whole point
-// of the HostServices seam.
 template <class Args, class Run>
-[[nodiscard]] auto body_with(Run run,
-     std::expected<Args, util::ToolError> (*parse)(const Json&)) {
-    return [run = std::move(run), parse](const Json& j) -> mcp::cap::Result {
-        auto parsed = parse(j);
+[[nodiscard]] auto body(Run run, ParseIn<Args> parse) {
+    return [run = std::move(run), parse](const Call& call, const Json& j) mutable -> mcp::cap::Result {
+        auto parsed = parse(j, call.with([](ToolState& s) {
+            return util::bounds_from(s.workspace_root, s.read_roots);
+        }));
         if (!parsed) return mcp::cap::Result::error(parsed.error().render());
-        return lower(run(*parsed));
+        return lower(run_on<Args>(run, call, *parsed));
     };
+}
+
+// The same, named for a runner that captures a host capability. That
+// difference (the capability travels in the closure, not a global) is the
+// point of the HostServices seam.
+template <class Args, class Run, class P>
+[[nodiscard]] auto body_with(Run run, P parse) {
+    return body<Args>(std::move(run), parse);
 }
 
 // ── Line-count diff (added/removed) ─────────────────────────────────────────

@@ -42,15 +42,12 @@ struct TreeDeleter   { void operator()(TSTree* t)   const noexcept { ts_tree_del
 using ParserPtr = std::unique_ptr<TSParser, ParserDeleter>;
 using TreePtr   = std::unique_ptr<TSTree, TreeDeleter>;
 
-// One parser per thread: construction is ~10 us, parse is ~20 us — reuse it.
-TSParser& thread_parser() {
-    thread_local ParserPtr p = [] {
-        ParserPtr q{ts_parser_new()};
-        ts_parser_set_language(q.get(), tree_sitter_bash());
-        return q;
-    }();
-    ts_parser_reset(p.get());
-    return *p;
+// A parser per analysis. Construction is ~10 us next to a ~20 us parse, and
+// a fresh one shares nothing between threads.
+ParserPtr make_parser() {
+    ParserPtr p{ts_parser_new()};
+    ts_parser_set_language(p.get(), tree_sitter_bash());
+    return p;
 }
 
 // Node type → small enum, once per node. Comparing C strings at every visit
@@ -804,8 +801,8 @@ void unwrap_nested(Script& s, std::size_t idx, int nesting) {
 void lower_into(std::string_view source, Script& out, Ctx extra, int nesting,
                 std::uint32_t span_b, std::uint32_t span_e) {
     if (source.size() > kMaxSource) { out.truncated = true; source = source.substr(0, kMaxSource); }
-    TSParser& p = thread_parser();
-    TreePtr tree{ts_parser_parse_string(&p, nullptr, source.data(),
+    const ParserPtr parser = make_parser();
+    TreePtr tree{ts_parser_parse_string(parser.get(), nullptr, source.data(),
                                         static_cast<std::uint32_t>(source.size()))};
     if (!tree) { out.truncated = true; return; }
     const TSNode root = ts_tree_root_node(tree.get());

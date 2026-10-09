@@ -12,6 +12,7 @@
 #include <mcp/cap/local.hpp>
 
 #include "agtest.hpp"
+#include "test_state.hpp"
 #include "test_exec.hpp"
 #include <cctype>
 #include <cstdio>
@@ -44,7 +45,7 @@ static void write_file(const fs::path& p, const std::string& s) {
 TEST_CASE("search_tools") {
     auto root = fs::temp_directory_path() / ("mcp_search_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
     // git_status/log/commit invoke `git` in the process cwd; agentty runs
     // with cwd == workspace, so mirror that here for a faithful test.
     auto prev_cwd = fs::current_path();
@@ -64,6 +65,7 @@ TEST_CASE("search_tools") {
     write_file(root / "sub" / "gamma.py", "def compute_total(x):\n    return x * 2\n");
 
     HostServices svc;
+    svc.state = ws_state;
 #if !defined(_WIN32)
     svc.exec = std::make_shared<mcp::test::PopenExec>();   // shell, git_*, find_definition run programs
 #endif
@@ -466,14 +468,14 @@ TEST_CASE("search_tools") {
         // a git repository". Widen the boundary to the parent of root while
         // cwd stays == root, then call git_status with NO path.
         {
-            auto saved_ws = util::workspace_root();
-            util::set_workspace_root(root.parent_path());
+            auto saved_ws = ws_state->state.workspace_root;
+            ws_state->state.workspace_root = util::canonical_root(root.parent_path());
             auto wide = call(*provider, "git_status", obj());  // no `path`
             assert(!wide.is_error
                    && "no-path git_status must resolve the cwd project under a "
                       "wider workspace boundary (`-w /`)");
             assert(wide.text.find("## ") != std::string::npos);
-            util::set_workspace_root(saved_ws);
+            ws_state->state.workspace_root = saved_ws;
             std::puts("git_status: wide-boundary (`-w /`) resolves cwd project");
         }
 

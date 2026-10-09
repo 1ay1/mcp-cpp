@@ -15,6 +15,7 @@
 
 #include <mcp/cap/capability.hpp>
 
+#include <concepts>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -25,9 +26,11 @@ namespace mcp::cap {
 
 class LocalProvider final : public CapabilityProvider {
 public:
-    // Handler: pure function from JSON args → Result. Must not throw (the
-    // provider guards it anyway, mapping a thrown exception to Result::error).
-    using Handler = std::function<Result(const Json& args)>;
+    // Handler: the request → Result. Must not throw (the provider guards it
+    // anyway, mapping a thrown exception to Result::error). A handler that
+    // only needs the arguments can be given as one of `const Json&`.
+    using Handler = std::function<Result(const Request& req)>;
+    using ArgsHandler = std::function<Result(const Json& args)>;
 
     explicit LocalProvider(std::string origin = "local")
         : origin_(std::move(origin)) {}
@@ -35,15 +38,21 @@ public:
     [[nodiscard]] std::string_view origin() const noexcept override { return origin_; }
 
     // Register a tool + its handler. `tool.name` is the dispatch key.
-    void add(Tool tool, Handler handler) {
+    template <class F>
+        requires std::invocable<F&, const Request&> || std::invocable<F&, const Json&>
+    void add(Tool tool, F handler) {
         const std::string key = tool.name;
-        handlers_[key] = std::move(handler);
+        if constexpr (std::invocable<F&, const Request&>)
+            handlers_[key] = Handler{std::move(handler)};
+        else
+            handlers_[key] = Handler{[h = std::move(handler)](const Request& r) mutable { return h(r.args); }};
         tools_.push_back(std::move(tool));
     }
 
     // Convenience: build a minimal Tool from name + description + raw schema.
+    template <class F>
     void add(std::string name, std::string description, Json input_schema,
-             Handler handler) {
+             F handler) {
         Tool t;
         t.name = name;
         if (!description.empty()) t.description = description;
@@ -60,7 +69,7 @@ public:
         if (it == handlers_.end())
             return Result::error("local: unknown tool '" + req.tool + "'");
         try {
-            return it->second(req.args);
+            return it->second(req);
         } catch (const std::exception& e) {
             return Result::error(std::string{"local tool threw: "} + e.what());
         } catch (...) {

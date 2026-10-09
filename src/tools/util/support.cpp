@@ -3,7 +3,6 @@
 // error.cpp / progress.cpp — out-of-line bits of the util support layer.
 
 #include <mcp/tools/util/error.hpp>
-#include <mcp/tools/util/progress.hpp>
 
 #include <format>
 
@@ -35,19 +34,3 @@ std::string ToolError::render() const {
 }
 
 } // namespace mcp::tools::util
-
-namespace mcp::tools::util::progress {
-namespace {
-    thread_local Sink g_sink;
-}
-void set(Sink s)                     { g_sink = std::move(s); }
-void clear()                         { g_sink = nullptr; }
-void emit(std::string_view snapshot) { if (g_sink) g_sink(snapshot); }
-} // namespace mcp::tools::util::progress
-
-namespace mcp::tools::util::cancellation {
-namespace { thread_local Probe g_probe; }
-void set(Probe probe) { g_probe = std::move(probe); }
-void clear() { g_probe = nullptr; }
-bool requested() { return g_probe && g_probe(); }
-} // namespace mcp::tools::util::cancellation

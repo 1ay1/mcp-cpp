@@ -13,6 +13,7 @@
 #include <mcp/cap/local.hpp>
 
 #include "agtest.hpp"
+#include "test_state.hpp"
 #include <cstdio>
 #include <chrono>
 #include <filesystem>
@@ -45,7 +46,7 @@ TEST_CASE("search_structural") {
     auto root = fs::temp_directory_path() /
                 ("mcp_structural_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
     auto prev_cwd = fs::current_path();
     fs::current_path(root);
 
@@ -66,6 +67,7 @@ TEST_CASE("search_structural") {
         "const empty = () => { try { risky(); } catch (e) {} };\n"); // L2 empty catch
 
     HostServices svc;
+    svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     // ── 1. malloc($SIZE) matches the single-NODE-arg calls (L2, L3), and
@@ -432,7 +434,7 @@ TEST_CASE("search_structural semantic bridge") {
     auto root = fs::temp_directory_path() /
                 ("mcp_structsem_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
     auto prev_cwd = fs::current_path();
     fs::current_path(root);
 
@@ -442,6 +444,7 @@ TEST_CASE("search_structural semantic bridge") {
 
     auto fake = std::make_shared<FakeRetriever>();
     HostServices svc;
+    svc.state = ws_state;
     svc.code_retriever = fake;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
@@ -544,11 +547,12 @@ TEST_CASE("rewrite_structural") {
     auto root = fs::temp_directory_path() /
                 ("mcp_rewrite_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
     auto prev_cwd = fs::current_path();
     fs::current_path(root);
 
     HostServices svc;
+    svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     swrite(root / "t.c",

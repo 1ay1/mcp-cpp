@@ -6,6 +6,7 @@
 // string/int; the parsers enforce the same invariants up front.
 
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 #include "tool_body.hpp"
 
 #include <mcp/tools/util/arg_reader.hpp>
@@ -74,8 +75,8 @@ std::expected<GlobArgs, ToolError> parse_glob_args(const json& j) {
     };
 }
 
-ExecResult run_glob(const GlobArgs& a) {
-    auto wp = util::make_workspace_path_checked(a.root, "glob");
+ExecResult run_glob(const Call& call, const GlobArgs& a) {
+    auto wp = util::make_workspace_path_checked(a.root, "glob", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
 
     const auto& pat = a.pattern;
@@ -237,8 +238,10 @@ std::expected<FindDefinitionArgs, ToolError> parse_find_definition_args(const js
     return out;
 }
 
-ExecResult run_find_definition(const FindDefinitionArgs& a, Exec& exec) {
-    auto wp = util::make_workspace_path_checked(a.root, "find_definition");
+[[nodiscard]] bool have_rg(const Call& call, Exec& exec);
+
+ExecResult run_find_definition(const Call& call, const FindDefinitionArgs& a, Exec& exec) {
+    auto wp = util::make_workspace_path_checked(a.root, "find_definition", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
 
     std::string esc;
@@ -259,14 +262,7 @@ ExecResult run_find_definition(const FindDefinitionArgs& a, Exec& exec) {
         "const|let|var|type|interface|export|func|fn|trait|mod|static)\\s+"
         + esc + "\\b|#define\\s+" + esc + "\\b|\\b\\w[\\w:*&<> ]*\\s+" + esc + "\\s*\\(";
 
-    static int rg_available = -1;
-    if (rg_available < 0) {
-        auto probe = run_prog(exec, {"rg", "--version"},
-                              std::chrono::seconds(2), 1024);
-        rg_available = (probe.started && probe.exit_code == 0) ? 1 : 0;
-    }
-
-    if (rg_available == 1) {
+    if (have_rg(call, exec)) {
         // Pass every argument via argv — the pattern contains regex meta
         // (|, (), \b, <, >, *) that a shell string would mangle or, worse,
         // interpret. argv form reaches rg byte-for-byte.
@@ -669,15 +665,18 @@ struct FileHit {
 
 enum class Backend { Ripgrep, BuiltIn };
 
-[[nodiscard]] Backend detect_backend(Exec& exec) {
-    // Cached: "is rg on PATH" does not change under us, and probing per
-    // grep would cost a spawn on every call.
-    static const Backend cached = [&]{
-        auto r = run_prog(exec, {"rg", "--version"}, std::chrono::seconds(3), 1024);
-        return (r.started && r.exit_code == 0)
-                ? Backend::Ripgrep : Backend::BuiltIn;
-    }();
-    return cached;
+// Is rg on the host's PATH? Remembered in the tool state: it doesn't change
+// under us, and probing per grep would cost a spawn on every call.
+[[nodiscard]] bool have_rg(const Call& call, Exec& exec) {
+    if (auto known = call.with([](ToolState& s) { return s.have_rg; })) return *known;
+    auto r = run_prog(exec, {"rg", "--version"}, std::chrono::seconds(3), 1024);
+    const bool yes = r.started && r.exit_code == 0;
+    call.with([&](ToolState& s) { s.have_rg = yes; });
+    return yes;
+}
+
+[[nodiscard]] Backend detect_backend(const Call& call, Exec& exec) {
+    return have_rg(call, exec) ? Backend::Ripgrep : Backend::BuiltIn;
 }
 
 [[nodiscard]] std::string enclosing_symbol(std::string_view content,
@@ -1138,7 +1137,7 @@ ExecResult run_ripgrep(const GrepArgs& a, Exec& exec) {
     return ToolOutput{std::move(body), std::nullopt};
 }
 
-ExecResult run_builtin(const GrepArgs& a) {
+ExecResult run_builtin(const Call& call, const GrepArgs& a) {
     // word=true forces whole-word matching. We compile a regex with \b anchors
     // around the (escaped-if-literal) pattern, so the fast literal path is
     // bypassed — correctness (no `foo` inside `foobar`) beats the micro-opt.
@@ -1214,7 +1213,7 @@ ExecResult run_builtin(const GrepArgs& a) {
     // Shares, not threads: the host's executor runs them. Share k scans
     // candidates k, k+n, … and counts its own matches against its slice of
     // the cap, so the shares share nothing while they run.
-    std::size_t nshares = std::min<std::size_t>(parallel_width(), kMaxWorkers);
+    std::size_t nshares = std::min<std::size_t>(call.width(), kMaxWorkers);
     nshares = std::max<std::size_t>(1, std::min(nshares, candidates.size()));
     const int share_cap = std::max<int>(1, kMaxScanned / static_cast<int>(nshares));
     std::vector<int> counted(nshares, 0);
@@ -1267,7 +1266,7 @@ ExecResult run_builtin(const GrepArgs& a) {
         }
     };
 
-    parallel_for(nshares, worker);
+    call.split(nshares, worker);
 
     int total = 0;
     bool share_capped = false;
@@ -1432,8 +1431,8 @@ ExecResult run_builtin(const GrepArgs& a) {
 
 // `exec` may be null (a host that runs no programs): then the builtin
 // scanner does the search instead of ripgrep.
-ExecResult run_grep(const GrepArgs& a, Exec* exec) {
-    auto wp = util::make_workspace_path_checked(a.root, "grep");
+ExecResult run_grep(const Call& call, const GrepArgs& a, Exec* exec) {
+    auto wp = util::make_workspace_path_checked(a.root, "grep", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
     GrepArgs gated = a;
     gated.root = wp->string();
@@ -1441,8 +1440,8 @@ ExecResult run_grep(const GrepArgs& a, Exec* exec) {
     // Block mode (context:"block") needs the file content in hand to expand a
     // hit to its enclosing brace scope — the builtin scanner always has it, so
     // force that path (ripgrep's --json gives only ±C fixed context).
-    const bool use_builtin = a.block || !exec || detect_backend(*exec) != Backend::Ripgrep;
-    auto r = use_builtin ? run_builtin(gated) : run_ripgrep(gated, *exec);
+    const bool use_builtin = a.block || !exec || detect_backend(call, *exec) != Backend::Ripgrep;
+    auto r = use_builtin ? run_builtin(call, gated) : run_ripgrep(gated, *exec);
     if (r.has_value()) r->text = util::to_valid_utf8(std::move(r->text));
     return r;
 }
@@ -1506,7 +1505,7 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "Paginated 20 results per page (`limit` changes that). Case-insensitive by default; pass "
         "case_sensitive=true for exact case. Use offset for subsequent pages.",
         grep_schema(), EffectSet{Effect::ReadFs},
-        body_with<GrepArgs>([exec](const GrepArgs& a) { return run_grep(a, exec.get()); }, parse_grep_args), 30'000);
+        body_with<GrepArgs>([exec](const Call& c, const GrepArgs& a) { return run_grep(c, a, exec.get()); }, parse_grep_args), 30'000);
 
     sh.add("glob",
         "Find files by glob pattern. Supports `*` (any run), `?` (one char), "
@@ -1526,7 +1525,7 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "To find USES of a symbol, use `grep` with word=true; for calls with a "
         "specific shape use `search_structural`.",
         find_definition_schema(), EffectSet{Effect::ReadFs},
-        body_with<FindDefinitionArgs>([exec](const FindDefinitionArgs& a) { return run_find_definition(a, *exec); }, parse_find_definition_args), 25'000);
+        body_with<FindDefinitionArgs>([exec](const Call& c, const FindDefinitionArgs& a) { return run_find_definition(c, a, *exec); }, parse_find_definition_args), 25'000);
 }
 
 } // namespace mcp::tools::detail

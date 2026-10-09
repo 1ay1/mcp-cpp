@@ -12,6 +12,7 @@
 #include <mcp/cap/local.hpp>
 
 #include "agtest.hpp"
+#include "test_state.hpp"
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -49,7 +50,7 @@ TEST_CASE("textproc") {
     auto root = fs::temp_directory_path() / ("mcp_textproc_test_" + std::to_string(mcp_getpid()));
     fs::remove_all(root);
     fs::create_directories(root / "src");
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
     auto prev_cwd = fs::current_path();
     fs::current_path(root);
 
@@ -66,6 +67,7 @@ TEST_CASE("textproc") {
     wr(root / "nums.txt", "score 10\nscore 25\nscore 5\n");
 
     HostServices svc;
+    svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     // ── extract: capture group 1 = import identifier ─────────────────────

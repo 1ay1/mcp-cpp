@@ -24,6 +24,8 @@
 //
 // extract is the outstanding outlier: see the PERF note in textproc.cpp.
 
+#include "test_state.hpp"
+#include "test_exec.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/cap/local.hpp>
@@ -54,10 +56,10 @@ Stat time_call(mcp::cap::CapabilityProvider& p, const std::string& name,
         // read/outline dedup per (context, file): a repeat returns the
         // sentinel in microseconds and would time nothing at all. Give every
         // rep its own context so each one does the real work.
-        if (name == "read" || name == "outline")
-            util::set_read_context("bench-" + std::to_string(i));
+        mcp::cap::Request req{name, args};
+        if (name == "read" || name == "outline") req.reader = "bench-" + std::to_string(i);
         const auto t0 = std::chrono::steady_clock::now();
-        auto r = p.execute(mcp::cap::Request{name, args});
+        auto r = p.execute(req);
         const auto t1 = std::chrono::steady_clock::now();
         ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
         bytes = r.text.size();
@@ -82,8 +84,10 @@ int main(int argc, char** argv) {
         std::printf("usage: mcp_tool_bench <directory>\n");
         return 2;
     }
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
     HostServices svc;
+    svc.state = ws_state;
+    svc.exec  = std::make_shared<mcp::test::PopenExec>();
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     std::printf("tool_bench on %s\n", root.string().c_str());

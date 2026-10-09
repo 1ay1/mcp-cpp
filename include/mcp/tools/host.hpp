@@ -46,6 +46,8 @@
 #include <variant>
 #include <vector>
 
+#include <mcp/tools/state.hpp>
+
 namespace mcp::tools {
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -377,6 +379,9 @@ struct ExecResult {
     /// a field and the rest are cases.
     bool truncated = false;
 
+    /// How long it ran, by the host's clock (the library reads none).
+    std::chrono::milliseconds elapsed{0};
+
     [[nodiscard]] bool ok() const noexcept {
         const auto* e = std::get_if<Exited>(&outcome);
         return e && e->code == 0;
@@ -400,6 +405,8 @@ struct Session {
         bool        truncated = false;
         /// Set exactly once, on the poll that observes the end.
         std::optional<ExecOutcome> outcome;
+        /// How long it has been running, by the host's clock.
+        std::chrono::seconds uptime{0};
     };
 
     /// Wait up to `wait` for new output, then return whatever there is.
@@ -470,11 +477,11 @@ struct HostServices {
     std::shared_ptr<Exec>           exec;
     // Null ⇒ the scan tools run single-threaded. See Executor.
     std::shared_ptr<Executor>       executor;
+    // What the tools remember between calls (workspace, caches, background
+    // processes). Null ⇒ make_provider makes a SoleStateAccess, fine for a
+    // host that runs one call at a time. See state.hpp.
+    std::shared_ptr<StateAccess>    state;
 };
 
-/// The scan tools' way into the host's executor (installed from
-/// HostServices::executor by make_provider). Inline when none is installed.
-void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn);
-[[nodiscard]] std::size_t parallel_width() noexcept;
 
 } // namespace mcp::tools

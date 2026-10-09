@@ -1,16 +1,10 @@
 # mcp-cpp — concurrency allowlist (checked by agentty's concurrency_banlist_mcp).
 #
-# mcp-cpp starts no threads and has no connection: the protocol is types and
-# answer tables, and the host drives a jsonrpc engine. Parallel scans go
-# through tools::Executor, which the host installs. What remains below are
-# locks and atomics that protect a structure's own state (a cache, a work
-# cursor); they are being moved out to the caller one by one.
-
-include/mcp/cap/process.hpp: atomic
-src/tools/fs.cpp: mutex
-src/tools/process.cpp: mutex atomic
-src/tools/repomap.cpp: mutex atomic const_cast
-src/tools/util/fs_helpers.cpp: mutex atomic thread_local
-src/tools/util/sandbox.cpp: atomic
-src/tools/util/shellx.cpp: thread_local
-src/tools/util/support.cpp: thread_local
+# mcp-cpp has no runtime: no threads, locks, atomics, thread_locals, clocks,
+# processes or global state. The protocol is types and answer tables, the
+# tools' memory is a ToolState the host owns, and parallel scans go through
+# the host's Executor. Nothing may appear below.
+#
+# repomap.cpp lists C++ keywords it skips as identifiers; "const_cast" there
+# is a string, not a cast.
+src/tools/repomap.cpp: const_cast

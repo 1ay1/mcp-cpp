@@ -11,11 +11,25 @@
 #include <vector>
 #include <string_view>
 
+#include <mcp/tools/state.hpp>        // FileSnapshot
 #include <mcp/tools/util/error.hpp>   // ToolError + factories
 
 namespace mcp::tools::util {
 
 namespace fs = std::filesystem;
+
+// Where a tool may reach: the workspace boundary (canonical) and the extra
+// directories a read may also reach (skills). A value: tool bodies copy it
+// out of the shared state and check paths against it with no lock held.
+struct Bounds {
+    fs::path              workspace;
+    std::vector<fs::path> read_roots;
+};
+
+// A Bounds from the state's fields. An empty workspace means the process cwd.
+[[nodiscard]] Bounds bounds_from(const fs::path& workspace, std::vector<fs::path> read_roots);
+// Canonicalise a root to store in the state (keeps the input if it can't).
+[[nodiscard]] fs::path canonical_root(fs::path root);
 
 // Forward declarations — WorkspacePath sits below ToolError-using factories.
 class WorkspacePath;
@@ -44,7 +58,7 @@ class WorkspacePath;
 // (the model frequently produces them), strips surrounding whitespace and
 // quotes, and returns an absolute path relative to cwd when not already
 // absolute — so error messages name an unambiguous location.
-[[nodiscard]] fs::path normalize_path(std::string_view s);
+[[nodiscard]] fs::path normalize_path(std::string_view s, const Bounds& b);
 
 // Strong typedef for an already-normalised filesystem path. The only way
 // to construct one is from a raw string via `NormalizedPath{"..."}`, which
@@ -53,7 +67,7 @@ class WorkspacePath;
 struct NormalizedPath {
     fs::path value;
 
-    explicit NormalizedPath(std::string_view raw) : value(normalize_path(raw)) {}
+    NormalizedPath(std::string_view raw, const Bounds& b) : value(normalize_path(raw, b)) {}
 
     [[nodiscard]] const fs::path& path() const noexcept { return value; }
     [[nodiscard]] std::string string() const { return value.string(); }
@@ -61,58 +75,17 @@ struct NormalizedPath {
 };
 
 // ── Workspace boundary ──────────────────────────────────────────────────
-// Every filesystem-touching tool refuses paths outside this root. Set
-// once at startup (main.cpp from cwd, or from the --workspace CLI flag);
-// query freely from tool implementations. The default before
-// `set_workspace_root` is called is the process's cwd at first call —
-// safe for tests and standalone helper use.
+// Every filesystem-touching tool refuses paths outside the boundary in its
+// Bounds (the host sets it in the tool state: from the cwd, or --workspace).
 //
 // The boundary is the simplest sandbox layer: it doesn't stop a model
 // from running shell commands that walk anywhere, but it does stop the
 // fast path of "model casually `read`s ~/.ssh/id_rsa or `write`s to
-// /etc/hosts". Pair with bash gating + a future OS-native sandbox
-// (sandbox-exec / bwrap / firejail) for a defense-in-depth story.
-void set_workspace_root(fs::path root);
-
-[[nodiscard]] const fs::path& workspace_root();
-
-// ── Read-dedup context ───────────────────────────────────────
-// WHICH conversation the current tool call belongs to.
-//
-// `read` de-duplicates identical re-reads by answering "the earlier
-// tool_result is still current — refer to that instead". That claim is only
-// true for the context that actually RECEIVED those bytes. The cache behind
-// it is a process-global static, so a subagent — fresh context, own turn
-// budget — would otherwise inherit the parent's entries and be refused
-// content it has never seen. That is not hypothetical: a coder subagent
-// spent its entire 23-turn budget re-requesting one file, got the sentinel
-// every time, and produced nothing.
-//
-// Set this to a stable per-conversation id (thread id, subagent id) around
-// a tool invocation; it is THREAD-LOCAL, so concurrent subagents each carry
-// their own. Empty (the default) means the primary conversation.
-void set_read_context(std::string id);
-
-[[nodiscard]] const std::string& read_context();
-
-// RAII scope: restores the previous context on exit, so nested invocations
-// (a subagent spawning its own tools) can't leak an id to their caller.
-class ReadContextScope {
-public:
-    explicit ReadContextScope(std::string id) : prev_{read_context()} {
-        set_read_context(std::move(id));
-    }
-    ~ReadContextScope() { set_read_context(prev_); }
-    ReadContextScope(const ReadContextScope&)            = delete;
-    ReadContextScope& operator=(const ReadContextScope&) = delete;
-
-private:
-    std::string prev_;
-};
+// /etc/hosts". Pair it with an OS sandbox for defense in depth.
 
 // The ACTIVE PROJECT directory: the process cwd (the directory the user
 // launched agentty in), clamped to stay inside the access boundary. This
-// is distinct from workspace_root(), which is the widenable ACCESS
+// is distinct from the workspace boundary, which is the widenable ACCESS
 // BOUNDARY (`--workspace /` opens the whole disk). Relative tool paths and
 // repo-scoped defaults resolve from HERE, not the boundary, so that
 // `read src/foo.cpp` under `--workspace /` still lands in the project the
@@ -121,22 +94,22 @@ private:
 // from outside a wider `-w` scope). Computed fresh each call (cheap: one
 // current_path() + canonicalise) since agentty never chdir's but tool
 // worker threads or embedders theoretically could.
-[[nodiscard]] fs::path project_root();
+[[nodiscard]] fs::path project_root(const Bounds& b);
 
 // True if `target` is at-or-under the workspace root after canonicalising
 // both sides. Symlink escape is blocked: a link inside the workspace that
 // points to /etc would resolve to /etc and fail the prefix check. Uses
 // weakly_canonical so a not-yet-existing path (e.g. write target) is
 // still checked correctly against its existing parent components.
-[[nodiscard]] bool is_within_workspace(const fs::path& target);
+[[nodiscard]] bool is_within_workspace(const fs::path& target, const Bounds& b);
 
 // Construct a NormalizedPath that's been workspace-checked in one shot.
 // Tools call:
-//     auto p = util::make_workspace_path(*raw, "read");
+//     auto p = util::make_workspace_path(*raw, "read", bounds);
 //     if (!p) return std::unexpected(p.error());
 // `tool_name` only appears in the error message and is purely cosmetic.
 [[nodiscard]] std::expected<struct NormalizedPath, ToolError>
-make_workspace_path(std::string_view raw, std::string_view tool_name);
+make_workspace_path(std::string_view raw, std::string_view tool_name, const Bounds& b);
 
 // ── WorkspacePath ───────────────────────────────────────────
 // A NormalizedPath that carries a *type-level* proof of workspace
@@ -160,14 +133,11 @@ class WorkspacePath {
     explicit WorkspacePath(NormalizedPath n) noexcept : inner_(std::move(n)) {}
 
     friend std::expected<WorkspacePath, ToolError>
-        make_workspace_path_checked(std::string_view raw,
-                                    std::string_view tool_name);
+        make_workspace_path_checked(std::string_view, std::string_view, const Bounds&);
     friend std::expected<WorkspacePath, ToolError>
-        promote_to_workspace_path(NormalizedPath p,
-                                  std::string_view tool_name);
+        promote_to_workspace_path(NormalizedPath, std::string_view, const Bounds&);
     friend std::expected<WorkspacePath, ToolError>
-        make_readable_path_checked(std::string_view raw,
-                                   std::string_view tool_name);
+        make_readable_path_checked(std::string_view, std::string_view, const Bounds&);
 
 public:
     [[nodiscard]] const fs::path&   path()   const noexcept { return inner_.path(); }
@@ -180,7 +150,7 @@ public:
 // yields a WorkspacePath instead of a NormalizedPath — use this in new
 // code so the gate's success travels with the value.
 [[nodiscard]] std::expected<WorkspacePath, ToolError>
-make_workspace_path_checked(std::string_view raw, std::string_view tool_name);
+make_workspace_path_checked(std::string_view raw, std::string_view tool_name, const Bounds& b);
 
 // ── Read-only allowlist roots ───────────────────────────────────────────
 // Skill directories (agentskills.io tier-3 resources) may live OUTSIDE
@@ -192,25 +162,25 @@ make_workspace_path_checked(std::string_view raw, std::string_view tool_name);
 // (make_workspace_path_checked) never do, so an allowlisted root can't
 // become a write escape.
 //
-// Registered by the skills scanner at discovery time. Idempotent;
-// bounded by the skill cap (≤ 64×2 roots per scope).
-void allow_read_root(const fs::path& root);
+// Add `root` (canonicalised) to a read-roots list, once. The host calls it
+// on the state's list when the skills scanner finds a directory.
+void allow_read_root(std::vector<fs::path>& roots, const fs::path& root);
 
-// True when `target` sits under a registered read-allowlist root
-// (post-canonicalisation, symlink-escape checked like the workspace).
-[[nodiscard]] bool is_read_allowlisted(const fs::path& target);
+// True when `target` sits under one of b's read roots (post-
+// canonicalisation, symlink-escape checked like the workspace).
+[[nodiscard]] bool is_read_allowlisted(const fs::path& target, const Bounds& b);
 
 // Read-gate factory: passes when the path is within the workspace OR
 // under a read-allowlist root. Use ONLY in read-side tools (`read`).
 [[nodiscard]] std::expected<WorkspacePath, ToolError>
-make_readable_path_checked(std::string_view raw, std::string_view tool_name);
+make_readable_path_checked(std::string_view raw, std::string_view tool_name, const Bounds& b);
 
 // Promote an already-normalised path through the containment gate.
 // Useful when the caller composed a NormalizedPath itself (e.g.
-// resolving an attachment path against workspace_root()) and now
+// resolving an attachment path against the workspace) and now
 // wants the typed proof.
 [[nodiscard]] std::expected<WorkspacePath, ToolError>
-promote_to_workspace_path(NormalizedPath p, std::string_view tool_name);
+promote_to_workspace_path(NormalizedPath p, std::string_view tool_name, const Bounds& b);
 
 // True for directory names we want recursive traversals (grep / glob /
 // list_dir) to skip by default. Keeps the skip list in one place so tools
@@ -248,28 +218,13 @@ promote_to_workspace_path(NormalizedPath p, std::string_view tool_name);
 // own change). Lookups never block on IO — the cache is purely an
 // in-memory hint surface.
 //
-// The cache is process-wide and persists for the lifetime of the agent.
-// A long-running session that keeps editing the same files only pays
-// the stat cost once per file per change — every subsequent staleness
-// check is a hash-table hit.
-struct FileSnapshot {
-    fs::file_time_type mtime{};
-    std::uintmax_t     size = 0;
-    std::uint64_t      content_hash = 0;   // FNV-1a of the bytes the tool saw
-};
+// The snapshots live in the tool state (ToolState::files), which the host
+// owns for as long as it likes.
+using FileSnapshot = ::mcp::tools::state::FileSnapshot;
 
-// Record that `path` was observed at `mtime` / `size` with the given
-// content hash. `path` is canonicalised internally. Pass `0` for
-// `content_hash` when the caller doesn't have the bytes handy (e.g.
-// stat-only paths); staleness checks then degrade to mtime+size only.
-void record_file_seen(const fs::path& path,
-                      fs::file_time_type mtime,
-                      std::uintmax_t size,
-                      std::uint64_t content_hash) noexcept;
-
-// Look up the snapshot the tools last saw for `path`. Returns nullopt
-// when no tool has touched the file this session. `path` is canonicalised.
-[[nodiscard]] std::optional<FileSnapshot> last_seen_file(const fs::path& path) noexcept;
+// The key a file's snapshot is stored under in the tool state (its
+// canonical path; works for a file that doesn't exist yet).
+[[nodiscard]] std::string snapshot_key(const fs::path& path) noexcept;
 
 // Compute FNV-1a 64-bit over a byte range. Inlineable; used by tools
 // that have already read the file to record its hash in the snapshot.
@@ -332,6 +287,8 @@ enum class StaleVerdict : std::uint8_t {
 // snapshot exists or stat fails. For a stronger guarantee, the caller
 // can additionally hash the file's current bytes and compare against
 // the snapshot's `content_hash`.
-[[nodiscard]] StaleVerdict staleness_of(const fs::path& path) noexcept;
+// `snap` is what the state holds for path (nullopt: never seen).
+[[nodiscard]] StaleVerdict staleness_of(const fs::path& path,
+                                        const std::optional<FileSnapshot>& snap) noexcept;
 
 } // namespace mcp::tools::util

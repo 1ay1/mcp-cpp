@@ -5,6 +5,7 @@
 // agentty's src/tool/tools/diagnostics.cpp.
 
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 #include "tool_body.hpp"
 
 #include <mcp/tools/util/arg_reader.hpp>
@@ -39,9 +40,8 @@ struct DiagnosticsArgs {
 
 enum class BuildSystem { None, CMake, Cargo, Go, Node, Make };
 
-[[nodiscard]] BuildSystem detect_build_system() noexcept {
+[[nodiscard]] BuildSystem detect_build_system(const fs::path& root) noexcept {
     std::error_code ec;
-    const auto root = util::project_root();
     if (fs::exists(root / "build/build.ninja", ec) || fs::exists(root / "build/Makefile", ec)) return BuildSystem::CMake;
     if (fs::exists(root / "Cargo.toml", ec))    return BuildSystem::Cargo;
     if (fs::exists(root / "go.mod", ec))        return BuildSystem::Go;
@@ -50,14 +50,14 @@ enum class BuildSystem { None, CMake, Cargo, Go, Node, Make };
     return BuildSystem::None;
 }
 
-[[nodiscard]] std::vector<std::string> build_argv_for(BuildSystem bs) {
+[[nodiscard]] std::vector<std::string> build_argv_for(BuildSystem bs, const fs::path& project) {
     // The ACTIVE PROJECT (cwd clamped inside the boundary), not the raw
     // access boundary: under `--workspace /` the boundary is `/`, and
     // `cmake --build /build` / `--manifest-path /Cargo.toml` are wrong.
-    const auto root = util::project_root().string();
+    const auto root = project.string();
     switch (bs) {
-        case BuildSystem::CMake: return {"cmake", "--build", (util::project_root() / "build").string()};
-        case BuildSystem::Cargo: return {"cargo", "check", "--manifest-path", (util::project_root() / "Cargo.toml").string()};
+        case BuildSystem::CMake: return {"cmake", "--build", (project / "build").string()};
+        case BuildSystem::Cargo: return {"cargo", "check", "--manifest-path", (project / "Cargo.toml").string()};
         case BuildSystem::Go:    return {"go", "-C", root, "build", "./..."};
         case BuildSystem::Node:  return {"npm", "--prefix", root, "exec", "--", "tsc", "--noEmit"};
         case BuildSystem::Make:  return {"make", "-C", root, "-n"};
@@ -111,10 +111,11 @@ std::expected<DiagnosticsArgs, ToolError> parse_diagnostics_args(const json& j) 
     return out;
 }
 
-ExecResult run_diagnostics(const DiagnosticsArgs& a, Exec& exec) {
+ExecResult run_diagnostics(const Call& call, const DiagnosticsArgs& a, Exec& exec) {
     std::vector<std::string> auto_argv;
     if (a.command.empty()) {
-        auto_argv = build_argv_for(detect_build_system());
+        const auto project = util::project_root(bounds(call));
+        auto_argv = build_argv_for(detect_build_system(project), project);
         if (auto_argv.empty())
             return std::unexpected(ToolError::not_found("no build system detected; pass a command"));
     }
@@ -190,17 +191,17 @@ std::expected<TestArgs, ToolError> parse_test_args(const json& j) {
     };
 }
 
-std::vector<std::string> test_argv_for(BuildSystem bs, const TestArgs& a) {
+std::vector<std::string> test_argv_for(BuildSystem bs, const TestArgs& a, const fs::path& project) {
     std::vector<std::string> argv;
-    const auto root = util::project_root().string();
+    const auto root = project.string();
     switch (bs) {
         case BuildSystem::CMake:
-            argv = {"ctest", "--test-dir", (util::project_root() / "build").string(), "--output-on-failure"};
+            argv = {"ctest", "--test-dir", (project / "build").string(), "--output-on-failure"};
             if (!a.filter.empty()) argv.insert(argv.end(), {"-R", a.filter});
             if (a.repeat > 1) argv.insert(argv.end(), {"--repeat", "until-fail:" + std::to_string(a.repeat)});
             break;
         case BuildSystem::Cargo:
-            argv = {"cargo", "test", "--manifest-path", (util::project_root() / "Cargo.toml").string()};
+            argv = {"cargo", "test", "--manifest-path", (project / "Cargo.toml").string()};
             if (!a.filter.empty()) argv.push_back(a.filter);
             break;
         case BuildSystem::Go:
@@ -255,9 +256,10 @@ std::vector<std::string> failing_test_lines(std::string_view output,
     return out;
 }
 
-ExecResult run_tests(const TestArgs& a, Exec& exec) {
-    const auto bs = a.command.empty() ? detect_build_system() : BuildSystem::None;
-    auto argv = a.command.empty() ? test_argv_for(bs, a)
+ExecResult run_tests(const Call& call, const TestArgs& a, Exec& exec) {
+    const auto project = util::project_root(bounds(call));
+    const auto bs = a.command.empty() ? detect_build_system(project) : BuildSystem::None;
+    auto argv = a.command.empty() ? test_argv_for(bs, a, project)
                                   : std::vector<std::string>{};
     if (a.command.empty() && argv.empty())
         return std::unexpected(ToolError::not_found(
@@ -336,7 +338,7 @@ void register_diagnostics_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "Run the project's build or lint command and return errors/warnings. "
         "Auto-detects build system (CMake, cargo, go, npm, make).",
         diagnostics_schema(), EffectSet{Effect::Exec},
-        body_with<DiagnosticsArgs>([exec](const DiagnosticsArgs& a) { return run_diagnostics(a, *exec); }, parse_diagnostics_args), 30'000);
+        body_with<DiagnosticsArgs>([exec](const Call& c, const DiagnosticsArgs& a) { return run_diagnostics(c, a, *exec); }, parse_diagnostics_args), 30'000);
 }
 
 void register_test_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
@@ -346,7 +348,7 @@ void register_test_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "Run focused project tests with structured pass/fail status, live output, filtering, repetition, and timeout. "
         "Auto-detects CTest, Cargo, Go, npm, or Make; pass command for custom runners.",
         test_schema(), EffectSet{Effect::Exec},
-        body_with<TestArgs>([exec](const TestArgs& a) { return run_tests(a, *exec); }, parse_test_args), 40'000);
+        body_with<TestArgs>([exec](const Call& c, const TestArgs& a) { return run_tests(c, a, *exec); }, parse_test_args), 40'000);
 }
 
 } // namespace mcp::tools::detail

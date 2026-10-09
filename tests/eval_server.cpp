@@ -9,6 +9,8 @@
 // Usage (driven by evals/run.py):
 //   eval_server -w <workspace>   < requests.jsonl   > responses.jsonl
 
+#include "test_state.hpp"
+#include "test_exec.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
@@ -29,9 +31,13 @@ int main(int argc, char** argv) {
     std::string workspace = ".";
     for (int i = 1; i + 1 < argc; ++i)
         if (std::string_view(argv[i]) == "-w") workspace = argv[i + 1];
-    util::set_workspace_root(workspace);
+    auto ws_state = mcp::test::state_at(workspace);
 
     HostServices svc;                        // no http/git backends needed
+
+    svc.state = ws_state;
+
+    svc.exec  = std::make_shared<mcp::test::PopenExec>();
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     auto reply = [](const json& id, json result) {

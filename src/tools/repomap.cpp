@@ -30,18 +30,17 @@
 // re-stats every call (cheap), the parse+graph only rebuilds on change.
 
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 
 #include <mcp/tools/util/fs_helpers.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -224,12 +223,23 @@ bool is_nested_project_root(const fs::path& dir) {
 // two projects in one session) doesn't force a full re-parse each call —
 // the single-slot cache it replaced thrashed to zero hit-rate the moment a
 // second root appeared. LRU eviction keeps the memory bounded.
-const RepoGraph& build_graph(const fs::path& root) {
-    struct CacheSlot { std::string root; RepoGraph graph; std::uint64_t seq; };
-    static std::vector<CacheSlot> cache;
-    static std::uint64_t seq_counter = 0;
-    constexpr std::size_t kCacheSlots = 4;
+// Built graphs, kept in the tool state (ToolState::repo_graphs) so a repeat
+// call on an unchanged tree skips the parse. A few roots, least recently
+// used evicted.
+struct GraphCache {
+    struct Slot { std::string root; std::shared_ptr<const RepoGraph> graph; std::uint64_t seq = 0; };
+    std::vector<Slot> slots;
+    std::uint64_t     seq = 0;
+};
+constexpr std::size_t kCacheSlots = 4;
 
+GraphCache& graph_cache(ToolState& s) {
+    if (!s.repo_graphs) s.repo_graphs = std::make_shared<GraphCache>();
+    return *static_cast<GraphCache*>(s.repo_graphs.get());
+}
+
+std::shared_ptr<const RepoGraph> build_graph(const Call& call, const fs::path& root,
+                                             const util::Bounds& b) {
     const std::string root_key = root.string();
 
     // Walk pass 1: enumerate files + stat signature.
@@ -275,7 +285,7 @@ const RepoGraph& build_graph(const fs::path& root) {
         // — but a `path=` subdir arg, a hardlink, or a future walk change could
         // in principle surface a path outside the boundary. One cheap check per
         // accepted source file makes the map pollution-proof unconditionally.
-        if (!util::is_within_workspace(entry.path())) continue;
+        if (!util::is_within_workspace(entry.path(), b)) continue;
         auto sz = entry.file_size(e2);
         // Skip empty files (no defs, no refs) and minified/generated blobs
         // (a 400KB single-line bundle is all noise and blows the parse time).
@@ -291,13 +301,16 @@ const RepoGraph& build_graph(const fs::path& root) {
 
     // Cache lookup: a slot with the same root AND an unchanged stat
     // signature is an exact hit. Touch its LRU seq and return it.
-    for (auto& slot : cache) {
-        if (slot.root == root_key && slot.graph.signature == sig
-            && !slot.graph.files.empty()) {
-            slot.seq = ++seq_counter;
-            return slot.graph;
-        }
-    }
+    if (auto hit = call.with([&](ToolState& s) -> std::shared_ptr<const RepoGraph> {
+            auto& c = graph_cache(s);
+            for (auto& slot : c.slots)
+                if (slot.root == root_key && slot.graph->signature == sig && !slot.graph->files.empty()) {
+                    slot.seq = ++c.seq;
+                    return slot.graph;
+                }
+            return nullptr;
+        }))
+        return hit;
 
     // Miss (new root, or the tree changed). Parse into a fresh graph.
     RepoGraph g;
@@ -305,13 +318,11 @@ const RepoGraph& build_graph(const fs::path& root) {
     std::vector<std::string> bodies;
     bodies.reserve(cands.size());
     const auto& pats = def_patterns();
-    // Walltime budget: on a pathological tree (thousands of large files, a
-    // slow network mount) the regex parse could stall the whole turn. Cap the
-    // parse pass; whatever was parsed before the deadline still yields a
-    // useful (if partial) map rather than a hang. Generous — a normal repo
-    // parses in tens of ms.
-    const auto parse_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    // On a pathological tree (thousands of large files, a slow network
+    // mount) the regex parse could stall the whole turn. The candidate cap
+    // bounds the work, and the parse stops early when the caller cancels
+    // (the host's timeout for the tool call, or the user); whatever parsed
+    // by then still yields a useful, partial map.
 
     // Parse each candidate file into a (FileNode, body) pair. The read +
     // per-line def regex scan is by FAR the dominant cost of build_graph
@@ -385,33 +396,19 @@ const RepoGraph& build_graph(const fs::path& root) {
         std::vector<FileNode>    parsed(cands.size());
         std::vector<std::string> parsed_bodies(cands.size());
         std::vector<char>        ok(cands.size(), 0);
-        std::atomic<std::size_t> next_idx{0};
-        std::atomic<bool>        past_deadline{false};
 
         // The host's executor decides the threads; we only choose how many
-        // shares. Small trees don't benefit from fanning out; run inline.
-        std::size_t nthreads = std::min<std::size_t>(parallel_width(), 16);
-        if (cands.size() < 32) nthreads = 1;
-
-        auto worker = [&] {
-            for (;;) {
-                std::size_t i = next_idx.fetch_add(1, std::memory_order_relaxed);
-                if (i >= cands.size()) break;
-                // Check the shared deadline every 64 files (cheap; a steady
-                // clock read per file would add up on a huge tree).
-                if ((i & 63) == 0
-                    && std::chrono::steady_clock::now() > parse_deadline) {
-                    past_deadline.store(true, std::memory_order_relaxed);
-                    break;
-                }
-                if (past_deadline.load(std::memory_order_relaxed)) break;
-                if (parse_one(cands[i], parsed[i], parsed_bodies[i]))
-                    ok[i] = 1;
+        // shares. Share k parses candidates k, k+n, … into its own slots.
+        // Small trees don't benefit from fanning out; run inline.
+        std::size_t nshares = std::min<std::size_t>(call.width(), 16);
+        if (cands.size() < 32) nshares = 1;
+        auto worker = [&](std::size_t k) {
+            for (std::size_t i = k, n = 0; i < cands.size(); i += nshares, ++n) {
+                if ((n & 63) == 63 && call.cancel_requested()) break;
+                if (parse_one(cands[i], parsed[i], parsed_bodies[i])) ok[i] = 1;
             }
         };
-
-        if (nthreads <= 1) worker();
-        else parallel_for(nthreads, [&](std::size_t) { worker(); });
+        call.split(nshares, worker);
 
         // Merge in index order — deterministic regardless of which thread got
         // which file.
@@ -480,25 +477,27 @@ const RepoGraph& build_graph(const fs::path& root) {
         }
     }
 
-    // Install into the cache under root_key. Reuse an existing slot for the
-    // same root (tree changed) if present; else evict the LRU slot once full.
-    CacheSlot* dst = nullptr;
-    for (auto& slot : cache)
-        if (slot.root == root_key) { dst = &slot; break; }
-    if (!dst) {
-        if (cache.size() < kCacheSlots) {
-            cache.push_back(CacheSlot{});
-            dst = &cache.back();
-        } else {
-            dst = &*std::min_element(
-                cache.begin(), cache.end(),
-                [](const CacheSlot& a, const CacheSlot& b) { return a.seq < b.seq; });
+    // Install under root_key. Reuse the slot for the same root (tree
+    // changed) if present; else evict the least recently used once full.
+    auto built = std::make_shared<const RepoGraph>(std::move(g));
+    call.with([&](ToolState& s) {
+        auto& c = graph_cache(s);
+        GraphCache::Slot* dst = nullptr;
+        for (auto& slot : c.slots)
+            if (slot.root == root_key) { dst = &slot; break; }
+        if (!dst) {
+            if (c.slots.size() < kCacheSlots) {
+                dst = &c.slots.emplace_back();
+            } else {
+                dst = &*std::min_element(c.slots.begin(), c.slots.end(),
+                    [](const auto& x, const auto& y) { return x.seq < y.seq; });
+            }
         }
-    }
-    dst->root = root_key;
-    dst->graph = std::move(g);
-    dst->seq = ++seq_counter;
-    return dst->graph;
+        dst->root  = root_key;
+        dst->graph = built;
+        dst->seq   = ++c.seq;
+    });
+    return built;
 }
 
 // PageRank with optional personalization. Damping 0.85. Iterates until the
@@ -569,7 +568,7 @@ struct RepoMapArgs {
     int         budget = 8000;   // bytes (~2000 tokens)
 };
 
-mcp::cap::Result run_repo_map(const Json& args) {
+mcp::cap::Result run_repo_map(const Call& call, const Json& args) {
     RepoMapArgs a;
     if (args.is_object()) {
         a.focus  = args.value("focus", std::string{});
@@ -586,18 +585,16 @@ mcp::cap::Result run_repo_map(const Json& args) {
     // subdirectory (or cwd was later changed), which is exactly the FIRST
     // call a fresh session makes on a big repo. An explicit relative `path`
     // still resolves against cwd as usual.
+    const auto b = bounds(call);
     if (a.root.empty() || a.root == ".")
-        a.root = util::project_root().string();
+        a.root = util::project_root(b).string();
 
-    auto wp = util::make_workspace_path_checked(a.root, "repo_map");
+    auto wp = util::make_workspace_path_checked(a.root, "repo_map", b);
     if (!wp) return mcp::cap::Result::error(wp.error().detail);
 
-    static std::mutex mu;
-    std::lock_guard<std::mutex> lock(mu);
-
-    // The cached graph is mutated by pagerank (rank field) — take a working
-    // copy of the const cache so personalization doesn't leak across calls.
-    RepoGraph g = build_graph(wp->path());
+    // The cached graph is shared and const; pagerank writes ranks, so work
+    // on a copy and personalisation doesn't leak across calls.
+    RepoGraph g = *build_graph(call, wp->path(), b);
     if (g.files.empty())
         return mcp::cap::Result::error(
             "repo_map: no source files found under " + wp->path().string());

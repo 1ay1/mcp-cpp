@@ -5,6 +5,7 @@
 // drive agentty's diff-review / changes-strip UI and stay load-bearing.
 
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 #include "tool_body.hpp"
 
 #include <mcp/tools/util/arg_reader.hpp>
@@ -90,25 +91,12 @@ hardened_git_argv(const std::vector<std::string>& argv) {
     return hardened;
 }
 
-// Run git under the host sandbox when one is active.
-//
-// Every git spawn in this file goes through here, and that is the point: git
-// EXECUTES CODE on the user's behalf. A commit runs pre-commit/commit-msg
-// hooks, a checkout runs post-checkout, a config'd credential helper or
-// core.fsmonitor is an arbitrary command, and all of it comes from the
-// repository -- which may have arrived by `git clone`.
-//
-// The call sites here used to use util::run_argv_s, which is the UNSANDBOXED
-// runner. Measured on agentty: a pre-commit hook invoked through the git_commit
-// tool wrote to $HOME, outside the workspace, while the identical write through
-// the shell tool was refused. The shell tool was confined and the git tools
-// were not, which is backwards -- a git hook is strictly more dangerous than an
-// `echo`, because the user did not type it and may never read it.
-//
-// util::sandbox::run_argv is the argv-form wrapper (no `sh -c`, so commit
-// messages with quotes and $vars survive exactly), and it falls through to the
-// plain runner when no backend is active -- so this is a no-op where the
-// sandbox is off rather than a new failure mode.
+// Every git spawn in this file goes through here, and through the host's
+// Exec, which applies its sandbox. That matters because git EXECUTES CODE on
+// the user's behalf: a commit runs pre-commit/commit-msg hooks, a checkout
+// runs post-checkout, a credential helper or core.fsmonitor is an arbitrary
+// command, and all of it comes from the repository. argv form (no `sh -c`),
+// so commit messages with quotes and $vars survive exactly.
 [[nodiscard]] RunResult run_git_argv(
         Exec& exec,
         const std::vector<std::string>& argv,
@@ -197,11 +185,11 @@ run_git(Exec& exec, const std::vector<std::string>& argv, std::string_view op,
 // toplevel is inside the access boundary, that's the repo to use. Only
 // fall back to the workspace root itself when cwd is unusable or its repo
 // escapes the boundary.
-std::filesystem::path default_git_start() {
+std::filesystem::path default_git_start(const util::Bounds& b) {
     // The active project (process cwd clamped inside the access boundary) is
     // the repo to run git in — shared with normalize_path and checkpoint.cpp
     // so all three agree on "the project" vs "the access boundary".
-    return util::project_root();
+    return util::project_root(b);
 }
 
 // Resolve the repository directory to run git in. Given a raw path (a
@@ -216,17 +204,17 @@ std::filesystem::path default_git_start() {
 // the workspace is not containment because Git would discover the same
 // parent repository again.
 std::expected<std::string, ToolError>
-resolve_git_dir(Exec& exec, std::string_view checked) {
+resolve_git_dir(Exec& exec, std::string_view checked, const util::Bounds& b) {
     namespace fs = std::filesystem;
     fs::path start = checked.empty()
-        ? default_git_start()
+        ? default_git_start(b)
         : fs::path{std::string{checked}};
     std::error_code ec;
     // If `start` is a file, its parent is the directory to probe.
     fs::path dir = start;
     if (!checked.empty() && !fs::is_directory(start, ec))
         dir = start.parent_path();
-    if (dir.empty()) dir = default_git_start();
+    if (dir.empty()) dir = default_git_start(b);
 
     auto r = run_git_argv(exec, 
         {"git", "-C", dir.string(), "rev-parse", "--show-toplevel"}, 4096);
@@ -235,7 +223,7 @@ resolve_git_dir(Exec& exec, std::string_view checked) {
         while (!top.empty() && (top.back() == '\n' || top.back() == '\r'))
             top.pop_back();
         if (!top.empty()) {
-            const fs::path& ws = util::workspace_root();
+            const fs::path& ws = b.workspace;
             fs::path topc = fs::weakly_canonical(fs::path{top}, ec);
             fs::path wsc  = fs::weakly_canonical(ws, ec);
             if (path_under(topc, wsc)) return top;
@@ -453,7 +441,7 @@ struct GitStatusArgs {
 
 std::expected<GitStatusArgs, ToolError> parse_git_status_args(const json& j) {
     util::ArgReader ar(j);
-    // Default is empty, NOT ".": an empty path lets resolve_git_dir(exec, ) pick
+    // Default is empty, NOT ".": an empty path lets resolve_git_dir() pick
     // the smart default (the process cwd / the project). A literal "." is
     // workspace-checked into the access boundary, which under `--workspace /`
     // becomes `/` and makes `git -C / status` fail "not a git repository".
@@ -463,14 +451,15 @@ std::expected<GitStatusArgs, ToolError> parse_git_status_args(const json& j) {
     };
 }
 
-ExecResult run_git_status(const GitStatusArgs& a, Exec& exec) {
+ExecResult run_git_status(const Call& call, const GitStatusArgs& a, Exec& exec) {
+    const auto b = bounds(call);
     std::string checked;
     if (!a.root.empty()) {
-        auto wp = util::make_workspace_path_checked(a.root, "git_status");
+        auto wp = util::make_workspace_path_checked(a.root, "git_status", b);
         if (!wp) return std::unexpected(std::move(wp.error()));
         checked = wp->string();
     }
-    auto git_dir = resolve_git_dir(exec, checked);
+    auto git_dir = resolve_git_dir(exec, checked, b);
     if (!git_dir) return std::unexpected(std::move(git_dir.error()));
     // porcelain=v1 (the `git status -s` short format: `XY path`, one line per
     // change, plus a `## branch...upstream [ahead/behind]` header). Stable
@@ -547,17 +536,18 @@ std::expected<GitDiffArgs, ToolError> parse_git_diff_args(const json& j) {
     };
 }
 
-ExecResult run_git_diff(const GitDiffArgs& a, Exec& exec) {
+ExecResult run_git_diff(const Call& call, const GitDiffArgs& a, Exec& exec) {
+    const auto b = bounds(call);
     if (auto v = validate_ref(a.ref); !v) return std::unexpected(std::move(v.error()));
     std::string checked;
     std::string pathspec;
     if (!a.path.empty()) {
-        auto wp = util::make_workspace_path_checked(a.path, "git_diff");
+        auto wp = util::make_workspace_path_checked(a.path, "git_diff", b);
         if (!wp) return std::unexpected(std::move(wp.error()));
         checked  = wp->string();
         pathspec = wp->string();
     }
-    auto git_dir = resolve_git_dir(exec, checked);
+    auto git_dir = resolve_git_dir(exec, checked, b);
     if (!git_dir) return std::unexpected(std::move(git_dir.error()));
     std::vector<std::string> argv = {"git", "-C", *git_dir, "diff",
                                      "--stat"};
@@ -637,7 +627,8 @@ std::expected<GitLogArgs, ToolError> parse_git_log_args(const json& j) {
     };
 }
 
-ExecResult run_git_log(const GitLogArgs& a, Exec& exec) {
+ExecResult run_git_log(const Call& call, const GitLogArgs& a, Exec& exec) {
+    const auto b = bounds(call);
     if (auto v = validate_ref(a.ref); !v) return std::unexpected(std::move(v.error()));
     int n = a.count;
     if (n <= 0) n = 20;
@@ -646,12 +637,12 @@ ExecResult run_git_log(const GitLogArgs& a, Exec& exec) {
     std::string checked;
     std::string pathspec;
     if (!a.path.empty()) {
-        auto wp = util::make_workspace_path_checked(a.path, "git_log");
+        auto wp = util::make_workspace_path_checked(a.path, "git_log", b);
         if (!wp) return std::unexpected(std::move(wp.error()));
         checked  = wp->string();
         pathspec = wp->string();
     }
-    auto git_dir = resolve_git_dir(exec, checked);
+    auto git_dir = resolve_git_dir(exec, checked, b);
     if (!git_dir) return std::unexpected(std::move(git_dir.error()));
     std::vector<std::string> argv = {"git", "-C", *git_dir, "log"};
     if (a.oneline) {
@@ -731,7 +722,8 @@ std::expected<GitCommitArgs, ToolError> parse_git_commit_args(const json& j) {
     };
 }
 
-ExecResult run_git_commit(const GitCommitArgs& a, Exec& exec) {
+ExecResult run_git_commit(const Call& call, const GitCommitArgs& a, Exec& exec) {
+    const auto b = bounds(call);
     // Resolve the repo to commit in from (in priority order): the explicit
     // `path` arg, the first staged file, else the smart default (the process
     // cwd — the project). This is what makes committing files in a sibling
@@ -739,16 +731,16 @@ ExecResult run_git_commit(const GitCommitArgs& a, Exec& exec) {
     // repository" when the workspace boundary is wide (e.g. `--workspace /`).
     std::string repo_hint;
     if (!a.path.empty()) {
-        auto wp = util::make_workspace_path_checked(a.path, "git_commit");
+        auto wp = util::make_workspace_path_checked(a.path, "git_commit", b);
         if (!wp) return std::unexpected(std::move(wp.error()));
         repo_hint = wp->string();
     } else if (!a.files.empty()) {
         auto wp = util::make_workspace_path_checked(a.files.front(),
-                                                    "git_commit");
+                                                    "git_commit", b);
         if (!wp) return std::unexpected(std::move(wp.error()));
         repo_hint = wp->string();
     }
-    auto git_dir = resolve_git_dir(exec, repo_hint);
+    auto git_dir = resolve_git_dir(exec, repo_hint, b);
     if (!git_dir) return std::unexpected(std::move(git_dir.error()));
 
     if (a.stage_all) {
@@ -767,11 +759,11 @@ ExecResult run_git_commit(const GitCommitArgs& a, Exec& exec) {
         fs::path stage_path;
         fs::path raw{f};
         if (raw.is_absolute()) {
-            auto wp = util::make_workspace_path_checked(f, "git_commit");
+            auto wp = util::make_workspace_path_checked(f, "git_commit", b);
             if (!wp) return std::unexpected(std::move(wp.error()));
             stage_path = fs::path{wp->string()};
         } else {
-            auto workspace_path = util::make_workspace_path_checked(f, "git_commit");
+            auto workspace_path = util::make_workspace_path_checked(f, "git_commit", b);
             if (!workspace_path)
                 return std::unexpected(std::move(workspace_path.error()));
 
@@ -784,7 +776,7 @@ ExecResult run_git_commit(const GitCommitArgs& a, Exec& exec) {
                 stage_path = checked_workspace;
             } else {
                 auto repo_relative = util::make_workspace_path_checked(
-                    (fs::path{*git_dir} / raw).string(), "git_commit");
+                    (fs::path{*git_dir} / raw).string(), "git_commit", b);
                 if (!repo_relative)
                     return std::unexpected(std::move(repo_relative.error()));
                 stage_path = fs::path{repo_relative->string()};
@@ -883,15 +875,16 @@ std::expected<GitShowArgs, ToolError> parse_git_show_args(const json& j) {
     return GitShowArgs{ar.str("ref", "HEAD"), std::move(path), format == "file"};
 }
 
-ExecResult run_git_show(const GitShowArgs& a, Exec& exec) {
+ExecResult run_git_show(const Call& call, const GitShowArgs& a, Exec& exec) {
+    const auto b = bounds(call);
     if (auto v = validate_ref(a.ref); !v) return std::unexpected(std::move(v.error()));
     std::string checked_path;
     if (!a.path.empty()) {
-        auto wp = util::make_workspace_path_checked(a.path, "git_show");
+        auto wp = util::make_workspace_path_checked(a.path, "git_show", b);
         if (!wp) return std::unexpected(wp.error());
         checked_path = wp->string();
     }
-    auto git_dir = resolve_git_dir(exec, checked_path);
+    auto git_dir = resolve_git_dir(exec, checked_path, b);
     if (!git_dir) return std::unexpected(std::move(git_dir.error()));
     std::vector<std::string> argv{"git", "-C", *git_dir, "show"};
     if (a.file_content) {
@@ -926,11 +919,12 @@ std::expected<GitBlameArgs, ToolError> parse_git_blame_args(const json& j) {
     return GitBlameArgs{*path, ar.str("ref", "HEAD"), start, end};
 }
 
-ExecResult run_git_blame(const GitBlameArgs& a, Exec& exec) {
+ExecResult run_git_blame(const Call& call, const GitBlameArgs& a, Exec& exec) {
+    const auto b = bounds(call);
     if (auto v = validate_ref(a.ref); !v) return std::unexpected(std::move(v.error()));
-    auto wp = util::make_workspace_path_checked(a.path, "git_blame");
+    auto wp = util::make_workspace_path_checked(a.path, "git_blame", b);
     if (!wp) return std::unexpected(wp.error());
-    auto git_dir = resolve_git_dir(exec, wp->string());
+    auto git_dir = resolve_git_dir(exec, wp->string(), b);
     if (!git_dir) return std::unexpected(std::move(git_dir.error()));
     std::vector<std::string> argv{"git", "-C", *git_dir, "blame", "--date=short"};
     if (a.start > 0) argv.insert(argv.end(), {"-L", std::to_string(a.start) + "," + std::to_string(a.end)});
@@ -989,14 +983,15 @@ std::expected<GitBranchArgs, ToolError> parse_git_branch_args(const json& j) {
     };
 }
 
-ExecResult run_git_branch(const GitBranchArgs& a, Exec& exec) {
+ExecResult run_git_branch(const Call& call, const GitBranchArgs& a, Exec& exec) {
+    const auto b = bounds(call);
     std::string checked;
     if (!a.path.empty()) {
-        auto wp = util::make_workspace_path_checked(a.path, "git_branch");
+        auto wp = util::make_workspace_path_checked(a.path, "git_branch", b);
         if (!wp) return std::unexpected(std::move(wp.error()));
         checked = wp->string();
     }
-    auto git_dir = resolve_git_dir(exec, checked);
+    auto git_dir = resolve_git_dir(exec, checked, b);
     if (!git_dir) return std::unexpected(std::move(git_dir.error()));
     const std::string& d = *git_dir;
 
@@ -1127,14 +1122,15 @@ std::expected<GitStashArgs, ToolError> parse_git_stash_args(const json& j) {
     };
 }
 
-ExecResult run_git_stash(const GitStashArgs& a, Exec& exec) {
+ExecResult run_git_stash(const Call& call, const GitStashArgs& a, Exec& exec) {
+    const auto b = bounds(call);
     std::string checked;
     if (!a.path.empty()) {
-        auto wp = util::make_workspace_path_checked(a.path, "git_stash");
+        auto wp = util::make_workspace_path_checked(a.path, "git_stash", b);
         if (!wp) return std::unexpected(std::move(wp.error()));
         checked = wp->string();
     }
-    auto git_dir = resolve_git_dir(exec, checked);
+    auto git_dir = resolve_git_dir(exec, checked, b);
     if (!git_dir) return std::unexpected(std::move(git_dir.error()));
     const std::string& d = *git_dir;
 
@@ -1232,14 +1228,15 @@ std::expected<GitRebaseArgs, ToolError> parse_git_rebase_args(const json& j) {
     };
 }
 
-ExecResult run_git_rebase(const GitRebaseArgs& a, Exec& exec) {
+ExecResult run_git_rebase(const Call& call, const GitRebaseArgs& a, Exec& exec) {
+    const auto b = bounds(call);
     std::string checked;
     if (!a.path.empty()) {
-        auto wp = util::make_workspace_path_checked(a.path, "git_rebase");
+        auto wp = util::make_workspace_path_checked(a.path, "git_rebase", b);
         if (!wp) return std::unexpected(std::move(wp.error()));
         checked = wp->string();
     }
-    auto git_dir = resolve_git_dir(exec, checked);
+    auto git_dir = resolve_git_dir(exec, checked, b);
     if (!git_dir) return std::unexpected(std::move(git_dir.error()));
     const std::string& d = *git_dir;
 
@@ -1320,14 +1317,15 @@ parse_git_cherry_pick_args(const json& j) {
     };
 }
 
-ExecResult run_git_cherry_pick(const GitCherryPickArgs& a, Exec& exec) {
+ExecResult run_git_cherry_pick(const Call& call, const GitCherryPickArgs& a, Exec& exec) {
+    const auto b = bounds(call);
     std::string checked;
     if (!a.path.empty()) {
-        auto wp = util::make_workspace_path_checked(a.path, "git_cherry_pick");
+        auto wp = util::make_workspace_path_checked(a.path, "git_cherry_pick", b);
         if (!wp) return std::unexpected(std::move(wp.error()));
         checked = wp->string();
     }
-    auto git_dir = resolve_git_dir(exec, checked);
+    auto git_dir = resolve_git_dir(exec, checked, b);
     if (!git_dir) return std::unexpected(std::move(git_dir.error()));
     const std::string& d = *git_dir;
 
@@ -1537,59 +1535,59 @@ void register_git_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "Show the current git status: branch, staged/unstaged changes, "
         "untracked files, ahead/behind counts.",
         git_status_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitStatusArgs>([exec](const GitStatusArgs& a) { return run_git_status(a, *exec); }, parse_git_status_args), 30'000);
+        body_with<GitStatusArgs>([exec](const Call& c, const GitStatusArgs& a) { return run_git_status(c, a, *exec); }, parse_git_status_args), 30'000);
 
     sh.add("git_diff",
         "Show git diff. By default shows unstaged changes. Use staged=true "
         "for staged changes, or specify a ref/range.",
         git_diff_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitDiffArgs>([exec](const GitDiffArgs& a) { return run_git_diff(a, *exec); }, parse_git_diff_args), 60'000);
+        body_with<GitDiffArgs>([exec](const Call& c, const GitDiffArgs& a) { return run_git_diff(c, a, *exec); }, parse_git_diff_args), 60'000);
 
     sh.add("git_log",
         "Show git commit history. Returns commit hash, author, date, and message.",
         git_log_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitLogArgs>([exec](const GitLogArgs& a) { return run_git_log(a, *exec); }, parse_git_log_args), 30'000);
+        body_with<GitLogArgs>([exec](const Call& c, const GitLogArgs& a) { return run_git_log(c, a, *exec); }, parse_git_log_args), 30'000);
 
     sh.add("git_show",
         "Show a commit with metadata and patch, or read one file exactly as it existed at a revision.",
         git_show_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitShowArgs>([exec](const GitShowArgs& a) { return run_git_show(a, *exec); }, parse_git_show_args), 60'000);
+        body_with<GitShowArgs>([exec](const Call& c, const GitShowArgs& a) { return run_git_show(c, a, *exec); }, parse_git_show_args), 60'000);
 
     sh.add("git_blame",
         "Annotate a file or line range with the commit, author, date, and source line that last changed it.",
         git_blame_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitBlameArgs>([exec](const GitBlameArgs& a) { return run_git_blame(a, *exec); }, parse_git_blame_args), 40'000);
+        body_with<GitBlameArgs>([exec](const Call& c, const GitBlameArgs& a) { return run_git_blame(c, a, *exec); }, parse_git_blame_args), 40'000);
 
     sh.add("git_commit",
         "Stage files and create a git commit. Specify files to stage, "
         "or use stage_all to stage everything.",
         git_commit_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitCommitArgs>([exec](const GitCommitArgs& a) { return run_git_commit(a, *exec); }, parse_git_commit_args), 0);
+        body_with<GitCommitArgs>([exec](const Call& c, const GitCommitArgs& a) { return run_git_commit(c, a, *exec); }, parse_git_commit_args), 0);
 
     sh.add("git_branch",
         "List, create, switch, or delete git branches. action=list (default) "
         "is read-only; create/switch/delete take a `name`.",
         git_branch_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitBranchArgs>([exec](const GitBranchArgs& a) { return run_git_branch(a, *exec); }, parse_git_branch_args), 20'000);
+        body_with<GitBranchArgs>([exec](const Call& c, const GitBranchArgs& a) { return run_git_branch(c, a, *exec); }, parse_git_branch_args), 20'000);
 
     sh.add("git_stash",
         "Shelve or restore uncommitted work. action=list (default) is "
         "read-only; push/pop/apply/drop/show manage the stash.",
         git_stash_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitStashArgs>([exec](const GitStashArgs& a) { return run_git_stash(a, *exec); }, parse_git_stash_args), 50'000);
+        body_with<GitStashArgs>([exec](const Call& c, const GitStashArgs& a) { return run_git_stash(c, a, *exec); }, parse_git_stash_args), 50'000);
 
     sh.add("git_rebase",
         "Reapply commits onto a new base (action=onto upstream=<ref>), or "
         "drive an in-progress rebase (continue/abort/skip).",
         git_rebase_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitRebaseArgs>([exec](const GitRebaseArgs& a) { return run_git_rebase(a, *exec); }, parse_git_rebase_args), 50'000);
+        body_with<GitRebaseArgs>([exec](const Call& c, const GitRebaseArgs& a) { return run_git_rebase(c, a, *exec); }, parse_git_rebase_args), 50'000);
 
     sh.add("git_cherry_pick",
         "Apply the changes from existing commit(s) onto HEAD "
         "(action=pick commits=[...]), or drive one in progress "
         "(continue/abort/skip).",
         git_cherry_pick_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitCherryPickArgs>([exec](const GitCherryPickArgs& a) { return run_git_cherry_pick(a, *exec); }, parse_git_cherry_pick_args),
+        body_with<GitCherryPickArgs>([exec](const Call& c, const GitCherryPickArgs& a) { return run_git_cherry_pick(c, a, *exec); }, parse_git_cherry_pick_args),
         50'000);
 }
 

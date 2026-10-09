@@ -6,6 +6,7 @@
 // FileChange (write) is carried via the detail::lower() meta bridge.
 
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 #include "tool_body.hpp"
 
 #include <mcp/tools/util/arg_reader.hpp>
@@ -19,7 +20,6 @@
 #include <expected>
 #include <filesystem>
 #include <format>
-#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -47,86 +47,21 @@ namespace {
 //  read
 // ─────────────────────────────────────────────────────────────────────────
 
-struct ReadCacheKey {
-    // WHOSE context already holds this read. The dedup sentinel below tells
-    // the caller "refer to the earlier tool_result instead" — a claim that is
-    // only TRUE for the conversation that actually received those bytes.
-    //
-    // This cache is a process-global static, so without this field a SUBAGENT
-    // (fresh context, own turn budget) inherited the parent's entries and got
-    // refusals for files it had never seen. Observed in the wild: a coder
-    // subagent burned all 23 of its turns re-requesting overlapping ranges of
-    // one file, receiving the sentinel every time, and made zero edits. The
-    // dedup is a context-economy optimisation; starving a fresh agent of the
-    // file it was sent to edit is not a trade worth making.
-    std::string context_id;
-    std::string canonical_path;
-
-    // NOTE deliberately NO offset/limit — see the comment on ReadCache::seen.
-    // One entry per (context, file), holding the range that is actually
-    // still in the caller's context.
-    bool operator==(const ReadCacheKey&) const noexcept = default;
-};
-struct ReadCacheKeyHash {
-    [[nodiscard]] std::size_t operator()(const ReadCacheKey& k) const noexcept {
-        std::size_t h = std::hash<std::string>{}(k.context_id);
-        h = h * 31u + std::hash<std::string>{}(k.canonical_path);
-        return h;
-    }
-};
-// What the caller still HAS, per file. mtime alone is not enough: the
-// sentinel says "refer to the earlier tool_result", which is a lie unless
-// that result is still in the conversation AND covered the range now being
-// asked for.
+// `read`'s memory: what the caller still HAS, per (reader, file). It lives
+// in the tool state (ToolState::reads) so the host owns it.
 //
-// It stopped being true for two reasons at once, and the two point at each
-// other:
+// mtime alone is not enough: the sentinel says "refer to the earlier
+// tool_result", which is a lie unless that result is still in the
+// conversation AND covered the range now being asked for. agentty collapses
+// every read of a file except the most recent one, and a cache that refused
+// any repeat of a range it had ever served pointed callers at bytes that
+// existed nowhere. So mirror supersession: ONE live range per file,
+// overwritten on every read. A repeat is answered from the entry only when
+// it asks for the same mtime AND a range the live entry actually covers.
 //
-//   * agentty collapses every read of a file EXCEPT the most recent one
-//     (wire::superseded_read_ids) — older ones are replaced on the wire by
-//     "refer to the more recent tool result".
-//   * this cache used to key on (path, offset, limit) and refuse ANY repeat
-//     of a range it had ever served.
-//
-// So: read a file at two ranges, and the older result is gone from context
-// while the cache still refuses to re-send it. Both sentinels then point at
-// each other and the bytes exist nowhere. Reproduced with reads at offsets
-// 1 / 310 / 1 / 251 / 310 — the last one is refused with its content absent.
-// The caller's only escape is to stop using `read`, which is exactly what
-// was observed: models fall back to `sed`/`cat`, or rewrite the whole file
-// blind rather than read it.
-//
-// So mirror supersession instead of fighting it: ONE live range per file,
-// overwritten on every read. A repeat is refused only when it asks for the
-// same mtime AND a range the live entry actually covers.
-struct ReadCacheEntry {
-    fs::file_time_type mtime{};
-    int offset = 1;      // first line of the range still in context
-    int limit  = 0;      // line count; 0 = whole file
-    int total  = 0;      // the file's length when we read it; 0 = unknown
-    // The bytes we served. THE point of keeping them: a repeat read can be
-    // ANSWERED instead of refused.
-    //
-    // The old entry was metadata only, and the sentinel it produced ("refer to
-    // the earlier tool_result") is a POINTER into the caller's context. That
-    // pointer is only sound while the thing it points at is still there, and a
-    // host has several ways to make it dangle: context compaction drops older
-    // turns, a wire-level read-collapse replaces an earlier read with its own
-    // pointer, a subagent starts from a fresh transcript. When it dangles the
-    // caller is told to look at bytes that exist nowhere, cannot recover, and
-    // reaches for `cat` -- which is the read-loop every agent harness with
-    // this design eventually reports.
-    //
-    // Holding the content costs memory bounded by kMaxBytes per live path and
-    // removes the failure mode entirely: the answer is always available, so
-    // "unchanged" becomes an ANNOTATION on real content rather than a refusal
-    // to produce any.
-    std::string content;
-};
-struct ReadCache {
-    std::mutex mu;
-    std::unordered_map<ReadCacheKey, ReadCacheEntry, ReadCacheKeyHash> seen;
-};
+// The reader is part of the key: a fresh subagent must not be told it
+// already has a file its parent read.
+using ReadCacheEntry = state::ReadSeen;
 
 // Does the range still in context contain the range being asked for?
 //
@@ -159,10 +94,7 @@ struct ReadCache {
     const long long want_hi = want_lo + want_limit - 1;
     return want_lo >= have_lo && want_hi <= have_hi;
 }
-[[nodiscard]] ReadCache& read_cache() {
-    static ReadCache c;
-    return c;
-}
+
 
 constexpr std::size_t kAutoOutlineSize = 32 * 1024;
 
@@ -812,7 +744,7 @@ struct ReadArgs {
 // argument object.
 std::string describe_keys(const json& j);
 
-std::expected<ReadArgs, ToolError> parse_read_args(const json& j) {
+std::expected<ReadArgs, ToolError> parse_read_args(const json& j, const util::Bounds& b) {
     util::ArgReader ar(j);
     auto path_opt = ar.require_str("path");
     if (!path_opt)
@@ -830,7 +762,7 @@ std::expected<ReadArgs, ToolError> parse_read_args(const json& j) {
         // containing `file`/`filename`/`file_path` means the key was wrong.
         return std::unexpected(ToolError::invalid_args(
             std::format("path required (received keys: {})", describe_keys(j))));
-    auto wp = util::make_readable_path_checked(*path_opt, "read");
+    auto wp = util::make_readable_path_checked(*path_opt, "read", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
     int offset = ar.integer("offset", 1);
     // NEGATIVE offset = tail semantics: offset:-50 means "the last 50
@@ -891,7 +823,7 @@ std::expected<ReadArgs, ToolError> parse_read_args(const json& j) {
     };
 }
 
-ExecResult run_read(const ReadArgs& a) {
+ExecResult run_read(const Call& call, const ReadArgs& a) {
     const auto& p = a.path.path();
     std::error_code ec;
     if (!fs::exists(p, ec))
@@ -908,9 +840,11 @@ ExecResult run_read(const ReadArgs& a) {
             std::error_code canon_ec;
             auto canon = fs::weakly_canonical(p, canon_ec);
             if (!canon_ec) {
-                ReadCacheKey key{util::read_context(), canon.string()};
-                std::lock_guard lk{read_cache().mu};
-                auto it = read_cache().seen.find(key);
+                auto seen = call.with([&](ToolState& st) -> std::optional<ReadCacheEntry> {
+                    auto it = st.reads.find({call.reader, canon.string()});
+                    if (it == st.reads.end()) return std::nullopt;
+                    return it->second;
+                });
                 // Refuse ONLY when the live entry still covers what is being
                 // asked for. Same file, same mtime, but a range the earlier
                 // result did not include means those bytes are nowhere in
@@ -918,10 +852,10 @@ ExecResult run_read(const ReadArgs& a) {
                 // no retry can get past. Coverage is computed against the
                 // RAW args, before symbol/tail resolution, because that is
                 // what the caller can see and reason about.
-                if (it != read_cache().seen.end()
-                    && it->second.mtime == current_mtime
-                    && covers(it->second, a.offset, a.limit, it->second.total)
-                    && !it->second.content.empty()) {
+                if (seen
+                    && seen->mtime == current_mtime
+                    && covers(*seen, a.offset, a.limit, seen->total)
+                    && !seen->content.empty()) {
                     // SERVE, don't refuse.
                     //
                     // This used to return a bare "refer to the earlier
@@ -943,7 +877,7 @@ ExecResult run_read(const ReadArgs& a) {
                     // over it, and a confused one still gets the content.
                     return ToolOutput{
                         "[cached \xe2\x80\x94 unchanged since your last read of this "
-                        "file]\n" + it->second.content,
+                        "file]\n" + seen->content,
                         std::nullopt};
                 }
             }
@@ -1176,18 +1110,17 @@ ExecResult run_read(const ReadArgs& a) {
             std::error_code canon_ec;
             auto canon = fs::weakly_canonical(p, canon_ec);
             if (!canon_ec) {
-                ReadCacheKey key{util::read_context(), canon.string()};
-                std::lock_guard lk{read_cache().mu};
                 // The OUTLINE path: the caller got a symbol map of the whole
                 // file, not its text. Record it as covering nothing, so any
                 // later request for actual lines is served. Refusing one
                 // with "you already read this" would be answering a request
                 // for content with a table of contents.
-                read_cache().seen[std::move(key)] =
-                    ReadCacheEntry{current_mtime, 1, 1};
+                call.with([&](ToolState& st) {
+                    st.reads[{call.reader, canon.string()}] = ReadCacheEntry{current_mtime, 1, 1, 0, {}};
+                });
             }
         }
-        util::record_file_seen(p, current_mtime,
+        record_seen(call, p, current_mtime,
                                static_cast<std::uintmax_t>(content.size()),
                                util::cheap_content_hash(content));
         return ToolOutput{std::move(out), std::nullopt};
@@ -1328,8 +1261,6 @@ ExecResult run_read(const ReadArgs& a) {
         std::error_code canon_ec;
         auto canon = fs::weakly_canonical(p, canon_ec);
         if (!canon_ec) {
-            ReadCacheKey key{util::read_context(), canon.string()};
-            std::lock_guard lk{read_cache().mu};
             // OVERWRITE, never accumulate. This mirrors what the host does
             // to the transcript: agentty keeps only the most recent read of
             // a file and collapses the rest, so the newest range is the only
@@ -1346,12 +1277,13 @@ ExecResult run_read(const ReadArgs& a) {
             // rather than pointing at a tool_result that may be gone. Bounded
             // by kMaxBytes per live path, and OVERWRITE means one entry per
             // file, not a growing set.
-            read_cache().seen[std::move(key)] =
-                ReadCacheEntry{current_mtime, a.offset, a.limit, total_lines,
-                               out};
+            call.with([&](ToolState& st) {
+                st.reads[{call.reader, canon.string()}] =
+                    ReadCacheEntry{current_mtime, a.offset, a.limit, total_lines, out};
+            });
         }
     }
-    util::record_file_seen(p, current_mtime,
+    record_seen(call, p, current_mtime,
                            static_cast<std::uintmax_t>(content.size()),
                            util::cheap_content_hash(content));
     return ToolOutput{std::move(out), std::nullopt};
@@ -1405,13 +1337,13 @@ std::string describe_keys(const json& j) {
     return out;
 }
 
-std::expected<WriteArgs, ToolError> parse_write_args(const json& j) {
+std::expected<WriteArgs, ToolError> parse_write_args(const json& j, const util::Bounds& b) {
     util::ArgReader ar(j);
     auto raw = ar.require_str("path");
     if (!raw)
         return std::unexpected(ToolError::invalid_args(
             std::format("path required (received keys: {})", describe_keys(j))));
-    auto wp = util::make_workspace_path_checked(*raw, "write");
+    auto wp = util::make_workspace_path_checked(*raw, "write", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
     std::string note;
     std::string content;
@@ -1436,7 +1368,7 @@ std::expected<WriteArgs, ToolError> parse_write_args(const json& j) {
                      ar.str("display_description", ""), std::move(note)};
 }
 
-ExecResult run_write(const WriteArgs& a) {
+ExecResult run_write(const Call& call, const WriteArgs& a) {
     const auto& p = a.path.path();
     constexpr std::size_t kMaxWriteBytes = 5u * 1024u * 1024u;
     if (a.content.size() > kMaxWriteBytes) {
@@ -1466,7 +1398,7 @@ ExecResult run_write(const WriteArgs& a) {
             original = util::read_file(a.path);
     }
     std::string staleness_warning;
-    if (exists && util::staleness_of(p) == util::StaleVerdict::Stale) {
+    if (exists && staleness(call, p) == util::StaleVerdict::Stale) {
         staleness_warning =
             "\xe2\x9a\xa0  The file has changed on disk since the last time a tool "
             "observed it this session. The write OVERWROTE those changes — "
@@ -1487,7 +1419,7 @@ ExecResult run_write(const WriteArgs& a) {
         std::error_code mt_ec;
         auto new_mtime = fs::last_write_time(p, mt_ec);
         if (!mt_ec) {
-            util::record_file_seen(p, new_mtime,
+            record_seen(call, p, new_mtime,
                                    static_cast<std::uintmax_t>(a.content.size()),
                                    util::cheap_content_hash(a.content));
         }
@@ -1547,8 +1479,8 @@ std::expected<ListDirArgs, ToolError> parse_list_dir_args(const json& j) {
     };
 }
 
-ExecResult run_list_dir(const ListDirArgs& a) {
-    auto wp = util::make_workspace_path_checked(a.root, "list_dir");
+ExecResult run_list_dir(const Call& call, const ListDirArgs& a) {
+    auto wp = util::make_workspace_path_checked(a.root, "list_dir", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
     std::error_code ec;
     if (!fs::exists(wp->path(), ec))
@@ -1638,7 +1570,7 @@ ExecResult run_list_dir(const ListDirArgs& a) {
 
 struct MoveArgs { fs::path source; fs::path destination; bool overwrite = false; };
 
-std::expected<MoveArgs, ToolError> parse_move_args(const json& j) {
+std::expected<MoveArgs, ToolError> parse_move_args(const json& j, const util::Bounds& b) {
     util::ArgReader r{j};
     auto source = r.require_str("source");
     if (!source || source->empty())
@@ -1646,9 +1578,9 @@ std::expected<MoveArgs, ToolError> parse_move_args(const json& j) {
     auto destination = r.require_str("destination");
     if (!destination || destination->empty())
         return std::unexpected(ToolError::invalid_args("destination is required"));
-    auto src = util::make_workspace_path_checked(*source, "move");
+    auto src = util::make_workspace_path_checked(*source, "move", b);
     if (!src) return std::unexpected(src.error());
-    auto dst = util::make_workspace_path_checked(*destination, "move");
+    auto dst = util::make_workspace_path_checked(*destination, "move", b);
     if (!dst) return std::unexpected(dst.error());
     return MoveArgs{src->path(), dst->path(), r.boolean("overwrite", false)};
 }
@@ -1694,14 +1626,14 @@ ExecResult run_move(const MoveArgs& a) {
 
 struct RemoveArgs { fs::path path; bool recursive = false; };
 
-std::expected<RemoveArgs, ToolError> parse_remove_args(const json& j) {
+std::expected<RemoveArgs, ToolError> parse_remove_args(const json& j, const util::Bounds& b) {
     util::ArgReader r{j};
     auto path = r.require_str("path");
     if (!path || path->empty())
         return std::unexpected(ToolError::invalid_args("path is required"));
-    auto checked = util::make_workspace_path_checked(*path, "remove");
+    auto checked = util::make_workspace_path_checked(*path, "remove", b);
     if (!checked) return std::unexpected(checked.error());
-    if (checked->path() == util::workspace_root())
+    if (checked->path() == b.workspace)
         return std::unexpected(ToolError::invalid_args("refusing to remove the workspace root"));
     return RemoveArgs{checked->path(), r.boolean("recursive", false)};
 }
@@ -1896,14 +1828,14 @@ ExecResult run_outline(const OutlineArgs& a) {
     return ToolOutput{util::to_valid_utf8(out.str()), std::nullopt};
 }
 
-std::expected<OutlineArgs, ToolError> parse_outline_args(const json& j) {
+std::expected<OutlineArgs, ToolError> parse_outline_args(const json& j, const util::Bounds& b) {
     util::ArgReader r(j);
     if (!r.is_object())
         return std::unexpected(ToolError::invalid_args("expected a JSON object"));
     auto path = r.require_str("path");
     if (!path || path->empty())
         return std::unexpected(ToolError::invalid_args("`path` is required"));
-    auto wp = util::make_readable_path_checked(*path, "outline");
+    auto wp = util::make_readable_path_checked(*path, "outline", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
     OutlineArgs a{std::move(*wp),
                   std::clamp(r.integer("max_entries", 400), 1, 2000),

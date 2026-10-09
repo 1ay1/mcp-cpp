@@ -70,6 +70,7 @@
 #include <mcp/tools/host.hpp>
 
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 #include "tool_body.hpp"
 
 namespace mcp::tools::detail {
@@ -91,8 +92,8 @@ constexpr std::size_t kMaxOutBytes   = 24u * 1024;        // output budget
 constexpr int         kContext       = 1;                 // ± lines of context
 
 // Shares to split a scan into; the host's executor owns the threads.
-std::size_t worker_count() {
-    return std::min<std::size_t>(parallel_width(), 16);
+std::size_t worker_count(const Call& call) {
+    return std::min<std::size_t>(call.width(), 16);
 }
 
 // Language families we tokenize. The extension decides comment/string rules;
@@ -1096,8 +1097,8 @@ void semantic_order(DocRetriever* sem, const StructArgs& a,
                      });
 }
 
-ExecResult run_structural(const StructArgs& a, DocRetriever* sem) {
-    auto wp = util::make_workspace_path_checked(a.root, "search_structural");
+ExecResult run_structural(const Call& call, const StructArgs& a, DocRetriever* sem) {
+    auto wp = util::make_workspace_path_checked(a.root, "search_structural", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
 
     // A pattern's Lang is inferred from its own syntax weakly; we recompile it
@@ -1166,7 +1167,7 @@ ExecResult run_structural(const StructArgs& a, DocRetriever* sem) {
     // Share k scans files k, k+n, … and counts its own hits against its slice
     // of the cap, so the shares share nothing while they run.
     std::vector<FileMatch> results(files.size());
-    const std::size_t nshares = std::max<std::size_t>(1, std::min(worker_count(), files.size()));
+    const std::size_t nshares = std::max<std::size_t>(1, std::min(worker_count(call), files.size()));
     const std::size_t share_cap = std::max<std::size_t>(1, kMaxMatches / nshares);
     std::vector<std::size_t> counted(nshares, 0);
 
@@ -1208,7 +1209,7 @@ ExecResult run_structural(const StructArgs& a, DocRetriever* sem) {
         }
     };
 
-    if (!files.empty()) parallel_for(nshares, worker);
+    if (!files.empty()) call.split(nshares, worker);
     bool capped = false;
     for (auto c : counted) capped = capped || c >= share_cap;
 
@@ -1409,8 +1410,8 @@ std::expected<RewriteArgs, ToolError> parse_rewrite_args(const json& j) {
     };
 }
 
-ExecResult run_rewrite(const RewriteArgs& a) {
-    auto wp = util::make_workspace_path_checked(a.root, "rewrite_structural");
+ExecResult run_rewrite(const Call& call, const RewriteArgs& a) {
+    auto wp = util::make_workspace_path_checked(a.root, "rewrite_structural", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
 
     auto probe_pat = compile_pattern_tree(a.pattern, Lang::CFamily);
@@ -1685,10 +1686,10 @@ void register_structural_tools(Shells& sh,
            "over-budget result sets render the most task-relevant files first.",
            structural_schema(),
            EffectSet{Effect::ReadFs},
-           [sem](const Json& j) -> mcp::cap::Result {
+           [sem](const Call& call, const Json& j) -> mcp::cap::Result {
                auto parsed = parse_args(j);
                if (!parsed) return mcp::cap::Result::error(parsed.error().render());
-               return lower(run_structural(*parsed, sem.get()));
+               return lower(run_structural(call, *parsed, sem.get()));
            },
            /*token_budget=*/30'000);
 

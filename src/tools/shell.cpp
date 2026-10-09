@@ -13,7 +13,6 @@
 #include <mcp/tools/util/bash_validate.hpp>
 #include <mcp/tools/util/shellx.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
-#include <mcp/tools/util/sandbox.hpp>
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/utf8.hpp>
 
@@ -94,7 +93,7 @@ std::string bound_lines(const std::string& in, int head, int tail) {
     return out;
 }
 
-std::expected<BashArgs, ToolError> parse_bash_args(const json& j) {
+std::expected<BashArgs, ToolError> parse_bash_args(const json& j, const util::Bounds& b) {
     util::ArgReader ar(j);
     auto cmd_opt = ar.require_str("command");
     if (!cmd_opt)
@@ -131,7 +130,7 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j) {
         if (!std::filesystem::is_directory(cd, ec))
             return std::unexpected(ToolError::invalid_args(
                 "cd '" + cd + "' is not a directory"));
-        if (auto wp = util::make_workspace_path_checked(cd, "shell"); !wp)
+        if (auto wp = util::make_workspace_path_checked(cd, "shell", b); !wp)
             return std::unexpected(std::move(wp.error()));
     }
 
@@ -315,7 +314,6 @@ std::string explain_exit_code(int code) {
 }
 
 ExecResult run_bash(const BashArgs& a, Exec& exec) {
-    auto t0 = std::chrono::steady_clock::now();
     const std::string& cmd_str = a.command;
     const int           tmo_s   = a.timeout;
 
@@ -461,8 +459,7 @@ ExecResult run_bash(const BashArgs& a, Exec& exec) {
         r.truncated = false;   // spilled, not lost
     }
 
-    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - t0).count();
+    const auto elapsed_ms = res.elapsed.count();
 
     if (!r.started)
         return std::unexpected(ToolError::spawn(

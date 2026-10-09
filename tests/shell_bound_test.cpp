@@ -10,6 +10,8 @@
 // Drives the REAL provider, not the helper, so the schema/parse/apply path
 // is covered end to end.
 
+#include "test_state.hpp"
+#include "test_exec.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
@@ -39,9 +41,13 @@ static bool has(const std::string& hay, const char* needle) {
 int main() {
     auto root = fs::temp_directory_path() / ("mcp_shell_bound_" + std::to_string(::getpid()));
     fs::create_directories(root);
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
 
     HostServices svc;
+
+    svc.state = ws_state;
+
+    svc.exec  = std::make_shared<mcp::test::PopenExec>();
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     auto run = [&](mcp::Json a) {

@@ -11,6 +11,7 @@
 
 #include "tool_body.hpp"
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
@@ -242,10 +243,10 @@ std::expected<QueryArgs, ToolError> parse_query_args(const json& j) {
     return a;
 }
 
-ExecResult run_json_query(const QueryArgs& a) {
+ExecResult run_json_query(const Call& call, const QueryArgs& a) {
     std::string text;
     if (!a.path.empty()) {
-        auto wp = util::make_readable_path_checked(a.path, "json_query");
+        auto wp = util::make_readable_path_checked(a.path, "json_query", bounds(call));
         if (!wp) return std::unexpected(std::move(wp.error()));
         const auto& p = wp->path();
         std::error_code ec;

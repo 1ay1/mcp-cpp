@@ -145,23 +145,18 @@ What can I do?   →  Registry::tools()
 Do this thing.   →  Registry::dispatch(Request{tool, args})
 ```
 
-A `CapabilityProvider` is the single seam. Today's implementations:
-
-| Provider              | Backs                                                    |
-|-----------------------|----------------------------------------------------------|
-| `LocalProvider`       | in-process C++ closures (the host's own tools)           |
-| `StdioServerProvider` | an external MCP server spawned over stdio (`ChildProcess`) |
-
-The `ClientProvider` base + `ChildProcess` bridge make new transports (HTTP/SSE
-MCP, an RPC service, a database) a matter of subclassing one interface — the
-agent **cannot tell them apart**, which is the point.
+A `CapabilityProvider` is the single seam. `LocalProvider` backs in-process
+C++ closures (the host's own tools); a host adds its own providers for
+anything else — a remote MCP server it connects to, an RPC service, a
+database — by implementing one interface. The agent **cannot tell them
+apart**, which is the point. (agentty's `mcp::Connection` is such a provider:
+an MCP server over stdio or HTTP, run on the host's own threads.)
 
 A `Registry` fans N providers into one surface: it presents the union of their
 tools, namespaces collisions as `<origin>__<name>`, routes `dispatch()` to the
-owning provider, and fans in resources + prompts the same way. It also forwards
-each provider's `*_list_changed` notification so a host can invalidate a tool
-index it built. MCP is just *one kind of provider* — remove it and the
-abstraction is intact.
+owning provider, and fans in resources + prompts the same way. It is a plain
+value with one owner: build it, then read it. MCP is just *one kind of
+provider* — remove it and the abstraction is intact.
 
 ```cpp
 #include <mcp/cap/cap.hpp>
@@ -169,7 +164,7 @@ using namespace mcp::cap;
 
 Registry reg;
 reg.add(std::make_shared<LocalProvider>("local"));         // your closures
-reg.add(std::make_shared<StdioServerProvider>(/*spawn cfg*/)); // a real MCP server
+reg.add(my_remote_server_provider);                        // any CapabilityProvider
 
 for (const Tool& t : reg.tools()) advertise(t);            // union, namespaced
 Result r = reg.dispatch("local__read", Json{{"path","a.c"}});
@@ -201,9 +196,20 @@ mcp::tools::HostServices svc;
 svc.memory    = std::make_shared<MyMemoryStore>();   // enables remember/forget/wipe
 svc.retriever = std::make_shared<MyDocRetriever>();  // enables search_docs
 svc.http      = std::make_shared<MyHttpClient>();    // enables web_fetch/web_search
+svc.exec      = std::make_shared<MyExec>();          // enables bash, git_*, process_*
 // leave svc.subagent null → no `task` tool is offered
 auto provider = mcp::tools::make_provider(svc);      // a CapabilityProvider
 ```
+
+The tools keep no state of their own. What they remember between calls —
+the workspace boundary, what each reader has already been shown, the last
+snapshot of every file they read or wrote, background processes, repo
+graphs — is a `ToolState` (`state.hpp`) the host owns and hands over as
+`svc.state`, together with how it is shared (`StateAccess::with`). Leave it
+null for a host that runs one call at a time. Per-call inputs ride on the
+request: `Request::reader` (whose context a `read` serves) and
+`Request::cancelled`. Running programs is always the host's (`svc.exec`),
+and so is its sandbox.
 
 Two pieces of metadata the bare wire has no field for ride in the result's
 structured payload under a reserved key (`meta.hpp`): an **`EffectSet`**

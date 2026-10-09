@@ -48,29 +48,18 @@ std::string apply_budget(std::string text, int budget) {
 
 } // namespace
 
-namespace {
-// The host's executor, installed by make_provider. Startup configuration:
-// set before any tool runs, like the sandbox and the workspace root.
-std::shared_ptr<Executor>& host_executor() {
-    static std::shared_ptr<Executor> e;
-    return e;
-}
-}  // namespace
-
-void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn) {
-    if (const auto& e = host_executor()) { e->parallel_for(n, fn); return; }
-    for (std::size_t i = 0; i < n; ++i) fn(i);   // no host executor: inline
+void Call::split(std::size_t n, const std::function<void(std::size_t)>& fn) const {
+    if (executor) { executor->parallel_for(n, fn); return; }
+    for (std::size_t i = 0; i < n; ++i) fn(i);
 }
 
-std::size_t parallel_width() noexcept {
-    const auto& e = host_executor();
-    return e ? std::max<std::size_t>(1, e->width()) : 1;
+std::size_t Call::width() const noexcept {
+    return executor ? std::max<std::size_t>(1, executor->width()) : 1;
 }
 
 std::shared_ptr<mcp::cap::CapabilityProvider>
 make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
     detail::Shells shells(cfg);
-    host_executor() = svc.executor;
 
     // Host-coupled tools — registered only when their backend is present.
     detail::register_memory_tools(shells, svc.memory);
@@ -107,6 +96,10 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
 
     auto provider = std::make_shared<mcp::cap::LocalProvider>(std::move(origin));
     const int default_budget = cfg.default_output_budget;
+    // The tools' memory between calls. The host shares it however it likes;
+    // without one, this provider keeps its own and expects one call at a time.
+    std::shared_ptr<StateAccess> state = svc.state;
+    if (!state) state = std::make_shared<SoleStateAccess>();
 
     for (auto& s : shells.items()) {
         EffectSet fx       = s.effects;
@@ -114,9 +107,16 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
         auto      handler  = std::move(s.handler);
 
         provider->add(s.tool,
-            [handler = std::move(handler), fx, budget](const mcp::Json& args)
+            [handler = std::move(handler), fx, budget, state, exe = svc.executor](const mcp::cap::Request& req)
                 -> mcp::cap::Result {
-                mcp::cap::Result r = handler(args);
+                Call call;
+                call.state     = state.get();
+                call.executor  = exe.get();
+                call.reader    = req.reader;
+                call.cancelled = req.cancelled;
+                if (!call.cancelled && req.stop.stop_possible())
+                    call.cancelled = [st = req.stop] { return st.stop_requested(); };
+                mcp::cap::Result r = handler(call, req.args);
                 if (!r.is_error) r.text = apply_budget(std::move(r.text), budget);
                 // The tool body (via lower()) may have put file change(s) in
                 // structured already; re-stamp effects WITHOUT dropping them.

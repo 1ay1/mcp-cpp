@@ -12,6 +12,7 @@
 #include <mcp/cap/local.hpp>
 
 #include "agtest.hpp"
+#include "test_state.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <chrono>
@@ -31,8 +32,11 @@ using namespace mcp::tools;
 namespace fs = std::filesystem;
 
 static mcp::cap::Result call(mcp::cap::CapabilityProvider& p,
-                             const std::string& name, mcp::Json args) {
-    return p.execute(mcp::cap::Request{name, std::move(args)});
+                             const std::string& name, mcp::Json args,
+                             std::string reader = {}) {
+    mcp::cap::Request req{name, std::move(args)};
+    req.reader = std::move(reader);
+    return p.execute(req);
 }
 
 static mcp::Json obj() { return mcp::Json::object(); }
@@ -46,8 +50,9 @@ TEST_CASE("edit diff stays minimal on large + CRLF files") {
     auto root = fs::temp_directory_path() /
         ("mcp_editmin_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
     HostServices svc;
+    svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     auto edit_and_diff = [&](const std::string& fname, const std::string& body,
@@ -124,9 +129,10 @@ TEST_CASE("edit diff stays minimal on large + CRLF files") {
 TEST_CASE("fs_tools") {
     auto root = fs::temp_directory_path() / ("mcp_fs_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
 
     HostServices svc;  // no host backends needed — Tier-1 is self-contained
+    svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     // ── write creates a file and carries a FileChange ────────────────────
@@ -327,9 +333,9 @@ TEST_CASE("fs_tools") {
             assert(!wr.is_error);
 
             static int ctx = 0;
-            util::set_read_context("prefilter" + std::to_string(++ctx));
+            const std::string reader = "prefilter" + std::to_string(++ctx);
             auto a = obj(); a["path"] = f;
-            auto r = call(*provider, "outline", a);
+            auto r = call(*provider, "outline", a, reader);
             assert(!r.is_error);
             // Require the DEFINITION ITSELF in the output, not merely a
             // non-empty answer. An earlier draft tested for the absence of

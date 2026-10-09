@@ -1,12 +1,10 @@
 #include <mcp/tools/util/fs_helpers.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <mutex>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -158,15 +156,24 @@ std::string write_file(const fs::path& p, std::string_view content) {
     // path. The temp must live in the same directory so the rename is a
     // single filesystem operation — cross-device rename falls back to a
     // non-atomic copy.
-    static std::atomic<uint64_t> seq{0};
-    const uint64_t n = seq.fetch_add(1, std::memory_order_relaxed);
+    //
+    // The temp name is made unique by creating it exclusively (O_EXCL) and
+    // retrying with a new suffix if it exists, so no counter is shared
+    // between concurrent writers. The suffix mixes pid, a stack address and
+    // the attempt, which is enough to make collisions rare.
 #ifdef _WIN32
     const unsigned long pid = static_cast<unsigned long>(::GetCurrentProcessId());
 #else
     const unsigned long pid = static_cast<unsigned long>(::getpid());
 #endif
-    fs::path tmp = real;
-    tmp += fs::path(".agentty-tmp-" + std::to_string(pid) + "-" + std::to_string(n));
+    const auto salt = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&pid));
+    fs::path tmp;
+    auto tmp_name = [&](int attempt) {
+        fs::path t = real;
+        t += fs::path(".agentty-tmp-" + std::to_string(pid) + "-"
+                      + std::to_string((salt >> 4) ^ (static_cast<std::uint64_t>(attempt) * 0x9e3779b97f4a7c15ULL)));
+        return t;
+    };
 
     // Preserve existing mode on POSIX so the rename doesn't regress perms.
 #ifndef _WIN32
@@ -192,14 +199,25 @@ std::string write_file(const fs::path& p, std::string_view content) {
     // path which silently corrupts multi-byte sequences on some MinGW
     // ucrt configurations.
     int fd = -1;
-    auto ws = tmp.wstring();
-    if (::_wsopen_s(&fd, ws.c_str(),
-                    _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY,
-                    _SH_DENYNO, _S_IREAD | _S_IWRITE) != 0 || fd < 0)
+    for (int attempt = 0; attempt < 16 && fd < 0; ++attempt) {
+        tmp = tmp_name(attempt);
+        auto ws = tmp.wstring();
+        if (::_wsopen_s(&fd, ws.c_str(),
+                        _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+                        _SH_DENYNO, _S_IREAD | _S_IWRITE) != 0) {
+            fd = -1;
+            if (errno != EEXIST) break;
+        }
+    }
+    if (fd < 0)
         return "cannot open '" + p.string() + "' for writing";
 #else
-    int fd = ::open(tmp.c_str(),
-                    O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int fd = -1;
+    for (int attempt = 0; attempt < 16 && fd < 0; ++attempt) {
+        tmp = tmp_name(attempt);
+        fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (fd < 0 && errno != EEXIST) break;
+    }
     if (fd < 0)
         return std::string("cannot open '") + p.string() + "' for writing: "
              + explain_errno(errno);
@@ -281,7 +299,7 @@ std::string write_file(const fs::path& p, std::string_view content) {
     return {};
 }
 
-fs::path normalize_path(std::string_view s) {
+fs::path normalize_path(std::string_view s, const Bounds& b) {
     while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
     while (!s.empty() && (s.back() == ' ' || s.back() == '\t'))  s.remove_suffix(1);
     if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"')
@@ -326,51 +344,29 @@ fs::path normalize_path(std::string_view s) {
         // anchoring to project_root() keeps it in the launched project. The
         // result is still containment-checked against the boundary by the
         // caller, so this only ever narrows where a relative path lands.
-        p = project_root() / p;
+        p = project_root(b) / p;
     }
     return p.lexically_normal();
 }
 
-namespace {
-
-// Function-local static so the default value is the cwd at first call,
-// regardless of static-initialisation order. Tests that don't call
-// set_workspace_root() still get a sensible default.
-fs::path& mutable_workspace_root() {
-    static fs::path root = [] {
+Bounds bounds_from(const fs::path& workspace, std::vector<fs::path> read_roots) {
+    Bounds b;
+    if (workspace.empty()) {
         std::error_code ec;
         auto cwd = fs::current_path(ec);
-        return ec ? fs::path{"/"} : cwd;
-    }();
-    return root;
+        b.workspace = ec ? fs::path{"/"} : fs::weakly_canonical(cwd, ec);
+        if (ec || b.workspace.empty()) b.workspace = cwd;
+    } else {
+        b.workspace = workspace;
+    }
+    b.read_roots = std::move(read_roots);
+    return b;
 }
 
-} // namespace
-
-void set_workspace_root(fs::path root) {
+fs::path canonical_root(fs::path root) {
     std::error_code ec;
     auto canon = fs::weakly_canonical(root, ec);
-    mutable_workspace_root() = ec ? std::move(root) : std::move(canon);
-}
-
-const fs::path& workspace_root() {
-    return mutable_workspace_root();
-}
-
-// Thread-local: concurrent subagents each stream on their own worker, so a
-// process-wide value would let one context's id leak into another's reads
-// — reintroducing exactly the cross-context starvation this exists to stop.
-std::string& mutable_read_context() {
-    static thread_local std::string id;
-    return id;
-}
-
-void set_read_context(std::string id) {
-    mutable_read_context() = std::move(id);
-}
-
-const std::string& read_context() {
-    return mutable_read_context();
+    return ec ? std::move(root) : std::move(canon);
 }
 
 namespace {
@@ -387,8 +383,8 @@ namespace {
 }
 } // namespace
 
-fs::path project_root() {
-    const fs::path& ws = mutable_workspace_root();   // already canonicalised
+fs::path project_root(const Bounds& b) {
+    const fs::path& ws = b.workspace;   // already canonicalised
     std::error_code ec;
     fs::path cwd = fs::current_path(ec);
     if (ec || cwd.empty()) return ws;
@@ -401,7 +397,7 @@ fs::path project_root() {
     return path_at_or_under(cwdc, ws) ? cwdc : ws;
 }
 
-bool is_within_workspace(const fs::path& target) {
+bool is_within_workspace(const fs::path& target, const Bounds& b) {
     if (target.empty()) return false;
     std::error_code ec;
     // weakly_canonical resolves what exists and leaves the rest as-is —
@@ -422,7 +418,7 @@ bool is_within_workspace(const fs::path& target) {
         if (pec || parent.empty()) return false;
         canon_target = parent / target.filename();
     }
-    auto canon_root = workspace_root();   // already canonicalised on set
+    const auto& canon_root = b.workspace;   // already canonicalised
     // Component-wise prefix check. Plain string startsWith would let
     // /home/user/project-other through when root is /home/user/project.
     auto rt = canon_root.begin();
@@ -436,22 +432,8 @@ bool is_within_workspace(const fs::path& target) {
 // ── Read-only allowlist roots ───────────────────────────────────────────
 namespace {
 
-// Canonicalised roots the READ gate also accepts (skill directories
-// under ~/.agentty/skills etc.). Guarded by its own mutex — reads come
-// from tool threads, registration from the skills scanner.
-struct ReadRoots {
-    std::mutex mu;
-    std::vector<fs::path> roots;
-};
-
-[[nodiscard]] ReadRoots& read_roots() {
-    static ReadRoots r;
-    return r;
-}
-
-// Component-wise "target under root" — same shape as the workspace
-// prefix check above; factored so both gates share the symlink-safe
-// canonicalisation rules.
+// Component-wise "target under root" — same shape as the workspace prefix
+// check above; both gates share the symlink-safe canonicalisation rules.
 [[nodiscard]] bool under_root(const fs::path& canon_target, const fs::path& root) {
     auto rt = root.begin();
     auto tt = canon_target.begin();
@@ -462,32 +444,28 @@ struct ReadRoots {
 
 } // namespace
 
-void allow_read_root(const fs::path& root) {
+void allow_read_root(std::vector<fs::path>& roots, const fs::path& root) {
     std::error_code ec;
     auto canon = fs::weakly_canonical(root, ec);
     if (ec || canon.empty()) return;
-    auto& rr = read_roots();
-    std::lock_guard lk{rr.mu};
-    if (std::find(rr.roots.begin(), rr.roots.end(), canon) == rr.roots.end())
-        rr.roots.push_back(std::move(canon));
+    if (std::find(roots.begin(), roots.end(), canon) == roots.end())
+        roots.push_back(std::move(canon));
 }
 
-bool is_read_allowlisted(const fs::path& target) {
+bool is_read_allowlisted(const fs::path& target, const Bounds& b) {
     if (target.empty()) return false;
     std::error_code ec;
     auto canon = fs::weakly_canonical(target, ec);
     if (ec) return false;   // reads need the file to exist; no parent retry
-    auto& rr = read_roots();
-    std::lock_guard lk{rr.mu};
-    for (const auto& r : rr.roots)
+    for (const auto& r : b.read_roots)
         if (under_root(canon, r)) return true;
     return false;
 }
 
 std::expected<NormalizedPath, ToolError>
-make_workspace_path(std::string_view raw, std::string_view tool_name) {
-    NormalizedPath p{raw};
-    if (!is_within_workspace(p.path())) {
+make_workspace_path(std::string_view raw, std::string_view tool_name, const Bounds& b) {
+    NormalizedPath p{raw, b};
+    if (!is_within_workspace(p.path(), b)) {
         // Helpful, actionable message: name the offending path, the
         // active root, and the two ways out (restart in a wider dir or
         // pass --workspace). The model can read this and either ask the
@@ -495,7 +473,7 @@ make_workspace_path(std::string_view raw, std::string_view tool_name) {
         return std::unexpected(ToolError::out_of_workspace(
             "tool '" + std::string{tool_name} + "' refused: '"
             + p.string() + "' is outside the workspace root '"
-            + workspace_root().string() + "'. "
+            + b.workspace.string() + "'. "
             "Restart agentty in a parent directory or pass "
             "--workspace <dir> to widen the scope."));
     }
@@ -504,27 +482,27 @@ make_workspace_path(std::string_view raw, std::string_view tool_name) {
 
 // ── WorkspacePath factories ───────────────────────────────────────
 std::expected<WorkspacePath, ToolError>
-make_workspace_path_checked(std::string_view raw, std::string_view tool_name) {
-    auto np = make_workspace_path(raw, tool_name);
+make_workspace_path_checked(std::string_view raw, std::string_view tool_name, const Bounds& b) {
+    auto np = make_workspace_path(raw, tool_name, b);
     if (!np) return std::unexpected(std::move(np.error()));
     return WorkspacePath{std::move(*np)};
 }
 
 std::expected<WorkspacePath, ToolError>
-promote_to_workspace_path(NormalizedPath p, std::string_view tool_name) {
-    if (!is_within_workspace(p.path())) {
+promote_to_workspace_path(NormalizedPath p, std::string_view tool_name, const Bounds& b) {
+    if (!is_within_workspace(p.path(), b)) {
         return std::unexpected(ToolError::out_of_workspace(
             "tool '" + std::string{tool_name} + "' refused: '"
             + p.string() + "' is outside the workspace root '"
-            + workspace_root().string() + "'."));
+            + b.workspace.string() + "'."));
     }
     return WorkspacePath{std::move(p)};
 }
 
 std::expected<WorkspacePath, ToolError>
-make_readable_path_checked(std::string_view raw, std::string_view tool_name) {
-    NormalizedPath p{raw};
-    if (is_within_workspace(p.path()) || is_read_allowlisted(p.path()))
+make_readable_path_checked(std::string_view raw, std::string_view tool_name, const Bounds& b) {
+    NormalizedPath p{raw, b};
+    if (is_within_workspace(p.path(), b) || is_read_allowlisted(p.path(), b))
         return WorkspacePath{std::move(p)};
     // Name the ACTUAL readable roots. Observed failure: skills live in
     // ~/.agents/skills but the model GUESSED ~/.agentty/skills/<name> (a
@@ -534,14 +512,12 @@ make_readable_path_checked(std::string_view raw, std::string_view tool_name) {
     // allowlisted roots turns the refusal into a one-shot redirect.
     std::string msg = "tool '" + std::string{tool_name} + "' refused: '"
         + p.string() + "' is outside the workspace root '"
-        + workspace_root().string() + "' and not under any skill "
+        + b.workspace.string() + "' and not under any skill "
         "directory.";
     {
-        auto& rr = read_roots();
-        std::lock_guard lk{rr.mu};
-        if (!rr.roots.empty()) {
+        if (!b.read_roots.empty()) {
             msg += " Readable skill directories:";
-            for (const auto& r : rr.roots) {
+            for (const auto& r : b.read_roots) {
                 msg += ' ';
                 msg += r.string();
                 msg += ';';
@@ -665,18 +641,8 @@ std::string sniff_image_media_type(const fs::path& p) {
     return {};
 }
 
-// ── File snapshot cache ────────────────────────────────────────────────────
+// ── File snapshots ──────────────────────────────────────────────────────────
 namespace {
-
-struct FileCache {
-    std::mutex mu;
-    std::unordered_map<std::string, FileSnapshot> by_path;
-};
-
-[[nodiscard]] FileCache& file_cache() {
-    static FileCache c;
-    return c;
-}
 
 // Canonicalise without requiring the file to exist (write target might
 // not exist yet at the moment we record). Falls back to the lexically-
@@ -694,29 +660,9 @@ struct FileCache {
 
 } // namespace
 
-void record_file_seen(const fs::path& path,
-                      fs::file_time_type mtime,
-                      std::uintmax_t size,
-                      std::uint64_t content_hash) noexcept {
-    auto key = canon_key(path);
-    if (key.empty()) return;
-    auto& c = file_cache();
-    std::lock_guard lk{c.mu};
-    c.by_path[std::move(key)] = FileSnapshot{mtime, size, content_hash};
-}
+std::string snapshot_key(const fs::path& path) noexcept { return canon_key(path); }
 
-std::optional<FileSnapshot> last_seen_file(const fs::path& path) noexcept {
-    auto key = canon_key(path);
-    if (key.empty()) return std::nullopt;
-    auto& c = file_cache();
-    std::lock_guard lk{c.mu};
-    auto it = c.by_path.find(key);
-    if (it == c.by_path.end()) return std::nullopt;
-    return it->second;
-}
-
-StaleVerdict staleness_of(const fs::path& path) noexcept {
-    auto snap = last_seen_file(path);
+StaleVerdict staleness_of(const fs::path& path, const std::optional<FileSnapshot>& snap) noexcept {
     if (!snap) return StaleVerdict::Unknown;
     std::error_code ec;
     auto cur_mtime = fs::last_write_time(path, ec);

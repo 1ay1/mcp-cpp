@@ -9,6 +9,7 @@
 // Drives the tool through the real make_provider() dispatch path.
 
 #include "agtest.hpp"
+#include "test_state.hpp"
 
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
@@ -49,8 +50,9 @@ TEST_CASE("repomap") {
         "struct Widget { int id; };\n"
         "int widget_area(const Widget& w) { return w.id * w.id; }\n");
 
-    mt::util::set_workspace_root(root.string());
+    auto ws_state = mcp::test::state_at(root.string());
     mt::HostServices svc;
+    svc.state = ws_state;
     auto provider = mt::make_provider(svc, mt::ToolsetConfig{}, "local");
 
     auto run_map = [&]() -> std::string {

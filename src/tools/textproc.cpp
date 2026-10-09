@@ -22,6 +22,7 @@
 
 #include "tool_body.hpp"
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/regex_guard.hpp>
@@ -299,8 +300,8 @@ split_fields(std::string_view line, std::string_view delim) {
     return std::string_view{content}.substr(s, e - s);
 }
 
-ExecResult run_extract(const ExtractArgs& a) {
-    auto wp = util::make_workspace_path_checked(a.root, "extract");
+ExecResult run_extract(const Call& call, const ExtractArgs& a) {
+    auto wp = util::make_workspace_path_checked(a.root, "extract", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
     const fs::path root = wp->path();
 
@@ -368,7 +369,7 @@ ExecResult run_extract(const ExtractArgs& a) {
     // k, k+n, … and counts into its own slot, so nothing is shared while they
     // run. Each share stops at its slice of the match cap.
     const std::size_t nshares = std::max<std::size_t>(1, std::min<std::size_t>(
-        parallel_width(), std::min<std::size_t>(kMaxWorkers, files.size())));
+        call.width(), std::min<std::size_t>(kMaxWorkers, files.size())));
     const int share_cap = std::max<int>(1, static_cast<int>(kMaxScanned / static_cast<int>(nshares)));
     std::vector<int> counted(nshares, 0);
 
@@ -430,7 +431,7 @@ ExecResult run_extract(const ExtractArgs& a) {
             } catch (...) { /* regex blow-up on this file — skip */ }
         }
     };
-    parallel_for(nshares, worker);
+    call.split(nshares, worker);
 
     // Flatten in file order (deterministic).
     std::vector<Projection> all;
@@ -535,8 +536,8 @@ std::expected<AggregateArgs, ToolError> parse_aggregate_args(const json& j) {
     return a;
 }
 
-ExecResult run_aggregate(const AggregateArgs& a) {
-    auto wp = util::make_workspace_path_checked(a.root, "aggregate");
+ExecResult run_aggregate(const Call& call, const AggregateArgs& a) {
+    auto wp = util::make_workspace_path_checked(a.root, "aggregate", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
     const fs::path root = wp->path();
 
@@ -560,7 +561,7 @@ ExecResult run_aggregate(const AggregateArgs& a) {
     // nothing is shared while they run. Each share stops at its slice of the
     // match cap.
     const std::size_t nshares = std::max<std::size_t>(1, std::min<std::size_t>(
-        parallel_width(), std::min<std::size_t>(kMaxWorkers, files.size())));
+        call.width(), std::min<std::size_t>(kMaxWorkers, files.size())));
     const int share_cap = std::max<int>(1, static_cast<int>(kMaxScanned / static_cast<int>(nshares)));
     std::vector<std::map<std::string, Bucket>> slots(nshares);
     std::vector<int> counted(nshares, 0);
@@ -617,7 +618,7 @@ ExecResult run_aggregate(const AggregateArgs& a) {
             } catch (...) { /* skip file */ }
         }
     };
-    parallel_for(nshares, worker);
+    call.split(nshares, worker);
     for (auto& local : slots)
         for (auto& [key, v] : local) {
             Bucket& g = buckets[key];
@@ -720,8 +721,8 @@ literal_replace(const std::string& s, const std::string& needle,
     return {std::move(out), n};
 }
 
-ExecResult run_replace(const ReplaceArgs& a) {
-    auto wp = util::make_workspace_path_checked(a.root, "replace");
+ExecResult run_replace(const Call& call, const ReplaceArgs& a) {
+    auto wp = util::make_workspace_path_checked(a.root, "replace", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
     const fs::path root = wp->path();
 
@@ -872,8 +873,9 @@ std::expected<ReadFilterArgs, ToolError> parse_read_filter_args(const json& j) {
     return a;
 }
 
-ExecResult run_read_filter(const ReadFilterArgs& a) {
-    auto wp = util::make_readable_path_checked(a.path, "read_filter");
+ExecResult run_read_filter(const Call& call, const ReadFilterArgs& a) {
+    const auto b = bounds(call);
+    auto wp = util::make_readable_path_checked(a.path, "read_filter", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
     const fs::path p = wp->path();
 
@@ -932,11 +934,11 @@ ExecResult run_read_filter(const ReadFilterArgs& a) {
 
     if (match_count == 0)
         return ToolOutput{"No lines match `" + a.pattern + "` in " +
-                          rel_path(p, util::project_root()) + " (" +
+                          rel_path(p, util::project_root(b)) + " (" +
                           std::to_string(N) + " lines scanned).", std::nullopt};
 
     std::ostringstream out;
-    out << rel_path(p, util::project_root()) << " \xe2\x80\x94 " << match_count
+    out << rel_path(p, util::project_root(b)) << " \xe2\x80\x94 " << match_count
         << " matching line" << (match_count==1?"":"s") << " of " << N
         << " (\xc2\xb1" << a.context << " context; gaps collapsed):\n\n";
 

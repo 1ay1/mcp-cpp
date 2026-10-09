@@ -20,4 +20,3 @@
 #include <mcp/cap/capability.hpp>
 #include <mcp/cap/local.hpp>
 #include <mcp/cap/registry.hpp>
-#include <mcp/cap/process.hpp>

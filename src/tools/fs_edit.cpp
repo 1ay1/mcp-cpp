@@ -6,6 +6,7 @@
 // to the host's diff-review UI via the detail::lower() meta bridge.
 
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 #include "tool_body.hpp"
 #include "diff.hpp"
 
@@ -100,14 +101,14 @@ struct EditArgs {
     std::string           display_description;
 };
 
-std::expected<EditArgs, ToolError> parse_edit_args(const json& j) {
+std::expected<EditArgs, ToolError> parse_edit_args(const json& j, const util::Bounds& b) {
     util::ArgReader ar(j);
     if (!ar.is_object())
         return std::unexpected(ToolError::invalid_args("args must be an object"));
     auto path_opt = ar.require_str("path");
     if (!path_opt)
         return std::unexpected(ToolError::invalid_args("path required"));
-    auto wp = util::make_workspace_path_checked(*path_opt, "edit");
+    auto wp = util::make_workspace_path_checked(*path_opt, "edit", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
 
     std::string desc = ar.str("display_description", "");
@@ -750,7 +751,7 @@ int apply_one(std::string& buf, const OneEdit& e,
     return 1;
 }
 
-ExecResult run_edit(const EditArgs& a) {
+ExecResult run_edit(const Call& call, const EditArgs& a) {
     const auto& p = a.path.path();
     std::error_code ec;
     if (!fs::exists(p, ec)) {
@@ -793,7 +794,7 @@ ExecResult run_edit(const EditArgs& a) {
               "`write` to rewrite it whole."));
 
     std::string staleness_warning;
-    if (util::staleness_of(p) == util::StaleVerdict::Stale) {
+    if (staleness(call, p) == util::StaleVerdict::Stale) {
         staleness_warning =
             "\xe2\x9a\xa0  The file has changed on disk since the last time a tool "
             "observed it this session. The edit was applied to the CURRENT "
@@ -934,7 +935,7 @@ ExecResult run_edit(const EditArgs& a) {
         std::error_code mt_ec;
         auto new_mtime = fs::last_write_time(p, mt_ec);
         if (!mt_ec) {
-            util::record_file_seen(p, new_mtime,
+            record_seen(call, p, new_mtime,
                                    static_cast<std::uintmax_t>(updated.size()),
                                    util::cheap_content_hash(updated));
         }
@@ -1187,7 +1188,7 @@ struct ApplyPatchArgs {
     return hunks;
 }
 
-ExecResult run_apply_patch(const ApplyPatchArgs& a) {
+ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
     const auto& p = a.path.path();
     std::error_code ec;
     if (!fs::exists(p, ec))
@@ -1232,9 +1233,9 @@ ExecResult run_apply_patch(const ApplyPatchArgs& a) {
         return std::unexpected(ToolError::binary(
             "refusing to patch binary file: " + a.path.string()));
 
-    std::string staleness;
-    if (util::staleness_of(p) == util::StaleVerdict::Stale)
-        staleness =
+    std::string stale_note;
+    if (staleness(call, p) == util::StaleVerdict::Stale)
+        stale_note =
             "\xe2\x9a\xa0  The file changed on disk since a tool last observed "
             "it this session. The patch was applied to the CURRENT bytes; "
             "re-read if the result looks wrong.\n\n";
@@ -1298,14 +1299,14 @@ ExecResult run_apply_patch(const ApplyPatchArgs& a) {
         updated.replace(it->pos, it->len, it->replacement);
 
     if (updated == original)
-        return ToolOutput{staleness + "Patch produced no change \u2014 the file "
+        return ToolOutput{stale_note + "Patch produced no change \u2014 the file "
             "already matches the patched state.", std::nullopt};
 
     auto d = diff::compute(a.path.string(), original, updated);
     if (auto werr = util::write_file(a.path, updated); !werr.empty())
         return std::unexpected(ToolError::io(werr));
     { std::error_code mt; auto nm = fs::last_write_time(p, mt);
-      if (!mt) util::record_file_seen(p, nm,
+      if (!mt) record_seen(call, p, nm,
                    static_cast<std::uintmax_t>(updated.size()),
                    util::cheap_content_hash(updated)); }
 
@@ -1341,7 +1342,7 @@ ExecResult run_apply_patch(const ApplyPatchArgs& a) {
         }
     }
     std::ostringstream msg;
-    if (!staleness.empty()) msg << staleness;
+    if (!stale_note.empty()) msg << stale_note;
     if (!a.display_description.empty()) msg << a.display_description << "\n\n";
     msg << "Patched " << a.path.string() << " (" << d.added << "+ "
         << d.removed << "-, " << hunks.size() << " hunk"
@@ -1353,7 +1354,7 @@ ExecResult run_apply_patch(const ApplyPatchArgs& a) {
     return ToolOutput{msg.str(), std::move(change)};
 }
 
-std::expected<ApplyPatchArgs, ToolError> parse_apply_patch_args(const json& j) {
+std::expected<ApplyPatchArgs, ToolError> parse_apply_patch_args(const json& j, const util::Bounds& b) {
     util::ArgReader r(j);
     if (!r.is_object())
         return std::unexpected(ToolError::invalid_args("expected a JSON object"));
@@ -1363,7 +1364,7 @@ std::expected<ApplyPatchArgs, ToolError> parse_apply_patch_args(const json& j) {
     auto patch = r.require_str("patch");
     if (!patch || patch->empty())
         return std::unexpected(ToolError::invalid_args("`patch` is required"));
-    auto wp = util::make_workspace_path_checked(*path, "apply_patch");
+    auto wp = util::make_workspace_path_checked(*path, "apply_patch", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
     ApplyPatchArgs a{std::move(*wp), std::move(*patch),
                      r.str("display_description")};
