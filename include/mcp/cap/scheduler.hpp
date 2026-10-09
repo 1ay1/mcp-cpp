@@ -35,9 +35,9 @@
 //     4. a Write with NO extractable path — unknown blast radius; conflicts
 //        with every other fs-touching call. (Net-only peers still parallelise.)
 //
-//   This is a PURE planner (plan_waves) plus a thin executor on mcp::Runtime
-//   (run / run_on). The planner has no I/O and is unit-testable in isolation;
-//   the executor is opt-in and lives behind the same one-call surface a host
+//   This is a PURE planner (plan_waves) plus a thin runner (run / run_plan)
+//   that takes the caller's Splitter. The planner has no I/O and is unit-testable in isolation;
+//   the runner is opt-in and lives behind the same one-call surface a host
 //   already uses (Registry::dispatch), so adopting it is a one-line change.
 //
 //   Header-only, core layer: it depends only on the cap abstraction and an
@@ -253,7 +253,7 @@ struct Plan {
     return plan_waves(facts);
 }
 
-// ── The executor ────────────────────────────────────────────────────────────
+// ── The runner ───────────────────────────────────────────────────────────────
 // Run a batch against any dispatcher, one wave after another. Calls within a
 // wave go through `split`, which may run them in parallel: the planner has
 // made sure they never touch overlapping fs state and never exec, so

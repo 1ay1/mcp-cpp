@@ -418,23 +418,16 @@ struct Session {
     virtual void stop() = 0;
 };
 
-/// Run work in parallel. mcp-cpp owns no threads: the scan tools (grep,
-/// structural search, repo map, extract/aggregate) split a file list into
-/// shares and hand them here; the host decides what threads run them.
-struct Executor {
-    Executor()                           = default;
-    Executor(const Executor&)            = delete;
-    Executor& operator=(const Executor&) = delete;
-    virtual ~Executor()                  = default;
-
+/// How a scan splits its work. mcp-cpp owns no threads: the scan tools
+/// (grep, structural search, repo map, extract/aggregate) cut a file list
+/// into shares and hand them to `run`, which the host supplies. Empty `run`
+/// means inline.
+struct Splitter {
     /// Run fn(i) for every i in [0, n) and return when all have finished.
-    /// Calls may run concurrently. A host with no threads to spare may run
-    /// them inline; the tools are correct either way.
-    virtual void parallel_for(std::size_t n,
-                              const std::function<void(std::size_t)>& fn) = 0;
-
+    /// Calls may run concurrently; the tools are correct either way.
+    std::function<void(std::size_t n, const std::function<void(std::size_t)>& fn)> run;
     /// How many shares are worth making. 1 means "run inline".
-    [[nodiscard]] virtual std::size_t width() const noexcept = 0;
+    std::size_t width = 1;
 };
 
 /// Run one program to completion. Blocking from the caller's point of view;
@@ -475,8 +468,8 @@ struct HostServices {
     std::shared_ptr<HttpClient>     http;       // web_fetch / web_search
     // Null ⇒ no shell / diagnostics / git_* / process_* tools. See Exec.
     std::shared_ptr<Exec>           exec;
-    // Null ⇒ the scan tools run single-threaded. See Executor.
-    std::shared_ptr<Executor>       executor;
+    // How scans split their work; empty runs them inline.
+    Splitter                        split;
     // What the tools remember between calls (workspace, caches, background
     // processes). Null ⇒ make_provider makes a SoleStateAccess, fine for a
     // host that runs one call at a time. See state.hpp.

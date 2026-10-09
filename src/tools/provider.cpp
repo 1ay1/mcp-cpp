@@ -49,12 +49,12 @@ std::string apply_budget(std::string text, int budget) {
 } // namespace
 
 void Call::split(std::size_t n, const std::function<void(std::size_t)>& fn) const {
-    if (executor) { executor->parallel_for(n, fn); return; }
+    if (splitter && splitter->run && n > 1) { splitter->run(n, fn); return; }
     for (std::size_t i = 0; i < n; ++i) fn(i);
 }
 
 std::size_t Call::width() const noexcept {
-    return executor ? std::max<std::size_t>(1, executor->width()) : 1;
+    return splitter && splitter->run ? std::max<std::size_t>(1, splitter->width) : 1;
 }
 
 std::shared_ptr<mcp::cap::CapabilityProvider>
@@ -100,6 +100,7 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
     // without one, this provider keeps its own and expects one call at a time.
     std::shared_ptr<StateAccess> state = svc.state;
     if (!state) state = std::make_shared<SoleStateAccess>();
+    auto split = std::make_shared<const Splitter>(std::move(svc.split));
 
     for (auto& s : shells.items()) {
         EffectSet fx       = s.effects;
@@ -107,11 +108,11 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
         auto      handler  = std::move(s.handler);
 
         provider->add(s.tool,
-            [handler = std::move(handler), fx, budget, state, exe = svc.executor](const mcp::cap::Request& req)
+            [handler = std::move(handler), fx, budget, state, split](const mcp::cap::Request& req)
                 -> mcp::cap::Result {
                 Call call;
                 call.state     = state.get();
-                call.executor  = exe.get();
+                call.splitter  = split.get();
                 call.reader    = req.reader;
                 call.cancelled = req.cancelled;
                 if (!call.cancelled && req.stop.stop_possible())

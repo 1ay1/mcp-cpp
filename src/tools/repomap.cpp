@@ -397,7 +397,7 @@ std::shared_ptr<const RepoGraph> build_graph(const Call& call, const fs::path& r
         std::vector<std::string> parsed_bodies(cands.size());
         std::vector<char>        ok(cands.size(), 0);
 
-        // The host's executor decides the threads; we only choose how many
+        // The host's splitter decides the threads; we only choose how many
         // shares. Share k parses candidates k, k+n, … into its own slots.
         // Small trees don't benefit from fanning out; run inline.
         std::size_t nshares = std::min<std::size_t>(call.width(), 16);

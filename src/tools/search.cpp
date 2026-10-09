@@ -1210,7 +1210,7 @@ ExecResult run_builtin(const Call& call, const GrepArgs& a) {
     std::optional<std::regex> exclude_re;
     if (!a.exclude.empty()) exclude_re.emplace(a.exclude, std::regex::ECMAScript | std::regex::optimize);
 
-    // Shares, not threads: the host's executor runs them. Share k scans
+    // Shares, not threads: the host's splitter runs them. Share k scans
     // candidates k, k+n, … and counts its own matches against its slice of
     // the cap, so the shares share nothing while they run.
     std::size_t nshares = std::min<std::size_t>(call.width(), kMaxWorkers);

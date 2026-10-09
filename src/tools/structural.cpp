@@ -91,7 +91,7 @@ constexpr std::size_t kMaxMatches    = 200;               // result cap
 constexpr std::size_t kMaxOutBytes   = 24u * 1024;        // output budget
 constexpr int         kContext       = 1;                 // ± lines of context
 
-// Shares to split a scan into; the host's executor owns the threads.
+// Shares to split a scan into; the host's splitter owns the threads.
 std::size_t worker_count(const Call& call) {
     return std::min<std::size_t>(call.width(), 16);
 }

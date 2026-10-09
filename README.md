@@ -246,8 +246,8 @@ auto results = cap::run(registry, batch,                  // 1:1 with batch, ori
   writing `src/` orders against reading `src/a.c`); a write with no extractable
   path serialises against all fs peers.
 - `plan_waves()` is a **pure** planner (no I/O, unit-tested in isolation);
-  `run()` is a thin `std::async` executor behind the same one-call surface the
-  host already uses. Works over **any** provider mix — a default `EffectFn`
+  `run()` runs each wave through the caller's `Splitter` (serial by default),
+  behind the same one-call surface the host already uses. Works over **any** provider mix — a default `EffectFn`
   reads the standard MCP `readOnlyHint` / `openWorldHint` annotations so it does
   something safe even for a third-party server that never heard of `EffectSet`.
 

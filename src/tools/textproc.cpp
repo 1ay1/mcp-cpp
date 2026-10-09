@@ -365,7 +365,7 @@ ExecResult run_extract(const Call& call, const ExtractArgs& a) {
 
     std::vector<std::vector<Projection>> per_file(files.size());
 
-    // Shares, not threads: the host's executor runs them. Share k scans files
+    // Shares, not threads: the host's splitter runs them. Share k scans files
     // k, k+n, … and counts into its own slot, so nothing is shared while they
     // run. Each share stops at its slice of the match cap.
     const std::size_t nshares = std::max<std::size_t>(1, std::min<std::size_t>(
@@ -556,7 +556,7 @@ ExecResult run_aggregate(const Call& call, const AggregateArgs& a) {
     struct Bucket { long long count = 0; double sum = 0; std::vector<std::string> samples; };
     std::map<std::string, Bucket> buckets;   // ordered for stable output
 
-    // Shares, not threads: the host's executor runs them. Share k scans files
+    // Shares, not threads: the host's splitter runs them. Share k scans files
     // k, k+n, k+2n, … into its own slot, and the slots are merged after, so
     // nothing is shared while they run. Each share stops at its slice of the
     // match cap.

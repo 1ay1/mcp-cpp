@@ -35,7 +35,7 @@
 namespace mcp::tools {
 
 struct Session;    // host.hpp
-struct Executor;   // host.hpp
+struct Splitter;   // host.hpp
 
 namespace state {
 
@@ -116,13 +116,13 @@ struct SoleStateAccess final : StateAccess {
 // What one call carries besides its arguments.
 struct Call {
     StateAccess*          state = nullptr;      // never null inside a tool body
-    Executor*             executor = nullptr;   // null: scans run inline
+    const Splitter*       splitter = nullptr;   // null: scans run inline
     std::string           reader;               // whose context a `read` serves
     std::function<bool()> cancelled;            // may be empty
 
     [[nodiscard]] bool cancel_requested() const { return cancelled && cancelled(); }
 
-    // A scan's parallel region: run fn(0..n-1) on the host's executor, or
+    // A scan's parallel region: run fn(0..n-1) through the host's splitter, or
     // inline without one. width() is how many shares are worth making.
     void split(std::size_t n, const std::function<void(std::size_t)>& fn) const;
     [[nodiscard]] std::size_t width() const noexcept;
