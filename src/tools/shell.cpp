@@ -313,7 +313,7 @@ std::string explain_exit_code(int code) {
 #endif
 }
 
-ExecResult run_bash(const BashArgs& a, Exec& exec) {
+ExecResult run_bash(const BashArgs& a, CallExec& exec) {
     const std::string& cmd_str = a.command;
     const int           tmo_s   = a.timeout;
 
@@ -610,7 +610,10 @@ void register_shell_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "instead (no cat/echo/sed/heredoc to create or modify files).",
 #endif
         bash_schema(), EffectSet{Effect::Exec},
-        body_with<BashArgs>([exec](const BashArgs& a) { return run_bash(a, *exec); },
+        body_with<BashArgs>([exec](const Call& c, const BashArgs& a) {
+                CallExec ce{*exec, c};
+                return run_bash(a, ce);
+            },
                             parse_bash_args), 30'000);
 }
 

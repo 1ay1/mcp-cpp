@@ -209,7 +209,7 @@ std::expected<FindDefinitionArgs, ToolError> parse_find_definition_args(const js
 // parsing below is untouched; `stop_when` is forwarded because only this
 // file knows when it has seen enough matches.
 [[nodiscard]] RunResult run_prog(
-        Exec& exec, std::vector<std::string> argv,
+        CallExec& exec, std::vector<std::string> argv,
         std::chrono::seconds timeout, std::size_t max_bytes,
         std::function<bool(std::string_view)> stop_when = {}) {
     ExecRequest req;
@@ -238,9 +238,9 @@ std::expected<FindDefinitionArgs, ToolError> parse_find_definition_args(const js
     return out;
 }
 
-[[nodiscard]] bool have_rg(const Call& call, Exec& exec);
+[[nodiscard]] bool have_rg(const Call& call, CallExec& exec);
 
-ExecResult run_find_definition(const Call& call, const FindDefinitionArgs& a, Exec& exec) {
+ExecResult run_find_definition(const Call& call, const FindDefinitionArgs& a, CallExec& exec) {
     auto wp = util::make_workspace_path_checked(a.root, "find_definition", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
 
@@ -667,7 +667,7 @@ enum class Backend { Ripgrep, BuiltIn };
 
 // Is rg on the host's PATH? Remembered in the tool state: it doesn't change
 // under us, and probing per grep would cost a spawn on every call.
-[[nodiscard]] bool have_rg(const Call& call, Exec& exec) {
+[[nodiscard]] bool have_rg(const Call& call, CallExec& exec) {
     if (auto known = call.with([](ToolState& s) { return s.have_rg; })) return *known;
     auto r = run_prog(exec, {"rg", "--version"}, std::chrono::seconds(3), 1024);
     const bool yes = r.started && r.exit_code == 0;
@@ -675,7 +675,7 @@ enum class Backend { Ripgrep, BuiltIn };
     return yes;
 }
 
-[[nodiscard]] Backend detect_backend(const Call& call, Exec& exec) {
+[[nodiscard]] Backend detect_backend(const Call& call, CallExec& exec) {
     return have_rg(call, exec) ? Backend::Ripgrep : Backend::BuiltIn;
 }
 
@@ -926,7 +926,7 @@ std::string grep_no_match_hint(const GrepArgs& a) {
     return h;
 }
 
-ExecResult run_ripgrep(const GrepArgs& a, Exec& exec) {
+ExecResult run_ripgrep(const GrepArgs& a, CallExec& exec) {
     std::vector<std::string> argv = {"rg", "--json", "--no-config"};
     if (!a.case_sensitive) argv.push_back("-i");
     if (a.word) argv.push_back("-w");           // whole-word match
@@ -1440,8 +1440,10 @@ ExecResult run_grep(const Call& call, const GrepArgs& a, Exec* exec) {
     // Block mode (context:"block") needs the file content in hand to expand a
     // hit to its enclosing brace scope — the builtin scanner always has it, so
     // force that path (ripgrep's --json gives only ±C fixed context).
-    const bool use_builtin = a.block || !exec || detect_backend(call, *exec) != Backend::Ripgrep;
-    auto r = use_builtin ? run_builtin(call, gated) : run_ripgrep(gated, *exec);
+    std::optional<CallExec> ce;
+    if (exec) ce.emplace(*exec, call);
+    const bool use_builtin = a.block || !ce || detect_backend(call, *ce) != Backend::Ripgrep;
+    auto r = use_builtin ? run_builtin(call, gated) : run_ripgrep(gated, *ce);
     if (r.has_value()) r->text = util::to_valid_utf8(std::move(r->text));
     return r;
 }
@@ -1525,7 +1527,7 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "To find USES of a symbol, use `grep` with word=true; for calls with a "
         "specific shape use `search_structural`.",
         find_definition_schema(), EffectSet{Effect::ReadFs},
-        body_with<FindDefinitionArgs>([exec](const Call& c, const FindDefinitionArgs& a) { return run_find_definition(c, a, *exec); }, parse_find_definition_args), 25'000);
+        body_with<FindDefinitionArgs>([exec](const Call& c, const FindDefinitionArgs& a) { CallExec ce{*exec, c}; return run_find_definition(c, a, ce); }, parse_find_definition_args), 25'000);
 }
 
 } // namespace mcp::tools::detail

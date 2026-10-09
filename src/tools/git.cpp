@@ -98,7 +98,7 @@ hardened_git_argv(const std::vector<std::string>& argv) {
 // command, and all of it comes from the repository. argv form (no `sh -c`),
 // so commit messages with quotes and $vars survive exactly.
 [[nodiscard]] RunResult run_git_argv(
-        Exec& exec,
+        CallExec& exec,
         const std::vector<std::string>& argv,
         std::size_t max_bytes = 30'000,
         std::chrono::seconds timeout = std::chrono::seconds{120}) {
@@ -130,7 +130,7 @@ hardened_git_argv(const std::vector<std::string>& argv) {
 }
 
 std::expected<std::string, ToolError>
-run_git(Exec& exec, const std::vector<std::string>& argv, std::string_view op,
+run_git(CallExec& exec, const std::vector<std::string>& argv, std::string_view op,
         std::size_t max_bytes = 30'000) {
     // Harden every git invocation for a non-interactive child (setsid, stdin
     // /dev/null, stdout a pipe):
@@ -204,7 +204,7 @@ std::filesystem::path default_git_start(const util::Bounds& b) {
 // the workspace is not containment because Git would discover the same
 // parent repository again.
 std::expected<std::string, ToolError>
-resolve_git_dir(Exec& exec, std::string_view checked, const util::Bounds& b) {
+resolve_git_dir(CallExec& exec, std::string_view checked, const util::Bounds& b) {
     namespace fs = std::filesystem;
     fs::path start = checked.empty()
         ? default_git_start(b)
@@ -245,7 +245,7 @@ resolve_git_dir(Exec& exec, std::string_view checked, const util::Bounds& b) {
 // and then runs git_diff gets a confusing empty result. We surface the names
 // so the callers can point the user INTO the submodule. Best-effort: any
 // failure yields an empty list (never an error — this is only a hint).
-std::vector<std::string> dirty_submodules(Exec& exec, const std::string& git_dir) {
+std::vector<std::string> dirty_submodules(CallExec& exec, const std::string& git_dir) {
     std::vector<std::string> out;
     // Fast path: no `.gitmodules` at the repo root ⇒ no submodules ⇒ don't
     // pay for a `git submodule foreach` subprocess on every status/diff in
@@ -451,7 +451,7 @@ std::expected<GitStatusArgs, ToolError> parse_git_status_args(const json& j) {
     };
 }
 
-ExecResult run_git_status(const Call& call, const GitStatusArgs& a, Exec& exec) {
+ExecResult run_git_status(const Call& call, const GitStatusArgs& a, CallExec& exec) {
     const auto b = bounds(call);
     std::string checked;
     if (!a.root.empty()) {
@@ -536,7 +536,7 @@ std::expected<GitDiffArgs, ToolError> parse_git_diff_args(const json& j) {
     };
 }
 
-ExecResult run_git_diff(const Call& call, const GitDiffArgs& a, Exec& exec) {
+ExecResult run_git_diff(const Call& call, const GitDiffArgs& a, CallExec& exec) {
     const auto b = bounds(call);
     if (auto v = validate_ref(a.ref); !v) return std::unexpected(std::move(v.error()));
     std::string checked;
@@ -627,7 +627,7 @@ std::expected<GitLogArgs, ToolError> parse_git_log_args(const json& j) {
     };
 }
 
-ExecResult run_git_log(const Call& call, const GitLogArgs& a, Exec& exec) {
+ExecResult run_git_log(const Call& call, const GitLogArgs& a, CallExec& exec) {
     const auto b = bounds(call);
     if (auto v = validate_ref(a.ref); !v) return std::unexpected(std::move(v.error()));
     int n = a.count;
@@ -722,7 +722,7 @@ std::expected<GitCommitArgs, ToolError> parse_git_commit_args(const json& j) {
     };
 }
 
-ExecResult run_git_commit(const Call& call, const GitCommitArgs& a, Exec& exec) {
+ExecResult run_git_commit(const Call& call, const GitCommitArgs& a, CallExec& exec) {
     const auto b = bounds(call);
     // Resolve the repo to commit in from (in priority order): the explicit
     // `path` arg, the first staged file, else the smart default (the process
@@ -875,7 +875,7 @@ std::expected<GitShowArgs, ToolError> parse_git_show_args(const json& j) {
     return GitShowArgs{ar.str("ref", "HEAD"), std::move(path), format == "file"};
 }
 
-ExecResult run_git_show(const Call& call, const GitShowArgs& a, Exec& exec) {
+ExecResult run_git_show(const Call& call, const GitShowArgs& a, CallExec& exec) {
     const auto b = bounds(call);
     if (auto v = validate_ref(a.ref); !v) return std::unexpected(std::move(v.error()));
     std::string checked_path;
@@ -919,7 +919,7 @@ std::expected<GitBlameArgs, ToolError> parse_git_blame_args(const json& j) {
     return GitBlameArgs{*path, ar.str("ref", "HEAD"), start, end};
 }
 
-ExecResult run_git_blame(const Call& call, const GitBlameArgs& a, Exec& exec) {
+ExecResult run_git_blame(const Call& call, const GitBlameArgs& a, CallExec& exec) {
     const auto b = bounds(call);
     if (auto v = validate_ref(a.ref); !v) return std::unexpected(std::move(v.error()));
     auto wp = util::make_workspace_path_checked(a.path, "git_blame", b);
@@ -983,7 +983,7 @@ std::expected<GitBranchArgs, ToolError> parse_git_branch_args(const json& j) {
     };
 }
 
-ExecResult run_git_branch(const Call& call, const GitBranchArgs& a, Exec& exec) {
+ExecResult run_git_branch(const Call& call, const GitBranchArgs& a, CallExec& exec) {
     const auto b = bounds(call);
     std::string checked;
     if (!a.path.empty()) {
@@ -1122,7 +1122,7 @@ std::expected<GitStashArgs, ToolError> parse_git_stash_args(const json& j) {
     };
 }
 
-ExecResult run_git_stash(const Call& call, const GitStashArgs& a, Exec& exec) {
+ExecResult run_git_stash(const Call& call, const GitStashArgs& a, CallExec& exec) {
     const auto b = bounds(call);
     std::string checked;
     if (!a.path.empty()) {
@@ -1228,7 +1228,7 @@ std::expected<GitRebaseArgs, ToolError> parse_git_rebase_args(const json& j) {
     };
 }
 
-ExecResult run_git_rebase(const Call& call, const GitRebaseArgs& a, Exec& exec) {
+ExecResult run_git_rebase(const Call& call, const GitRebaseArgs& a, CallExec& exec) {
     const auto b = bounds(call);
     std::string checked;
     if (!a.path.empty()) {
@@ -1317,7 +1317,7 @@ parse_git_cherry_pick_args(const json& j) {
     };
 }
 
-ExecResult run_git_cherry_pick(const Call& call, const GitCherryPickArgs& a, Exec& exec) {
+ExecResult run_git_cherry_pick(const Call& call, const GitCherryPickArgs& a, CallExec& exec) {
     const auto b = bounds(call);
     std::string checked;
     if (!a.path.empty()) {
@@ -1535,59 +1535,59 @@ void register_git_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "Show the current git status: branch, staged/unstaged changes, "
         "untracked files, ahead/behind counts.",
         git_status_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitStatusArgs>([exec](const Call& c, const GitStatusArgs& a) { return run_git_status(c, a, *exec); }, parse_git_status_args), 30'000);
+        body_with<GitStatusArgs>([exec](const Call& c, const GitStatusArgs& a) { CallExec ce{*exec, c}; return run_git_status(c, a, ce); }, parse_git_status_args), 30'000);
 
     sh.add("git_diff",
         "Show git diff. By default shows unstaged changes. Use staged=true "
         "for staged changes, or specify a ref/range.",
         git_diff_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitDiffArgs>([exec](const Call& c, const GitDiffArgs& a) { return run_git_diff(c, a, *exec); }, parse_git_diff_args), 60'000);
+        body_with<GitDiffArgs>([exec](const Call& c, const GitDiffArgs& a) { CallExec ce{*exec, c}; return run_git_diff(c, a, ce); }, parse_git_diff_args), 60'000);
 
     sh.add("git_log",
         "Show git commit history. Returns commit hash, author, date, and message.",
         git_log_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitLogArgs>([exec](const Call& c, const GitLogArgs& a) { return run_git_log(c, a, *exec); }, parse_git_log_args), 30'000);
+        body_with<GitLogArgs>([exec](const Call& c, const GitLogArgs& a) { CallExec ce{*exec, c}; return run_git_log(c, a, ce); }, parse_git_log_args), 30'000);
 
     sh.add("git_show",
         "Show a commit with metadata and patch, or read one file exactly as it existed at a revision.",
         git_show_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitShowArgs>([exec](const Call& c, const GitShowArgs& a) { return run_git_show(c, a, *exec); }, parse_git_show_args), 60'000);
+        body_with<GitShowArgs>([exec](const Call& c, const GitShowArgs& a) { CallExec ce{*exec, c}; return run_git_show(c, a, ce); }, parse_git_show_args), 60'000);
 
     sh.add("git_blame",
         "Annotate a file or line range with the commit, author, date, and source line that last changed it.",
         git_blame_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitBlameArgs>([exec](const Call& c, const GitBlameArgs& a) { return run_git_blame(c, a, *exec); }, parse_git_blame_args), 40'000);
+        body_with<GitBlameArgs>([exec](const Call& c, const GitBlameArgs& a) { CallExec ce{*exec, c}; return run_git_blame(c, a, ce); }, parse_git_blame_args), 40'000);
 
     sh.add("git_commit",
         "Stage files and create a git commit. Specify files to stage, "
         "or use stage_all to stage everything.",
         git_commit_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitCommitArgs>([exec](const Call& c, const GitCommitArgs& a) { return run_git_commit(c, a, *exec); }, parse_git_commit_args), 0);
+        body_with<GitCommitArgs>([exec](const Call& c, const GitCommitArgs& a) { CallExec ce{*exec, c}; return run_git_commit(c, a, ce); }, parse_git_commit_args), 0);
 
     sh.add("git_branch",
         "List, create, switch, or delete git branches. action=list (default) "
         "is read-only; create/switch/delete take a `name`.",
         git_branch_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitBranchArgs>([exec](const Call& c, const GitBranchArgs& a) { return run_git_branch(c, a, *exec); }, parse_git_branch_args), 20'000);
+        body_with<GitBranchArgs>([exec](const Call& c, const GitBranchArgs& a) { CallExec ce{*exec, c}; return run_git_branch(c, a, ce); }, parse_git_branch_args), 20'000);
 
     sh.add("git_stash",
         "Shelve or restore uncommitted work. action=list (default) is "
         "read-only; push/pop/apply/drop/show manage the stash.",
         git_stash_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitStashArgs>([exec](const Call& c, const GitStashArgs& a) { return run_git_stash(c, a, *exec); }, parse_git_stash_args), 50'000);
+        body_with<GitStashArgs>([exec](const Call& c, const GitStashArgs& a) { CallExec ce{*exec, c}; return run_git_stash(c, a, ce); }, parse_git_stash_args), 50'000);
 
     sh.add("git_rebase",
         "Reapply commits onto a new base (action=onto upstream=<ref>), or "
         "drive an in-progress rebase (continue/abort/skip).",
         git_rebase_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitRebaseArgs>([exec](const Call& c, const GitRebaseArgs& a) { return run_git_rebase(c, a, *exec); }, parse_git_rebase_args), 50'000);
+        body_with<GitRebaseArgs>([exec](const Call& c, const GitRebaseArgs& a) { CallExec ce{*exec, c}; return run_git_rebase(c, a, ce); }, parse_git_rebase_args), 50'000);
 
     sh.add("git_cherry_pick",
         "Apply the changes from existing commit(s) onto HEAD "
         "(action=pick commits=[...]), or drive one in progress "
         "(continue/abort/skip).",
         git_cherry_pick_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitCherryPickArgs>([exec](const Call& c, const GitCherryPickArgs& a) { return run_git_cherry_pick(c, a, *exec); }, parse_git_cherry_pick_args),
+        body_with<GitCherryPickArgs>([exec](const Call& c, const GitCherryPickArgs& a) { CallExec ce{*exec, c}; return run_git_cherry_pick(c, a, ce); }, parse_git_cherry_pick_args),
         50'000);
 }
 

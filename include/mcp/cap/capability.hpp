@@ -48,6 +48,10 @@ struct Request {
     // Whose context the call serves (a conversation, a subagent run). A
     // provider that remembers what it has shown someone keys on this.
     std::string reader = {};
+    // The host's own per-call data, passed through untouched to whatever the
+    // host plugged in (its Exec, SkillResolver, SubagentRunner). mcp-cpp
+    // never reads it. Lets a host keep call-scoped facts off thread-locals.
+    const void* host = nullptr;
 };
 
 // The outcome of executing a capability. `text` is the human/model-facing

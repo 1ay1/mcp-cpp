@@ -115,6 +115,9 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
                 call.splitter  = split.get();
                 call.reader    = req.reader;
                 call.cancelled = req.cancelled;
+                call.stop      = req.stop;
+                call.progress  = req.progress;
+                call.host      = req.host;
                 if (!call.cancelled && req.stop.stop_possible())
                     call.cancelled = [st = req.stop] { return st.stop_requested(); };
                 mcp::cap::Result r = handler(call, req.args);

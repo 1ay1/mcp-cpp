@@ -113,12 +113,12 @@ void register_skill_tool(Shells& sh, const std::shared_ptr<SkillResolver>& res) 
             }},
         },
         EffectSet{},
-        [res](const Json& args) -> mcp::cap::Result {
+        [res](const Call& call, const Json& args) -> mcp::cap::Result {
             std::string name = args.value("name", std::string{});
             if (name.empty())
                 return mcp::cap::Result::error("skill: `name` is required.");
             std::string err;
-            auto body = res->load(name, err);
+            auto body = res->load(call, name, err);
             if (!body)
                 return mcp::cap::Result::error(
                     err.empty() ? ("skill: unknown skill '" + name + "'.") : err);
@@ -279,8 +279,8 @@ void register_task_tool(Shells& sh, const std::shared_ptr<SubagentRunner>& runne
             }},
         },
         EffectSet{Effect::ReadFs, Effect::Net},
-        [runner](const Json& args) -> mcp::cap::Result {
-            if (auto reason = runner->unavailable_reason(); !reason.empty())
+        [runner](const Call& call, const Json& args) -> mcp::cap::Result {
+            if (auto reason = runner->unavailable_reason(call); !reason.empty())
                 return mcp::cap::Result::error("task: " + std::move(reason));
             SubagentRequest req;
             req.prompt = args.value("prompt", std::string{});
@@ -288,7 +288,7 @@ void register_task_tool(Shells& sh, const std::shared_ptr<SubagentRunner>& runne
                 return mcp::cap::Result::error("task: `prompt` is required.");
             req.agent_type = args.value("agent_type", std::string{"general"});
             bool is_error = false;
-            std::string report = runner->run(req, is_error);
+            std::string report = runner->run(call, req, is_error);
             return is_error ? mcp::cap::Result::error(report)
                             : mcp::cap::Result::ok(report);
         });

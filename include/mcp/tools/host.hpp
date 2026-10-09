@@ -144,8 +144,9 @@ public:
     virtual ~SkillResolver() = default;
     // Resolve a skill name to its full instruction body. On success returns
     // the body and leaves `err` empty; on failure returns nullopt + `err`.
+    // `call` is the tool call asking (its host data, reader, cancel).
     [[nodiscard]] virtual std::optional<std::string>
-        load(const std::string& name, std::string& err) = 0;
+        load(const Call& call, const std::string& name, std::string& err) = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -199,12 +200,13 @@ public:
     virtual ~SubagentRunner() = default;
     // Empty when a subagent can run right now; otherwise an actionable reason
     // suitable for returning directly as a tool execution error.
-    [[nodiscard]] virtual std::string unavailable_reason() const = 0;
-    [[nodiscard]] bool available() const { return unavailable_reason().empty(); }
+    [[nodiscard]] virtual std::string unavailable_reason(const Call& call) const = 0;
+    [[nodiscard]] bool available(const Call& call) const { return unavailable_reason(call).empty(); }
     // Run a subagent to completion and return its condensed report. On
-    // failure returns the error text and sets `is_error`.
+    // failure returns the error text and sets `is_error`. `call` is the task
+    // tool call (its progress sink, cancel, host data).
     [[nodiscard]] virtual std::string
-        run(const SubagentRequest&, bool& is_error) = 0;
+        run(const Call& call, const SubagentRequest&, bool& is_error) = 0;
     // Host-defined EXTRA agent types beyond the built-in five (user-authored
     // .agentty/agents/*.md in agentty). Merged into the task tool's
     // agent_type enum at registration so the model can discover them.
@@ -310,15 +312,9 @@ struct ExecRequest {
     Budgets                  budgets;
     std::optional<std::size_t> max_output_bytes;
 
-    // Deliberately NO progress sink and NO cancellation probe.
-    //
-    // Both describe things the HOST already knows: where this tool call's
-    // output should be shown, and whether its user asked to stop. Passing
-    // them down means the library carries a std::function it must remember
-    // to null-check before calling -- and an empty std::function invoked is
-    // undefined behaviour, which is a trap for a field that is empty in the
-    // common case. The request is pure data; the host wires its own plumbing
-    // on its own side of the call.
+    // No progress sink and no cancellation probe in the request. Both
+    // describe the tool CALL, not the program, and the call already carries
+    // them: Exec::run takes the Call alongside this request.
 
     /// Stop once the output so far is enough. Called with everything
     /// captured to that point; true means stop.
@@ -438,7 +434,9 @@ struct Exec {
     Exec& operator=(const Exec&) = delete;
     virtual ~Exec()              = default;
 
-    [[nodiscard]] virtual ExecResult run(const ExecRequest&) = 0;
+    /// `call` is the tool call this runs for: the host streams output to its
+    /// progress sink and stops when it is cancelled.
+    [[nodiscard]] virtual ExecResult run(const Call& call, const ExecRequest&) = 0;
 
     /// Start one and come back for it later. Same request type, because it
     /// is the same question asked with a different lifetime -- budgets still
@@ -451,6 +449,23 @@ struct Exec {
     /// that reports what confinement is in force needs to ask rather than
     /// assume. (A descendant that calls setsid() escapes a process group.)
     [[nodiscard]] virtual bool stops_whole_tree() const noexcept = 0;
+};
+
+/// The host's Exec as one tool call sees it: run() carries that call, so its
+/// output streams to the call's progress sink and stops when it is
+/// cancelled. Tool bodies hold this, never the bare Exec. Lives on the
+/// tool body's stack; neither pointer is owned.
+class CallExec {
+public:
+    CallExec(Exec& exec, const Call& call) noexcept : exec_(&exec), call_(&call) {}
+    [[nodiscard]] ExecResult run(const ExecRequest& r) { return exec_->run(*call_, r); }
+    [[nodiscard]] std::expected<std::shared_ptr<Session>, std::string>
+    start(const ExecRequest& r) { return exec_->start(r); }
+    [[nodiscard]] bool stops_whole_tree() const noexcept { return exec_->stops_whole_tree(); }
+    [[nodiscard]] const Call& call() const noexcept { return *call_; }
+private:
+    Exec*       exec_;
+    const Call* call_;
 };
 
 struct HostServices {

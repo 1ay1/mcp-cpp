@@ -133,7 +133,7 @@ std::expected<StartArgs, ToolError> parse_start(const json& args, const util::Bo
     return StartArgs{*command, checked->string()};
 }
 
-ExecResult run_start(const Call& call, const StartArgs& args, Exec& exec) {
+ExecResult run_start(const Call& call, const StartArgs& args, CallExec& exec) {
     // Drop sessions whose child exited and whose output a poll has fully
     // drained — a model that starts many short-lived processes and never
     // calls process_stop would otherwise hit the cap with a confusing error.
@@ -254,7 +254,7 @@ std::expected<PollArgs, ToolError> parse_poll(const json& args) {
                     std::clamp(reader.integer("wait_ms", 250), 0, 300000)};
 }
 
-ExecResult run_poll(const Call& call, const PollArgs& args, Exec&) {
+ExecResult run_poll(const Call& call, const PollArgs& args, CallExec&) {
     auto session = find_proc(call, args.id);
     if (!session)
         return std::unexpected(ToolError::not_found(
@@ -321,7 +321,7 @@ std::expected<StopArgs, ToolError> parse_stop(const json& args) {
     return StopArgs{*id};
 }
 
-ExecResult run_stop(const Call& call, const StopArgs& args, Exec&) {
+ExecResult run_stop(const Call& call, const StopArgs& args, CallExec&) {
     auto session = call.with([&](ToolState& s) -> std::shared_ptr<state::Proc> {
         auto it = s.procs.find(args.id);
         if (it == s.procs.end()) return nullptr;
@@ -394,19 +394,19 @@ void register_process_tools(Shells& shells, const std::shared_ptr<Exec>& exec) {
         "process_poll (incremental output) and process_stop (cleanup). Use bash "
         "for commands that finish on their own.",
         start_schema(), EffectSet{Effect::Exec},
-        body_with<StartArgs>([exec](const Call& c, const StartArgs& a) { return run_start(c, a, *exec); }, parse_start), 4000);
+        body_with<StartArgs>([exec](const Call& c, const StartArgs& a) { CallExec ce{*exec, c}; return run_start(c, a, ce); }, parse_start), 4000);
     shells.add("process_poll",
         "Fetch output produced by a background session SINCE THE LAST POLL, plus "
         "its status (running + uptime, or exited + exit code). Blocks briefly for "
         "new output. Reports if any output scrolled past the rolling buffer.",
         poll_schema(), EffectSet{Effect::Exec},
-        body_with<PollArgs>([exec](const Call& c, const PollArgs& a) { return run_poll(c, a, *exec); }, parse_poll), 30000);
+        body_with<PollArgs>([exec](const Call& c, const PollArgs& a) { CallExec ce{*exec, c}; return run_poll(c, a, ce); }, parse_poll), 30000);
     shells.add("process_stop",
         "Terminate (SIGTERM→SIGKILL) and reap a background session, returning its "
         "exit code and any final output not yet delivered by process_poll. Always "
         "call this to clean up a session you started.",
         stop_schema(), EffectSet{Effect::Exec},
-        body_with<StopArgs>([exec](const Call& c, const StopArgs& a) { return run_stop(c, a, *exec); }, parse_stop), 30000);
+        body_with<StopArgs>([exec](const Call& c, const StopArgs& a) { CallExec ce{*exec, c}; return run_stop(c, a, ce); }, parse_stop), 30000);
 }
 
 } // namespace mcp::tools::detail

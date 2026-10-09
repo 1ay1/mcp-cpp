@@ -83,7 +83,7 @@ public:
 
 class FakeSkills : public SkillResolver {
 public:
-    std::optional<std::string> load(const std::string& name, std::string& err) override {
+    std::optional<std::string> load(const Call&, const std::string& name, std::string& err) override {
         if (name == "known") return std::string{"# Known skill body"};
         err = "no such skill"; return std::nullopt;
     }
@@ -109,10 +109,10 @@ public:
 class FakeRunner : public SubagentRunner {
 public:
     bool ok = true;
-    std::string unavailable_reason() const override {
+    std::string unavailable_reason(const Call&) const override {
         return ok ? std::string{} : "test backend is offline";
     }
-    std::string run(const SubagentRequest& r, bool& is_error) override {
+    std::string run(const Call&, const SubagentRequest& r, bool& is_error) override {
         is_error = false; return "report for: " + r.prompt;
     }
 };

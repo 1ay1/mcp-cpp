@@ -77,7 +77,7 @@ std::expected<DiagnosticsArgs, ToolError> parse_diagnostics_args(const json& j) 
 // One shape for "run this and give me the bytes", whether the caller has an
 // argv or a command line. The shell is just another program you name.
 [[nodiscard]] RunResult run_via(
-        Exec& exec, const std::vector<std::string>& argv,
+        CallExec& exec, const std::vector<std::string>& argv,
         std::string_view shell_cmd, std::size_t max_bytes,
         std::chrono::seconds timeout) {
     ExecRequest req;
@@ -111,7 +111,7 @@ std::expected<DiagnosticsArgs, ToolError> parse_diagnostics_args(const json& j) 
     return out;
 }
 
-ExecResult run_diagnostics(const Call& call, const DiagnosticsArgs& a, Exec& exec) {
+ExecResult run_diagnostics(const Call& call, const DiagnosticsArgs& a, CallExec& exec) {
     std::vector<std::string> auto_argv;
     if (a.command.empty()) {
         const auto project = util::project_root(bounds(call));
@@ -256,7 +256,7 @@ std::vector<std::string> failing_test_lines(std::string_view output,
     return out;
 }
 
-ExecResult run_tests(const Call& call, const TestArgs& a, Exec& exec) {
+ExecResult run_tests(const Call& call, const TestArgs& a, CallExec& exec) {
     const auto project = util::project_root(bounds(call));
     const auto bs = a.command.empty() ? detect_build_system(project) : BuildSystem::None;
     auto argv = a.command.empty() ? test_argv_for(bs, a, project)
@@ -338,7 +338,7 @@ void register_diagnostics_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "Run the project's build or lint command and return errors/warnings. "
         "Auto-detects build system (CMake, cargo, go, npm, make).",
         diagnostics_schema(), EffectSet{Effect::Exec},
-        body_with<DiagnosticsArgs>([exec](const Call& c, const DiagnosticsArgs& a) { return run_diagnostics(c, a, *exec); }, parse_diagnostics_args), 30'000);
+        body_with<DiagnosticsArgs>([exec](const Call& c, const DiagnosticsArgs& a) { CallExec ce{*exec, c}; return run_diagnostics(c, a, ce); }, parse_diagnostics_args), 30'000);
 }
 
 void register_test_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
@@ -348,7 +348,7 @@ void register_test_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "Run focused project tests with structured pass/fail status, live output, filtering, repetition, and timeout. "
         "Auto-detects CTest, Cargo, Go, npm, or Make; pass command for custom runners.",
         test_schema(), EffectSet{Effect::Exec},
-        body_with<TestArgs>([exec](const Call& c, const TestArgs& a) { return run_tests(c, a, *exec); }, parse_test_args), 40'000);
+        body_with<TestArgs>([exec](const Call& c, const TestArgs& a) { CallExec ce{*exec, c}; return run_tests(c, a, ce); }, parse_test_args), 40'000);
 }
 
 } // namespace mcp::tools::detail

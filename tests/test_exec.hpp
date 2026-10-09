@@ -89,7 +89,7 @@ private:
 };
 
 struct PopenExec final : tools::Exec {
-    tools::ExecResult run(const tools::ExecRequest& r) override {
+    tools::ExecResult run(const tools::Call&, const tools::ExecRequest& r) override {
         auto q = [](const std::string& s) {
             std::string o = "'";
             for (char c : s) o += (c == '\'') ? std::string("'\\''") : std::string(1, c);

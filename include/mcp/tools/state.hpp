@@ -27,7 +27,9 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -122,6 +124,12 @@ struct Call {
     const Splitter*       splitter = nullptr;   // null: scans run inline
     std::string           reader;               // whose context a `read` serves
     std::function<bool()> cancelled;            // may be empty
+    std::stop_token       stop;                 // the same cancel, as an event
+    // Live output for the host to show while the call runs; may be empty.
+    std::function<void(std::string_view)> progress;
+    // The host's per-call data (cap::Request::host), handed back to the
+    // host's own services. Never read here.
+    const void*           host = nullptr;
 
     [[nodiscard]] bool cancel_requested() const { return cancelled && cancelled(); }
 
