@@ -11,6 +11,7 @@
 //
 #pragma once
 
+#include <jsonrpc/error.hpp>
 #include <mcp/codec.hpp>
 
 namespace mcp {
