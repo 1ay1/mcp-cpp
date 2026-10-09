@@ -317,14 +317,10 @@ fs::path normalize_path(std::string_view s, const Bounds& b) {
     // getpwnam_r for that and the model's never seen it work.)
     std::string expanded;
     if (!s.empty() && s.front() == '~' && (s.size() == 1 || s[1] == '/')) {
-        // Home root: $HOME (POSIX / MSYS2 / Cygwin) with a $USERPROFILE
-        // fallback for native Windows, where $HOME is usually unset. Without
-        // the fallback a `~/...` path argument silently failed to expand on
-        // Windows and was passed through verbatim.
-        const char* home = std::getenv("HOME");
-        if (!home || !*home) home = std::getenv("USERPROFILE");
-        if (home && *home) {
-            expanded = home;
+        // The host says where home is (ToolState::home); without it `~`
+        // stays literal.
+        if (!b.home.empty()) {
+            expanded = b.home.string();
             expanded.append(s.data() + 1, s.size() - 1);
             s = expanded;
         }
@@ -349,7 +345,7 @@ fs::path normalize_path(std::string_view s, const Bounds& b) {
     return p.lexically_normal();
 }
 
-Bounds bounds_from(const fs::path& workspace, std::vector<fs::path> read_roots) {
+Bounds bounds_from(const fs::path& workspace, std::vector<fs::path> read_roots, fs::path home) {
     Bounds b;
     if (workspace.empty()) {
         std::error_code ec;
@@ -360,6 +356,7 @@ Bounds bounds_from(const fs::path& workspace, std::vector<fs::path> read_roots) 
         b.workspace = workspace;
     }
     b.read_roots = std::move(read_roots);
+    b.home       = std::move(home);
     return b;
 }
 

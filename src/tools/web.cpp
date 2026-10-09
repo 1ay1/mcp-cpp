@@ -993,12 +993,7 @@ std::string clip_to_fragment(std::string body, std::string_view fragment) {
     return false;
 }
 
-[[nodiscard]] bool jina_enabled_globally() {
-    const char* env = std::getenv("AGENTTY_NO_JINA");
-    return !(env && env[0] != '\0' && env[0] != '0');
-}
-
-ExecResult run_web_fetch(HttpClient& client, const WebFetchArgs& a) {
+ExecResult run_web_fetch(HttpClient& client, const WebFetchArgs& a, bool jina) {
     auto pu = parse_url(a.url);
     if (!pu) return std::unexpected(
         ToolError::invalid_args("could not parse url: " + a.url + " (" + pu.error() + ")"));
@@ -1042,7 +1037,7 @@ ExecResult run_web_fetch(HttpClient& client, const WebFetchArgs& a) {
     }
 
     bool used_jina = false;
-    if (html_in && a.allow_jina && jina_enabled_globally()
+    if (html_in && a.allow_jina && jina
         && looks_like_spa_shell(body, raw_body)
         && a.method == "GET")
     {
@@ -1393,7 +1388,7 @@ std::vector<SearchHit> parse_startpage(const std::string& body, int count) {
 
 ExecResult run_web_search(HttpClient& client, const WebSearchArgs& a) {
     using Parser = std::vector<SearchHit>(*)(const std::string&, int);
-    struct Engine {
+    struct SearchEngine {
         std::string name;
         std::string host;
         std::string path;     // includes ?q=... for GET
@@ -1402,7 +1397,7 @@ ExecResult run_web_search(HttpClient& client, const WebSearchArgs& a) {
         Parser      parse;
     };
     std::string q_esc = url_escape(a.query);
-    const Engine chain[] = {
+    const SearchEngine chain[] = {
         {"Brave",      "search.brave.com",
          "/search?q=" + q_esc + "&source=web", "",
          false, parse_brave},
@@ -1556,7 +1551,7 @@ json web_search_schema() {
 
 } // namespace
 
-void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http) {
+void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http, bool jina) {
     if (!http) return;   // no transport → no web tools
 
     sh.add("web_fetch",
@@ -1566,12 +1561,12 @@ void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http) {
         "Supports #fragment to clip the output to that section. "
         "JS/SPA pages are auto-rendered via r.jina.ai when the primary "
         "fetch returns a near-empty shell (disable per-request by sending "
-        "a `x-no-jina: 1` header, or globally by setting AGENTTY_NO_JINA=1).",
+        "a `x-no-jina: 1` header).",
         web_fetch_schema(), EffectSet{Effect::Net},
-        [http](const json& args) -> mcp::cap::Result {
+        [http, jina](const json& args) -> mcp::cap::Result {
             auto parsed = parse_web_fetch_args(args);
             if (!parsed) return mcp::cap::Result::error(parsed.error().render());
-            return lower(run_web_fetch(*http, *parsed));
+            return lower(run_web_fetch(*http, *parsed, jina));
         }, 20'000);
 
     sh.add("web_search",

@@ -34,12 +34,12 @@ static void roundtrip(const T& v, const char* label) {
 TEST_CASE("codec") {
     // ── scalars / unions ────────────────────────────────────────────────
     {
-        RequestId s{std::string{"req-7"}};
-        RequestId n{std::int64_t{42}};
+        WireId s{std::string{"req-7"}};
+        WireId n{std::int64_t{42}};
         CHECK(to_json(s) == Json("req-7"));
         CHECK(to_json(n) == Json(42));
-        CHECK(from_json<RequestId>(Json("x")).index() == 0);
-        CHECK(from_json<RequestId>(Json(99)).index() == 1);
+        CHECK(std::holds_alternative<std::string>(from_json<WireId>(Json("x"))));
+        CHECK(std::holds_alternative<std::int64_t>(from_json<WireId>(Json(99))));
     }
 
     // ── content blocks (tagged sum on "type") ───────────────────────────
@@ -240,7 +240,7 @@ TEST_CASE("codec") {
         roundtrip(pp, "ProgressParams");
 
         CancelledParams cp;
-        cp.requestId = RequestId{std::int64_t{7}};
+        cp.requestId = WireId{std::int64_t{7}};
         cp.reason = "user aborted";
         CHECK(to_json(cp)["requestId"] == 7);
         roundtrip(cp, "CancelledParams");

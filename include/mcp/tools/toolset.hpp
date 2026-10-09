@@ -88,6 +88,9 @@ struct ToolsetConfig {
     bool diagnostics  = true;   // diagnostics
     bool git          = true;   // git_status/diff/log/commit
     bool web          = true;   // web_fetch, web_search
+    // Let web_fetch re-render a JS/SPA shell through r.jina.ai. A request can
+    // still opt out with an `x-no-jina` header.
+    bool jina         = true;
 
     // Per-tool output budget defaults (chars). 0 ⇒ no cap. The shell applies
     // these the same way agentty's dispatcher did.

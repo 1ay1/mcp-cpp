@@ -92,7 +92,7 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
         detail::register_test_tool(shells, svc.exec);
     }
     if (cfg.git)         detail::register_git_tools(shells, svc.exec);
-    if (cfg.web)         detail::register_web_tools(shells, svc.http);
+    if (cfg.web)         detail::register_web_tools(shells, svc.http, cfg.jina);
 
     auto provider = std::make_shared<mcp::cap::LocalProvider>(std::move(origin));
     const int default_budget = cfg.default_output_budget;

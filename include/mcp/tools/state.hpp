@@ -78,6 +78,9 @@ struct ToolState {
     std::filesystem::path workspace_root;
     // Extra directories a read may reach (skills). Canonical, deduplicated.
     std::vector<std::filesystem::path> read_roots;
+    // What `~` in a path argument expands to. The host fills it ($HOME, or
+    // %USERPROFILE% on Windows); empty leaves `~` literal.
+    std::filesystem::path home;
 
     // `read`'s memory, keyed (reader, canonical path).
     std::map<std::pair<std::string, std::string>, state::ReadSeen> reads;

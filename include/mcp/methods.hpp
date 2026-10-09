@@ -808,14 +808,14 @@ template <> struct CodecOf<SubscriptionsListenParams> {
 //  Notifications.
 //==============================================================================
 struct CancelledParams {
-    Maybe<RequestId>   requestId;
+    Maybe<WireId>      requestId;
     Maybe<std::string> reason;
     Json               meta = Json::object();
 };
 template <> struct CodecOf<CancelledParams> {
     static Codec<CancelledParams> get() {
         return record<CancelledParams>(
-            optional("requestId", &CancelledParams::requestId, scalar_codec()),
+            optional("requestId", &CancelledParams::requestId, codec<WireId>()),
             optional("reason",    &CancelledParams::reason),
             meta    ("_meta",     &CancelledParams::meta));
     }
@@ -831,7 +831,7 @@ struct ProgressParams {
 template <> struct CodecOf<ProgressParams> {
     static Codec<ProgressParams> get() {
         return record<ProgressParams>(
-            required("progressToken", &ProgressParams::progressToken, scalar_codec()),
+            required("progressToken", &ProgressParams::progressToken, codec<ProgressToken>()),
             required("progress",      &ProgressParams::progress),
             optional("total",         &ProgressParams::total),
             optional("message",       &ProgressParams::message),

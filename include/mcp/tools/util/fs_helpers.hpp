@@ -24,10 +24,12 @@ namespace fs = std::filesystem;
 struct Bounds {
     fs::path              workspace;
     std::vector<fs::path> read_roots;
+    fs::path              home;   // what `~` expands to; empty: no expansion
 };
 
 // A Bounds from the state's fields. An empty workspace means the process cwd.
-[[nodiscard]] Bounds bounds_from(const fs::path& workspace, std::vector<fs::path> read_roots);
+[[nodiscard]] Bounds bounds_from(const fs::path& workspace, std::vector<fs::path> read_roots,
+                                 fs::path home = {});
 // Canonicalise a root to store in the state (keeps the input if it can't).
 [[nodiscard]] fs::path canonical_root(fs::path root);
 

@@ -13,7 +13,7 @@ namespace mcp::tools::detail {
 
 // Where this call may reach, copied out of the state.
 [[nodiscard]] inline util::Bounds bounds(const Call& c) {
-    return c.with([](ToolState& s) { return util::bounds_from(s.workspace_root, s.read_roots); });
+    return c.with([](ToolState& s) { return util::bounds_from(s.workspace_root, s.read_roots, s.home); });
 }
 
 // The last snapshot of `path`, if any tool saw it.
