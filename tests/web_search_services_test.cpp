@@ -318,6 +318,14 @@ TEST_CASE("web search: reply parsers") {
     REQUIRE(b.hits.size() == 1);
     CHECK(b.hits[0].snippet == "bd");
 
+    // Firecrawl's description is page markdown (recorded live). The snippet
+    // is plain text, the way the scrapers always produced it.
+    auto md = parse_json_hits("firecrawl-free",
+        R"({"success":true,"data":{"web":[{"url":"https://corrode.dev/blog/async/",)"
+        R"("title":"T","description":"## [Why Bother?](https://corrode.dev/blog/async/#why-bother)\nIn the **first** article"}]}})", 5);
+    REQUIRE(md.hits.size() == 1);
+    CHECK(md.hits[0].snippet == "Why Bother? In the first article");
+
     // Wrong shape is "unreadable", not "no results".
     CHECK(!parse_json_hits("tavily-free", "<html>nope</html>", 5).ok);
     CHECK(!parse_json_hits("tavily-free", R"({"detail":{"error":"x"}})", 5).ok);
@@ -340,6 +348,26 @@ TEST_CASE("web search: failures are told apart") {
     // A key-less service refusing us is access withdrawn, not a bad key.
     CHECK(classify_http(svc("tavily-free"), 401, "") == WebSearchFailure::Blocked);
     CHECK(classify_http(brave, 503, "") == WebSearchFailure::Transient);
+}
+
+TEST_CASE("web search: a normal results page is not mistaken for a captcha") {
+    // Every real Brave results page carries this string in its inline i18n
+    // bundle. Matching the bare word "captcha" turned a page the parser found
+    // nothing on (a layout change, a query with no hits) into "blocked".
+    const std::string ok_page =
+        R"(<title>rust async - Brave Search</title><script>)"
+        R"({"Switch to traditional captcha":"Switch to traditional CAPTCHA"})"
+        R"(</script><div class="snippet svelte-x">...</div>)";
+    CHECK(classify_http(svc("brave-free"), 200, ok_page) == WebSearchFailure::Unreadable);
+
+    // The two challenge pages, by the markers only they carry.
+    const std::string brave_challenge =
+        R"(Your request has been flagged as being suspicious and Brave Search )"
+        R"(decided to schedule a captcha for you.<script>{page:"/captcha"}</script>)";
+    CHECK(classify_http(svc("brave-free"), 200, brave_challenge) == WebSearchFailure::Blocked);
+    const std::string ddg_challenge =
+        R"(<div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div>)";
+    CHECK(classify_http(svc("ddg-free"), 200, ddg_challenge) == WebSearchFailure::Blocked);
 }
 
 TEST_CASE("web search: fails over, and says why") {

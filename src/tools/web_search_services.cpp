@@ -269,6 +269,42 @@ std::string str_at(const json& j, const char* key) {
     return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string{};
 }
 
+// Plain text from the markdown some services put in a snippet (Firecrawl's
+// `description` is page markdown: "## [Why Bother?](https://...#why)\nIn the
+// first article...", seen live). The scrapers always produced plain text,
+// and a link's URL inside a snippet is noise next to the result's own URL.
+// Deliberately small: heading markers at a line start, [text](url) -> text,
+// and emphasis markers. Anything else passes through unchanged.
+std::string flatten_markdown(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    bool line_start = true;
+    for (std::size_t i = 0; i < s.size();) {
+        const char c = s[i];
+        if (line_start) {
+            std::size_t j = i;
+            while (j < s.size() && s[j] == '#') ++j;
+            if (j > i && j < s.size() && s[j] == ' ') { i = j + 1; line_start = false; continue; }
+        }
+        line_start = (c == '\n');
+        if (c == '[') {
+            const auto close = s.find(']', i + 1);
+            if (close != std::string_view::npos && close + 1 < s.size() && s[close + 1] == '(') {
+                const auto paren = s.find(')', close + 2);
+                if (paren != std::string_view::npos) {
+                    out.append(s.substr(i + 1, close - i - 1));
+                    i = paren + 1;
+                    continue;
+                }
+            }
+        }
+        if ((c == '*' || c == '_') && i + 1 < s.size() && s[i + 1] == c) { i += 2; continue; }
+        out.push_back(c);
+        ++i;
+    }
+    return out;
+}
+
 std::string join_strings(const json& arr, std::string_view sep) {
     std::string out;
     if (!arr.is_array()) return out;
@@ -370,7 +406,7 @@ HttpRequest req_ddg_free(const WebSearchQuery& q) {
     r.url = "https://html.duckduckgo.com/html/";
     std::string_view region = q.dial("region");
     r.body = "q=" + url_escape(q.text) + "&kl="
-           + (region.empty() ? std::string{"us-en"} : std::string{region});
+           + url_escape(region.empty() ? std::string_view{"us-en"} : region);
     if (auto s = q.dial("safe"); !s.empty())
         r.body += "&kp=" + url_escape(s);
     r.headers = browser_headers("html.duckduckgo.com", true);
@@ -483,7 +519,7 @@ std::vector<SearchHit> collect(const json& arr, const char* url_key,
             std::string s = it->is_string() ? it->get<std::string>()
                           : it->is_array()  ? join_strings(*it, " ... ")
                                             : std::string{};
-            if (!s.empty()) { h.snippet = tidy(std::move(s), 500); break; }
+            if (!s.empty()) { h.snippet = tidy(flatten_markdown(s), 500); break; }
         }
         if (h.url.empty()) continue;
         if (h.title.empty()) h.title = h.url;
@@ -619,10 +655,24 @@ HttpRequest build_web_search_request(const WebSearchService& svc,
 WebSearchFailure classify_http(const WebSearchService& svc, int status,
                             std::string_view body) {
     // 2xx that is not results: a challenge page served with 200/202.
+    //
+    // Markers, not the bare word "captcha": every NORMAL Brave results page
+    // carries "Switch to traditional captcha" in its inline i18n bundle (25 of
+    // 25 saved good pages). The classifier only sees a 2xx page when the
+    // parser found nothing on it, so the bare word turned "the layout changed"
+    // or "no results for this query" into a false "blocked". These are the
+    // strings only the challenge pages carry:
+    //   Brave       page:"/captcha" (its router state) and "flagged as
+    //               being suspicious" (the visible text)
+    //   DuckDuckGo  "anomaly-modal" / "Select all squares" / "bots use
+    //               DuckDuckGo too", on a 202
     if (status >= 200 && status < 300) {
-        if (status == 202 || contains_ci(body, "captcha")
+        if (status == 202
+            || contains(body, "page:\"/captcha\"")
+            || contains_ci(body, "flagged as being suspicious")
             || contains_ci(body, "select all squares")
-            || contains_ci(body, "anomaly-modal"))
+            || contains(body, "anomaly-modal")
+            || contains_ci(body, "bots use duckduckgo too"))
             return WebSearchFailure::Blocked;
         return WebSearchFailure::Unreadable;
     }
