@@ -146,7 +146,7 @@ TEST_CASE("web_tools") {
         auto args = obj(); args["query"] = "test query";
         auto r = call(*provider, "web_search", args);
         assert(!r.is_error);
-        assert(r.text.find("[via Brave]") != std::string::npos);
+        assert(r.text.find("[via Brave Free]") != std::string::npos);
         assert(r.text.find("Result Title") != std::string::npos);
         assert(r.text.find("https://result.test/page") != std::string::npos);
         assert(read_effects(r).has(Effect::Net));

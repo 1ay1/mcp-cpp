@@ -11,6 +11,7 @@
 #include <mcp/cap/capability.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
+#include <mcp/tools/web_search.hpp>
 
 #include <chrono>
 #include <functional>
@@ -127,6 +128,7 @@ void register_data_tools(Shells&);     // json_query (jq-lite for structured dat
 void register_diagnostics_tool(Shells&, const std::shared_ptr<Exec>&);
 void register_test_tool(Shells&, const std::shared_ptr<Exec>&);
 void register_git_tools(Shells&, const std::shared_ptr<Exec>&);
-void register_web_tools(Shells&, const std::shared_ptr<HttpClient>&);
+void register_web_tools(Shells&, const std::shared_ptr<HttpClient>&,
+                        const std::shared_ptr<WebSearchPlanSource>&);
 
 } // namespace mcp::tools::detail
