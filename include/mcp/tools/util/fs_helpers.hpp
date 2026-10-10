@@ -4,6 +4,7 @@
 // traversal" list — centralised here so the rules are consistent across
 // grep / glob / list_dir / find_definition.
 
+#include <mcp/tools/files.hpp>
 #include <expected>
 #include <filesystem>
 #include <optional>
@@ -25,13 +26,16 @@ struct Bounds {
     fs::path              workspace;
     std::vector<fs::path> read_roots;
     fs::path              home;   // what `~` expands to; empty: no expansion
+    // The host's filesystem: canonicalising and the cwd are reads of the
+    // disk too, so the path helpers reach it through here. Never null.
+    FileSystem*           files = nullptr;
 };
 
-// A Bounds from the state's fields. An empty workspace means the process cwd.
-[[nodiscard]] Bounds bounds_from(const fs::path& workspace, std::vector<fs::path> read_roots,
-                                 fs::path home = {});
+// A Bounds from the state's fields. An empty workspace means the cwd.
+[[nodiscard]] Bounds bounds_from(FileSystem& files, const fs::path& workspace,
+                                 std::vector<fs::path> read_roots, fs::path home = {});
 // Canonicalise a root to store in the state (keeps the input if it can't).
-[[nodiscard]] fs::path canonical_root(fs::path root);
+[[nodiscard]] fs::path canonical_root(const FileSystem& files, fs::path root);
 
 // Forward declarations — WorkspacePath sits below ToolError-using factories.
 class WorkspacePath;
@@ -45,7 +49,7 @@ class WorkspacePath;
 // thread persistence, memory store under ~/.agentty/). Routing through
 // a typed parameter keeps the boundary visible at the call site —
 // reviewers can see at a glance which form a tool picked.
-[[nodiscard]] std::string read_file(const fs::path& p);
+[[nodiscard]] std::string read_file(const FileSystem& files, const fs::path& p);
 [[nodiscard]] std::string read_file(const WorkspacePath& p);
 
 // Write content atomically-ish (truncate + write + flush). Returns the
@@ -53,7 +57,7 @@ class WorkspacePath;
 // lambdas terse while still forcing callers to surface failures.
 //
 // See `read_file` above for the WorkspacePath vs fs::path overload split.
-[[nodiscard]] std::string write_file(const fs::path& p, std::string_view content);
+[[nodiscard]] std::string write_file(FileSystem& files, const fs::path& p, std::string_view content);
 [[nodiscard]] std::string write_file(const WorkspacePath& p, std::string_view content);
 
 // Normalise a user-supplied path. Accepts forward slashes on Windows
@@ -67,9 +71,11 @@ class WorkspacePath;
 // calls `normalize_path` — so "did I already normalize this?" is answered
 // by the type. Passed by value (cheap: holds a single fs::path).
 struct NormalizedPath {
-    fs::path value;
+    fs::path    value;
+    FileSystem* files = nullptr;   // from the Bounds it was made under
 
-    NormalizedPath(std::string_view raw, const Bounds& b) : value(normalize_path(raw, b)) {}
+    NormalizedPath(std::string_view raw, const Bounds& b)
+        : value(normalize_path(raw, b)), files(b.files) {}
 
     [[nodiscard]] const fs::path& path() const noexcept { return value; }
     [[nodiscard]] std::string string() const { return value.string(); }
@@ -146,6 +152,8 @@ public:
     [[nodiscard]] std::string       string() const          { return inner_.string(); }
     [[nodiscard]] bool              empty()  const noexcept { return inner_.empty(); }
     [[nodiscard]] const NormalizedPath& normalized() const noexcept { return inner_; }
+    // The filesystem this path was checked against.
+    [[nodiscard]] FileSystem& files() const noexcept { return *inner_.files; }
 };
 
 // Workspace-checked factory. Same contract as make_workspace_path but
@@ -166,7 +174,7 @@ make_workspace_path_checked(std::string_view raw, std::string_view tool_name, co
 //
 // Add `root` (canonicalised) to a read-roots list, once. The host calls it
 // on the state's list when the skills scanner finds a directory.
-void allow_read_root(std::vector<fs::path>& roots, const fs::path& root);
+void allow_read_root(const FileSystem& files, std::vector<fs::path>& roots, const fs::path& root);
 
 // True when `target` sits under one of b's read roots (post-
 // canonicalisation, symlink-escape checked like the workspace).
@@ -201,12 +209,12 @@ promote_to_workspace_path(NormalizedPath p, std::string_view tool_name, const Bo
 
 // Heuristic: scan the first 512 bytes for a NUL. Good enough to avoid
 // grep'ing PNGs / executables / model weights into the prompt.
-[[nodiscard]] bool is_binary_file(const fs::path& p);
+[[nodiscard]] bool is_binary_file(const FileSystem& files, const fs::path& p);
 
 // Identify an image file by its magic bytes (PNG/JPEG/GIF/WebP) — returns the
 // MIME type, or "" if it isn't a recognised image. Extension-agnostic. Lets
 // `read` hand an image to a vision model instead of refusing it as binary.
-[[nodiscard]] std::string sniff_image_media_type(const fs::path& p);
+[[nodiscard]] std::string sniff_image_media_type(const FileSystem& files, const fs::path& p);
 
 // ── Per-file state cache ────────────────────────────────────────────────
 // Shared across tools so edit/write can detect "the file changed since the
@@ -226,7 +234,7 @@ using FileSnapshot = ::mcp::tools::state::FileSnapshot;
 
 // The key a file's snapshot is stored under in the tool state (its
 // canonical path; works for a file that doesn't exist yet).
-[[nodiscard]] std::string snapshot_key(const fs::path& path) noexcept;
+[[nodiscard]] std::string snapshot_key(const FileSystem& files, const fs::path& path) noexcept;
 
 // Compute FNV-1a 64-bit over a byte range. Inlineable; used by tools
 // that have already read the file to record its hash in the snapshot.
@@ -290,7 +298,7 @@ enum class StaleVerdict : std::uint8_t {
 // can additionally hash the file's current bytes and compare against
 // the snapshot's `content_hash`.
 // `snap` is what the state holds for path (nullopt: never seen).
-[[nodiscard]] StaleVerdict staleness_of(const fs::path& path,
+[[nodiscard]] StaleVerdict staleness_of(const FileSystem& files, const fs::path& path,
                                         const std::optional<FileSnapshot>& snap) noexcept;
 
 } // namespace mcp::tools::util

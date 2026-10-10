@@ -4,6 +4,7 @@
 // edit / list_dir) end-to-end through make_provider(), proving the ported
 // bodies behave and that write/edit carry a FileChange back via the meta.
 
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
@@ -44,7 +45,13 @@ static mcp::Json obj() { return mcp::Json::object(); }
 // Regression: a small edit must produce a MINIMAL diff (not every line as '-'),
 // even on a large file or a CRLF file. Reproduces the reported "edit shows all
 // - lines" symptom. FileChange.before/after are diffed through the same engine
-// the card uses.
+// the card uses.// Tests stand in for the host; they write fixtures through the same disk.
+inline mcp::tools::NativeFileSystem& test_fs() {
+    static mcp::tools::NativeFileSystem f;
+    return f;
+}
+
+
 TEST_CASE("edit diff stays minimal on large + CRLF files") {
     namespace diff = mcp::tools::detail::diff;
     auto root = fs::temp_directory_path() /
@@ -52,6 +59,7 @@ TEST_CASE("edit diff stays minimal on large + CRLF files") {
     fs::create_directories(root);
     auto ws_state = mcp::test::state_at(root);
     HostServices svc;
+    svc.files = std::make_shared<NativeFileSystem>();
     svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
@@ -59,7 +67,7 @@ TEST_CASE("edit diff stays minimal on large + CRLF files") {
                              const std::string& oldt, const std::string& newt,
                              int& added, int& removed) {
         auto p = (root / fname).string();
-        (void)util::write_file(root / fname, body);
+        (void)util::write_file(test_fs(), root / fname, body);
         auto e = obj(); e["old_text"] = oldt; e["new_text"] = newt;
         auto args = obj(); args["path"] = p;
         args["edits"] = mcp::Json::array({e});
@@ -105,7 +113,7 @@ TEST_CASE("edit diff stays minimal on large + CRLF files") {
             body += "source line number " + std::to_string(i) +
                     " with some real content here\n";
         auto p = (root / "huge.c").string();
-        (void)util::write_file(root / "huge.c", body);
+        (void)util::write_file(test_fs(), root / "huge.c", body);
         auto e = obj();
         e["old_text"] = "this block absolutely does not exist anywhere in\n"
                         "the file even fuzzily so the matcher scans + fails";
@@ -132,6 +140,8 @@ TEST_CASE("fs_tools") {
     auto ws_state = mcp::test::state_at(root);
 
     HostServices svc;  // no host backends needed — Tier-1 is self-contained
+
+    svc.files = std::make_shared<NativeFileSystem>();
     svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
@@ -663,7 +673,7 @@ TEST_CASE("fs_tools") {
         std::string body;
         for (int i = 1; i <= 100; ++i)
             body += "line_" + std::to_string(i) + "\n";
-        (void)util::write_file(root / "tail.log", body);
+        (void)util::write_file(test_fs(), root / "tail.log", body);
         auto args = obj();
         args["path"]   = (root / "tail.log").string();
         args["offset"] = -5;
@@ -691,7 +701,7 @@ TEST_CASE("fs_tools") {
         png.append(reinterpret_cast<const char*>(sig), 8);
         png.append("\x00\x00\x00\x0DIHDR", 8);      // length + "IHDR"
         png.append(64, '\x00');                       // some body bytes
-        (void)util::write_file(root / "pic.png", png);
+        (void)util::write_file(test_fs(), root / "pic.png", png);
 
         auto args = obj();
         args["path"] = (root / "pic.png").string();
@@ -711,7 +721,7 @@ TEST_CASE("fs_tools") {
     {
         std::string blob(64, '\x00');
         blob[0] = 'M'; blob[1] = 'Z';                 // DOS/PE header, not an image
-        (void)util::write_file(root / "prog.bin", blob);
+        (void)util::write_file(test_fs(), root / "prog.bin", blob);
         auto args = obj();
         args["path"] = (root / "prog.bin").string();
         auto r = call(*provider, "read", args);
@@ -727,7 +737,7 @@ TEST_CASE("fs_tools") {
         std::string body;
         for (int i = 1; i <= 1000; ++i)
             body += "L" + std::to_string(i) + "\n";
-        (void)util::write_file(root / "big.txt", body);
+        (void)util::write_file(test_fs(), root / "big.txt", body);
         const auto bp = (root / "big.txt").string();
 
         // offset only, no limit → ~250-line window (not 1000).
@@ -769,7 +779,7 @@ TEST_CASE("fs_tools") {
 
     // ── edit regex mode: capture-group rename across the file ─────────
     {
-        (void)util::write_file(root / "log.c",
+        (void)util::write_file(test_fs(), root / "log.c",
             "void f() {\n"
             "    log_info(\"a\");\n"
             "    log_warn(\"b\");\n"
@@ -786,7 +796,7 @@ TEST_CASE("fs_tools") {
         args["edits"] = ed;
         auto r = call(*provider, "edit", args);
         assert(!r.is_error);
-        std::string disk = util::read_file(root / "log.c");
+        std::string disk = util::read_file(test_fs(), root / "log.c");
         assert(disk.find("logger.info(\"a\")") != std::string::npos);
         assert(disk.find("logger.warn(\"b\")") != std::string::npos);
         assert(disk.find("logger.error(\"c\")") != std::string::npos);
@@ -796,7 +806,7 @@ TEST_CASE("fs_tools") {
 
     // ── edit regex: multi-hit without replace_all is refused ──────────
     {
-        (void)util::write_file(root / "multi.c", "int a = old(1);\nint b = old(2);\n");
+        (void)util::write_file(test_fs(), root / "multi.c", "int a = old(1);\nint b = old(2);\n");
         auto args = obj();
         args["path"] = (root / "multi.c").string();
         mcp::Json ed = mcp::Json::array();
@@ -815,7 +825,7 @@ TEST_CASE("fs_tools") {
         args["edits"] = ed2;
         auto r2 = call(*provider, "edit", args);
         assert(!r2.is_error);
-        std::string disk = util::read_file(root / "multi.c");
+        std::string disk = util::read_file(test_fs(), root / "multi.c");
         assert(disk.find("fresh(1)") != std::string::npos);
         assert(disk.find("fresh(2)") != std::string::npos);
         std::puts("edit: regex ambiguity + expected count ok");
@@ -845,7 +855,7 @@ TEST_CASE("fs_tools") {
 
     // ── edit regex on a CRLF file: matches via LF-normalize, CRLF restored ─
     {
-        (void)util::write_file(root / "win.c",
+        (void)util::write_file(test_fs(), root / "win.c",
             "int a = legacy(1);\r\nint b = keep(2);\r\n");
         auto args = obj();
         args["path"] = (root / "win.c").string();
@@ -858,7 +868,7 @@ TEST_CASE("fs_tools") {
         args["edits"] = ed;
         auto r = call(*provider, "edit", args);
         assert(!r.is_error);
-        std::string disk = util::read_file(root / "win.c");
+        std::string disk = util::read_file(test_fs(), root / "win.c");
         assert(disk.find("modern(1);") != std::string::npos);
         assert(disk.find("keep(2);\r\n") != std::string::npos);  // CRLF intact
         std::puts("edit: regex CRLF fallback ok");
@@ -866,7 +876,7 @@ TEST_CASE("fs_tools") {
 
     // ── outline: nested symbol tree with line numbers, no bodies ─────────
     {
-        (void)util::write_file(root / "shape.py",
+        (void)util::write_file(test_fs(), root / "shape.py",
             "import os\n"
             "\n"
             "class Widget:\n"
@@ -898,7 +908,7 @@ TEST_CASE("fs_tools") {
 
     // ── outline: file with no defs degrades gracefully ──────────────────
     {
-        (void)util::write_file(root / "plain.txt", "just\nsome\nprose\n");
+        (void)util::write_file(test_fs(), root / "plain.txt", "just\nsome\nprose\n");
         auto args = obj(); args["path"] = (root / "plain.txt").string();
         auto r = call(*provider, "outline", args);
         assert(!r.is_error);

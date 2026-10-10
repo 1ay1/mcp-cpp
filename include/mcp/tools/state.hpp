@@ -37,6 +37,7 @@
 namespace mcp::tools {
 
 struct Session;    // host.hpp
+class  FileSystem; // files.hpp
 struct Splitter;   // host.hpp
 
 namespace state {
@@ -122,6 +123,7 @@ struct SoleStateAccess final : StateAccess {
 struct Call {
     StateAccess*          state = nullptr;      // never null inside a tool body
     const Splitter*       splitter = nullptr;   // null: scans run inline
+    FileSystem*           files = nullptr;      // the host's disk; see fs()
     std::string           reader;               // whose context a `read` serves
     std::function<bool()> cancelled;            // may be empty
     std::stop_token       stop;                 // the same cancel, as an event
@@ -132,6 +134,9 @@ struct Call {
     const void*           host = nullptr;
 
     [[nodiscard]] bool cancel_requested() const { return cancelled && cancelled(); }
+
+    // The host's filesystem. Every file a tool touches goes through it.
+    [[nodiscard]] FileSystem& fs() const noexcept { return *files; }
 
     // A scan's parallel region: run fn(0..n-1) through the host's splitter, or
     // inline without one. width() is how many shares are worth making.

@@ -46,6 +46,7 @@
 #include <variant>
 #include <vector>
 
+#include <mcp/tools/files.hpp>
 #include <mcp/tools/state.hpp>
 
 namespace mcp::tools {
@@ -489,6 +490,10 @@ struct HostServices {
     // processes). Null ⇒ make_provider makes a SoleStateAccess, fine for a
     // host that runs one call at a time. See state.hpp.
     std::shared_ptr<StateAccess>    state;
+    // Every file the tools read, write, list or stat goes through this; the
+    // library itself does no IO. Null ⇒ no filesystem, search or edit tools
+    // (they can't run). mcp/tools/native_files.hpp has a ready-made one.
+    std::shared_ptr<FileSystem>     files;
 };
 
 

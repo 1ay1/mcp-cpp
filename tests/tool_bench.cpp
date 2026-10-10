@@ -26,6 +26,7 @@
 
 #include "test_state.hpp"
 #include "test_exec.hpp"
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/cap/local.hpp>
@@ -86,6 +87,7 @@ int main(int argc, char** argv) {
     }
     auto ws_state = mcp::test::state_at(root);
     HostServices svc;
+    svc.files = std::make_shared<NativeFileSystem>();
     svc.state = ws_state;
     svc.exec  = std::make_shared<mcp::test::PopenExec>();
     auto provider = make_provider(svc, ToolsetConfig{}, "local");

@@ -5,6 +5,7 @@
 // registration (gated on svc.http), SSRF refusal, HTML→text extraction,
 // the multi-engine search fallback chain, and Net effects.
 
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
@@ -67,6 +68,8 @@ TEST_CASE("web_tools") {
                   "</div>")});
 
     HostServices svc;
+
+    svc.files = std::make_shared<NativeFileSystem>();
     svc.http = fake;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 

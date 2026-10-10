@@ -13,13 +13,19 @@ namespace mcp::tools::detail {
 
 // Where this call may reach, copied out of the state.
 [[nodiscard]] inline util::Bounds bounds(const Call& c) {
-    return c.with([](ToolState& s) { return util::bounds_from(s.workspace_root, s.read_roots, s.home); });
+    auto b = c.with([](ToolState& s) {
+        util::Bounds out;
+        out.workspace = s.workspace_root; out.read_roots = s.read_roots; out.home = s.home;
+        return out;
+    });
+    // Canonicalising touches the disk: done outside the state lock.
+    return util::bounds_from(c.fs(), b.workspace, std::move(b.read_roots), std::move(b.home));
 }
 
 // The last snapshot of `path`, if any tool saw it.
 [[nodiscard]] inline std::optional<util::FileSnapshot>
 last_seen(const Call& c, const std::filesystem::path& path) {
-    auto key = util::snapshot_key(path);
+    auto key = util::snapshot_key(c.fs(), path);
     if (key.empty()) return std::nullopt;
     return c.with([&](ToolState& s) -> std::optional<util::FileSnapshot> {
         auto it = s.files.find(key);
@@ -32,13 +38,13 @@ last_seen(const Call& c, const std::filesystem::path& path) {
 inline void record_seen(const Call& c, const std::filesystem::path& path,
                         std::filesystem::file_time_type mtime, std::uintmax_t size,
                         std::uint64_t content_hash) {
-    auto key = util::snapshot_key(path);
+    auto key = util::snapshot_key(c.fs(), path);
     if (key.empty()) return;
     c.with([&](ToolState& s) { s.files[key] = util::FileSnapshot{mtime, size, content_hash}; });
 }
 
 [[nodiscard]] inline util::StaleVerdict staleness(const Call& c, const std::filesystem::path& path) {
-    return util::staleness_of(path, last_seen(c, path));
+    return util::staleness_of(c.fs(), path, last_seen(c, path));
 }
 
 }  // namespace mcp::tools::detail

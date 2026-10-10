@@ -1005,13 +1005,12 @@ std::string semantic_query(const StructArgs& a,
 // the workspace and still spans the claimed lines — ground-truth gate against
 // index staleness. Returns the (possibly clipped) verified line count, or 0
 // to drop the lead.
-int verify_lead(const fs::path& ws_root, DocPassage& p) {
+int verify_lead(const FileSystem& files, const fs::path& ws_root, DocPassage& p) {
     if (p.path.empty()) return 0;
     fs::path f = fs::path{p.path}.is_absolute() ? fs::path{p.path}
                                                 : ws_root / p.path;
-    std::error_code ec;
-    if (!fs::exists(f, ec) || ec) return 0;
-    std::string bytes = util::read_file(f);
+    if (!files.stat(f).exists) return 0;
+    std::string bytes = util::read_file(files, f);
     if (bytes.empty()) return 0;
     int nlines = 1;
     for (char c : bytes) if (c == '\n') ++nlines;
@@ -1024,7 +1023,7 @@ int verify_lead(const fs::path& ws_root, DocPassage& p) {
 
 // Zero structural hits: turn the dead end into verified leads. Clearly
 // labeled approximate — the model knows these are neighbours, not matches.
-std::string semantic_leads(DocRetriever* sem, const StructArgs& a,
+std::string semantic_leads(const FileSystem& files, DocRetriever* sem, const StructArgs& a,
                            const std::vector<PNode>& pat,
                            const fs::path& ws_root) {
     if (!sem || !sem->warm()) return {};
@@ -1037,7 +1036,7 @@ std::string semantic_leads(DocRetriever* sem, const StructArgs& a,
     std::ostringstream out;
     std::size_t shown = 0;
     for (auto& p : passages) {
-        if (!verify_lead(ws_root, p)) continue;   // stale → silently dropped
+        if (!verify_lead(files, ws_root, p)) continue;   // stale → silently dropped
         if (shown == 0)
             out << "\n\nSemantically nearest code (approximate leads from the "
                    "code index, verified against disk — NOT structural "
@@ -1118,26 +1117,18 @@ ExecResult run_structural(const Call& call, const StructArgs& a, DocRetriever* s
     std::vector<fs::path> files;
     files.reserve(4096);
     {
-        std::error_code ec;
-        for (auto it = fs::recursive_directory_iterator(
-                 wp->path(), fs::directory_options::skip_permission_denied, ec);
-             it != fs::recursive_directory_iterator(); it.increment(ec)) {
-            if (ec) { ec.clear(); continue; }
-            std::error_code lec;
-            bool is_dir = it->is_directory(lec);
-            if (it->is_symlink(lec)) { if (is_dir) it.disable_recursion_pending(); continue; }
-            if (is_dir) {
-                if (util::should_skip_dir(it->path().filename().string()))
-                    it.disable_recursion_pending();
-                continue;
-            }
-            const fs::path& p = it->path();
-            if (!is_source_ext(p)) continue;
+        call.fs().walk(wp->path(), [&](const DirEntry& e) {
+            if (e.symlink) return e.directory ? WalkStep::skip_dir : WalkStep::next;
+            if (e.directory)
+                return util::should_skip_dir(e.path.filename().string()) ? WalkStep::skip_dir
+                                                                          : WalkStep::next;
+            const fs::path& p = e.path;
+            if (!is_source_ext(p)) return WalkStep::next;
             if (!a.glob.empty() && !util::glob_match(a.glob, p.filename().string()))
-                continue;
+                return WalkStep::next;
             files.push_back(p);
-            if (files.size() >= kMaxScanned) break;
-        }
+            return files.size() >= kMaxScanned ? WalkStep::stop : WalkStep::next;
+        });
     }
     if (files.empty())
         return ToolOutput{"no source files under the search root.", std::nullopt};
@@ -1181,11 +1172,11 @@ ExecResult run_structural(const Call& call, const StructArgs& a, DocRetriever* s
             // corner) is skipped; the scan completes.
             try {
                 std::error_code ec;
-                auto sz = fs::file_size(p, ec);
+                auto sz = call.fs().stat(p).size;
                 if (ec || sz == 0 || sz > kMaxFileBytes) continue;
-                if (util::is_binary_file(p)) continue;
+                if (util::is_binary_file(call.fs(), p)) continue;
 
-                std::string bytes = util::read_file(p);
+                std::string bytes = util::read_file(call.fs(), p);
                 if (bytes.empty()) continue;
 
                 Lang lang = lang_of(p);
@@ -1198,10 +1189,9 @@ ExecResult run_structural(const Call& call, const StructArgs& a, DocRetriever* s
                 auto hits = match_file(pat_by_lang[key], tree);
                 if (hits.empty()) continue;
 
-                std::error_code rec;
-                auto rel = fs::relative(p, wp->path(), rec);
+                auto rel = p.lexically_relative(wp->path());   // walked from root
                 results[idx] = FileMatch{
-                    rec ? p.string() : rel.generic_string(),
+                    rel.empty() ? p.string() : rel.generic_string(),
                     std::move(hits),
                 };
                 total_hits += results[idx].hits.size();
@@ -1223,7 +1213,7 @@ ExecResult run_structural(const Call& call, const StructArgs& a, DocRetriever* s
             "token-for-token (metavariables $X / $$$X match one / many). If you "
             "wanted a text match, use `grep` instead.";
         // RAG proposes: append verified semantic neighbours as leads.
-        msg += semantic_leads(sem, a, probe_pat, wp->path());
+        msg += semantic_leads(call.fs(), sem, a, probe_pat, wp->path());
         return ToolOutput{std::move(msg), std::nullopt};
     }
 
@@ -1243,8 +1233,8 @@ ExecResult run_structural(const Call& call, const StructArgs& a, DocRetriever* s
     for (auto& fm : results) {
         if (fm.rel.empty()) continue;
         // Re-read for context rendering (cheap; only matched files).
-        std::string bytes = util::read_file(fs::path{a.root} / fm.rel);
-        if (bytes.empty()) bytes = util::read_file(fs::path{fm.rel});
+        std::string bytes = util::read_file(call.fs(), fs::path{a.root} / fm.rel);
+        if (bytes.empty()) bytes = util::read_file(call.fs(), fs::path{fm.rel});
         auto lines = split_lines(bytes);
 
         // For expand mode, rebuild the node tree once per matched file so each
@@ -1440,26 +1430,18 @@ ExecResult run_rewrite(const Call& call, const RewriteArgs& a) {
     // Collect candidate files (same walk as search).
     std::vector<fs::path> files;
     {
-        std::error_code ec;
-        for (auto it = fs::recursive_directory_iterator(
-                 wp->path(), fs::directory_options::skip_permission_denied, ec);
-             it != fs::recursive_directory_iterator(); it.increment(ec)) {
-            if (ec) { ec.clear(); continue; }
-            std::error_code lec;
-            bool is_dir = it->is_directory(lec);
-            if (it->is_symlink(lec)) { if (is_dir) it.disable_recursion_pending(); continue; }
-            if (is_dir) {
-                if (util::should_skip_dir(it->path().filename().string()))
-                    it.disable_recursion_pending();
-                continue;
-            }
-            const fs::path& p = it->path();
-            if (!is_source_ext(p)) continue;
+        call.fs().walk(wp->path(), [&](const DirEntry& e) {
+            if (e.symlink) return e.directory ? WalkStep::skip_dir : WalkStep::next;
+            if (e.directory)
+                return util::should_skip_dir(e.path.filename().string()) ? WalkStep::skip_dir
+                                                                          : WalkStep::next;
+            const fs::path& p = e.path;
+            if (!is_source_ext(p)) return WalkStep::next;
             if (!a.glob.empty() && !util::glob_match(a.glob, p.filename().string()))
-                continue;
+                return WalkStep::next;
             files.push_back(p);
-            if (files.size() >= kMaxScanned) break;
-        }
+            return files.size() >= kMaxScanned ? WalkStep::stop : WalkStep::next;
+        });
     }
     if (files.empty())
         return ToolOutput{"no source files under the search root.", std::nullopt};
@@ -1483,10 +1465,10 @@ ExecResult run_rewrite(const Call& call, const RewriteArgs& a) {
     for (const auto& p : files) {
         if (total_repl >= kMaxMatches) { truncated = true; break; }
         std::error_code ec;
-        auto sz = fs::file_size(p, ec);
+        auto sz = call.fs().stat(p).size;
         if (ec || sz == 0 || sz > kMaxFileBytes) continue;
-        if (util::is_binary_file(p)) continue;
-        std::string bytes = util::read_file(p);
+        if (util::is_binary_file(call.fs(), p)) continue;
+        std::string bytes = util::read_file(call.fs(), p);
         if (bytes.empty()) continue;
 
         Lang lang = lang_of(p);
@@ -1518,9 +1500,8 @@ ExecResult run_rewrite(const Call& call, const RewriteArgs& a) {
         rebuilt.reserve(bytes.size());
         std::size_t cursor = 0;
         std::size_t applied_here = 0;
-        std::error_code rec;
-        auto rel = fs::relative(p, wp->path(), rec);
-        std::string relname = rec ? p.string() : rel.generic_string();
+        auto rel = p.lexically_relative(wp->path());   // walked from root
+        std::string relname = rel.empty() ? p.string() : rel.generic_string();
 
         for (const Hit* h : kept) {
             auto rendered = render_template(tpl, h->binds, bytes);
@@ -1548,7 +1529,7 @@ ExecResult run_rewrite(const Call& call, const RewriteArgs& a) {
         ++files_changed;
 
         if (a.apply) {
-            if (auto err = util::write_file(p, rebuilt); !err.empty())
+            if (auto err = util::write_file(call.fs(), p, rebuilt); !err.empty())
                 return std::unexpected(ToolError::io(
                     "rewrite_structural: " + err));
             // Surface the LAST file's change for the host diff-review UI

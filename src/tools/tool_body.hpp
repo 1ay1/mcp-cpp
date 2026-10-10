@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include "call_state.hpp"
+
 #include <mcp/cap/capability.hpp>
 #include <mcp/tools/meta.hpp>
 #include <mcp/tools/state.hpp>
@@ -102,9 +104,7 @@ template <class Args, class Run>
 template <class Args, class Run>
 [[nodiscard]] auto body(Run run, ParseIn<Args> parse) {
     return [run = std::move(run), parse](const Call& call, const Json& j) mutable -> mcp::cap::Result {
-        auto parsed = parse(j, call.with([](ToolState& s) {
-            return util::bounds_from(s.workspace_root, s.read_roots, s.home);
-        }));
+        auto parsed = parse(j, detail::bounds(call));
         if (!parsed) return mcp::cap::Result::error(parsed.error().render());
         return lower(run_on<Args>(run, call, *parsed));
     };

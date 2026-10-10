@@ -69,8 +69,12 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
     detail::register_search_code_tool(shells, svc.code_retriever);
     detail::register_task_tool(shells, svc.subagent);
 
-    // Self-contained Tier-1 tools land here, gated on cfg.* toggles, once the
-    // bodies are ported:
+    // Everything below reads or writes files, which only the host's
+    // FileSystem may do. Without one, none of it is advertised: a tool the
+    // host can't serve is absent, not present-and-failing.
+    const bool disk = svc.files != nullptr;
+    if (!disk) { cfg.filesystem = cfg.shell = cfg.search = cfg.diagnostics = cfg.git = false; }
+
     if (cfg.filesystem)  detail::register_fs_tools(shells);
     // Exec-dependent families. Null exec ⇒ not advertised at all, the same
     // rule register_web_tools follows for a null HttpClient: a tool the host
@@ -101,6 +105,7 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
     std::shared_ptr<StateAccess> state = svc.state;
     if (!state) state = std::make_shared<SoleStateAccess>();
     auto split = std::make_shared<const Splitter>(std::move(svc.split));
+    std::shared_ptr<FileSystem> files = svc.files;
 
     for (auto& s : shells.items()) {
         EffectSet fx       = s.effects;
@@ -108,11 +113,12 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
         auto      handler  = std::move(s.handler);
 
         provider->add(s.tool,
-            [handler = std::move(handler), fx, budget, state, split](const mcp::cap::Request& req)
+            [handler = std::move(handler), fx, budget, state, split, files](const mcp::cap::Request& req)
                 -> mcp::cap::Result {
                 Call call;
                 call.state     = state.get();
                 call.splitter  = split.get();
+                call.files     = files.get();
                 call.reader    = req.reader;
                 call.cancelled = req.cancelled;
                 call.stop      = req.stop;

@@ -2,6 +2,7 @@
 //
 // data_test.cpp — json_query (jq-lite) driven through make_provider().
 
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
@@ -48,6 +49,8 @@ TEST_CASE("json_query") {
     fs::current_path(root);
 
     HostServices svc;
+
+    svc.files = std::make_shared<NativeFileSystem>();
     svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 

@@ -5,6 +5,7 @@
 // make_provider(), proving the ported bodies behave + the workspace
 // boundary + effects flow through.
 
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
@@ -65,6 +66,8 @@ TEST_CASE("search_tools") {
     write_file(root / "sub" / "gamma.py", "def compute_total(x):\n    return x * 2\n");
 
     HostServices svc;
+
+    svc.files = std::make_shared<NativeFileSystem>();
     svc.state = ws_state;
 #if !defined(_WIN32)
     svc.exec = std::make_shared<mcp::test::PopenExec>();   // shell, git_*, find_definition run programs
@@ -469,7 +472,7 @@ TEST_CASE("search_tools") {
         // cwd stays == root, then call git_status with NO path.
         {
             auto saved_ws = ws_state->state.workspace_root;
-            ws_state->state.workspace_root = util::canonical_root(root.parent_path());
+            ws_state->state.workspace_root = util::canonical_root(NativeFileSystem{}, root.parent_path());
             auto wide = call(*provider, "git_status", obj());  // no `path`
             assert(!wide.is_error
                    && "no-path git_status must resolve the cwd project under a "

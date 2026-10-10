@@ -20,8 +20,6 @@
 #include <cstdio>
 #include <expected>
 #include <filesystem>
-#include <fstream>
-#include <random>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -126,8 +124,7 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j, const util::Bo
 
     std::string cd = ar.str("cd", "");
     if (!cd.empty()) {
-        std::error_code ec;
-        if (!std::filesystem::is_directory(cd, ec))
+        if (!b.files->stat(cd).directory)
             return std::unexpected(ToolError::invalid_args(
                 "cd '" + cd + "' is not a directory"));
         if (auto wp = util::make_workspace_path_checked(cd, "shell", b); !wp)
@@ -403,22 +400,20 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
     if (r.output.size() > kModelPreviewBytes) {
         spill_total = r.output.size();
         try {
-            namespace fs = std::filesystem;
-            auto dir = fs::temp_directory_path() / "agentty-bash";
-            std::error_code ec;
-            fs::create_directories(dir, ec);
-            std::random_device rd;
-            std::mt19937_64 gen(rd());
-            char name[32];
-            std::snprintf(name, sizeof(name), "out-%016llx.txt",
-                          static_cast<unsigned long long>(gen()));
-            auto path = dir / name;
-            std::ofstream f(path, std::ios::binary | std::ios::trunc);
-            if (f) {
-                f.write(r.output.data(),
-                        static_cast<std::streamsize>(r.output.size()));
-                f.close();
-                spill_path = path.string();
+            auto scratch = exec.call().fs().scratch_dir();
+            if (!scratch.empty()) {
+                auto dir = scratch / "agentty-bash";
+                std::error_code ec;
+                exec.call().fs().create_directories(dir, ec);
+                // Named by content: the same output lands in the same file,
+                // and no entropy source is needed to make a name.
+                char name[40];
+                std::snprintf(name, sizeof(name), "out-%016llx.txt",
+                              static_cast<unsigned long long>(
+                                  std::hash<std::string>{}(r.output)));
+                auto path = dir / name;
+                if (exec.call().fs().write_atomic(path, r.output).empty())
+                    spill_path = path.string();
             }
         } catch (...) {
         }

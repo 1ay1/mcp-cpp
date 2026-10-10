@@ -112,6 +112,17 @@ if(MCP_BUILD_TOOLS)
     # onto the JSON wire, where the encoder rejects them (json type_error.316).
     # /utf-8 forces both the source and execution charsets to UTF-8.
     target_compile_options(mcp_tools PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+
+    # The tool library does no IO; every file it touches goes through the
+    # host's FileSystem. This is a ready-made one over the process's own disk,
+    # separate so a host that routes files elsewhere doesn't link it.
+    add_library(mcp_tools_native_files STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/tools_native/native_files.cpp)
+    add_library(mcp::tools_native_files ALIAS mcp_tools_native_files)
+    target_include_directories(mcp_tools_native_files
+        PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                $<INSTALL_INTERFACE:include>)
+    target_compile_features(mcp_tools_native_files PUBLIC cxx_std_23)
 endif()
 
 if(MCP_BUILD_TESTS)

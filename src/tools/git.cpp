@@ -212,7 +212,7 @@ resolve_git_dir(CallExec& exec, std::string_view checked, const util::Bounds& b)
     std::error_code ec;
     // If `start` is a file, its parent is the directory to probe.
     fs::path dir = start;
-    if (!checked.empty() && !fs::is_directory(start, ec))
+    if (!checked.empty() && !exec.call().fs().stat(start).directory)
         dir = start.parent_path();
     if (dir.empty()) dir = default_git_start(b);
 
@@ -224,8 +224,8 @@ resolve_git_dir(CallExec& exec, std::string_view checked, const util::Bounds& b)
             top.pop_back();
         if (!top.empty()) {
             const fs::path& ws = b.workspace;
-            fs::path topc = fs::weakly_canonical(fs::path{top}, ec);
-            fs::path wsc  = fs::weakly_canonical(ws, ec);
+            fs::path topc = exec.call().fs().canonical(fs::path{top}, ec);
+            fs::path wsc  = exec.call().fs().canonical(ws, ec);
             if (path_under(topc, wsc)) return top;
             return std::unexpected(ToolError::out_of_workspace(
                 "git repository root '" + topc.string()
@@ -251,7 +251,7 @@ std::vector<std::string> dirty_submodules(CallExec& exec, const std::string& git
     // pay for a `git submodule foreach` subprocess on every status/diff in
     // the overwhelmingly common non-submodule repo.
     std::error_code ec;
-    if (!fs::exists(fs::path{git_dir} / ".gitmodules", ec)) return out;
+    if (!exec.call().fs().stat(fs::path{git_dir} / ".gitmodules").exists) return out;
     // A submodule.<n>.ignore / diff.ignoreSubmodules setting hides some
     // submodules from `git status` but not from the foreach walk, so with
     // one present keep the exhaustive walk (the old behaviour, exactly).
@@ -328,7 +328,7 @@ std::vector<std::string> dirty_submodules(CallExec& exec, const std::string& git
                         out.push_back(disp);
                         // Nested submodules can only be dirty if this one is
                         // (their dirt shows up as this one's `m`/`u`).
-                        if (fs::exists(dir / path / ".gitmodules", ec))
+                        if (exec.call().fs().stat(dir / path / ".gitmodules").exists)
                             scan(dir / path, disp + "/");
                     }
                 }
@@ -769,7 +769,7 @@ ExecResult run_git_commit(const Call& call, const GitCommitArgs& a, CallExec& ex
 
             std::error_code ec;
             const fs::path checked_workspace{workspace_path->string()};
-            auto rel = fs::relative(checked_workspace, fs::path{*git_dir}, ec);
+            auto rel = relative_to(call.fs(), checked_workspace, fs::path{*git_dir}, ec);
             const bool inside_repo = !ec && !rel.empty()
                 && *rel.begin() != fs::path{".."};
             if (inside_repo) {
@@ -889,7 +889,7 @@ ExecResult run_git_show(const Call& call, const GitShowArgs& a, CallExec& exec) 
     std::vector<std::string> argv{"git", "-C", *git_dir, "show"};
     if (a.file_content) {
         std::error_code ec;
-        auto relative = fs::relative(checked_path, *git_dir, ec);
+        auto relative = relative_to(call.fs(), checked_path, *git_dir, ec);
         if (ec || relative.empty())
             return std::unexpected(ToolError::invalid_args("path is not inside the repository"));
         argv.push_back(a.ref + ":" + relative.generic_string());

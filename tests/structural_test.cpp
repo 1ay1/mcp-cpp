@@ -6,6 +6,7 @@
 // $$$, balanced-group capture, and — the load-bearing property — NEVER
 // matching inside comments or string literals.
 
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
@@ -67,6 +68,8 @@ TEST_CASE("search_structural") {
         "const empty = () => { try { risky(); } catch (e) {} };\n"); // L2 empty catch
 
     HostServices svc;
+
+    svc.files = std::make_shared<NativeFileSystem>();
     svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
@@ -444,6 +447,7 @@ TEST_CASE("search_structural semantic bridge") {
 
     auto fake = std::make_shared<FakeRetriever>();
     HostServices svc;
+    svc.files = std::make_shared<NativeFileSystem>();
     svc.state = ws_state;
     svc.code_retriever = fake;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
@@ -552,6 +556,8 @@ TEST_CASE("rewrite_structural") {
     fs::current_path(root);
 
     HostServices svc;
+
+    svc.files = std::make_shared<NativeFileSystem>();
     svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 

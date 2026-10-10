@@ -40,7 +40,6 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -203,17 +202,16 @@ bool is_stopword(const std::string& s) {
 // catch vendored non-git trees. The workspace root itself is exempt (checked
 // by the caller via depth>0), so the top-level project's own `.git` never
 // stops the walk before it starts.
-bool is_nested_project_root(const fs::path& dir) {
-    std::error_code ec;
+bool is_nested_project_root(const FileSystem& files, const fs::path& dir) {
     // `.git` as either a directory (normal repo) or a file (submodule/worktree
     // gitlink) marks a distinct repository boundary.
-    if (fs::exists(dir / ".git", ec)) return true;
+    if (files.stat(dir / ".git").exists) return true;
     // Other unambiguous project-root markers for vendored/non-git trees.
     static constexpr std::string_view kMarkers[] = {
         ".hg", ".svn", ".jj",           // other VCS roots
     };
     for (auto m : kMarkers)
-        if (fs::exists(dir / fs::path{m}, ec)) return true;
+        if (files.stat(dir / fs::path{m}).exists) return true;
     return false;
 }
 
@@ -246,58 +244,44 @@ std::shared_ptr<const RepoGraph> build_graph(const Call& call, const fs::path& r
     struct Cand { fs::path abs; std::string rel; std::uint64_t sig; };
     std::vector<Cand> cands;
     std::uint64_t sig = 0;
-    std::error_code ec;
     constexpr std::size_t kMaxFiles = 5000;
-    for (auto it = fs::recursive_directory_iterator(
-             root, fs::directory_options::skip_permission_denied, ec);
-         it != fs::recursive_directory_iterator() && cands.size() < kMaxFiles;
-         it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        const auto& entry = *it;
-        std::error_code e2;
-        // SYMLINK LOOP GUARD: recursive_directory_iterator follows directory
-        // symlinks by default, so a cyclic link (a/link -> a, or two dirs
-        // pointing at each other) makes the walk run forever and re-parse
-        // the same files. Never recurse THROUGH a symlinked directory, and
-        // never treat a symlinked file as a source node (it would be counted
-        // twice — once at the link, once at the target inside the tree).
-        if (entry.is_symlink(e2)) {
-            if (entry.is_directory(e2)) it.disable_recursion_pending();
-            continue;
-        }
-        if (entry.is_directory(e2)) {
-            auto name = entry.path().filename().string();
+    // The walk never recurses THROUGH a symlinked directory (a cyclic link
+    // would run forever); a symlinked file isn't a source node either (it'd
+    // be counted twice, once at the link and once at its target).
+    call.fs().walk(root, [&](const DirEntry& entry) {
+        if (cands.size() >= kMaxFiles) return WalkStep::stop;
+        if (entry.symlink) return entry.directory ? WalkStep::skip_dir : WalkStep::next;
+        if (entry.directory) {
+            auto name = entry.path.filename().string();
             if (util::should_skip_dir(name)
-                || (it.depth() > 0 && name.starts_with("."))
+                || (entry.depth > 0 && name.starts_with("."))
                 // NESTED-PROJECT BOUNDARY: never descend into a submodule /
                 // vendored checkout / unrelated nested repo. This is the hard
                 // stop that keeps sibling-project files (maya-py/, mcp-cpp/,
                 // …) out of the map no matter how the workspace is laid out.
-                || is_nested_project_root(entry.path()))
-                it.disable_recursion_pending();
-            continue;
+                || is_nested_project_root(call.fs(), entry.path))
+                return WalkStep::skip_dir;
+            return WalkStep::next;
         }
-        if (!entry.is_regular_file(e2)) continue;
-        if (!is_map_source(entry.path())) continue;
-        // CONTAINMENT BACKSTOP: belt-and-suspenders re-assert that this file
-        // really is under the workspace root. The walk root was already gated
-        // by make_workspace_path_checked, and we never recurse through symlinks
-        // — but a `path=` subdir arg, a hardlink, or a future walk change could
-        // in principle surface a path outside the boundary. One cheap check per
-        // accepted source file makes the map pollution-proof unconditionally.
-        if (!util::is_within_workspace(entry.path(), b)) continue;
-        auto sz = entry.file_size(e2);
+        if (!entry.regular) return WalkStep::next;
+        if (!is_map_source(entry.path)) return WalkStep::next;
+        // CONTAINMENT BACKSTOP: re-assert this file really is under the
+        // workspace root. The walk root was already gated and we never recurse
+        // through symlinks, but a `path=` subdir, a hardlink or a future walk
+        // change could surface a path outside. One cheap check per file.
+        if (!util::is_within_workspace(entry.path, b)) return WalkStep::next;
+        const auto sz = entry.size;
         // Skip empty files (no defs, no refs) and minified/generated blobs
         // (a 400KB single-line bundle is all noise and blows the parse time).
-        if (e2 || sz == 0 || sz > 512 * 1024) continue;
-        auto mt = fs::last_write_time(entry.path(), e2);
+        if (sz == 0 || sz > 512 * 1024) return WalkStep::next;
         std::uint64_t fsig = static_cast<std::uint64_t>(sz)
-            ^ static_cast<std::uint64_t>(mt.time_since_epoch().count());
+            ^ static_cast<std::uint64_t>(entry.mtime.time_since_epoch().count());
         sig = sig * 1099511628211ull + fsig;
-        auto rel = fs::relative(entry.path(), root, e2).string();
-        if (rel.empty()) rel = entry.path().filename().string();
-        cands.push_back({entry.path(), std::move(rel), fsig});
-    }
+        auto rel = entry.path.lexically_relative(root).string();   // walked from root
+        if (rel.empty()) rel = entry.path.filename().string();
+        cands.push_back({entry.path, std::move(rel), fsig});
+        return WalkStep::next;
+    });
 
     // Cache lookup: a slot with the same root AND an unchanged stat
     // signature is an exact hit. Touch its LRU seq and return it.
@@ -336,10 +320,9 @@ std::shared_ptr<const RepoGraph> build_graph(const Call& call, const fs::path& r
     // reach on normal repos.
     auto parse_one = [&](const Cand& c,
                          FileNode& node_out, std::string& body_out) -> bool {
-        std::ifstream in(c.abs, std::ios::binary);
-        if (!in) return false;
-        std::string body((std::istreambuf_iterator<char>(in)),
-                          std::istreambuf_iterator<char>());
+        auto read = call.fs().read(c.abs);
+        if (!read) return false;
+        std::string body = std::move(*read);
         // Binary/blob guard: a NUL byte in the first 512 bytes means this is
         // not text the def regexes can meaningfully parse (a mis-extensioned
         // binary, a UTF-16 file). Skip it — running regex over binary is both

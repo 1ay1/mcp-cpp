@@ -45,11 +45,23 @@ public:
         ::close(fd_);
     }
     Update poll(std::chrono::milliseconds wait) override {
+        // Keep gathering until the child exits or the window ends. Returning
+        // on the first output raced the exit: `echo x; exit 7` prints, then
+        // dies a moment later, and the caller saw it still running. Not
+        // waiting for EOF: a backgrounded grandchild can hold the pipe open.
         std::unique_lock lk(mu_);
-        cv_.wait_for(lk, wait, [&] { return !pending_.empty() || eof_; });
+        const auto until = std::chrono::steady_clock::now() + wait;
+        for (;;) {
+            reap_locked();
+            if (exited_) {
+                // Let the reader drain what the child wrote before it died.
+                cv_.wait_for(lk, std::chrono::milliseconds{20}, [&] { return eof_; });
+                break;
+            }
+            if (cv_.wait_until(lk, until) == std::cv_status::timeout) { reap_locked(); break; }
+        }
         Update u;
         u.output = std::exchange(pending_, {});
-        reap_locked();
         u.running = !exited_;
         if (exited_ && eof_ && !reported_) { u.outcome = outcome_; reported_ = true; }
         u.uptime = std::chrono::duration_cast<std::chrono::seconds>(

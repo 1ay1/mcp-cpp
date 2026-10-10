@@ -11,6 +11,7 @@
 
 #include "test_state.hpp"
 #include "test_exec.hpp"
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
@@ -34,6 +35,8 @@ int main(int argc, char** argv) {
     auto ws_state = mcp::test::state_at(workspace);
 
     HostServices svc;                        // no http/git backends needed
+
+    svc.files = std::make_shared<NativeFileSystem>();
 
     svc.state = ws_state;
 

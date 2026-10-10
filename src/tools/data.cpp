@@ -250,9 +250,9 @@ ExecResult run_json_query(const Call& call, const QueryArgs& a) {
         if (!wp) return std::unexpected(std::move(wp.error()));
         const auto& p = wp->path();
         std::error_code ec;
-        if (!fs::exists(p, ec))  return std::unexpected(ToolError::not_found(wp->string()));
-        if (!fs::is_regular_file(p, ec)) return std::unexpected(ToolError::not_a_file(wp->string()));
-        if (auto sz = fs::file_size(p, ec); !ec && sz > 16u*1024u*1024u)
+        if (!call.fs().stat(p).exists)  return std::unexpected(ToolError::not_found(wp->string()));
+        if (!call.fs().stat(p).regular) return std::unexpected(ToolError::not_a_file(wp->string()));
+        if (auto sz = call.fs().stat(p).size; !ec && sz > 16u*1024u*1024u)
             return std::unexpected(ToolError::too_large("file > 16 MiB"));
         try { text = util::read_file(*wp); }
         catch (...) { return std::unexpected(ToolError::io("cannot read " + wp->string())); }

@@ -40,13 +40,12 @@ struct DiagnosticsArgs {
 
 enum class BuildSystem { None, CMake, Cargo, Go, Node, Make };
 
-[[nodiscard]] BuildSystem detect_build_system(const fs::path& root) noexcept {
-    std::error_code ec;
-    if (fs::exists(root / "build/build.ninja", ec) || fs::exists(root / "build/Makefile", ec)) return BuildSystem::CMake;
-    if (fs::exists(root / "Cargo.toml", ec))    return BuildSystem::Cargo;
-    if (fs::exists(root / "go.mod", ec))        return BuildSystem::Go;
-    if (fs::exists(root / "package.json", ec))  return BuildSystem::Node;
-    if (fs::exists(root / "Makefile", ec))      return BuildSystem::Make;
+[[nodiscard]] BuildSystem detect_build_system(const FileSystem& files, const fs::path& root) noexcept {
+    if (files.stat(root / "build/build.ninja").exists || files.stat(root / "build/Makefile").exists) return BuildSystem::CMake;
+    if (files.stat(root / "Cargo.toml").exists)    return BuildSystem::Cargo;
+    if (files.stat(root / "go.mod").exists)        return BuildSystem::Go;
+    if (files.stat(root / "package.json").exists)  return BuildSystem::Node;
+    if (files.stat(root / "Makefile").exists)      return BuildSystem::Make;
     return BuildSystem::None;
 }
 
@@ -115,7 +114,7 @@ ExecResult run_diagnostics(const Call& call, const DiagnosticsArgs& a, CallExec&
     std::vector<std::string> auto_argv;
     if (a.command.empty()) {
         const auto project = util::project_root(bounds(call));
-        auto_argv = build_argv_for(detect_build_system(project), project);
+        auto_argv = build_argv_for(detect_build_system(call.fs(), project), project);
         if (auto_argv.empty())
             return std::unexpected(ToolError::not_found("no build system detected; pass a command"));
     }
@@ -258,7 +257,7 @@ std::vector<std::string> failing_test_lines(std::string_view output,
 
 ExecResult run_tests(const Call& call, const TestArgs& a, CallExec& exec) {
     const auto project = util::project_root(bounds(call));
-    const auto bs = a.command.empty() ? detect_build_system(project) : BuildSystem::None;
+    const auto bs = a.command.empty() ? detect_build_system(call.fs(), project) : BuildSystem::None;
     auto argv = a.command.empty() ? test_argv_for(bs, a, project)
                                   : std::vector<std::string>{};
     if (a.command.empty() && argv.empty())

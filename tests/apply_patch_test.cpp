@@ -6,6 +6,7 @@
 // hunk writes nothing), ambiguity rejection, and the FileChange carry.
 
 #include <chrono>
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
@@ -55,6 +56,8 @@ TEST_CASE("apply_patch") {
     fs::current_path(root);
 
     HostServices svc;
+
+    svc.files = std::make_shared<NativeFileSystem>();
     svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 

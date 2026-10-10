@@ -23,7 +23,6 @@
 #include <expected>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -92,56 +91,40 @@ ExecResult run_glob(const Call& call, const GlobArgs& a) {
     std::vector<Entry> entries;
     entries.reserve(512);
 
-    std::error_code ec;
-    for (auto it = fs::recursive_directory_iterator(wp->path(),
-                fs::directory_options::skip_permission_denied, ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        auto fn = it->path().filename().string();
-        bool is_dir_entry = it->is_directory(ec);
-        // Symlink-loop guard: don't recurse THROUGH a symlinked directory
-        // (a cyclic link makes recursive_directory_iterator spin forever).
-        // Symlinked entries are still reported below via the is_symlink flag
-        // when they match, but we never descend into them.
-        {
-            std::error_code lec;
-            if (it->is_symlink(lec) && is_dir_entry) {
-                it.disable_recursion_pending();
-                continue;
-            }
-        }
-        if (is_dir_entry) {
-            if (util::should_skip_dir(fn)) { it.disable_recursion_pending(); continue; }
-        }
+    // The walk never descends through a symlinked directory (a cyclic link
+    // would never end); those entries aren't reported either.
+    call.fs().walk(wp->path(), [&](const DirEntry& e) {
+        auto fn = e.path.filename().string();
+        const bool is_dir_entry = e.directory;
+        if (e.symlink && is_dir_entry) return WalkStep::skip_dir;
+        if (is_dir_entry && util::should_skip_dir(fn)) return WalkStep::skip_dir;
         bool hit = has_glob ? util::glob_match(pat, fn)
                             : fn.find(pat) != std::string::npos;
         // Slash-bearing patterns ('src/*.cpp', '**/util/*.hpp') are PATH
         // patterns — match them against the workspace-relative path, not
         // just the basename, so directory-scoped globs work as users expect.
         if (!hit && has_glob && pat.find('/') != std::string::npos)
-            hit = glob_hit(pat, it->path(), wp->path());
+            hit = glob_hit(pat, e.path, wp->path());
         if (hit) {
-            bool is_link = it->is_symlink(ec);
+            const bool is_link = e.symlink;
             uintmax_t sz = 0;
             std::int64_t mt = 0;
             if (!is_dir_entry && !is_link) {
-                std::error_code sec;
-                sz = it->file_size(sec);
-                if (auto t = it->last_write_time(sec); !sec)
-                    mt = t.time_since_epoch().count();
+                sz = e.size;
+                mt = e.mtime.time_since_epoch().count();
             }
             // Workspace-relative path: denser output, and the model feeds
             // these straight back into read/edit which resolve relative
             // paths against the project root anyway.
-            std::error_code rec2;
-            auto rel = fs::relative(it->path(), wp->path(), rec2);
+            // Lexical: the walk yields paths under the root as given.
+            auto rel = e.path.lexically_relative(wp->path());
             entries.push_back({
-                (rec2 || rel.empty()) ? it->path().string()
-                                      : rel.generic_string(),
+                rel.empty() ? e.path.string() : rel.generic_string(),
                 is_dir_entry, is_link, sz, mt});
-            if (entries.size() > 500) break;
+            if (entries.size() > 500) return WalkStep::stop;
         }
-    }
+        return WalkStep::next;
+    });
 
     if (entries.empty())
         return ToolOutput{"no matches. Try a different pattern, or `list_dir` "
@@ -303,35 +286,16 @@ ExecResult run_find_definition(const Call& call, const FindDefinitionArgs& a, Ca
 
     std::ostringstream out;
     int matches = 0;
-    std::error_code ec;
     constexpr uintmax_t kMaxFileBytes = 512u * 1024u;
-    for (auto it = fs::recursive_directory_iterator(wp->path(),
-                fs::directory_options::skip_permission_denied, ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        const auto& entry = *it;
-        auto fn = entry.path().filename().string();
-        const bool is_dir = entry.is_directory(ec);
-
-        // Symlink-loop guard: never descend into a symlinked directory.
-        {
-            std::error_code lec;
-            if (is_dir && entry.is_symlink(lec)) {
-                it.disable_recursion_pending();
-                continue;
-            }
-        }
-        if (is_dir && util::should_skip_dir(fn)) {
-            it.disable_recursion_pending();
-            continue;
-        }
-        if (fn.starts_with(".")) {
-            if (is_dir) it.disable_recursion_pending();
-            continue;
-        }
-        if (is_dir) continue;
-        if (!entry.is_regular_file(ec)) continue;
-        auto ext = entry.path().extension().string();
+    call.fs().walk(wp->path(), [&](const DirEntry& entry) {
+        auto fn = entry.path.filename().string();
+        const bool is_dir = entry.directory;
+        // Never descend into a symlinked directory (the walk won't either).
+        if (is_dir && entry.symlink) return WalkStep::skip_dir;
+        if (is_dir && util::should_skip_dir(fn)) return WalkStep::skip_dir;
+        if (fn.starts_with(".")) return is_dir ? WalkStep::skip_dir : WalkStep::next;
+        if (is_dir || !entry.regular) return WalkStep::next;
+        auto ext = entry.path.extension().string();
         static const std::vector<std::string> code_exts = {
             ".cpp", ".hpp", ".c", ".h", ".cc", ".hh", ".cxx", ".hxx",
             ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs",
@@ -341,27 +305,26 @@ ExecResult run_find_definition(const Call& call, const FindDefinitionArgs& a, Ca
         };
         bool is_code = false;
         for (const auto& e : code_exts) { if (ext == e) { is_code = true; break; } }
-        if (!is_code) continue;
-        std::error_code sec;
-        auto sz = entry.file_size(sec);
-        if (!sec && (sz == 0 || sz > kMaxFileBytes)) continue;
+        if (!is_code) return WalkStep::next;
+        if (entry.size == 0 || entry.size > kMaxFileBytes) return WalkStep::next;
 
-        std::ifstream ifs(entry.path());
-        if (!ifs) continue;
+        const auto text = call.fs().read(entry.path);
+        if (!text) return WalkStep::next;
+        std::istringstream ifs(*text);
         std::string line;
         int n = 1;
         while (std::getline(ifs, line)) {
             for (const auto& re : patterns) {
                 if (std::regex_search(line, re)) {
-                    out << entry.path().string() << ":" << n << ": " << line << "\n";
-                    if (++matches > 50) goto done;
+                    out << entry.path.string() << ":" << n << ": " << line << "\n";
+                    if (++matches > 50) return WalkStep::stop;
                     break;
                 }
             }
             n++;
         }
-    }
-    done:
+        return WalkStep::next;
+    });
     if (matches == 0) return ToolOutput{"no definitions found for '" + a.symbol + "'", std::nullopt};
     if (matches > 50) out << "[>50 definitions, truncated]\n";
     std::string body = out.str();
@@ -510,9 +473,9 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
     if (pattern.find('/') == std::string_view::npos)
         return util::glob_match(pattern, file.filename().string());
 
-    std::error_code rec;
-    fs::path rel = fs::relative(file, root, rec);
-    std::string rp = (rec || rel.empty() ? file : rel).generic_string();
+    // Lexical: `file` came from walking `root`, so it's under it as given.
+    fs::path rel = file.lexically_relative(root);
+    std::string rp = (rel.empty() ? file : rel).generic_string();
     while (rp.starts_with("./")) rp.erase(0, 2);
 
     if (util::glob_match(pattern, rp)) return true;
@@ -1076,7 +1039,7 @@ ExecResult run_ripgrep(const GrepArgs& a, CallExec& exec) {
         bool body_loaded = false;
         auto breadcrumb_for = [&](int match_line) -> std::string {
             if (!body_loaded) {
-                file_body = util::read_file(fs::path{f.path});
+                file_body = util::read_file(exec.call().fs(), fs::path{f.path});
                 body_loaded = true;
             }
             if (file_body.empty()) return {};
@@ -1175,29 +1138,21 @@ ExecResult run_builtin(const Call& call, const GrepArgs& a) {
 
     std::vector<fs::path> candidates;
     {
-        std::error_code ec;
-        for (auto it = fs::recursive_directory_iterator(a.root,
-                    fs::directory_options::skip_permission_denied, ec);
-             it != fs::recursive_directory_iterator(); it.increment(ec)) {
-            if (ec) { ec.clear(); continue; }
-            const auto& entry = *it;
-            auto fn = entry.path().filename().string();
-            if (entry.is_directory(ec)) {
-                std::error_code lec;
-                if (entry.is_symlink(lec)) { it.disable_recursion_pending(); continue; }
-                if (util::should_skip_dir(fn)) it.disable_recursion_pending();
-                continue;
+        call.fs().walk(fs::path{a.root}, [&](const DirEntry& entry) {
+            auto fn = entry.path.filename().string();
+            if (entry.directory) {
+                if (entry.symlink || util::should_skip_dir(fn)) return WalkStep::skip_dir;
+                return WalkStep::next;
             }
-            if (!entry.is_regular_file(ec)) continue;
-            if (fn.starts_with(".")) continue;
+            if (!entry.regular) return WalkStep::next;
+            if (fn.starts_with(".")) return WalkStep::next;
             if (!a.file_glob.empty()
-                && !glob_hit(a.file_glob, entry.path(), fs::path{a.root})) continue;
-            if (likely_binary_ext(entry.path())) continue;
-            std::error_code sec;
-            auto sz = entry.file_size(sec);
-            if (sec || sz == 0 || sz > kMaxFileBytes) { sec.clear(); continue; }
-            candidates.push_back(entry.path());
-        }
+                && !glob_hit(a.file_glob, entry.path, fs::path{a.root})) return WalkStep::next;
+            if (likely_binary_ext(entry.path)) return WalkStep::next;
+            if (entry.size == 0 || entry.size > kMaxFileBytes) return WalkStep::next;
+            candidates.push_back(entry.path);
+            return WalkStep::next;
+        });
     }
 
     if (candidates.empty()) {
@@ -1230,7 +1185,7 @@ ExecResult run_builtin(const Call& call, const GrepArgs& a) {
             // whole process. A file that blows the matcher is skipped, the
             // rest of the scan completes.
             try {
-                std::string content = util::read_file(path);
+                std::string content = util::read_file(call.fs(), path);
                 if (content.empty()) continue;
                 auto head = std::min<std::size_t>(content.size(), 4096);
                 if (std::memchr(content.data(), '\0', head)) continue;
@@ -1295,9 +1250,8 @@ ExecResult run_builtin(const Call& call, const GrepArgs& a) {
         std::size_t listed = 0;
         for (const auto& h : hits) {
             if (h.path.empty()) continue;
-            std::error_code rec;
-            auto rel = fs::relative(h.path, a.root, rec);
-            std::string rp = (rec || rel.empty() ? h.path : rel).generic_string();
+            auto rel = h.path.lexically_relative(a.root);   // walked from root
+            std::string rp = (rel.empty() ? h.path : rel).generic_string();
             auto n = h.match_offsets.size();
             if (a.mode == GrepArgs::Mode::FilesOnly) {
                 out << rp << "  (" << n << (n == 1 ? " match)" : " matches)") << "\n";

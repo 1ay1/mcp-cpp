@@ -826,19 +826,19 @@ std::expected<ReadArgs, ToolError> parse_read_args(const json& j, const util::Bo
 ExecResult run_read(const Call& call, const ReadArgs& a) {
     const auto& p = a.path.path();
     std::error_code ec;
-    if (!fs::exists(p, ec))
+    if (!call.fs().stat(p).exists)
         return std::unexpected(ToolError::not_found("file not found: " + a.path.string()
             + ". Run `list_dir` on the parent directory or `glob` by name to verify."));
-    if (!fs::is_regular_file(p, ec))
+    if (!call.fs().stat(p).regular)
         return std::unexpected(ToolError::not_a_file("not a regular file: " + a.path.string()));
 
     fs::file_time_type current_mtime{};
     {
         std::error_code mtime_ec;
-        current_mtime = fs::last_write_time(p, mtime_ec);
+        current_mtime = call.fs().stat(p).mtime;
         if (!mtime_ec && a.symbol.empty()) {
             std::error_code canon_ec;
-            auto canon = fs::weakly_canonical(p, canon_ec);
+            auto canon = call.fs().canonical(p, canon_ec);
             if (!canon_ec) {
                 auto seen = call.with([&](ToolState& st) -> std::optional<ReadCacheEntry> {
                     auto it = st.reads.find({call.reader, canon.string()});
@@ -884,7 +884,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
         }
     }
     constexpr uintmax_t kMaxBytes = 1024u * 1024u;
-    uintmax_t sz = fs::file_size(p, ec);
+    uintmax_t sz = call.fs().stat(p).size;
 
     // Image files: hand the picture to a vision model instead of refusing it
     // as binary. Sniffed by magic bytes (extension-agnostic), capped larger
@@ -893,7 +893,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
     // model just sees the text note. Checked BEFORE the 1 MiB text cap so a
     // normal-sized image isn't rejected for being "too large".
     if (a.symbol.empty()) {
-        if (auto mime = util::sniff_image_media_type(p); !mime.empty()) {
+        if (auto mime = util::sniff_image_media_type(call.fs(), p); !mime.empty()) {
             constexpr uintmax_t kMaxImageBytes = 8u * 1024u * 1024u;
             if (!ec && sz > kMaxImageBytes)
                 return std::unexpected(ToolError::too_large(std::format(
@@ -921,7 +921,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
             "For a structural overview, run `grep` for the symbols you need.",
             sz / 1024, a.path.string())));
     }
-    if (util::is_binary_file(p)) {
+    if (util::is_binary_file(call.fs(), p)) {
         return std::unexpected(ToolError::binary(std::format(
             "cannot read binary file: {} ({} bytes). "
             "Use the `shell` tool with `file`, `hexdump`, or similar.",
@@ -974,7 +974,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
                 const auto ext  = p.extension().string();
                 auto push = [&](const fs::path& q) {
                     std::error_code qec;
-                    if (q != p && fs::is_regular_file(q, qec)
+                    if (q != p && call.fs().stat(q).regular
                         && std::find(near.begin(), near.end(), q) == near.end())
                         near.push_back(q);
                 };
@@ -1005,21 +1005,20 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
                 // Siblings with the same extension family, capped.
                 std::error_code dec;
                 int budget = 60;
-                for (const auto& e : fs::directory_iterator(dir, dec)) {
+                for (const auto& e : call.fs().list(dir, dec)) {
                     if (--budget < 0) break;
-                    if (!e.is_regular_file(dec)) continue;
-                    const auto x = e.path().extension().string();
+                    if (!e.regular) continue;
+                    const auto x = e.path.extension().string();
                     if (std::ranges::find(kSrc, x) != std::end(kSrc)
                         || std::ranges::find(kHdr, x) != std::end(kHdr)
                         || x == ext)
-                        push(e.path());
+                        push(e.path);
                 }
             }
             for (const auto& q : near) {
-                std::error_code qec;
-                if (fs::file_size(q, qec) > kMaxBytes || qec) continue;
+                if (call.fs().stat(q).size > kMaxBytes) continue;
                 std::string other;
-                try { other = util::read_file(q); } catch (...) { continue; }
+                try { other = util::read_file(call.fs(), q); } catch (...) { continue; }
                 bool other_decl = false;
                 auto r2 = resolve_symbol_range(other, a.symbol, &other_decl);
                 if (!r2 || (rng && other_decl)) continue;
@@ -1108,7 +1107,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
             out = a.display_description + "\n" + out;
         if (current_mtime.time_since_epoch().count() != 0) {
             std::error_code canon_ec;
-            auto canon = fs::weakly_canonical(p, canon_ec);
+            auto canon = call.fs().canonical(p, canon_ec);
             if (!canon_ec) {
                 // The OUTLINE path: the caller got a symbol map of the whole
                 // file, not its text. Record it as covering nothing, so any
@@ -1259,7 +1258,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
         out = a.display_description + "\n" + out;
     if (current_mtime.time_since_epoch().count() != 0) {
         std::error_code canon_ec;
-        auto canon = fs::weakly_canonical(p, canon_ec);
+        auto canon = call.fs().canonical(p, canon_ec);
         if (!canon_ec) {
             // OVERWRITE, never accumulate. This mirrors what the host does
             // to the transcript: agentty keeps only the most recent read of
@@ -1379,20 +1378,20 @@ ExecResult run_write(const Call& call, const WriteArgs& a) {
     }
     std::string original;
     std::error_code ec;
-    bool exists = fs::exists(p, ec);
-    if (exists && fs::is_directory(p, ec))
+    bool exists = call.fs().stat(p).exists;
+    if (exists && call.fs().stat(p).directory)
         return std::unexpected(ToolError::not_a_file(
             "'" + a.path.string() + "' is a directory — write needs a file path."));
     auto parent = p.parent_path();
-    if (!parent.empty() && fs::exists(parent, ec) && !fs::is_directory(parent, ec))
+    if (!parent.empty() && call.fs().stat(parent).exists && !call.fs().stat(parent).directory)
         return std::unexpected(ToolError::not_a_directory(
             "parent of '" + a.path.string() + "' exists but is not a directory."));
     uintmax_t original_size = 0;
     if (exists) {
-        if (!fs::is_regular_file(p, ec))
+        if (!call.fs().stat(p).regular)
             return std::unexpected(ToolError::not_a_file(
                 "not a regular file: " + a.path.string()));
-        original_size = fs::file_size(p, ec);
+        original_size = call.fs().stat(p).size;
         if (ec) original_size = 0;
         if (original_size <= kMaxWriteBytes)
             original = util::read_file(a.path);
@@ -1417,7 +1416,7 @@ ExecResult run_write(const Call& call, const WriteArgs& a) {
         return std::unexpected(ToolError::io(err));
     {
         std::error_code mt_ec;
-        auto new_mtime = fs::last_write_time(p, mt_ec);
+        auto new_mtime = call.fs().stat(p).mtime;
         if (!mt_ec) {
             record_seen(call, p, new_mtime,
                                    static_cast<std::uintmax_t>(a.content.size()),
@@ -1483,9 +1482,9 @@ ExecResult run_list_dir(const Call& call, const ListDirArgs& a) {
     auto wp = util::make_workspace_path_checked(a.root, "list_dir", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
     std::error_code ec;
-    if (!fs::exists(wp->path(), ec))
+    if (!call.fs().stat(wp->path()).exists)
         return std::unexpected(ToolError::not_found("directory not found: " + a.root));
-    if (!fs::is_directory(wp->path(), ec))
+    if (!call.fs().stat(wp->path()).directory)
         return std::unexpected(ToolError::not_a_directory("not a directory: " + a.root));
 
     std::ostringstream out;
@@ -1498,18 +1497,17 @@ ExecResult run_list_dir(const Call& call, const ListDirArgs& a) {
         if (bytes < 1024*1024*1024) { std::snprintf(buf, sizeof(buf), "%.1fM", b/(1024.0*1024.0)); return buf; }
         std::snprintf(buf, sizeof(buf), "%.1fG", b/(1024.0*1024.0*1024.0)); return buf;
     };
-    auto list_entry = [&](const fs::directory_entry& entry, int depth) {
+    auto list_entry = [&](const DirEntry& entry, int depth) {
         if (count > 1000) return;
         std::string indent(static_cast<std::size_t>(depth) * 2, ' ');
-        auto fn = entry.path().filename().string();
-        if (entry.is_directory(ec)) {
+        auto fn = entry.path.filename().string();
+        if (entry.directory) {
             out << indent << fn << "/\n";
-        } else if (entry.is_regular_file(ec)) {
-            auto sz = entry.file_size(ec);
-            out << indent << fn << "  " << format_size(ec ? 0 : sz) << "\n";
-        } else if (entry.is_symlink(ec)) {
+        } else if (entry.regular) {
+            out << indent << fn << "  " << format_size(entry.size) << "\n";
+        } else if (entry.symlink) {
             std::error_code link_ec;
-            auto target = fs::read_symlink(entry.path(), link_ec);
+            auto target = call.fs().read_symlink(entry.path, link_ec);
             if (link_ec)
                 out << indent << fn << " -> <unreadable: " << link_ec.message() << ">\n";
             else
@@ -1518,35 +1516,26 @@ ExecResult run_list_dir(const Call& call, const ListDirArgs& a) {
         count++;
     };
     if (a.recursive) {
-        for (auto it = fs::recursive_directory_iterator(wp->path(),
-                    fs::directory_options::skip_permission_denied, ec);
-             it != fs::recursive_directory_iterator(); it.increment(ec)) {
-            if (ec) { ec.clear(); continue; }
-            if (it.depth() > a.max_depth) { it.disable_recursion_pending(); continue; }
-            const auto& entry = *it;
-            auto fn = entry.path().filename().string();
-            const bool is_dir = entry.is_directory(ec);
-            if (is_dir && util::should_skip_dir(fn)) {
-                list_entry(entry, it.depth());
-                it.disable_recursion_pending();
-                if (count > 1000) { out << "[>1000 entries, truncated]\n"; break; }
-                continue;
+        call.fs().walk(wp->path(), [&](const DirEntry& entry) {
+            if (entry.depth > a.max_depth) return WalkStep::skip_dir;
+            auto fn = entry.path.filename().string();
+            if (entry.directory && util::should_skip_dir(fn)) {
+                list_entry(entry, entry.depth);
+                if (count > 1000) { out << "[>1000 entries, truncated]\n"; return WalkStep::stop; }
+                return WalkStep::skip_dir;
             }
-            if (is_dir && it.depth() > 0 && fn.starts_with(".")) {
-                it.disable_recursion_pending();
-                continue;
-            }
-            list_entry(*it, it.depth());
-            if (count > 1000) { out << "[>1000 entries, truncated]\n"; break; }
-        }
+            if (entry.directory && entry.depth > 0 && fn.starts_with("."))
+                return WalkStep::skip_dir;
+            list_entry(entry, entry.depth);
+            if (count > 1000) { out << "[>1000 entries, truncated]\n"; return WalkStep::stop; }
+            return WalkStep::next;
+        });
     } else {
-        std::vector<fs::directory_entry> entries;
-        for (auto& e : fs::directory_iterator(wp->path(), ec))
-            entries.push_back(e);
+        std::vector<DirEntry> entries = call.fs().list(wp->path(), ec);
         std::sort(entries.begin(), entries.end(), [](const auto& x, const auto& y) {
-            bool da = x.is_directory(), db = y.is_directory();
+            bool da = x.directory, db = y.directory;
             if (da != db) return da > db;
-            return x.path().filename() < y.path().filename();
+            return x.path.filename() < y.path.filename();
         });
         for (auto& e : entries) list_entry(e, 0);
         // list_entry stops appending AND counting past the cap — signal
@@ -1585,37 +1574,35 @@ std::expected<MoveArgs, ToolError> parse_move_args(const json& j, const util::Bo
     return MoveArgs{src->path(), dst->path(), r.boolean("overwrite", false)};
 }
 
-ExecResult run_move(const MoveArgs& a) {
+ExecResult run_move(const Call& call, const MoveArgs& a) {
     std::error_code ec;
-    if (!fs::exists(a.source, ec))
+    if (!call.fs().stat(a.source).exists)
         return std::unexpected(ToolError::not_found(a.source.string()));
-    if (fs::exists(a.destination, ec)) {
+    if (call.fs().stat(a.destination).exists) {
         if (!a.overwrite)
             return std::unexpected(ToolError::ambiguous(
                 "destination exists; pass overwrite:true to replace it"));
-        if (fs::is_directory(a.destination, ec) && !fs::is_empty(a.destination, ec))
+        if (call.fs().stat(a.destination).directory && !call.fs().list(a.destination, ec).empty())
             return std::unexpected(ToolError::invalid_args(
                 "refusing to replace a non-empty destination directory"));
-        fs::remove(a.destination, ec);
+        call.fs().remove(a.destination, ec);
         if (ec) return std::unexpected(ToolError::io(ec.message()));
     }
-    fs::create_directories(a.destination.parent_path(), ec);
+    call.fs().create_directories(a.destination.parent_path(), ec);
     if (ec) return std::unexpected(ToolError::io(ec.message()));
-    fs::rename(a.source, a.destination, ec);
+    call.fs().rename(a.source, a.destination, ec);
     if (ec) {
         // Cross-filesystem/device rename (EXDEV: different volume, tmpfs,
         // bind mount) can't be a rename(2). Fall back to copy+delete — the
         // semantics the caller asked for — instead of surfacing a cryptic
         // "Invalid cross-device link".
         std::error_code copy_ec;
-        fs::copy(a.source, a.destination,
-                 fs::copy_options::recursive | fs::copy_options::copy_symlinks,
-                 copy_ec);
+        call.fs().copy(a.source, a.destination, copy_ec);
         if (copy_ec)
             return std::unexpected(ToolError::io(
                 "move failed: " + ec.message()
                 + "; copy fallback also failed: " + copy_ec.message()));
-        fs::remove_all(a.source, copy_ec);
+        call.fs().remove_all(a.source, copy_ec);
         if (copy_ec)
             return std::unexpected(ToolError::io(
                 "moved (copied) to " + a.destination.string()
@@ -1638,20 +1625,20 @@ std::expected<RemoveArgs, ToolError> parse_remove_args(const json& j, const util
     return RemoveArgs{checked->path(), r.boolean("recursive", false)};
 }
 
-ExecResult run_remove(const RemoveArgs& a) {
+ExecResult run_remove(const Call& call, const RemoveArgs& a) {
     std::error_code ec;
-    if (!fs::exists(a.path, ec))
+    if (!call.fs().stat(a.path).exists)
         return std::unexpected(ToolError::not_found(
             "nothing to remove at " + a.path.string()
             + " — it doesn't exist (already deleted, or a wrong path). If you "
               "intended it gone, the desired state is already met; otherwise "
               "`list_dir` the parent to check the name."));
-    const bool directory = fs::is_directory(a.path, ec);
-    if (directory && !a.recursive && !fs::is_empty(a.path, ec))
+    const bool directory = call.fs().stat(a.path).directory;
+    if (directory && !a.recursive && !call.fs().list(a.path, ec).empty())
         return std::unexpected(ToolError::invalid_args(
             "directory is not empty; pass recursive:true to remove its contents"));
-    const auto count = a.recursive ? fs::remove_all(a.path, ec)
-                                   : static_cast<std::uintmax_t>(fs::remove(a.path, ec));
+    const auto count = a.recursive ? call.fs().remove_all(a.path, ec)
+                                   : static_cast<std::uintmax_t>(call.fs().remove(a.path, ec));
     if (ec) return std::unexpected(ToolError::io("remove failed: " + ec.message()));
     return ToolOutput{std::format("Removed {} ({} filesystem entr{})", a.path.string(), count,
                                   count == 1 ? "y" : "ies"), std::nullopt};
@@ -1791,15 +1778,15 @@ struct OutlineArgs {
     return out;
 }
 
-ExecResult run_outline(const OutlineArgs& a) {
+ExecResult run_outline(const Call& call, const OutlineArgs& a) {
     const auto& p = a.path.path();
     std::error_code ec;
-    if (!fs::exists(p, ec))
+    if (!call.fs().stat(p).exists)
         return std::unexpected(ToolError::not_found(a.path.string()));
-    if (!fs::is_regular_file(p, ec))
+    if (!call.fs().stat(p).regular)
         return std::unexpected(ToolError::not_a_file(a.path.string()));
     constexpr std::uintmax_t kMaxBytes = 8u * 1024u * 1024u;
-    if (auto sz = fs::file_size(p, ec); !ec && sz > kMaxBytes)
+    if (auto sz = call.fs().stat(p).size; !ec && sz > kMaxBytes)
         return std::unexpected(ToolError::too_large(std::format(
             "file is {} KiB (> 8 MiB outline cap).", sz / 1024)));
 

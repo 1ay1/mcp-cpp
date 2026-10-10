@@ -8,6 +8,7 @@
 //   • effects ride back in the Result meta;
 //   • the host backend receives exactly the parsed request.
 
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
@@ -138,6 +139,7 @@ TEST_CASE("toolset") {
     // ── backend present → tools registered + driven end to end ───────────
     auto store = std::make_shared<FakeStore>();
     HostServices svc; svc.memory = store;
+    svc.files = std::make_shared<NativeFileSystem>();
     auto p = make_provider(svc);
 
     // remember + forget + wipe_memory all advertised

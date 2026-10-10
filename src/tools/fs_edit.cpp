@@ -21,7 +21,6 @@
 #include <expected>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <limits>
 #include <optional>
 #include <regex>
@@ -754,9 +753,9 @@ int apply_one(std::string& buf, const OneEdit& e,
 ExecResult run_edit(const Call& call, const EditArgs& a) {
     const auto& p = a.path.path();
     std::error_code ec;
-    if (!fs::exists(p, ec)) {
+    if (!call.fs().stat(p).exists) {
         auto parent = p.parent_path();
-        bool parent_ok = !parent.empty() && fs::exists(parent, ec);
+        bool parent_ok = !parent.empty() && call.fs().stat(parent).exists;
         if (!parent_ok)
             return std::unexpected(ToolError::not_found(
                 "file not found: " + a.path.string()
@@ -768,12 +767,12 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
             + ". To create a new file use the `write` tool; "
               "`edit` only modifies existing files."));
     }
-    if (!fs::is_regular_file(p, ec))
+    if (!call.fs().stat(p).regular)
         return std::unexpected(ToolError::not_a_file(
             "not a regular file: " + a.path.string()
             + " (is it a directory or symlink to one?)"));
     constexpr std::uintmax_t kMaxEditBytes = 1024u * 1024u;
-    const std::uintmax_t size = fs::file_size(p, ec);
+    const std::uintmax_t size = call.fs().stat(p).size;
     if (ec)
         return std::unexpected(ToolError::io(
             "cannot determine file size before editing: " + a.path.string()
@@ -786,7 +785,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
             "streaming/scripted transformation (for example via `bash`) or split "
             "the file into smaller files.",
             size / 1024)));
-    if (util::is_binary_file(p))
+    if (util::is_binary_file(call.fs(), p))
         return std::unexpected(ToolError::binary(
             "refusing to edit binary file: " + a.path.string()
             + " (contains NUL bytes — likely an image, archive, or compiled "
@@ -805,14 +804,11 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
     // Read through a hard cap as well as checking metadata above. The path may
     // grow or be replaced between stat and open; a size-only preflight is not
     // a memory bound. Reading at most cap+1 makes that race fail closed.
-    std::ifstream bounded(p, std::ios::binary);
+    auto bounded = call.fs().read_prefix(p, static_cast<std::size_t>(kMaxEditBytes) + 1);
     if (!bounded)
         return std::unexpected(ToolError::io(
             "cannot open file for bounded edit read: " + a.path.string()));
-    std::string original(static_cast<std::size_t>(kMaxEditBytes) + 1, '\0');
-    bounded.read(original.data(), static_cast<std::streamsize>(original.size()));
-    original.resize(static_cast<std::size_t>(bounded.gcount()));
-    bounded.close();
+    std::string original = std::move(*bounded);
     if (original.size() > kMaxEditBytes)
         return std::unexpected(ToolError::too_large(
             "file exceeded the 1 MiB edit cap while being opened/read; edit "
@@ -933,7 +929,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
         return std::unexpected(ToolError::io(werr));
     {
         std::error_code mt_ec;
-        auto new_mtime = fs::last_write_time(p, mt_ec);
+        auto new_mtime = call.fs().stat(p).mtime;
         if (!mt_ec) {
             record_seen(call, p, new_mtime,
                                    static_cast<std::uintmax_t>(updated.size()),
@@ -1191,20 +1187,20 @@ struct ApplyPatchArgs {
 ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
     const auto& p = a.path.path();
     std::error_code ec;
-    if (!fs::exists(p, ec))
+    if (!call.fs().stat(p).exists)
         return std::unexpected(ToolError::not_found(
             "file not found: " + a.path.string()
             + ". apply_patch modifies an existing file; use `write` to create "
               "a new one."));
-    if (!fs::is_regular_file(p, ec))
+    if (!call.fs().stat(p).regular)
         return std::unexpected(ToolError::not_a_file(
             "not a regular file: " + a.path.string()));
     constexpr std::uintmax_t kMaxBytes = 1024u * 1024u;
-    const std::uintmax_t size = fs::file_size(p, ec);
+    const std::uintmax_t size = call.fs().stat(p).size;
     if (!ec && size > kMaxBytes)
         return std::unexpected(ToolError::too_large(std::format(
             "file is {} KiB (> 1 MiB apply_patch cap).", size / 1024)));
-    if (util::is_binary_file(p))
+    if (util::is_binary_file(call.fs(), p))
         return std::unexpected(ToolError::binary(
             "refusing to patch binary file: " + a.path.string()));
 
@@ -1305,7 +1301,7 @@ ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
     auto d = diff::compute(a.path.string(), original, updated);
     if (auto werr = util::write_file(a.path, updated); !werr.empty())
         return std::unexpected(ToolError::io(werr));
-    { std::error_code mt; auto nm = fs::last_write_time(p, mt);
+    { std::error_code mt; auto nm = call.fs().stat(p).mtime;
       if (!mt) record_seen(call, p, nm,
                    static_cast<std::uintmax_t>(updated.size()),
                    util::cheap_content_hash(updated)); }

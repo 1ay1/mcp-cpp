@@ -12,6 +12,7 @@
 
 #include "test_state.hpp"
 #include "test_exec.hpp"
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
@@ -64,6 +65,8 @@ int main() {
     auto ws_state = mcp::test::state_at(root);
 
     HostServices svc;
+
+    svc.files = std::make_shared<NativeFileSystem>();
 
     svc.state = ws_state;
 
@@ -218,7 +221,7 @@ int main() {
         auto id = extract_id(r.text);
         // The shell may exit inside the settle window (session dropped, exit 0
         // clean path) — only probe the open-pipe hint when a session survives.
-        if (contains(r.text, "running") && !id.empty()) {
+        if (!contains(r.text, "exited immediately") && !id.empty()) {
             mcp::Json p = mcp::Json::object();
             p["id"] = id; p["wait_ms"] = 1200;   // < the 3s grandchild sleep
             auto pr = call(*provider, "process_poll", p);

@@ -122,9 +122,8 @@ constexpr int         kMaxReplaceHits = 10'000;
                             const fs::path& root) {
     if (pattern.empty()) return true;
     if (pattern.find('/') != std::string_view::npos) {
-        std::error_code ec;
-        auto rel = fs::relative(file, root, ec);
-        std::string rp = (ec ? file : rel).generic_string();
+        auto rel = file.lexically_relative(root);   // walked from root: lexical is exact
+        std::string rp = (rel.empty() ? file : rel).generic_string();
         return glob_one(pattern, rp);
     }
     return glob_one(pattern, file.filename().string());
@@ -134,30 +133,22 @@ constexpr int         kMaxReplaceHits = 10'000;
 // grep: prune skip-dirs + symlinked dirs, drop dotfiles, binary exts, empty /
 // oversized files, and apply an optional file glob.
 [[nodiscard]] std::vector<fs::path>
-collect_files(const fs::path& root, std::string_view file_glob) {
+collect_files(const FileSystem& files, const fs::path& root, std::string_view file_glob) {
     std::vector<fs::path> out;
-    std::error_code ec;
-    for (auto it = fs::recursive_directory_iterator(
-                 root, fs::directory_options::skip_permission_denied, ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        const auto& entry = *it;
-        auto fn = entry.path().filename().string();
-        if (entry.is_directory(ec)) {
-            std::error_code lec;
-            if (entry.is_symlink(lec)) { it.disable_recursion_pending(); continue; }
-            if (util::should_skip_dir(fn)) it.disable_recursion_pending();
-            continue;
+    files.walk(root, [&](const DirEntry& entry) {
+        auto fn = entry.path.filename().string();
+        if (entry.directory) {
+            if (entry.symlink || util::should_skip_dir(fn)) return WalkStep::skip_dir;
+            return WalkStep::next;
         }
-        if (!entry.is_regular_file(ec)) continue;
-        if (fn.starts_with(".")) continue;
-        if (!file_glob.empty() && !glob_hit(file_glob, entry.path(), root)) continue;
-        if (likely_binary_ext(entry.path())) continue;
-        std::error_code sec;
-        auto sz = entry.file_size(sec);
-        if (sec || sz == 0 || sz > kMaxFileBytes) { sec.clear(); continue; }
-        out.push_back(entry.path());
-    }
+        if (!entry.regular) return WalkStep::next;
+        if (fn.starts_with(".")) return WalkStep::next;
+        if (!file_glob.empty() && !glob_hit(file_glob, entry.path, root)) return WalkStep::next;
+        if (likely_binary_ext(entry.path)) return WalkStep::next;
+        if (entry.size == 0 || entry.size > kMaxFileBytes) return WalkStep::next;
+        out.push_back(entry.path);
+        return WalkStep::next;
+    });
     return out;
 }
 
@@ -201,9 +192,8 @@ compile_pattern(const std::string& pattern, bool case_sensitive, bool word) {
 }
 
 [[nodiscard]] std::string rel_path(const fs::path& p, const fs::path& root) {
-    std::error_code ec;
-    auto rel = fs::relative(p, root, ec);
-    return (ec || rel.empty() ? p : rel).generic_string();
+    auto rel = p.lexically_relative(root);   // walked from root: lexical is exact
+    return (rel.empty() ? p : rel).generic_string();
 }
 
 // A single projected value plus provenance.
@@ -317,7 +307,7 @@ ExecResult run_extract(const Call& call, const ExtractArgs& a) {
         // group validity is checked per-match below (regex smatch size)
     }
 
-    auto files = collect_files(root, a.file_glob);
+    auto files = collect_files(call.fs(), root, a.file_glob);
     if (files.empty())
         return ToolOutput{"No files to scan (empty dir or all filtered).", std::nullopt};
 
@@ -377,7 +367,7 @@ ExecResult run_extract(const Call& call, const ExtractArgs& a) {
         int& total = counted[k];
         for (std::size_t i = k; i < files.size() && total < share_cap; i += nshares) {
             std::string content;
-            try { content = util::read_file(files[i]); } catch (...) { continue; }
+            try { content = util::read_file(call.fs(), files[i]); } catch (...) { continue; }
             if (content.empty()) continue;
             auto head = std::min<std::size_t>(content.size(), 4096);
             if (std::memchr(content.data(), '\0', head)) continue;
@@ -548,7 +538,7 @@ ExecResult run_aggregate(const Call& call, const AggregateArgs& a) {
         return std::unexpected(ToolError::invalid_args(
             "by=capture needs a regex with a group; the pattern is a literal"));
 
-    auto files = collect_files(root, a.file_glob);
+    auto files = collect_files(call.fs(), root, a.file_glob);
     if (files.empty())
         return ToolOutput{"No files to scan.", std::nullopt};
 
@@ -571,7 +561,7 @@ ExecResult run_aggregate(const Call& call, const AggregateArgs& a) {
         int& total = counted[k];
         for (std::size_t i = k; i < files.size() && total < share_cap; i += nshares) {
             std::string content;
-            try { content = util::read_file(files[i]); } catch (...) { continue; }
+            try { content = util::read_file(call.fs(), files[i]); } catch (...) { continue; }
             if (content.empty()) continue;
             auto head = std::min<std::size_t>(content.size(), 4096);
             if (std::memchr(content.data(), '\0', head)) continue;
@@ -737,7 +727,7 @@ ExecResult run_replace(const Call& call, const ReplaceArgs& a) {
         }
     }
 
-    auto files = collect_files(root, a.file_glob);
+    auto files = collect_files(call.fs(), root, a.file_glob);
     if (files.empty())
         return ToolOutput{"No files to scan.", std::nullopt};
 
@@ -751,7 +741,7 @@ ExecResult run_replace(const Call& call, const ReplaceArgs& a) {
 
     for (const auto& f : files) {
         std::string content;
-        try { content = util::read_file(f); } catch (...) { continue; }
+        try { content = util::read_file(call.fs(), f); } catch (...) { continue; }
         if (content.empty()) continue;
         auto head = std::min<std::size_t>(content.size(), 4096);
         if (std::memchr(content.data(), '\0', head)) continue;
@@ -818,7 +808,7 @@ ExecResult run_replace(const Call& call, const ReplaceArgs& a) {
         int written = 0;
         for (std::size_t i = 0; i < writes.size(); ++i) {
             auto& [p, content] = writes[i];
-            auto err = util::write_file(p, content);
+            auto err = util::write_file(call.fs(), p, content);
             if (!err.empty()) continue;
             ++written;
             // Queue this file for diff-review: original → written content.
@@ -880,13 +870,13 @@ ExecResult run_read_filter(const Call& call, const ReadFilterArgs& a) {
     const fs::path p = wp->path();
 
     std::error_code ec;
-    if (!fs::exists(p, ec))
+    if (!call.fs().stat(p).exists)
         return std::unexpected(ToolError::not_found(p.string()));
-    if (!fs::is_regular_file(p, ec))
+    if (!call.fs().stat(p).regular)
         return std::unexpected(ToolError::not_a_file(p.string()));
 
     std::string content;
-    try { content = util::read_file(p); } catch (...) {
+    try { content = util::read_file(call.fs(), p); } catch (...) {
         return std::unexpected(ToolError::io("could not read " + p.string()));
     }
     auto head = std::min<std::size_t>(content.size(), 4096);
