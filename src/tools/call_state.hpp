@@ -18,8 +18,13 @@ namespace mcp::tools::detail {
         out.workspace = s.workspace_root; out.read_roots = s.read_roots; out.home = s.home;
         return out;
     });
+    if (!c.scope_workspace.empty()) b.workspace = c.scope_workspace;
     // Canonicalising touches the disk: done outside the state lock.
-    return util::bounds_from(c.fs(), b.workspace, std::move(b.read_roots), std::move(b.home));
+    auto out = util::bounds_from(c.fs(), b.workspace, std::move(b.read_roots), std::move(b.home));
+    for (const auto& r : c.scope_extra_roots)
+        if (!r.empty()) out.extra_roots.push_back(util::canonical_root(c.fs(), r));
+    if (!c.scope_project.empty()) out.project = util::canonical_root(c.fs(), c.scope_project);
+    return out;
 }
 
 // The last snapshot of `path`, if any tool saw it.

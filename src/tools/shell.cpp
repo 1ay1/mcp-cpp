@@ -129,6 +129,9 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j, const util::Bo
                 "cd '" + cd + "' is not a directory"));
         if (auto wp = util::make_workspace_path_checked(cd, "shell", b); !wp)
             return std::unexpected(std::move(wp.error()));
+    } else if (!b.project.empty()) {
+        // A host serving sessions in several folders: run in this one's.
+        cd = b.project.string();
     }
 
     // Optional env overrides: {"env": {"CI": "1", "RUST_LOG": "debug"}}.

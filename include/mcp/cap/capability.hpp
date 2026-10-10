@@ -52,6 +52,15 @@ struct Request {
     // host plugged in (its Exec, SkillResolver, SubagentRunner). mcp-cpp
     // never reads it. Lets a host keep call-scoped facts off thread-locals.
     const void* host = nullptr;
+    // Optional per-call workspace scope, for a host whose calls serve
+    // different folders (one ACP agent, several editor sessions). Empty
+    // fields leave the provider's shared defaults in place.
+    std::string              scope_workspace = {};
+    std::vector<std::string> scope_extra_roots = {};
+    std::string              scope_project = {};
+    // Ask the user (an MCP server's elicitation/create during this call).
+    // MCP-shaped params in, ElicitResult JSON out. Empty: declined.
+    std::function<Json(const Json&)> elicit = nullptr;
 };
 
 // The outcome of executing a capability. `text` is the human/model-facing

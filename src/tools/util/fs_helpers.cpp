@@ -107,6 +107,7 @@ namespace {
 
 fs::path project_root(const Bounds& b) {
     const fs::path& ws = b.workspace;   // already canonicalised
+    if (!b.project.empty()) return b.project;   // the host said where
     std::error_code ec;
     fs::path cwd = b.files->cwd();
     if (cwd.empty()) return ws;
@@ -143,12 +144,10 @@ bool is_within_workspace(const fs::path& target, const Bounds& b) {
     const auto& canon_root = b.workspace;   // already canonicalised
     // Component-wise prefix check. Plain string startsWith would let
     // /home/user/project-other through when root is /home/user/project.
-    auto rt = canon_root.begin();
-    auto tt = canon_target.begin();
-    for (; rt != canon_root.end() && tt != canon_target.end(); ++rt, ++tt) {
-        if (*rt != *tt) return false;
-    }
-    return rt == canon_root.end();
+    if (path_at_or_under(canon_target, canon_root)) return true;
+    for (const auto& r : b.extra_roots)
+        if (path_at_or_under(canon_target, r)) return true;
+    return false;
 }
 
 // ── Read-only allowlist roots ───────────────────────────────────────────

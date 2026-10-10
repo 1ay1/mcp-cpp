@@ -132,6 +132,11 @@ struct Call {
     // The host's per-call data (cap::Request::host), handed back to the
     // host's own services. Never read here.
     const void*           host = nullptr;
+    // Optional per-call scope, for a host serving sessions in different
+    // folders (an ACP agent). Empty fields fall back to the shared state.
+    std::filesystem::path              scope_workspace;
+    std::vector<std::filesystem::path> scope_extra_roots;
+    std::filesystem::path              scope_project;
 
     [[nodiscard]] bool cancel_requested() const { return cancelled && cancelled(); }
 

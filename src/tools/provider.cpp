@@ -124,6 +124,9 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
                 call.stop      = req.stop;
                 call.progress  = req.progress;
                 call.host      = req.host;
+                call.scope_workspace = req.scope_workspace;
+                for (const auto& r : req.scope_extra_roots) call.scope_extra_roots.emplace_back(r);
+                call.scope_project = req.scope_project;
                 if (!call.cancelled && req.stop.stop_possible())
                     call.cancelled = [st = req.stop] { return st.stop_requested(); };
                 mcp::cap::Result r = handler(call, req.args);

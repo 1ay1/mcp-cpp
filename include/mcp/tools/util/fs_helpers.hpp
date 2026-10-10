@@ -29,6 +29,12 @@ struct Bounds {
     // The host's filesystem: canonicalising and the cwd are reads of the
     // disk too, so the path helpers reach it through here. Never null.
     FileSystem*           files = nullptr;
+    // More directories the call may read AND write, as if they were the
+    // workspace (an editor's additional workspace roots). Canonical.
+    std::vector<fs::path> extra_roots;
+    // Where relative paths resolve, when the host knows better than the
+    // process cwd (one agent serving sessions in different folders).
+    fs::path              project;
 };
 
 // A Bounds from the state's fields. An empty workspace means the cwd.
