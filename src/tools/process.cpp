@@ -137,13 +137,22 @@ ExecResult run_start(const Call& call, const StartArgs& args, CallExec& exec) {
     // Drop sessions whose child exited and whose output a poll has fully
     // drained — a model that starts many short-lived processes and never
     // calls process_stop would otherwise hit the cap with a confusing error.
-    const bool full = call.with([](ToolState& s) {
-        std::erase_if(s.procs, [](const auto& kv) {
-            const auto& p = *kv.second;
-            return !p.running && p.delivered >= p.output_base + p.output.size();
-        });
-        return s.procs.size() >= kMaxSessions;
+    // The dropped ones are moved out and destroyed AFTER the lock: the host's
+    // session takes its own lock in its destructor, and nesting the two aborts.
+    auto [full, dropped] = call.with([](ToolState& s) {
+        std::vector<std::shared_ptr<state::Proc>> gone;
+        for (auto it = s.procs.begin(); it != s.procs.end();) {
+            const auto& p = *it->second;
+            if (!p.running && p.delivered >= p.output_base + p.output.size()) {
+                gone.push_back(std::move(it->second));
+                it = s.procs.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return std::pair{s.procs.size() >= kMaxSessions, std::move(gone)};
     });
+    dropped.clear();   // sessions die here, with no lock held
     if (full)
         return std::unexpected(ToolError::invalid_args(
             "process session limit reached (32 live sessions); call "
