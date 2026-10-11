@@ -96,7 +96,10 @@ std::string bound_lines(const std::string& in, int head, int tail) {
 // What a model sends as `command` isn't always a script. Turn the common
 // shapes into one: an argv array, a ```fenced``` block, a pasted "$ cmd".
 std::string normalize_command(const json& j, std::string cmd) {
-    if (auto it = j.find("command"); it != j.end() && it->is_array() && !it->empty()
+    auto it = j.end();
+    for (const char* k : {"command", "cmd", "shell_command", "shell", "script", "run", "cmdline"})
+        if (it = j.find(k); it != j.end()) break;
+    if (it != j.end() && it->is_array() && !it->empty()
         && std::ranges::all_of(*it, [](const json& e) { return e.is_string(); })) {
         // ["bash","-c","script"] is the script itself.
         if (it->size() == 3 && ((*it)[0] == "bash" || (*it)[0] == "sh") && (*it)[1] == "-c")
