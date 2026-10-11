@@ -26,6 +26,8 @@
 #include <system_error>
 #include <vector>
 #include <algorithm>
+#include <cctype>
+#include <cstring>
 
 #include <nlohmann/json.hpp>
 
@@ -91,12 +93,66 @@ std::string bound_lines(const std::string& in, int head, int tail) {
     return out;
 }
 
+// What a model sends as `command` isn't always a script. Turn the common
+// shapes into one: an argv array, a ```fenced``` block, a pasted "$ cmd".
+std::string normalize_command(const json& j, std::string cmd) {
+    if (auto it = j.find("command"); it != j.end() && it->is_array() && !it->empty()
+        && std::ranges::all_of(*it, [](const json& e) { return e.is_string(); })) {
+        // ["bash","-c","script"] is the script itself.
+        if (it->size() == 3 && ((*it)[0] == "bash" || (*it)[0] == "sh") && (*it)[1] == "-c")
+            return (*it)[2].get<std::string>();
+        std::string out;
+        for (const auto& e : *it) {
+            const auto s = e.get<std::string>();
+            if (!out.empty()) out += ' ';
+            const bool plain = !s.empty() && std::ranges::all_of(s, [](char c) {
+                return std::isalnum(static_cast<unsigned char>(c)) || std::strchr("-_./=:,+@%", c);
+            });
+            if (plain) { out += s; continue; }
+            out += '\'';
+            for (char c : s) { if (c == '\'') out += "'\\''"; else out += c; }
+            out += '\'';
+        }
+        return out;
+    }
+    // ```bash ... ``` around the whole command.
+    auto trim = [](std::string s) {
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+        std::size_t i = 0;
+        while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+        return s.substr(i);
+    };
+    cmd = trim(std::move(cmd));
+    if (cmd.starts_with("```") && cmd.size() > 6 && cmd.ends_with("```")) {
+        auto nl = cmd.find('\n');
+        if (nl != std::string::npos && nl < cmd.size() - 3)
+            cmd = trim(cmd.substr(nl + 1, cmd.size() - 3 - (nl + 1)));
+    }
+    // A pasted prompt: "$ make" on every line.
+    if (cmd.starts_with("$ ")) {
+        std::string out;
+        std::size_t pos = 0;
+        bool all = true;
+        while (pos <= cmd.size()) {
+            auto nl = cmd.find('\n', pos);
+            std::string line = cmd.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+            if (!line.empty() && !line.starts_with("$ ")) { all = false; break; }
+            if (!out.empty()) out += '\n';
+            out += line.empty() ? line : line.substr(2);
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+        }
+        if (all) cmd = std::move(out);
+    }
+    return cmd;
+}
+
 std::expected<BashArgs, ToolError> parse_bash_args(const json& j, const util::Bounds& b) {
     util::ArgReader ar(j);
     auto cmd_opt = ar.require_str("command");
     if (!cmd_opt)
         return std::unexpected(ToolError::invalid_args("command required"));
-    std::string cmd = *std::move(cmd_opt);
+    std::string cmd = normalize_command(j, *std::move(cmd_opt));
     // AST guard: judges every command in the script (pipes, chains, $(…),
     // control flow, bash -c, sudo/env/xargs/find -exec). If the script does
     // not parse cleanly, ALSO run the legacy text validator — fail closed.
@@ -124,11 +180,16 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j, const util::Bo
 
     std::string cd = ar.str("cd", "");
     if (!cd.empty()) {
+        // Relative cd is relative to the session's folder, and goes on
+        // absolute: the sandbox chdirs in its own namespace, where a relative
+        // path fails (claybin "chdir errno 2").
+        if (auto wp = util::make_workspace_path_checked(cd, "shell", b); !wp)
+            return std::unexpected(std::move(wp.error()));
+        else
+            cd = wp->string();
         if (!b.files->stat(cd).directory)
             return std::unexpected(ToolError::invalid_args(
                 "cd '" + cd + "' is not a directory"));
-        if (auto wp = util::make_workspace_path_checked(cd, "shell", b); !wp)
-            return std::unexpected(std::move(wp.error()));
     } else if (!b.project.empty()) {
         // A host serving sessions in several folders: run in this one's.
         cd = b.project.string();

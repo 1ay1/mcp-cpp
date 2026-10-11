@@ -46,6 +46,18 @@ struct Bounds {
 // Forward declarations — WorkspacePath sits below ToolError-using factories.
 class WorkspacePath;
 
+// A path as a model wrote it, cleaned up: surrounding quotes or backticks,
+// a `file:LINE`, `file:A-B` or `file#LA-LB` suffix (the range comes back in
+// line_from / line_to, 0 when absent). The suffix is only stripped when the
+// file without it exists, so a real name containing ':' is left alone.
+struct TidyPath {
+    std::string path;
+    int         line_from = 0;
+    int         line_to   = 0;
+};
+[[nodiscard]] TidyPath tidy_model_path(const FileSystem& files, const Bounds& b,
+                                       std::string raw);
+
 // Read an entire file as a binary blob. Returns "" on open failure (callers
 // that need to distinguish missing vs empty should stat first).
 //

@@ -42,6 +42,7 @@ add_executable(mcp_tests
     bash_validate_test.cpp
     fuzzy_match_test.cpp
     shellx_test.cpp
+    tool_robustness_test.cpp
 )
 target_link_libraries(mcp_tests PRIVATE mcp::mcp mcp::tools mcp::tools_native_files doctest::doctest Threads::Threads)
 include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)

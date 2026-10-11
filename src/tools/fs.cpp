@@ -744,9 +744,102 @@ struct ReadArgs {
 // argument object.
 std::string describe_keys(const json& j);
 
-std::expected<ReadArgs, ToolError> parse_read_args(const json& j, const util::Bounds& b) {
+// A range written as "10-20", "10:20", "10", [10,20] or {start,end}.
+// Returns {from, to}; to is 0 when open-ended.
+std::optional<std::pair<int, int>> parse_line_range(const json& v) {
+    auto as_int = [](const json& x) -> std::optional<int> {
+        if (x.is_number_integer()) return x.get<int>();
+        if (x.is_string()) {
+            try { return std::stoi(x.get<std::string>()); } catch (...) {}
+        }
+        return std::nullopt;
+    };
+    if (v.is_array() && !v.empty()) {
+        auto a = as_int(v[0]);
+        if (!a) return std::nullopt;
+        auto z = v.size() > 1 ? as_int(v[1]) : std::nullopt;
+        return std::pair{*a, z.value_or(0)};
+    }
+    if (v.is_object()) {
+        for (auto [s, e] : {std::pair{"start", "end"}, std::pair{"from", "to"}})
+            if (v.contains(s))
+                if (auto a = as_int(v[s])) {
+                    auto z = v.contains(e) ? as_int(v[e]) : std::nullopt;
+                    return std::pair{*a, z.value_or(0)};
+                }
+        return std::nullopt;
+    }
+    if (v.is_number_integer()) return std::pair{v.get<int>(), 0};
+    if (!v.is_string()) return std::nullopt;
+    std::string s = v.get<std::string>();
+    std::erase_if(s, [](char c) { return c == ' ' || c == 'L' || c == 'l'; });
+    const auto sep = s.find_first_of("-:,");
+    try {
+        if (sep == std::string::npos) return std::pair{std::stoi(s), 0};
+        const int a = std::stoi(s.substr(0, sep));
+        const std::string rest = s.substr(sep + 1);
+        return std::pair{a, rest.empty() ? 0 : std::stoi(rest)};
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+// The shapes models send instead of path/offset/end_line, folded into those:
+// a quoted path, "file:10-20" / "file#L10-L20", lines:"10-20",
+// line_range:[10,20], and a one-entry paths:[...] array.
+json tidy_read_args(const json& j, const util::Bounds& b) {
+    if (!j.is_object()) return j;
+    json out = j;
+    if (!out.contains("path")) {
+        for (const char* k : {"paths", "files", "file_paths"})
+            if (auto it = out.find(k); it != out.end() && it->is_array() && it->size() == 1
+                && (*it)[0].is_string()) {
+                out["path"] = (*it)[0];
+                break;
+            }
+    }
+    bool has_range = out.contains("offset") || out.contains("start_line")
+                  || out.contains("end_line") || out.contains("limit");
+    if (!has_range)
+        for (const char* k : {"lines", "line_range", "range", "line"})
+            if (auto it = out.find(k); it != out.end())
+                if (auto r = parse_line_range(*it); r && r->first > 0) {
+                    if (std::string_view{k} == "line" && r->second == 0) {
+                        // One line asked for: show it with some context.
+                        out["offset"] = std::max(1, r->first - 20);
+                        out["end_line"] = r->first + 40;
+                    } else {
+                        out["offset"] = r->first;
+                        if (r->second >= r->first) out["end_line"] = r->second;
+                    }
+                    has_range = true;
+                    break;
+                }
+    // Path under whatever key the model used.
+    const char* pkey = "path";
+    for (const char* k : {"path", "file_path", "file", "filename", "filepath", "filePath"})
+        if (out.contains(k)) { pkey = k; break; }
+    if (auto it = out.find(pkey); it != out.end() && it->is_string() && b.files) {
+        auto t = util::tidy_model_path(*b.files, b, it->get<std::string>());
+        *it = t.path;
+        if (t.line_from > 0 && !has_range) {
+            out["offset"] = t.line_from;
+            if (t.line_to >= t.line_from) out["end_line"] = t.line_to;
+        }
+    }
+    return out;
+}
+
+std::expected<ReadArgs, ToolError> parse_read_args(const json& raw_j, const util::Bounds& b) {
+    const json j = tidy_read_args(raw_j, b);
     util::ArgReader ar(j);
     auto path_opt = ar.require_str("path");
+    if (!path_opt && j.is_object())
+        for (const char* k : {"paths", "files", "file_paths"})
+            if (auto it = j.find(k); it != j.end() && it->is_array() && it->size() > 1)
+                return std::unexpected(ToolError::invalid_args(std::format(
+                    "read takes one `path`; got {} in `{}`. Make one read call per file "
+                    "(they run in parallel).", it->size(), k)));
     if (!path_opt)
         // Name the keys we DID receive, the way parse_write_args does.
         //
@@ -826,9 +919,46 @@ std::expected<ReadArgs, ToolError> parse_read_args(const json& j, const util::Bo
 ExecResult run_read(const Call& call, const ReadArgs& a) {
     const auto& p = a.path.path();
     std::error_code ec;
-    if (!call.fs().stat(p).exists)
+    if (!call.fs().stat(p).exists) {
+        // Same name somewhere else in the parent, or a different case/extension.
+        std::string near;
+        const auto parent = p.parent_path();
+        const auto want = p.filename().string();
+        auto lower = [](std::string s) {
+            for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return s;
+        };
+        if (call.fs().stat(parent).directory) {
+            int shown = 0;
+            for (const auto& e : call.fs().list(parent, ec)) {
+                const auto name = e.path.filename().string();
+                const bool close = lower(name) == lower(want)
+                    || e.path.stem() == p.stem()
+                    || (want.size() >= 4 && lower(name).find(lower(p.stem().string())) != std::string::npos);
+                if (!close) continue;
+                near += (shown++ ? ", " : "") + name;
+                if (shown == 5) break;
+            }
+        }
         return std::unexpected(ToolError::not_found("file not found: " + a.path.string()
-            + ". Run `list_dir` on the parent directory or `glob` by name to verify."));
+            + (near.empty() ? std::string{". Run `list_dir` on the parent directory or `glob` by name to verify."}
+                            : ". Similar names in " + parent.string() + ": " + near + ".")));
+    }
+    if (call.fs().stat(p).directory) {
+        // A directory: show what's in it rather than fail.
+        auto entries = call.fs().list(p, ec);
+        std::ranges::sort(entries, [](const DirEntry& x, const DirEntry& y) {
+            return x.directory != y.directory ? x.directory : x.path.filename() < y.path.filename();
+        });
+        std::string out = a.path.string() + " is a directory. Its entries:\n";
+        std::size_t n = 0;
+        for (const auto& e : entries) {
+            if (++n > 200) { out += "... (" + std::to_string(entries.size() - 200) + " more)\n"; break; }
+            out += "  " + e.path.filename().string() + (e.directory ? "/" : "") + "\n";
+        }
+        out += "Read a file by its full path.";
+        return ToolOutput{std::move(out), std::nullopt};
+    }
     if (!call.fs().stat(p).regular)
         return std::unexpected(ToolError::not_a_file("not a regular file: " + a.path.string()));
 

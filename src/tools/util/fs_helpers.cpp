@@ -1,6 +1,7 @@
 #include <mcp/tools/util/fs_helpers.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -26,7 +27,8 @@ fs::path normalize_path(std::string_view s, const Bounds& b) {
     while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
     while (!s.empty() && (s.back() == ' ' || s.back() == '\t'))  s.remove_suffix(1);
     if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"')
-                          || (s.front() == '\'' && s.back() == '\''))) {
+                          || (s.front() == '\'' && s.back() == '\'')
+                          || (s.front() == '`' && s.back() == '`'))) {
         s.remove_prefix(1);
         s.remove_suffix(1);
     }
@@ -89,6 +91,52 @@ fs::path canonical_root(const FileSystem& files, fs::path root) {
     std::error_code ec;
     auto canon = files.canonical(root, ec);
     return ec ? std::move(root) : std::move(canon);
+}
+
+TidyPath tidy_model_path(const FileSystem& files, const Bounds& b, std::string raw) {
+    TidyPath out;
+    while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.back()))) raw.pop_back();
+    std::size_t lead = 0;
+    while (lead < raw.size() && std::isspace(static_cast<unsigned char>(raw[lead]))) ++lead;
+    raw.erase(0, lead);
+    if (raw.size() >= 2 && raw.front() == raw.back()
+        && (raw.front() == '`' || raw.front() == '"' || raw.front() == '\''))
+        raw = raw.substr(1, raw.size() - 2);
+    out.path = raw;
+    if (raw.empty() || files.stat(normalize_path(raw, b)).exists) return out;
+
+    // Peel "#L10-L20", ":10-20", ":10:5" or ":10" off the end.
+    auto num = [](std::string_view s, std::size_t& i) {
+        int v = 0; std::size_t start = i;
+        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) v = v * 10 + (s[i++] - '0');
+        return i > start ? v : -1;
+    };
+    for (std::size_t cut = raw.size(); cut-- > 0;) {
+        const char c = raw[cut];
+        if (c != ':' && c != '#') continue;
+        std::string_view tail{raw.data() + cut + 1, raw.size() - cut - 1};
+        std::size_t i = 0;
+        if (c == '#' && i < tail.size() && (tail[i] == 'L' || tail[i] == 'l')) ++i;
+        const int a = num(tail, i);
+        if (a < 0) continue;
+        int z = 0;
+        if (i < tail.size() && (tail[i] == '-' || tail[i] == ':' || tail[i] == ',')) {
+            const bool range = tail[i] == '-' || tail[i] == ',';
+            ++i;
+            if (i < tail.size() && (tail[i] == 'L' || tail[i] == 'l')) ++i;
+            const int v = num(tail, i);
+            if (v < 0) continue;
+            if (range) z = v;   // ":10:5" is line:column
+        }
+        if (i != tail.size()) continue;
+        std::string base = raw.substr(0, cut);
+        if (base.empty() || !files.stat(normalize_path(base, b)).exists) continue;
+        out.path = std::move(base);
+        out.line_from = a;
+        out.line_to = z >= a ? z : 0;
+        break;
+    }
+    return out;
 }
 
 namespace {

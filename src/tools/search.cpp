@@ -374,7 +374,49 @@ struct GrepArgs {
     enum class Mode { Content, FilesOnly, Count };
     Mode        mode = Mode::Content;
     std::string display_description;
+    bool        literal = false;   // the escaped retry of a bad regex
 };
+
+// A pattern that failed as a regex, made into one that can't fail: each
+// `|` branch is taken as plain text ("\\[" and "\[" mean "[") and escaped,
+// so "foo(|bar" still finds either word.
+std::string literal_alternation(std::string_view p) {
+    auto plain = [](std::string_view s) {
+        std::string out;
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '\\' && i + 1 < s.size()) {
+                std::size_t j = i;
+                while (j < s.size() && s[j] == '\\') ++j;
+                if (j < s.size() && std::ispunct(static_cast<unsigned char>(s[j]))) {
+                    out += s[j];
+                    i = j;
+                    continue;
+                }
+            }
+            out += s[i];
+        }
+        return out;
+    };
+    auto escape = [](std::string_view s) {
+        std::string out;
+        for (char c : s) {
+            if (std::strchr("\\.^$|?*+()[]{}", c)) out += '\\';
+            out += c;
+        }
+        return out;
+    };
+    std::string out;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= p.size(); ++i) {
+        if (i < p.size() && p[i] != '|') continue;
+        if (!out.empty() || i > start) {
+            if (start > 0) out += '|';
+            out += escape(plain(p.substr(start, i - start)));
+        }
+        start = i + 1;
+    }
+    return out;
+}
 
 std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
     util::ArgReader ar(j);
@@ -893,7 +935,11 @@ ExecResult run_ripgrep(const GrepArgs& a, CallExec& exec) {
     std::vector<std::string> argv = {"rg", "--json", "--no-config"};
     if (!a.case_sensitive) argv.push_back("-i");
     if (a.word) argv.push_back("-w");           // whole-word match
-    if (is_literal_pattern(a.pattern)) argv.push_back("-F");
+    if (!a.literal && is_literal_pattern(a.pattern)) argv.push_back("-F");
+    // A pattern spanning lines (a real newline or a `\n` escape) needs
+    // multiline mode; rg refuses it otherwise.
+    if (a.pattern.find('\n') != std::string::npos || a.pattern.find("\\n") != std::string::npos)
+        argv.push_back("-U");
     argv.push_back("-C");
     // Summary modes never render lines — context bytes are pure waste.
     argv.push_back(std::to_string(
@@ -935,7 +981,23 @@ ExecResult run_ripgrep(const GrepArgs& a, CallExec& exec) {
             "rg failed to start: " + r.start_error));
     if (r.exit_code == 1 && !r.stopped_early)
         return ToolOutput{grep_no_match_hint(a), std::nullopt};
-    if (r.exit_code != 0)
+    // A pattern rg can't parse (`foo(`, a literal \n, a stray escape) was
+    // almost always meant as text: search it literally and say so.
+    if (r.exit_code == 2 && !a.literal
+        && (r.output.find("regex parse error") != std::string::npos
+            || r.output.find("is not allowed in a regex") != std::string::npos)) {
+        GrepArgs lit = a;
+        lit.pattern = literal_alternation(a.pattern);
+        lit.literal = true;   // escaped already; marks the one retry
+        auto again = run_ripgrep(lit, exec);
+        if (again) again->text = "[note: pattern isn't a valid regex, searched it as plain text]\n"
+                                 + std::move(again->text);
+        return again;
+    }
+    // rg exits 2 for any unreadable file (a /sys node, a dangling symlink)
+    // even when it found matches. Only fail when nothing came back.
+    const bool any_match = r.output.find("{\"type\":\"match\"") != std::string::npos;
+    if (r.exit_code != 0 && !(r.exit_code == 2 && any_match))
         return std::unexpected(ToolError::subprocess(
             "rg exited " + std::to_string(r.exit_code) + ":\n"
             + r.output.substr(0, 1024)));
@@ -1104,7 +1166,7 @@ ExecResult run_builtin(const Call& call, const GrepArgs& a) {
     // word=true forces whole-word matching. We compile a regex with \b anchors
     // around the (escaped-if-literal) pattern, so the fast literal path is
     // bypassed — correctness (no `foo` inside `foobar`) beats the micro-opt.
-    const bool literal = !a.word && is_literal_pattern(a.pattern);
+    const bool literal = !a.word && !a.literal && is_literal_pattern(a.pattern);
     std::regex re;
     if (!literal) {
         // std::regex is an uninterruptible backtracker; a nested unbounded
@@ -1131,8 +1193,18 @@ ExecResult run_builtin(const Call& call, const GrepArgs& a) {
         }
         try { re = std::regex(src, flags); }
         catch (const std::regex_error& e) {
-            return std::unexpected(ToolError::invalid_regex(
-                std::string{"invalid regex '"} + a.pattern + "': " + e.what()));
+            if (a.literal)   // already the escaped retry
+                return std::unexpected(ToolError::invalid_regex(
+                    std::string{"invalid regex '"} + a.pattern + "': " + e.what()));
+            // Not a regex: search it as text, like the rg path does.
+            GrepArgs lit = a;
+            lit.word = false;
+            lit.pattern = literal_alternation(a.pattern);
+            lit.literal = true;
+            auto again = run_builtin(call, lit);
+            if (again) again->text = "[note: pattern isn't a valid regex, searched it as plain text]\n"
+                                     + std::move(again->text);
+            return again;
         }
     }
 
@@ -1386,9 +1458,19 @@ ExecResult run_builtin(const Call& call, const GrepArgs& a) {
 // `exec` may be null (a host that runs no programs): then the builtin
 // scanner does the search instead of ripgrep.
 ExecResult run_grep(const Call& call, const GrepArgs& a, Exec* exec) {
-    auto wp = util::make_workspace_path_checked(a.root, "grep", bounds(call));
+    // "src/foo.cpp:120" or a quoted path: search the file itself.
+    GrepArgs tidy = a;
+    if (!a.root.empty() && a.root != ".")
+        tidy.root = util::tidy_model_path(call.fs(), bounds(call), a.root).path;
+    auto wp = util::make_workspace_path_checked(tidy.root, "grep", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
-    GrepArgs gated = a;
+    if (!call.fs().stat(wp->path()).exists)
+        return std::unexpected(ToolError::not_found(
+            "path not found: " + wp->string() + ". Use glob or list_dir to find it"
+            + (tidy.root.find(' ') != std::string::npos
+                   ? std::string{"; for several paths, make one grep call per path"} : std::string{})
+            + "."));
+    GrepArgs gated = std::move(tidy);
     gated.root = wp->string();
 
     // Block mode (context:"block") needs the file content in hand to expand a
