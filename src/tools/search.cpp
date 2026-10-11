@@ -1019,14 +1019,22 @@ ExecResult run_ripgrep(const GrepArgs& a, CallExec& exec) {
             json j = json::parse(line, nullptr, false);
             if (j.is_discarded() || !j.is_object()) continue;
             auto type = j.value("type", "");
+            // rg reports a line or path that isn't valid UTF-8 as base64
+            // under "bytes" instead of "text"; decode it and make it valid.
+            auto text_of = [](const json& o) -> std::string {
+                if (!o.is_object()) return {};
+                if (auto t = o.find("text"); t != o.end() && t->is_string()) return t->get<std::string>();
+                if (auto b = o.find("bytes"); b != o.end() && b->is_string())
+                    return util::to_valid_utf8(util::b64_decode(b->get<std::string>()));
+                return {};
+            };
             if (type == "begin") {
-                auto path = j["data"]["path"].value("text", "");
+                auto path = text_of(j["data"]["path"]);
                 files.push_back({std::move(path), {}, 0});
             } else if ((type == "context" || type == "match") && !files.empty()) {
                 auto& d = j["data"];
                 int ln = d.value("line_number", 0);
-                std::string text = d.contains("lines")
-                    ? d["lines"].value("text", std::string{}) : std::string{};
+                std::string text = d.contains("lines") ? text_of(d["lines"]) : std::string{};
                 while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
                     text.pop_back();
                 bool is_match = (type == "match");

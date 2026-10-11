@@ -15,6 +15,7 @@
 #include <mcp/tools/state.hpp>
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
+#include <mcp/tools/util/utf8.hpp>
 
 #include <concepts>
 #include <functional>
@@ -33,20 +34,23 @@ using mcp::Json;
 // the provider's attach_meta carries it to the host's diff-review UI. On
 // error returns an is_error Result whose text is the rendered ToolError.
 inline mcp::cap::Result lower(util::ExecResult r) {
+    // The one exit for every tool body. A file, a command's output or an
+    // error can carry bytes that aren't UTF-8; they are made valid here, so
+    // no tool can hand the host a result that fails to encode.
     if (!r) {
-        return mcp::cap::Result::error(r.error().render());
+        return mcp::cap::Result::error(util::to_valid_utf8(r.error().render()));
     }
-    mcp::cap::Result out = mcp::cap::Result::ok(std::move(r->text));
+    mcp::cap::Result out = mcp::cap::Result::ok(util::to_valid_utf8(std::move(r->text)));
     if (r->change || !r->changes.empty() || !r->images.empty()) {
         out.structured = Json::object();
         Json m = Json::object();
         auto encode = [](const mcp::tools::FileChange& c) {
             return Json{
-                {"path",    c.path},
+                {"path",    util::to_valid_utf8(c.path)},
                 {"added",   c.added},
                 {"removed", c.removed},
-                {"before",  c.before},
-                {"after",   c.after},
+                {"before",  util::to_valid_utf8(c.before)},
+                {"after",   util::to_valid_utf8(c.after)},
             };
         };
         if (r->change) m["change"] = encode(*r->change);

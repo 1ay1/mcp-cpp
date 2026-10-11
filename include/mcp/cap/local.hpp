@@ -71,7 +71,12 @@ public:
         try {
             return it->second(req);
         } catch (const std::exception& e) {
-            return Result::error(std::string{"local tool threw: "} + e.what());
+            // what() can quote raw input (a path, a bad byte): keep it ASCII
+            // so the error itself always encodes.
+            std::string w = e.what();
+            for (char& c : w)
+                if (static_cast<unsigned char>(c) >= 0x80 || static_cast<unsigned char>(c) < 0x20) c = '?';
+            return Result::error(std::string{"local tool threw: "} + w);
         } catch (...) {
             return Result::error("local tool threw");
         }

@@ -153,6 +153,9 @@ constexpr std::size_t kAutoOutlineSize = 32 * 1024;
 // prefilter that drops a match makes definitions silently vanish from
 // outlines, and nothing downstream can tell.
 [[nodiscard]] inline bool outline_plausible(std::string_view line) noexcept {
+    // A definition never sits on a line this long; a minified or generated
+    // line does, and the backtracking regex would spend seconds on it.
+    if (line.size() > 4096) return false;
     std::size_t k = 0;
     while (k < line.size() && (line[k] == ' ' || line[k] == '\t')) ++k;
     if (k >= line.size()) return false;
