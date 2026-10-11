@@ -1362,6 +1362,7 @@ ExecResult run_web_search(HttpClient& client, const WebSearchPlan& plan,
         q.count = std::clamp(a.count, 1, svc->max_count);
         if (svc->language && plan.language.size() == 2) q.language = plan.language;
         q.dials = validate_dials(*svc, slot);
+        q.now = plan.now;
 
         HttpRequest req = build_web_search_request(*svc, key, q);
         auto resp = http_send(client, req.method, req.url, req.headers, req.body);

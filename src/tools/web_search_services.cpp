@@ -472,7 +472,8 @@ HttpRequest req_exa(const WebSearchQuery& q, std::string_view key) {
     if (!q.exclude.empty()) b["excludeDomains"] = q.exclude;
     if (auto v = q.dial("type"); !v.empty())     b["type"] = std::string{v};
     if (auto v = q.dial("category"); !v.empty()) b["category"] = std::string{v};
-    if (int d = days_for(q.dial("freshness")); d > 0)
+    if (int d = days_for(q.dial("freshness")); d > 0
+        && q.now != std::chrono::system_clock::time_point{})   // host gave the time
         b["startPublishedDate"] = iso_days_ago(q.now, d);
     return json_post("https://api.exa.ai/search", b,
                      {{"x-api-key", std::string{key}}});

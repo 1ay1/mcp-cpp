@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -81,6 +82,9 @@ struct WebSearchPlan {
     // ISO 639-1 code ("en", "de"), or "" for each service's own default.
     // Only services with WebSearchService::language set use it.
     std::string language;
+    // The host's wall-clock time for this call, for date-relative filters
+    // ("published in the last week"). The library never reads a clock.
+    std::chrono::system_clock::time_point now{};
 };
 
 // What the tool uses when the host supplies no plan: Brave Free, then

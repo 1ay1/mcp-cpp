@@ -65,7 +65,7 @@ struct WebSearchQuery {
     std::vector<std::string> exclude;
     // Validated dial choices: dial id -> value id, only non-default values.
     std::vector<std::pair<std::string, std::string>> dials;
-    std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+    std::chrono::system_clock::time_point now{};   // from WebSearchPlan::now
 
     [[nodiscard]] std::string_view dial(std::string_view id) const noexcept;
 };
