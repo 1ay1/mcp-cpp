@@ -37,6 +37,7 @@ add_executable(mcp_tests
     structural_test.cpp
     repomap_test.cpp
     web_tools_test.cpp
+    web_search_services_test.cpp
     arg_reader_test.cpp
     terminal_strip_test.cpp
     bash_validate_test.cpp

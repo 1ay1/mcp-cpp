@@ -35,6 +35,7 @@
 
 #pragma once
 
+#include <mcp/tools/web_search.hpp>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -482,6 +483,10 @@ struct HostServices {
     std::shared_ptr<DocRetriever>   code_retriever;  // search_code
     std::shared_ptr<SubagentRunner> subagent;   // task
     std::shared_ptr<HttpClient>     http;       // web_fetch / web_search
+    // Which services web_search tries, in what order, with what key. Null
+    // means the key-less default chain (see default_web_search_plan()). Read on
+    // every call, so the host can change it while running.
+    std::shared_ptr<WebSearchPlanSource> web_search_plan;
     // Null ⇒ no shell / diagnostics / git_* / process_* tools. See Exec.
     std::shared_ptr<Exec>           exec;
     // How scans split their work; empty runs them inline.
