@@ -198,10 +198,13 @@ TEST_CASE("concurrent execution") {
     CHECK(results[1].text == "done:b");
     CHECK(results[2].text == "done:c");
     CHECK(results[3].text == "done:d");
-    // Concurrency proof: all four ran together (>=2 in flight at the peak;
-    // expect 4) and wall-clock is far under the 160ms serial sum.
+    // Concurrency proof: calls OVERLAPPED -- >=2 in flight at once. That is
+    // the property, and it holds however slow the machine is. Wall clock is
+    // only a sanity bound: a shared CI mac ran this at 124ms against a
+    // 120ms limit with all four in flight, so keep it under the 160ms
+    // serial sum plus generous scheduling slack rather than near it.
     CHECK(max_in_flight.load() >= 2);
-    CHECK(elapsed < 120);
+    CHECK(elapsed < 400);
     std::cerr << "  [concurrent] peak in-flight=" << max_in_flight.load()
               << " elapsed=" << elapsed << "ms (serial would be ~160ms)\n";
 }

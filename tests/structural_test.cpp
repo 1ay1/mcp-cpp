@@ -402,7 +402,11 @@ TEST_CASE("search_structural") {
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         assert(!r.is_error);              // bounded, not a crash/error
-        assert(ms < 2'000);               // was unbounded (seconds+) before cap
+        // Unbounded was tens of seconds; capped is ~0.6s on an M-series Mac
+        // (Debug). 10s still separates the two by an order of magnitude
+        // without flaking on a shared CI runner (2.48s seen on a GitHub
+        // macOS VM).
+        assert(ms < 10'000);
         std::printf("structural: multi-$$$ DoS bounded (%lld ms)\n", (long long)ms);
     }
 
