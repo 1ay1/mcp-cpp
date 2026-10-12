@@ -1289,6 +1289,10 @@ ExecResult run_builtin(const Call& call, const GrepArgs& a) {
                         const std::string_view line{content.data() + b0, le - b0};
                         if (!std::regex_search(line.begin(), line.end(), *exclude_re)) kept.push_back(off);
                     }
+                    // The scan already counted these; un-count what exclude
+                    // drops, or the summary says "Found 3" over 2 listed
+                    // lines (and a fully-excluded file still adds to it).
+                    total_matches -= static_cast<int>(offsets.size() - kept.size());
                     offsets.swap(kept);
                 }
                 if (offsets.empty()) continue;

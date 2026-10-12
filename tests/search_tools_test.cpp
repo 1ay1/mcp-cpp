@@ -85,6 +85,34 @@ TEST_CASE("search_tools") {
         std::puts("grep: ok (found across files)");
     }
 
+    // ── a FILE root is a walk of one ─────────────────────────────────────
+    // recursive_directory_iterator on a regular file is ENOTDIR, which made
+    // the builtin grep (the only one on a host without ripgrep) answer
+    // "No matches" for grep path=some/file. Pin both layers.
+    {
+        NativeFileSystem nfs;
+        int seen = 0;
+        bool self = false;
+        (void)nfs.walk(root / "beta.txt", [&](const DirEntry& e) {
+            ++seen;
+            self = e.regular && e.path.filename() == "beta.txt";
+            return WalkStep::next;
+        });
+        assert(seen == 1 && self);
+
+        HostServices nsvc;   // no exec: forces the builtin scanner
+        nsvc.files = std::make_shared<NativeFileSystem>();
+        nsvc.state = ws_state;
+        auto bp = make_provider(nsvc, ToolsetConfig{}, "local");
+        auto args = obj(); args["pattern"] = "NEEDLE_marker";
+        args["path"] = (root / "beta.txt").string();
+        auto r = call(*bp, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("No matches") == std::string::npos);
+        assert(r.text.find("NEEDLE_marker") != std::string::npos);
+        std::puts("grep: ok (builtin, single-file root)");
+    }
+
     // ── grep limit: replaces `| head -N` (the tip and prompt name it) ────
     {
         std::string many;
