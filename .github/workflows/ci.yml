@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# mcp-cpp ran no CI of its own, so a tool bug (builtin grep answering
+# "No matches" for a single-file path) shipped straight into agentty.
+#
+# ripgrep is deliberately NOT installed: the builtin scanner is what a host
+# without rg gets (a stock Mac), and it has to be the path under test.
+jobs:
+  test:
+    name: build + test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-gcc16
+            os: ubuntu-24.04
+          - name: macos-gcc16
+            os: macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y g++-16 ninja-build
+          echo "CC=gcc-16" >> "$GITHUB_ENV"
+          echo "CXX=g++-16" >> "$GITHUB_ENV"
+
+      - name: Install toolchain (macOS)
+        if: runner.os == 'macOS'
+        # GCC can't parse every SDK's headers, so use the newest it accepts.
+        run: |
+          brew install gcc@16 ninja || true
+          GXX="$(brew --prefix gcc@16)/bin/g++-16"
+          for s in $(ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX[0-9]*.sdk \
+                            /Applications/Xcode*.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX[0-9]*.sdk \
+                            2>/dev/null | sort -rV); do
+            if printf '#include <xpc/xpc.h>\nint main(){}\n' | "$GXX" -isysroot "$s" -x c++ -fsyntax-only - 2>/dev/null; then
+              echo "SDK_FLAG=-DCMAKE_OSX_SYSROOT=$s" >> "$GITHUB_ENV"; break
+            fi
+          done
+          echo "CC=$(brew --prefix gcc@16)/bin/gcc-16" >> "$GITHUB_ENV"
+          echo "CXX=$GXX" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Debug -DMCP_BUILD_TESTS=ON ${SDK_FLAG:-}
+
+      - name: Build
+        run: cmake --build build -j4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j4 --timeout 300
