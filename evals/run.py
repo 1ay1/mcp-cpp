@@ -100,7 +100,12 @@ def check(resp, expect):
 # paths (the workspace lives in a fresh mktemp dir each run) and match counts
 # that depend on scan order. Normalise the workspace path to <WS>.
 def normalise_golden(text, workspace):
-    return text.replace(str(workspace), "<WS>")
+    # Canonical first: on macOS the temp dir is /var/... but the tools report
+    # the resolved /private/var/..., and replacing the short form first would
+    # leave a '/private' prefix in front of <WS>.
+    for p in sorted({os.path.realpath(str(workspace)), str(workspace)}, key=len, reverse=True):
+        text = text.replace(p, "<WS>")
+    return text
 
 
 def check_golden(resp, golden_path, workspace, update):
