@@ -401,6 +401,18 @@ std::vector<DirEntry> NativeFileSystem::list(const fs::path& dir, std::error_cod
 bool NativeFileSystem::walk(const fs::path& root,
                             const std::function<WalkStep(const DirEntry&)>& visit) const {
     std::error_code ec;
+    // A file root is a walk of one. recursive_directory_iterator on a
+    // regular file fails with ENOTDIR, which silently made the builtin
+    // grep (the only one on a host without ripgrep -- a stock Mac) report
+    // "No matches" for `grep path=src/foo.cpp`.
+    if (fs::directory_entry self(root, ec); !ec && !self.is_directory(ec)) {
+        if (ec || !self.exists(ec)) return false;
+        DirEntry d;
+        stat_of(self, 0, &d);
+        (void)visit(d);
+        return true;
+    }
+    ec.clear();
     fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
     if (ec) return false;
     for (; it != fs::recursive_directory_iterator(); it.increment(ec)) {
