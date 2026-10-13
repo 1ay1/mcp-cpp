@@ -134,6 +134,90 @@ TEST_CASE("edit diff stays minimal on large + CRLF files") {
     fs::remove_all(root);
 }
 
+TEST_CASE("fs tools keep data safe on edge-case paths and encodings") {
+    auto root = fs::temp_directory_path() /
+        ("mcp_fs_edge_" + std::to_string(mcp_getpid()));
+    fs::remove_all(root);
+    fs::create_directories(root / "d" / "sub");
+    auto ws_state = mcp::test::state_at(root);
+    HostServices svc;
+    svc.files = std::make_shared<NativeFileSystem>();
+    svc.state = ws_state;
+    auto provider = make_provider(svc, ToolsetConfig{}, "local");
+    auto slurp = [](const fs::path& p) { return util::read_file(test_fs(), p); };
+
+    // move onto itself with overwrite used to delete the destination first,
+    // which was the source: the file was gone.
+    (void)util::write_file(test_fs(), root / "keep.txt", std::string{"precious\n"});
+    {
+        auto args = obj();
+        args["source"] = (root / "keep.txt").string();
+        args["destination"] = (root / "." / "keep.txt").string();
+        args["overwrite"] = true;
+        auto r = call(*provider, "move", args);
+        assert(r.is_error);
+        assert(slurp(root / "keep.txt") == "precious\n");
+    }
+    // a directory moved under itself recursed in the copy fallback.
+    {
+        auto args = obj();
+        args["source"] = (root / "d").string();
+        args["destination"] = (root / "d" / "sub" / "inside").string();
+        auto r = call(*provider, "move", args);
+        assert(r.is_error);
+        assert(r.text.find("into itself") != std::string::npos);
+        assert(!fs::exists(root / "d" / "sub" / "inside"));
+    }
+    // every spelling of the workspace root is refused.
+    for (std::string spelled : {(root / ".").string(), root.string() + "/",
+                                (root / "d" / "..").string(), (root / "d" / "sub" / ".." / "..").string()}) {
+        auto args = obj();
+        args["path"] = spelled;
+        args["recursive"] = true;
+        auto r = call(*provider, "remove", args);
+        assert(r.is_error);
+        assert(fs::exists(root / "keep.txt"));
+    }
+    // write over a CRLF / BOM file keeps its conventions.
+    (void)util::write_file(test_fs(), root / "win.txt", std::string{"a\r\nb\r\n"});
+    (void)util::write_file(test_fs(), root / "bom.txt", std::string{"\xEF\xBB\xBFx\n"});
+    {
+        auto args = obj();
+        args["file_path"] = (root / "win.txt").string();
+        args["content"] = "x\ny\n";
+        assert(!call(*provider, "write", args).is_error);
+        assert(slurp(root / "win.txt") == "x\r\ny\r\n");
+        args["file_path"] = (root / "bom.txt").string();
+        args["content"] = "y\n";
+        assert(!call(*provider, "write", args).is_error);
+        assert(slurp(root / "bom.txt") == "\xEF\xBB\xBFy\n");
+    }
+    // multi-line edit on a CRLF file doesn't splice bare \n lines in.
+    {
+        auto e = obj(); e["old_text"] = "x\ny"; e["new_text"] = "one\ntwo\nthree";
+        auto args = obj(); args["path"] = (root / "win.txt").string();
+        args["edits"] = mcp::Json::array({e});
+        assert(!call(*provider, "edit", args).is_error);
+        assert(slurp(root / "win.txt") == "one\r\ntwo\r\nthree\r\n");
+    }
+    // one hit on a multi-MB line shows a window around it, not the line.
+    {
+        std::string big(2'000'000, 'x');
+        big += "NEEDLE";
+        big += std::string(1000, 'y');
+        big += "\n";
+        (void)util::write_file(test_fs(), root / "min.js", big);
+        auto args = obj(); args["path"] = (root / "min.js").string();
+        args["pattern"] = "NEEDLE";
+        auto r = call(*provider, "read_filter", args);
+        assert(!r.is_error);
+        assert(r.text.size() < 4000);
+        assert(r.text.find("NEEDLE") != std::string::npos);
+    }
+    fs::remove_all(root);
+    std::puts("fs-edge: move/remove/write/edit/read_filter edge cases ok");
+}
+
 TEST_CASE("fs_tools") {
     auto root = fs::temp_directory_path() / ("mcp_fs_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);

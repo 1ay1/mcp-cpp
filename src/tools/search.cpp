@@ -638,6 +638,8 @@ struct LineInfo {
     std::size_t  line_end;
 };
 
+using util::clip_line;
+
 [[nodiscard]] std::vector<LineInfo>
 offsets_to_lines(std::string_view content,
                  const std::vector<std::size_t>& offsets) {
@@ -1042,7 +1044,11 @@ ExecResult run_ripgrep(const GrepArgs& a, CallExec& exec) {
                 // so `| grep -v` semantics without losing the surroundings.
                 if (is_match && exclude_re && std::regex_search(text, *exclude_re))
                     is_match = false;
-                files.back().rows.push_back({ln, std::move(text), is_match});
+                std::size_t focus = 0;
+                if (type == "match" && d.contains("submatches") && d["submatches"].is_array()
+                    && !d["submatches"].empty())
+                    focus = d["submatches"][0].value("start", std::size_t{0});
+                files.back().rows.push_back({ln, clip_line(text, focus), is_match});
                 if (is_match) {
                     ++files.back().matches;
                     ++total_matches;
@@ -1433,8 +1439,11 @@ ExecResult run_builtin(const Call& call, const GrepArgs& a) {
                 std::size_t le = line_starts[static_cast<std::size_t>(i) + 1] - 1;
                 if (le > h.content.size()) le = h.content.size();
                 if (ls <= le) {
-                    out.write(h.content.data() + ls,
-                              static_cast<std::streamsize>(le - ls));
+                    // Centre the window on the first match in this line, if any.
+                    std::size_t focus = 0;
+                    for (std::size_t off : h.match_offsets)
+                        if (off >= ls && off < le) { focus = off - ls; break; }
+                    out << clip_line({h.content.data() + ls, le - ls}, focus);
                 }
                 out << "\n";
             }

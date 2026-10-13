@@ -35,4 +35,11 @@ namespace mcp::tools::util {
 // encoding guarantee.
 [[nodiscard]] std::string strip_terminal_controls(std::string_view in);
 
+// A line longer than max_bytes, cut to a window around byte `focus` on UTF-8
+// boundaries, with the dropped byte counts noted at each end. Keeps one match
+// in a minified file from dumping megabytes into a search result.
+inline constexpr std::size_t kMaxShownLineBytes = 500;
+[[nodiscard]] std::string clip_line(std::string_view line, std::size_t focus = 0,
+                                    std::size_t max_bytes = kMaxShownLineBytes);
+
 } // namespace mcp::tools::util

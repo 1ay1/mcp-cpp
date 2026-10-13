@@ -107,6 +107,25 @@ std::string to_valid_utf8(std::string s) {
     return sanitize_utf8(s);
 }
 
+std::string clip_line(std::string_view line, std::size_t focus, std::size_t max_bytes) {
+    if (line.size() <= max_bytes) return std::string{line};
+    const auto back_to_char = [&](std::size_t i) {
+        while (i > 0 && i < line.size()
+               && (static_cast<unsigned char>(line[i]) & 0xC0) == 0x80) --i;
+        return i;
+    };
+    std::size_t start = focus > max_bytes / 4 ? focus - max_bytes / 4 : 0;
+    if (start + max_bytes > line.size()) start = line.size() - max_bytes;
+    start = back_to_char(start);
+    const std::size_t end = back_to_char(std::min(line.size(), start + max_bytes));
+    std::string out;
+    if (start > 0) out += "[" + std::to_string(start) + " bytes] \xe2\x80\xa6";
+    out.append(line.substr(start, end - start));
+    if (end < line.size())
+        out += "\xe2\x80\xa6 [" + std::to_string(line.size() - end) + " bytes]";
+    return out;
+}
+
 std::string strip_terminal_controls(std::string_view in) {
     // Nothing to strip is the overwhelmingly common case (rg --json, git,
     // compilers with NO_COLOR): one tight scan, then return a plain copy.

@@ -50,6 +50,7 @@ namespace {
 struct BashArgs {
     std::string command;
     int         timeout;   // [1, 300]
+    bool        timeout_given = false;  // caller set timeout/timeout_ms
     std::string cd;        // optional; empty = inherit cwd
     std::vector<std::pair<std::string, std::string>> env;  // caller overrides
     std::string display_description;
@@ -171,6 +172,7 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j, const util::Bo
         return std::unexpected(ToolError::invalid_args("command must not be empty"));
 
     int timeout_int = ar.integer("timeout", 60);
+    const bool timeout_given = ar.has("timeout") || ar.has("timeout_ms");
     if (ar.has("timeout_ms")) {
         int ms = ar.integer("timeout_ms", 0);
         if (ms > 0) timeout_int = (ms + 999) / 1000;
@@ -299,6 +301,7 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j, const util::Bo
     return BashArgs{
         std::move(cmd),
         timeout_int,
+        timeout_given,
         std::move(cd),
         std::move(env),
         ar.str("display_description", ""),
@@ -425,6 +428,9 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
     if (!cwd.empty()) ereq.cwd = cwd;
     ereq.env              = child_env;
     ereq.budgets.idle     = std::chrono::seconds{tmo_s};
+    // An explicit timeout is a promise about total runtime, not just silence:
+    // a loop that prints every second must still stop when asked.
+    if (a.timeout_given) ereq.budgets.wall = std::chrono::seconds{tmo_s};
     ereq.max_output_bytes = kCaptureCap;
 
     const auto res = exec.run(ereq);
@@ -643,7 +649,7 @@ json bash_schema() {
                 "forces a clean non-interactive env (NO_COLOR, PAGER=cat, "
                 "GIT_TERMINAL_PROMPT=0, TERM=dumb, \u2026) so output is quiet and "
                 "nothing blocks on a prompt \u2014 only set this to add/override."}}},
-            {"timeout", {{"type","integer"}, {"description","Timeout in seconds (default 60, max 300)"}}},
+            {"timeout", {{"type","integer"}, {"description","Timeout in seconds (max 300). If set, the command is stopped after this long even while it's still printing. If omitted, it's stopped after 60s of silence."}}},
             {"timeout_ms", {{"type","integer"}, {"description",
                 "Alternative timeout in milliseconds (rounded up to seconds)."}}},
             {"head_lines", {{"type","integer"}, {"description",

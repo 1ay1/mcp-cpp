@@ -831,8 +831,33 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
     std::size_t skipped_noop = 0;
     std::size_t applied = 0;
     std::size_t idempotent = 0;
+    // A CRLF file keeps CRLF: the model writes \n, so give its text the file's
+    // endings before matching. Otherwise an exact hit spliced bare \n lines in.
+    const bool file_crlf = [&] {
+        const auto nl = original.find('\n');
+        return nl != std::string::npos && nl > 0 && original[nl - 1] == '\r';
+    }();
+    const auto to_crlf = [](std::string_view s) {
+        std::string out;
+        out.reserve(s.size() + s.size() / 40);
+        for (std::size_t k = 0; k < s.size(); ++k) {
+            if (s[k] == '\n' && (k == 0 || s[k - 1] != '\r')) out.push_back('\r');
+            out.push_back(s[k]);
+        }
+        return out;
+    };
+    std::vector<OneEdit> crlf_edits;
+    const auto edit_at = [&](std::size_t k) -> const OneEdit& {
+        return crlf_edits.empty() ? a.edits[k] : crlf_edits[k];
+    };
+    if (file_crlf)
+        for (const auto& e : a.edits) {
+            OneEdit c = e;
+            if (!c.regex) { c.old_text = to_crlf(c.old_text); c.new_text = to_crlf(c.new_text); }
+            crlf_edits.push_back(std::move(c));
+        }
     for (std::size_t i = 0; i < a.edits.size(); ++i) {
-        const auto& ed = a.edits[i];
+        const auto& ed = edit_at(i);
         if (ed.old_text == ed.new_text) { ++skipped_noop; continue; }
         std::string err;
         int n = apply_one(updated, ed, a.path.string(), err);
@@ -848,7 +873,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
             for (const auto& prior : outcomes) {
                 if (prior.applied <= 0) continue;
                 std::string tmp_err;
-                (void)apply_one(updated, a.edits[prior.index], a.path.string(), tmp_err);
+                (void)apply_one(updated, edit_at(prior.index), a.path.string(), tmp_err);
             }
             outcomes.push_back({i, n, true, std::format(
                 "expected_replacements={} but matched {} occurrence(s)",

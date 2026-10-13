@@ -937,8 +937,23 @@ ExecResult run_read_filter(const Call& call, const ReadFilterArgs& a) {
     while (i < N) {
         if (keep[i]) {
             if (emitted >= a.max_lines) { truncated = true; break; }
-            // width-aligned line number
-            out << (i + 1) << "\t" << lines[i] << "\n";
+            // width-aligned line number; a huge line is clipped around its match
+            std::size_t focus = 0;
+            if (lines[i].size() > util::kMaxShownLineBytes && !a.invert) {
+                if (literal) {
+                    std::string lc = lines[i];
+                    if (!a.case_sensitive)
+                        for (auto& c : lc) c = (char)std::tolower((unsigned char)c);
+                    if (auto at = lc.find(needle); at != std::string::npos) focus = at;
+                } else {
+                    std::smatch sm;
+                    try {
+                        if (std::regex_search(lines[i], sm, **compiled))
+                            focus = static_cast<std::size_t>(sm.position(0));
+                    } catch (...) {}
+                }
+            }
+            out << (i + 1) << "\t" << util::clip_line(lines[i], focus) << "\n";
             ++emitted; ++i;
         } else {
             int gap_start = i;

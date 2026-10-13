@@ -1537,23 +1537,43 @@ ExecResult run_write(const Call& call, const WriteArgs& a) {
             "if that's not what you wanted, re-read the file and rewrite "
             "with the intended merged content.\n\n";
     }
-    if (exists && !original.empty() && original == a.content)
+    // Overwriting keeps the file's conventions, like edit does: a CRLF file
+    // stays CRLF and a BOM stays put, so a whole-file rewrite isn't a diff
+    // on every line.
+    std::string content_buf;
+    std::string_view content = a.content;
+    if (exists && !original.empty()) {
+        constexpr std::string_view kBom = "\xEF\xBB\xBF";
+        const auto nl = original.find('\n');
+        const bool crlf = nl != std::string::npos && nl > 0 && original[nl - 1] == '\r';
+        const bool bom = original.starts_with(kBom) && !content.starts_with(kBom);
+        if (crlf || bom) {
+            if (bom) content_buf.append(kBom);
+            for (std::size_t i = 0; i < content.size(); ++i) {
+                if (crlf && content[i] == '\n' && (i == 0 || content[i - 1] != '\r'))
+                    content_buf.push_back('\r');
+                content_buf.push_back(content[i]);
+            }
+            content = content_buf;
+        }
+    }
+    if (exists && !original.empty() && original == content)
         return ToolOutput{"File already matches content — no changes written.",
                           std::nullopt};
     FileChange change;
     if (!exists || (!original.empty() && original_size <= kMaxWriteBytes))
-        change = make_change(a.path.string(), original, a.content);
+        change = make_change(a.path.string(), original, std::string{content});
     else
         change.path = a.path.string();
-    if (auto err = util::write_file(a.path, a.content); !err.empty())
+    if (auto err = util::write_file(a.path, content); !err.empty())
         return std::unexpected(ToolError::io(err));
     {
         std::error_code mt_ec;
         auto new_mtime = call.fs().stat(p).mtime;
         if (!mt_ec) {
             record_seen(call, p, new_mtime,
-                                   static_cast<std::uintmax_t>(a.content.size()),
-                                   util::cheap_content_hash(a.content));
+                                   static_cast<std::uintmax_t>(content.size()),
+                                   util::cheap_content_hash(content));
         }
     }
     std::string prefix;
@@ -1709,13 +1729,37 @@ std::expected<MoveArgs, ToolError> parse_move_args(const json& j, const util::Bo
 
 ExecResult run_move(const Call& call, const MoveArgs& a) {
     std::error_code ec;
-    if (!call.fs().stat(a.source).exists)
+    const auto src_st = call.fs().stat(a.source);
+    if (!src_st.exists)
         return std::unexpected(ToolError::not_found(a.source.string()));
-    if (call.fs().stat(a.destination).exists) {
+    // Compare resolved paths: "f" and "./f", or a link and its target, are
+    // the same file, and the overwrite branch below would delete it first.
+    const auto key = [&](const fs::path& p) {
+        std::error_code e;
+        auto c = call.fs().canonical(p, e);
+        if (e || c.empty()) c = p.lexically_normal();
+        return c.has_filename() ? c : c.parent_path();
+    };
+    const auto src_key = key(a.source);
+    const auto dst_key = key(a.destination);
+    if (src_key == dst_key)
+        return std::unexpected(ToolError::invalid_args(
+            "source and destination are the same path; nothing to move"));
+    // A directory moved under itself fails rename, and the copy fallback then
+    // recurses into its own output until the path is too long.
+    if (src_st.directory) {
+        auto s = src_key.begin(), d = dst_key.begin();
+        for (; s != src_key.end() && d != dst_key.end() && *s == *d; ++s, ++d) {}
+        if (s == src_key.end())
+            return std::unexpected(ToolError::invalid_args(
+                "cannot move a directory into itself: " + a.destination.string()));
+    }
+    const auto dst_st = call.fs().stat(a.destination);
+    if (dst_st.exists) {
         if (!a.overwrite)
             return std::unexpected(ToolError::ambiguous(
                 "destination exists; pass overwrite:true to replace it"));
-        if (call.fs().stat(a.destination).directory && !call.fs().list(a.destination, ec).empty())
+        if (dst_st.directory && !call.fs().list(a.destination, ec).empty())
             return std::unexpected(ToolError::invalid_args(
                 "refusing to replace a non-empty destination directory"));
         call.fs().remove(a.destination, ec);
@@ -1753,7 +1797,17 @@ std::expected<RemoveArgs, ToolError> parse_remove_args(const json& j, const util
         return std::unexpected(ToolError::invalid_args("path is required"));
     auto checked = util::make_workspace_path_checked(*path, "remove", b);
     if (!checked) return std::unexpected(checked.error());
-    if (checked->path() == b.workspace)
+    // Compare resolved paths: ".", "./", "d/.." and "<root>/" all name the
+    // workspace root, and a raw == let them through to remove_all.
+    std::error_code ec;
+    const auto resolve = [&](const fs::path& p) {
+        std::error_code e;
+        auto c = b.files->canonical(p, e);
+        if (e || c.empty()) c = p.lexically_normal();
+        return c.has_filename() ? c : c.parent_path();
+    };
+    const auto target = resolve(checked->path());
+    if (target == resolve(b.workspace) || (!b.project.empty() && target == resolve(b.project)))
         return std::unexpected(ToolError::invalid_args("refusing to remove the workspace root"));
     return RemoveArgs{checked->path(), r.boolean("recursive", false)};
 }
