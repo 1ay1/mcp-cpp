@@ -1760,12 +1760,16 @@ std::expected<RemoveArgs, ToolError> parse_remove_args(const json& j, const util
 
 ExecResult run_remove(const Call& call, const RemoveArgs& a) {
     std::error_code ec;
+    // Already gone = the desired state, so SUCCESS (like `rm -f`). It was a
+    // red [not found] failure, which a weak model (#91: gpt-oss) read as
+    // "the job is blocked" and gave up on the whole task instead of moving
+    // on to writing the new files. A wrong path still shows: the output says
+    // nothing was there, so a model that meant something else can check.
     if (!call.fs().stat(a.path).exists)
-        return std::unexpected(ToolError::not_found(
-            "nothing to remove at " + a.path.string()
-            + " — it doesn't exist (already deleted, or a wrong path). If you "
-              "intended it gone, the desired state is already met; otherwise "
-              "`list_dir` the parent to check the name."));
+        return ToolOutput{"Nothing to remove: " + a.path.string()
+                          + " does not exist (already gone). Desired state met "
+                            "\xe2\x80\x94 continue with the next step.",
+                          std::nullopt};
     const bool directory = call.fs().stat(a.path).directory;
     if (directory && !a.recursive && !call.fs().list(a.path, ec).empty())
         return std::unexpected(ToolError::invalid_args(

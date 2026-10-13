@@ -355,6 +355,9 @@ std::string explain_exit_code(int code) {
         case 137: return "(137: killed, SIGKILL — usually the OOM killer; the process ran out of memory)";
         case 139: return "(139: segfault, SIGSEGV)";
         case 143: return "(143: terminated, SIGTERM)";
+#ifdef _WIN32
+        case 9009: return "(9009: command not found \xe2\x80\x94 cmd.exe doesn't recognise it; check the name, PATH, or that the tool is installed)";
+#endif
         default:  return {};
     }
 }
@@ -559,7 +562,16 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
                 << fence(r.output) << next_step;
         }
     } else if (r.exit_code != 0) {
-        const std::string code_hint = explain_exit_code(r.exit_code);
+        std::string code_hint = explain_exit_code(r.exit_code);
+#ifdef _WIN32
+        // cmd.exe has no 127: an unknown command exits 9009 at top level and
+        // plain 1 inside a chain, so the reliable signal is its message.
+        if (code_hint.empty()
+            && r.output.find("is not recognized as an internal or external command")
+                   != std::string::npos)
+            code_hint = "(command not found \xe2\x80\x94 cmd.exe doesn't recognise it; "
+                        "check the name, PATH, or that the tool is installed)";
+#endif
         out << "Command \"" << a.command << "\" failed with exit code "
             << r.exit_code << ".";
         if (!code_hint.empty()) out << " " << code_hint;
