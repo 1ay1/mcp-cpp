@@ -1,0 +1,4 @@
+Aggregated 2 matches by capture → 2 groups (op=count).
+
+1	alice
+1	bob

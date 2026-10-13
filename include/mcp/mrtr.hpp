@@ -17,13 +17,15 @@
 //   no session, reconstructs its context purely from the (integrity-protected)
 //   requestState. This loops until the server returns a final result.
 //
-//   `run_mrtr()` drives that loop generically over any raw request, so it works
-//   for tools/call, completion/complete, prompts/get, resources/read — every
-//   request the spec allows an InputRequiredResult on.
+//   `mrtr_retry()` is one turn of that loop, as a pure function: given the
+//   params sent and the result received, it returns the params to send next,
+//   or Nothing when the result is final. The caller owns the loop and the
+//   sending, so this works for any request the spec allows an
+//   InputRequiredResult on (tools/call, completion/complete, prompts/get,
+//   resources/read).
 //
 #pragma once
 
-#include <mcp/rpc.hpp>
 #include <mcp/methods.hpp>
 
 #include <functional>
@@ -82,51 +84,27 @@ inline Json fulfill_input_requests(const Json& inputRequests,
     return responses;
 }
 
-//==============================================================================
-//  run_mrtr — drive a request to a FINAL result, fulfilling any input_required
-//             rounds along the way.
-//
-//    engine        the RpcEngine to send on (per-request _meta already armed
-//                  via Client::enable_modern_metadata()).
-//    method        the wire method (e.g. method::CallTool).
-//    params        the initial request params (Json).
-//    handlers      how to answer sampling / elicitation / roots sub-requests.
-//    max_rounds    safety bound on the retry loop (a misbehaving server could
-//                  otherwise loop forever); each input_required round counts.
-//
-//  Returns the final (resultType != "input_required") raw result Json. Throws
-//  RpcError on a transport/JSON-RPC error, or if max_rounds is exhausted.
-//==============================================================================
-inline Json run_mrtr(RpcEngine& engine,
-                     std::string_view method,
-                     Json params,
-                     const MrtrHandlers& handlers,
-                     int max_rounds = 8) {
-    for (int round = 0; round < max_rounds; ++round) {
-        Json result = engine.request_raw(method, params).get();
-
-        if (!is_input_required(result))
-            return result;                          // final result — done.
-
-        // Fulfil the requested inputs (if any) and prepare the retry.
-        Json retry = params.is_object() ? params : Json::object();
-        Json& meta = retry["_meta"];
-        if (!meta.is_object()) meta = Json::object();
-
-        if (result.contains("inputRequests")) {
-            Json responses = fulfill_input_requests(result["inputRequests"], handlers);
-            if (!responses.empty())
-                meta[std::string(meta_key::InputResponses)] = std::move(responses);
-        }
-        // Echo the opaque requestState EXACTLY if present; never include one
-        // the server didn't send (spec: MUST NOT).
-        if (result.contains("requestState"))
-            meta[std::string(meta_key::RequestState)] = result["requestState"];
-
-        params = std::move(retry);                  // loop with the enriched request.
+// One MRTR turn. `params` is what was sent, `result` what came back. If the
+// result is final, Nothing. Otherwise the retry params: the inputs fulfilled
+// with `handlers` and the server's requestState echoed (never invented), both
+// under `_meta`. Callers should bound the number of turns.
+inline Maybe<Json> mrtr_retry(const Json& params, const Json& result,
+                              const MrtrHandlers& handlers) {
+    if (!is_input_required(result)) return Nothing;
+    Json retry = params.is_object() ? params : Json::object();
+    Json& meta = retry["_meta"];
+    if (!meta.is_object()) meta = Json::object();
+    if (result.contains("inputRequests")) {
+        Json responses = fulfill_input_requests(result["inputRequests"], handlers);
+        if (!responses.empty())
+            meta[std::string(meta_key::InputResponses)] = std::move(responses);
     }
-    throw RpcError(errc::InternalError,
-                   "MRTR: exceeded max rounds without a final result");
+    if (result.contains("requestState"))
+        meta[std::string(meta_key::RequestState)] = result["requestState"];
+    return retry;
 }
+
+// How many input_required turns a caller should allow before giving up.
+inline constexpr int kMrtrMaxRounds = 8;
 
 } // namespace mcp

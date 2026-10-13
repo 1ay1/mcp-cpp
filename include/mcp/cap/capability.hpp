@@ -26,6 +26,7 @@
 #include <mcp/codec.hpp>     // to_json
 
 #include <functional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -41,6 +42,25 @@ struct Request {
     Json        args = Json::object();
     std::function<void(std::string_view)> progress = nullptr;
     std::function<bool()> cancelled = nullptr;
+    // The same cancel as an event, when the caller has one. Lets a provider
+    // react the moment it fires instead of polling `cancelled`.
+    std::stop_token stop = {};
+    // Whose context the call serves (a conversation, a subagent run). A
+    // provider that remembers what it has shown someone keys on this.
+    std::string reader = {};
+    // The host's own per-call data, passed through untouched to whatever the
+    // host plugged in (its Exec, SkillResolver, SubagentRunner). mcp-cpp
+    // never reads it. Lets a host keep call-scoped facts off thread-locals.
+    const void* host = nullptr;
+    // Optional per-call workspace scope, for a host whose calls serve
+    // different folders (one ACP agent, several editor sessions). Empty
+    // fields leave the provider's shared defaults in place.
+    std::string              scope_workspace = {};
+    std::vector<std::string> scope_extra_roots = {};
+    std::string              scope_project = {};
+    // Ask the user (an MCP server's elicitation/create during this call).
+    // MCP-shaped params in, ElicitResult JSON out. Empty: declined.
+    std::function<Json(const Json&)> elicit = nullptr;
 };
 
 // The outcome of executing a capability. `text` is the human/model-facing

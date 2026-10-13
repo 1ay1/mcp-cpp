@@ -2,34 +2,26 @@
 //
 // mcp/ids.hpp — scalar identifier types & closed enumerations.
 //
-//   The MCP schema has several "string | number" unions (RequestId,
-//   ProgressToken) and pure-string opaque ids (Cursor, task ids). We model:
+//   The MCP schema has "string | number" ids (a request id on the wire, a
+//   progress token) and pure-string opaque ids (Cursor, task ids). We model:
 //
-//     • string|number unions  →  Sum<std::string, std::int64_t> with a
-//                                 structural variant_codec
+//     • string|number ids     →  jsonrpc::Id, the core's wire id
 //     • opaque string ids     →  Newtype<Tag, std::string> (nominal typing)
 //     • closed string enums   →  scoped enum + enum_codec
 //
 #pragma once
 
+#include <jsonrpc/error.hpp>
 #include <mcp/codec.hpp>
 
 namespace mcp {
 
 //==============================================================================
-//  RequestId  =  string | number          (JSON-RPC 2.0 / schema.ts)
-//  ProgressToken = string | number
+//  WireId = string | number: a request id as the peer sent it (JSON-RPC 2.0).
+//  ProgressToken has the same shape.
 //==============================================================================
-using Scalar = Sum<std::string, std::int64_t>;
-
-inline Codec<Scalar> scalar_codec() {
-    return variant_codec<Scalar>(codec<std::string>(), codec<std::int64_t>());
-}
-
-using RequestId     = Scalar;
-using ProgressToken = Scalar;
-
-template <> struct CodecOf<Scalar> { static Codec<Scalar> get() { return scalar_codec(); } };
+using WireId        = jsonrpc::Id;
+using ProgressToken = jsonrpc::Id;
 
 //==============================================================================
 //  Opaque string ids.

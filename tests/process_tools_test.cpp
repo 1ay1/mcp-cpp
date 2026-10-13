@@ -10,6 +10,9 @@
 //
 // POSIX-only: uses `sh -c`, `sleep`, `echo`, and exit codes.
 
+#include "test_state.hpp"
+#include "test_exec.hpp"
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
@@ -59,9 +62,15 @@ static std::string extract_id(const std::string& text) {
 int main() {
     auto root = fs::temp_directory_path() / ("mcp_proc_test_" + std::to_string(::getpid()));
     fs::create_directories(root);
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
 
     HostServices svc;
+
+    svc.files = std::make_shared<NativeFileSystem>();
+
+    svc.state = ws_state;
+
+    svc.exec  = std::make_shared<mcp::test::PopenExec>();
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     // ── 1. immediate crash reported at START with exit code ──────────────
@@ -171,7 +180,61 @@ int main() {
         std::puts("reap exited: ok");
     }
 
-    // ── 4. bad id gives a recovery hint, never a crash ───────────────────
+    // ── 4. dying breath: final line + exit land in ONE poll ─────────────
+    // A server that prints its fatal error and dies mid-poll must deliver
+    // that tail to the SAME poll (the reader-EOF drain), not report a bare
+    // "exited" with the error swallowed. Before the reader_finished() fix,
+    // poll broke the moment the child died — racing the reader thread.
+    {
+        mcp::Json a = mcp::Json::object();
+        // Quiet through the 300ms settle window, then one last line + death.
+        a["command"] = "sleep 0.6; echo FATAL-BIND-FAIL; exit 9";
+        auto r = call(*provider, "process_start", a);
+        CHECK(!r.is_error);
+        CHECK(contains(r.text, "running"));
+        auto id = extract_id(r.text);
+        CHECK(!id.empty());
+
+        mcp::Json p = mcp::Json::object();
+        p["id"] = id; p["wait_ms"] = 2000;   // spans the exit
+        auto pr = call(*provider, "process_poll", p);
+        CHECK(!pr.is_error);
+        // The single poll that observes death must carry the dying words.
+        CHECK(contains(pr.text, "FATAL-BIND-FAIL"));
+        CHECK(contains(pr.text, "exited"));
+        std::puts("dying-breath tail in one poll: ok");
+
+        mcp::Json s = mcp::Json::object(); s["id"] = id;
+        auto sr = call(*provider, "process_stop", s);
+        CHECK(!sr.is_error);
+    }
+
+    // ── 5. grandchild keeps the pipe open → poll says so ────────────────
+    // The shell exits but a backgrounded child inherits the write end: the
+    // pipe has no EOF, so "no further output" would be a lie. Poll must
+    // distinguish this from the fully-drained case.
+    {
+        mcp::Json a = mcp::Json::object();
+        a["command"] = "(sleep 3; echo late) & exit 0";
+        auto r = call(*provider, "process_start", a);
+        CHECK(!r.is_error);
+        auto id = extract_id(r.text);
+        // The shell may exit inside the settle window (session dropped, exit 0
+        // clean path) — only probe the open-pipe hint when a session survives.
+        if (!contains(r.text, "exited immediately") && !id.empty()) {
+            mcp::Json p = mcp::Json::object();
+            p["id"] = id; p["wait_ms"] = 1200;   // < the 3s grandchild sleep
+            auto pr = call(*provider, "process_poll", p);
+            CHECK(!pr.is_error);
+            if (contains(pr.text, "exited") && !contains(pr.text, "late"))
+                CHECK(contains(pr.text, "pipe is still open"));
+            mcp::Json s = mcp::Json::object(); s["id"] = id;
+            (void)call(*provider, "process_stop", s);
+        }
+        std::puts("grandchild-held pipe: ok");
+    }
+
+    // ── 6. bad id gives a recovery hint, never a crash ───────────────────
     {
         mcp::Json p = mcp::Json::object(); p["id"] = "proc-does-not-exist";
         auto pr = call(*provider, "process_poll", p);
@@ -179,6 +242,32 @@ int main() {
         CHECK(contains(pr.text, "unknown process session")
               || contains(pr.text, "does-not-exist"));
         std::puts("bad-id hint: ok");
+    }
+
+    // ── 7. a large wait_ms (past the OLD 5 s cap) is honoured and STILL
+    //       returns the instant output arrives — not after the full wait.
+    //       Regression: wait_ms used to clamp to 5000, so a poll meant to
+    //       block on a slow build returned early every time and the model
+    //       had to busy-spin.
+    {
+        mcp::Json a = mcp::Json::object();
+        a["command"] = "sleep 0.4; echo delayed-line";
+        auto r = call(*provider, "process_start", a);
+        CHECK(!r.is_error);
+        auto id = extract_id(r.text);
+        CHECK(!id.empty());
+
+        mcp::Json p = mcp::Json::object();
+        p["id"] = id;
+        p["wait_ms"] = 60000;   // 1 min: would be clamped to 5 s before the fix
+        const auto t0 = std::chrono::steady_clock::now();
+        auto pr = call(*provider, "process_poll", p);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        CHECK(!pr.is_error);
+        CHECK(contains(pr.text, "delayed-line"));   // got the output
+        CHECK(elapsed < 5000);                        // returned when it arrived, not at the deadline
+        std::puts("large wait_ms early-return: ok");
     }
 
     fs::remove_all(root);

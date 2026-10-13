@@ -5,13 +5,16 @@
 // make_provider(), proving the ported bodies behave + the workspace
 // boundary + effects flow through.
 
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/cap/local.hpp>
 
-#include <cassert>
+#include "agtest.hpp"
+#include "test_state.hpp"
+#include "test_exec.hpp"
 #include <cctype>
 #include <cstdio>
 #include <filesystem>
@@ -40,10 +43,10 @@ static void write_file(const fs::path& p, const std::string& s) {
     f.write(s.data(), static_cast<std::streamsize>(s.size()));
 }
 
-int main() {
+TEST_CASE("search_tools") {
     auto root = fs::temp_directory_path() / ("mcp_search_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
     // git_status/log/commit invoke `git` in the process cwd; agentty runs
     // with cwd == workspace, so mirror that here for a faithful test.
     auto prev_cwd = fs::current_path();
@@ -63,6 +66,12 @@ int main() {
     write_file(root / "sub" / "gamma.py", "def compute_total(x):\n    return x * 2\n");
 
     HostServices svc;
+
+    svc.files = std::make_shared<NativeFileSystem>();
+    svc.state = ws_state;
+#if !defined(_WIN32)
+    svc.exec = std::make_shared<mcp::test::PopenExec>();   // shell, git_*, find_definition run programs
+#endif
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     // ── grep finds the marker across files ───────────────────────────────
@@ -74,6 +83,80 @@ int main() {
         assert(r.text.find("beta.txt") != std::string::npos);
         assert(read_effects(r).has(Effect::ReadFs));
         std::puts("grep: ok (found across files)");
+    }
+
+    // ── a FILE root is a walk of one ─────────────────────────────────────
+    // recursive_directory_iterator on a regular file is ENOTDIR, which made
+    // the builtin grep (the only one on a host without ripgrep) answer
+    // "No matches" for grep path=some/file. Pin both layers.
+    {
+        NativeFileSystem nfs;
+        int seen = 0;
+        bool self = false;
+        (void)nfs.walk(root / "beta.txt", [&](const DirEntry& e) {
+            ++seen;
+            self = e.regular && e.path.filename() == "beta.txt";
+            return WalkStep::next;
+        });
+        assert(seen == 1 && self);
+
+        HostServices nsvc;   // no exec: forces the builtin scanner
+        nsvc.files = std::make_shared<NativeFileSystem>();
+        nsvc.state = ws_state;
+        auto bp = make_provider(nsvc, ToolsetConfig{}, "local");
+        auto args = obj(); args["pattern"] = "NEEDLE_marker";
+        args["path"] = (root / "beta.txt").string();
+        auto r = call(*bp, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("No matches") == std::string::npos);
+        assert(r.text.find("NEEDLE_marker") != std::string::npos);
+        std::puts("grep: ok (builtin, single-file root)");
+    }
+
+    // ── grep limit: replaces `| head -N` (the tip and prompt name it) ────
+    {
+        std::string many;
+        for (int i = 0; i < 40; ++i)
+            many += "LIMIT_hit " + std::to_string(i) + "\nfiller\nfiller\n";   // own block each
+        write_file(root / "many.txt", many);
+        auto args = obj();
+        args["pattern"] = "LIMIT_hit"; args["path"] = root.string(); args["limit"] = 3;
+        args["context"] = "0";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("Showing matches 1-3 of 40") != std::string::npos);
+        assert(r.text.find("Use offset: 3") != std::string::npos);
+        args["limit"] = 0;             // clamped to 1, never unbounded
+        r = call(*provider, "grep", args);
+        assert(r.text.find("Showing matches 1-1 of 40") != std::string::npos);
+        // context beyond the old cap of 10 is honoured (grep -A 30 use).
+        args["limit"] = 1; args["context"] = "30";
+        r = call(*provider, "grep", args);
+        assert(r.text.find("LIMIT_hit 10") != std::string::npos);   // 30 lines = 10 hits later
+        fs::remove(root / "many.txt");
+        std::puts("grep: limit + wide context ok");
+    }
+
+    // ── grep exclude: replaces `| grep -v PAT` ─────────────────────────────
+    {
+        write_file(root / "ex.txt", "EXCL keep one\nfiller\nfiller\nEXCL drop test\nfiller\nfiller\nEXCL keep two\n");
+        auto args = obj();
+        args["pattern"] = "EXCL"; args["path"] = root.string(); args["context"] = "0";
+        args["exclude"] = "drop|nothing";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("keep one") != std::string::npos);
+        assert(r.text.find("keep two") != std::string::npos);
+        assert(r.text.find("drop test") == std::string::npos);
+        assert(r.text.find("2 matches") != std::string::npos);
+        args["exclude"] = "(a+)+";                         // backtracking bomb refused
+        r = call(*provider, "grep", args);
+        assert(r.is_error);
+        args["exclude"] = "[unclosed";                     // bad regex refused, not ignored
+        r = call(*provider, "grep", args);
+        assert(r.is_error);
+        fs::remove(root / "ex.txt");
+        std::puts("grep: exclude ok");
     }
 
     // ── grep with file glob narrows to .cpp ──────────────────────────────
@@ -112,6 +195,131 @@ int main() {
         assert(r.is_error || r.text.find("No match") != std::string::npos
                           || r.text.find("alpha.cpp") == std::string::npos);
         std::puts("grep: case_sensitive=true ok");
+    }
+
+    // ── grep word=true matches whole words only (absorbs find_references) ─
+    {
+        // "total" appears inside "compute_total" (L2) — a whole-word search
+        // must NOT match it as a substring.
+        write_file(root / "words.cpp",
+            "int total = 0;\n"           // L1 whole word
+            "int compute_total(int);\n"); // L2 substring only
+        auto args = obj();
+        args["pattern"] = "total";
+        args["word"]    = true;
+        args["path"]    = root.string();
+        args["glob"]    = "words.cpp";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("L1") != std::string::npos);   // `total`
+        assert(r.text.find("L2") == std::string::npos);   // `compute_total` excluded
+        std::puts("grep: word=true whole-word match ok");
+    }
+
+    // ── grep context:block returns the whole enclosing function ─────────
+    {
+        // alpha.cpp: compute_total spans L2..L7; a hit inside it with
+        // context:block should return the whole function, not just ±2 lines.
+        auto args = obj();
+        args["pattern"] = "NEEDLE_marker";   // on L6 of alpha.cpp
+        args["path"]    = root.string();
+        args["glob"]    = "alpha.cpp";
+        args["context"] = "block";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        // The whole function body is present: the opening signature (L2) and
+        // the closing brace region well outside a ±2 window around L6.
+        assert(r.text.find("compute_total") != std::string::npos);
+        assert(r.text.find("L2") != std::string::npos);   // function opener
+        std::puts("grep: context=block returns enclosing function ok");
+    }
+
+    // ── grep context:block handles C++ raw strings (quote/brace inside
+    //    R"(…)" must not mis-balance the scope scan) ───────────────────
+    {
+        write_file(root / "rawblk.cpp",
+            "int f() {\n"                                  // L1
+            "    auto re = R\"(a \" and } here)\";\n"       // L2 trap
+            "    int found = 7;\n"                          // L3 hit
+            "    return found;\n"                           // L4
+            "}\n"                                          // L5
+            "int g() { return 0; }\n");                     // L6 must NOT leak in
+        auto args = obj();
+        args["pattern"] = "found = 7";
+        args["path"]    = root.string();
+        args["glob"]    = "rawblk.cpp";
+        args["context"] = "block";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("int f()") != std::string::npos);   // scope start
+        assert(r.text.find("return found;") != std::string::npos);
+        assert(r.text.find("int g()") == std::string::npos);   // no over-capture
+        std::puts("grep: context=block handles raw strings ok");
+    }
+
+    // ── grep context:block on PYTHON uses indent scope, not braces ──────
+    {
+        write_file(root / "blk.py",
+            "def handler(req):\n"                    // L1 header
+            "    opts = {'a': 1}\n"                  // L2 dict literal trap
+            "    NEEDLE_py = req\n"                  // L3 hit
+            "    return NEEDLE_py\n"                 // L4 tail must show
+            "\n"
+            "def other():\n"                          // L6 must NOT leak in
+            "    pass\n");
+        auto args = obj();
+        args["pattern"] = "NEEDLE_py =";
+        args["path"]    = root.string();
+        args["glob"]    = "blk.py";
+        args["context"] = "block";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("def handler") != std::string::npos);   // header
+        assert(r.text.find("return NEEDLE_py") != std::string::npos); // tail
+        assert(r.text.find("def other") == std::string::npos);     // bounded
+        std::puts("grep: context=block python indent scope ok");
+    }
+
+    // ── grep output:files — survey mode, no line bodies ──────────────
+    {
+        auto args = obj();
+        args["pattern"] = "NEEDLE_marker";
+        args["path"]    = root.string();
+        args["output"]  = "files";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("alpha.cpp") != std::string::npos);
+        assert(r.text.find("match)") != std::string::npos);     // count shown
+        assert(r.text.find("NEEDLE_marker") == std::string::npos); // no bodies
+        std::puts("grep: output=files survey mode ok");
+    }
+
+    // ── grep output:count — per-file counts only ───────────────────
+    {
+        auto args = obj();
+        args["pattern"] = "NEEDLE_marker";
+        args["path"]    = root.string();
+        args["output"]  = "count";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("alpha.cpp") != std::string::npos);
+        assert(r.text.find("NEEDLE_marker") == std::string::npos);
+        std::puts("grep: output=count ok");
+    }
+
+    // ── grep context:"0" — match lines only, no context rows ──────────
+    {
+        auto args = obj();
+        args["pattern"] = "NEEDLE_marker";
+        args["path"]    = root.string();
+        args["glob"]    = "alpha.cpp";
+        args["context"] = "0";
+        auto r = call(*provider, "grep", args);
+        assert(!r.is_error);
+        assert(r.text.find("NEEDLE_marker") != std::string::npos);
+        // alpha.cpp L5 is 2 lines above the needle — must NOT appear at ±0.
+        assert(r.text.find("L4:") == std::string::npos);
+        std::puts("grep: context=0 match-lines-only ok");
     }
 
     // ── case-fold literal scanner: non-letter lead byte + mixed-case ─────
@@ -215,7 +423,7 @@ int main() {
     {
         auto args = obj();
         args["command"] = "echo hello_from_bash";
-        auto r = call(*provider, "bash", args);
+        auto r = call(*provider, "shell", args);
         assert(!r.is_error);
         assert(r.text.find("hello_from_bash") != std::string::npos);
         assert(read_effects(r).has(Effect::Exec));
@@ -226,7 +434,7 @@ int main() {
     {
         auto args = obj();
         args["command"] = "exit 7";
-        auto r = call(*provider, "bash", args);
+        auto r = call(*provider, "shell", args);
         assert(!r.is_error);  // tool succeeds; payload reports the failure
         assert(r.text.find("exit code 7") != std::string::npos);
         std::puts("bash: exit-code reporting ok");
@@ -235,7 +443,7 @@ int main() {
     // ── bash empty command rejected ──────────────────────────────────────
     {
         auto args = obj(); args["command"] = "";
-        auto r = call(*provider, "bash", args);
+        auto r = call(*provider, "shell", args);
         assert(r.is_error);
         std::puts("bash: empty command refused");
     }
@@ -267,7 +475,7 @@ int main() {
         // init a repo inside the workspace + configure identity
         auto g = obj(); g["command"] =
             "git init -q && git config user.email t@t.t && git config user.name T";
-        auto gi = call(*provider, "bash", g);
+        auto gi = call(*provider, "shell", g);
         assert(!gi.is_error);
 
         // git_status on a clean-ish repo (untracked files present)
@@ -291,14 +499,14 @@ int main() {
         // a git repository". Widen the boundary to the parent of root while
         // cwd stays == root, then call git_status with NO path.
         {
-            auto saved_ws = util::workspace_root();
-            util::set_workspace_root(root.parent_path());
+            auto saved_ws = ws_state->state.workspace_root;
+            ws_state->state.workspace_root = util::canonical_root(NativeFileSystem{}, root.parent_path());
             auto wide = call(*provider, "git_status", obj());  // no `path`
             assert(!wide.is_error
                    && "no-path git_status must resolve the cwd project under a "
                       "wider workspace boundary (`-w /`)");
             assert(wide.text.find("## ") != std::string::npos);
-            util::set_workspace_root(saved_ws);
+            ws_state->state.workspace_root = saved_ws;
             std::puts("git_status: wide-boundary (`-w /`) resolves cwd project");
         }
 
@@ -329,7 +537,7 @@ int main() {
             "git -C nested config user.email t@t.t && "
             "git -C nested config user.name T && "
             "printf nested > nested/inside.txt";
-        auto ngi = call(*provider, "bash", ng);
+        auto ngi = call(*provider, "shell", ng);
         assert(!ngi.is_error);
 
         auto nc = obj();
@@ -353,8 +561,14 @@ int main() {
         // hint the user would see a bare "no changes".
         {
             auto sm = obj(); sm["command"] =
-                // A bare upstream to add as a submodule.
-                "git init -q --bare " + (root / "up.git").string() + " && "
+                // A bare upstream to add as a submodule. Pin the initial
+                // branch: on git configured with init.defaultBranch=main
+                // (the modern default), a plain --bare repo's HEAD points at
+                // refs/heads/main while the seed below pushes HEAD:master —
+                // the submodule clone then checks out an unborn branch and
+                // `submodule add` fails before .gitmodules exists.
+                "git init -q --bare --initial-branch=master "
+                + (root / "up.git").string() + " && "
                 "git clone -q " + (root / "up.git").string() + " seedwt && "
                 "cd seedwt && git config user.email t@t.t && "
                 "git config user.name T && echo hi > f.txt && "
@@ -366,7 +580,7 @@ int main() {
                 "git commit -q -m 'add submodule' && "
                 // Dirty the submodule working tree with an untracked file.
                 "echo scratch > mod/untracked.txt";
-            auto smi = call(*provider, "bash", sm);
+            auto smi = call(*provider, "shell", sm);
             assert(!smi.is_error && "submodule setup must succeed");
 
             // git_status names the dirty submodule.
@@ -397,6 +611,48 @@ int main() {
             assert(sir.text.find("untracked.txt") != std::string::npos
                    && "git_status path=mod must operate inside the submodule");
             std::puts("git_status: path into submodule routes to submodule repo");
+
+            // The dirty-submodule list is now derived from porcelain=v2
+            // instead of a foreach walk. Pin it to the OLD walk's answer
+            // in every state: clean, untracked, modified, staged, moved
+            // commit (walk ignores it), and a nested dirty submodule.
+            auto walk = [&] {
+                auto w = obj(); w["command"] =
+                    "git submodule --quiet foreach --recursive "
+                    "'git diff --quiet && git diff --cached --quiet && "
+                    "test -z \"$(git status --porcelain)\" || echo \"$displaypath\"'";
+                return call(*provider, "shell", w).text;
+            };
+            auto flagged = [&](const std::string& name) {
+                auto r = call(*provider, "git_status", obj());
+                return r.text.find("submodules with uncommitted changes")
+                           != std::string::npos
+                    && r.text.find(name) != std::string::npos;
+            };
+            auto sh = [&](const std::string& c) {
+                auto s = obj(); s["command"] = c;
+                auto r = call(*provider, "shell", s);
+                assert(!r.is_error);
+            };
+            struct St { const char* name; std::string setup; };
+            const std::vector<St> states = {
+                {"clean",     "rm -f mod/untracked.txt"},
+                {"untracked", "echo u > mod/u2.txt"},
+                {"modified",  "rm -f mod/u2.txt && echo m >> mod/f.txt"},
+                {"staged",    "git -C mod add f.txt"},
+                {"committed", "git -C mod -c user.email=t@t.t -c user.name=T "
+                              "commit -q -m moved"},
+            };
+            for (const auto& s : states) {
+                sh(s.setup);
+                const bool old_says = walk().find("mod") != std::string::npos;
+                const bool new_says = flagged("mod");
+                std::printf("submodule state %-9s old=%d new=%d\n",
+                            s.name, old_says, new_says);
+                assert(old_says == new_says
+                       && "dirty-submodule detection must match the old walk");
+            }
+            std::puts("git_status: submodule detection matches old walk");
         }
 
         // git_commit with empty message rejected
@@ -518,7 +774,7 @@ int main() {
 
         // Clean the working tree back up for the following tests.
         auto cl = obj(); cl["command"] = "git checkout -- amend_me.txt";
-        (void)call(*provider, "bash", cl);
+        (void)call(*provider, "shell", cl);
 
         // push with nothing to stash is a friendly no-op, not an error.
         auto spn = obj(); spn["action"] = "push";
@@ -537,7 +793,7 @@ int main() {
             "printf cherry > cherry_file.txt && git add cherry_file.txt && "
             "git commit -q -m 'cherry commit' && "
             "echo SHA=$(git rev-parse HEAD) && git switch master -q";
-        auto sr = call(*provider, "bash", setup);
+        auto sr = call(*provider, "shell", setup);
         assert(!sr.is_error);
         // Extract the printed SHA.
         std::string txt = sr.text;
@@ -585,7 +841,7 @@ int main() {
             "git switch master -q && "
             "printf mainline > mainline.txt && git add mainline.txt && "
             "git commit -q -m 'mainline work' && git switch rb-topic -q";
-        auto sr = call(*provider, "bash", setup);
+        auto sr = call(*provider, "shell", setup);
         assert(!sr.is_error);
 
         auto rb = obj(); rb["action"] = "onto"; rb["upstream"] = "master";
@@ -597,7 +853,7 @@ int main() {
 
         // After the rebase, mainline.txt is reachable from the topic branch.
         auto chk = obj(); chk["command"] = "test -f mainline.txt && echo HAS_MAINLINE";
-        auto chkr = call(*provider, "bash", chk);
+        auto chkr = call(*provider, "shell", chk);
         assert(!chkr.is_error && chkr.text.find("HAS_MAINLINE") != std::string::npos
                && "rebase must replay topic on top of advanced master");
         std::puts("git_rebase: topic replayed on advanced master");
@@ -611,7 +867,7 @@ int main() {
         assert(rbcr.is_error && "continue with no rebase in progress must error");
         std::puts("git_rebase: guard rails ok");
 
-        (void)call(*provider, "bash", [] {
+        (void)call(*provider, "shell", [] {
             auto o = obj(); o["command"] = "git switch master -q"; return o; }());
     }
 
@@ -744,6 +1000,4 @@ int main() {
     }
 
     fs::remove_all(root);
-    std::puts("ALL SEARCH/SHELL/DIAGNOSTICS TOOL TESTS PASSED");
-    return 0;
 }

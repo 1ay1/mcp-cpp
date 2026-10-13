@@ -1,0 +1,13 @@
+// Tier-1 deterministic tool evals — one JSON object per line.
+// Verifiers: contains[], not_contains[], equals, regex, is_error.
+{"name": "aggregate: TODO owners grouped by capture", "tool": "aggregate", "args": {"pattern": "TODO\\((\\w+)\\)", "by": "capture", "group": 1, "glob": "*.py"}, "expect": {"contains": ["alice", "bob"]}}
+{"name": "extract: field/awk column of a matching line", "tool": "extract", "args": {"pattern": "DEBOUNCE", "column": 3, "glob": "*.py"}, "expect": {"contains": ["250"]}}
+{"name": "extract concise omits file:line", "tool": "extract", "args": {"pattern": "class (\\w+)", "group": 1, "glob": "*.py"}, "expect": {"contains": ["Widget"], "not_contains": [".py:"]}}
+{"name": "extract detailed adds file:line", "tool": "extract", "args": {"pattern": "class (\\w+)", "group": 1, "glob": "*.py", "response_format": "detailed"}, "expect": {"contains": ["Widget", "app.py:"]}}
+{"name": "read_filter keeps matches, collapses gaps", "tool": "read_filter", "args": {"path": "app.py", "pattern": "def ", "context": 0}, "expect": {"contains": ["def render", "def build"], "not_contains": ["import os"]}}
+{"name": "outline: nested symbols, no bodies", "tool": "outline", "args": {"path": "app.py"}, "expect": {"contains": ["class Widget", "def render"], "not_contains": ["self.name = name"]}}
+{"name": "json_query: object keys", "tool": "json_query", "args": {"path": "package.json", "query": ".scripts | keys"}, "expect": {"contains": ["build", "test", "lint"]}}
+{"name": "json_query: nested member raw", "tool": "json_query", "args": {"path": "package.json", "query": ".dependencies.react", "raw": true}, "expect": {"equals": "^18.2.0"}}
+{"name": "json_query: slice length is one array", "tool": "json_query", "args": {"path": "package.json", "query": ".services[0:2] | length"}, "expect": {"equals": "2"}}
+{"name": "json_query: bad regex path is an error", "tool": "json_query", "args": {"path": "package.json", "query": ".services["}, "expect": {"is_error": true}}
+{"name": "replace: dry-run does not write", "tool": "replace", "args": {"find": "Widget", "replacement": "Gadget", "glob": "*.py"}, "expect": {"contains": ["DRY RUN", "Gadget"], "not_contains": ["Wrote"]}}

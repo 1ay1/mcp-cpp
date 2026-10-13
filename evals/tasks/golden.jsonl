@@ -1,0 +1,10 @@
+// Golden-output evals — assert the FULL output text (not just substrings), so
+// a FORMATTING or RANKING regression is caught (a reordered aggregate table, a
+// changed outline indent, a json_query dump shape). The `golden` field names a
+// file under evals/golden/. Regenerate after an INTENTIONAL change:
+//   AGENTTY_EVAL_SERVER=… python3 evals/run.py --update
+// then review the diff before committing.
+{"name": "golden: aggregate ranked table", "tool": "aggregate", "args": {"pattern": "TODO\\((\\w+)\\)", "by": "capture", "group": 1, "glob": "*.py"}, "golden": "aggregate_todos.txt"}
+{"name": "golden: outline nested tree", "tool": "outline", "args": {"path": "app.py"}, "golden": "outline_app.txt"}
+{"name": "golden: json_query keys", "tool": "json_query", "args": {"path": "package.json", "query": ".scripts | keys"}, "golden": "jsonquery_scripts.txt"}
+{"name": "golden: extract count table", "tool": "extract", "args": {"pattern": "def (\\w+)", "group": 1, "count": true, "glob": "*.py"}, "golden": "extract_defs.txt"}

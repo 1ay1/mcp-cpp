@@ -6,8 +6,9 @@
 // http::default_client().send() directly with a host/port/path Request;
 // here every request routes through the injected HttpClient (host.hpp),
 // which owns TLS + redirect-following. The HTML→text extraction, SSRF
-// guard, SPA/jina fallback, fragment clipping, and multi-engine search
-// parsing are ported verbatim.
+// guard, SPA/jina fallback and fragment clipping are ported verbatim.
+// web_search has since moved on: the services it can use, and what each one
+// needs, live in web_search_services.cpp; this file runs the failover loop.
 //
 // Because the injected HttpClient follows redirects itself, the manual
 // per-hop redirect loop in agentty's web_fetch collapses to a single
@@ -20,6 +21,9 @@
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/utf8.hpp>
 #include <mcp/tools/util/error.hpp>
+#include <mcp/tools/web_search.hpp>
+
+#include "web_search_services.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -176,6 +180,45 @@ std::expected<ParsedUrl, std::string> parse_url(std::string_view url) {
     if (h.starts_with("fe80:") || h.starts_with("fe8")
         || h.starts_with("fe9") || h.starts_with("fea")
         || h.starts_with("feb")) return true;
+
+    // IPv4-mapped / -compatible IPv6 (::ffff:127.0.0.1, ::ffff:a9fe:a9fe,
+    // ::127.0.0.1) resolve to the embedded IPv4 and are a classic SSRF filter
+    // bypass: the prefix checks above miss them and the dotted-quad folding
+    // below rejects them (they contain ':'). Extract the trailing IPv4 (dotted,
+    // or the last two hex groups of a ::ffff: mapping) and fold it to dotted
+    // form so the private-range check catches it. Genuine public IPv6 has no
+    // embedded v4 and is left to pass — we don't blanket-block v6.
+    if (h.find(':') != std::string::npos
+        && (h.starts_with("::ffff:") || h.starts_with("::"))) {
+        auto last_colon = h.rfind(':');
+        std::string tail = h.substr(last_colon + 1);
+        if (tail.find('.') != std::string::npos) {
+            h = tail;   // ::ffff:127.0.0.1 -> "127.0.0.1"
+        } else if (h.starts_with("::ffff:")) {
+            auto prev_colon = (last_colon == 0) ? std::string::npos
+                                                : h.rfind(':', last_colon - 1);
+            std::string g_hi = (prev_colon != std::string::npos)
+                                   ? h.substr(prev_colon + 1, last_colon - prev_colon - 1)
+                                   : std::string{};
+            auto hex4 = [](const std::string& g, unsigned& v) -> bool {
+                if (g.empty() || g.size() > 4) return false;
+                v = 0;
+                for (char ch : g) {
+                    unsigned d;
+                    if (ch >= '0' && ch <= '9') d = static_cast<unsigned>(ch - '0');
+                    else if (ch >= 'a' && ch <= 'f') d = static_cast<unsigned>(ch - 'a' + 10);
+                    else return false;
+                    v = v * 16 + d;
+                }
+                return true;
+            };
+            unsigned hi, lo;
+            if (!g_hi.empty() && hex4(g_hi, hi) && hex4(tail, lo)) {
+                h = std::to_string((hi >> 8) & 0xff) + "." + std::to_string(hi & 0xff)
+                  + "." + std::to_string((lo >> 8) & 0xff) + "." + std::to_string(lo & 0xff);
+            }
+        }
+    }
 
     // Canonicalize the many legal IPv4 spellings into dotted-quad octets
     // BEFORE the private-range checks. A dotted-quad-only guard is trivially
@@ -954,12 +997,7 @@ std::string clip_to_fragment(std::string body, std::string_view fragment) {
     return false;
 }
 
-[[nodiscard]] bool jina_enabled_globally() {
-    const char* env = std::getenv("AGENTTY_NO_JINA");
-    return !(env && env[0] != '\0' && env[0] != '0');
-}
-
-ExecResult run_web_fetch(HttpClient& client, const WebFetchArgs& a) {
+ExecResult run_web_fetch(HttpClient& client, const WebFetchArgs& a, bool jina) {
     auto pu = parse_url(a.url);
     if (!pu) return std::unexpected(
         ToolError::invalid_args("could not parse url: " + a.url + " (" + pu.error() + ")"));
@@ -1003,7 +1041,7 @@ ExecResult run_web_fetch(HttpClient& client, const WebFetchArgs& a) {
     }
 
     bool used_jina = false;
-    if (html_in && a.allow_jina && jina_enabled_globally()
+    if (html_in && a.allow_jina && jina
         && looks_like_spa_shell(body, raw_body)
         && a.method == "GET")
     {
@@ -1077,27 +1115,6 @@ std::expected<WebSearchArgs, ToolError> parse_web_search_args(const json& j) {
     };
 }
 
-std::string url_escape(std::string_view s) {
-    static constexpr char hex[] = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(s.size() * 3);
-    for (char ch : s) {
-        const unsigned char c = static_cast<unsigned char>(ch);
-        const bool unreserved =
-            (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') ||
-            c == '-' || c == '_' || c == '.' || c == '~';
-        if (unreserved) {
-            out.push_back(static_cast<char>(c));
-        } else {
-            out.push_back('%');
-            out.push_back(hex[c >> 4]);
-            out.push_back(hex[c & 0xF]);
-        }
-    }
-    return out;
-}
-
 std::string url_unescape(std::string_view s) {
     std::string out;
     out.reserve(s.size());
@@ -1161,12 +1178,6 @@ void clean_text(std::string& s) {
     while (!out.empty() && out.front() == ' ') out.erase(0, 1);
     s = std::move(out);
 }
-
-struct SearchHit {
-    std::string title;
-    std::string url;
-    std::string snippet;
-};
 
 std::string_view get_attr(std::string_view tag, std::string_view name) {
     for (size_t p = 0; p + name.size() + 2 < tag.size(); ++p) {
@@ -1312,106 +1323,90 @@ std::vector<SearchHit> parse_brave(const std::string& body, int count) {
     return hits;
 }
 
-std::vector<SearchHit> parse_startpage(const std::string& body, int count) {
-    std::vector<SearchHit> hits;
-    size_t pos = 0;
-    while (pos < body.size() && static_cast<int>(hits.size()) < count) {
-        size_t ti = body.find("class=\"result-title", pos);
-        if (ti == std::string::npos) ti = body.find("class=\"w-gl__result-title", pos);
-        if (ti == std::string::npos) break;
-        size_t a_open = body.rfind("<a ", ti);
-        if (a_open == std::string::npos || ti - a_open > 256) {
-            pos = ti + 1;
-            continue;
-        }
-        size_t tag_end = body.find('>', a_open);
-        if (tag_end == std::string::npos) break;
-        std::string_view tag_body{body.data() + a_open, tag_end - a_open};
-        std::string url{get_attr(tag_body, "href")};
-        size_t a_close = body.find("</a>", tag_end);
-        if (a_close == std::string::npos) { pos = tag_end + 1; continue; }
-        std::string title = body.substr(tag_end + 1, a_close - tag_end - 1);
-        std::string snippet;
-        size_t scan_end = std::min(body.size(), a_close + 2048);
-        size_t ds = body.find("description", a_close);
-        if (ds != std::string::npos && ds < scan_end) {
-            size_t dg = body.find('>', ds);
-            if (dg != std::string::npos && dg < scan_end) {
-                size_t de = body.find("</", dg + 1);
-                if (de != std::string::npos)
-                    snippet = body.substr(dg + 1, de - dg - 1);
-            }
-        }
-        clean_text(title);
-        clean_text(snippet);
-        if (!title.empty() && url.starts_with("http")) {
-            hits.push_back({std::move(title), std::move(url), std::move(snippet)});
-        }
-        pos = a_close + 4;
-    }
-    return hits;
-}
-
-ExecResult run_web_search(HttpClient& client, const WebSearchArgs& a) {
-    using Parser = std::vector<SearchHit>(*)(const std::string&, int);
-    struct Engine {
-        std::string name;
-        std::string host;
-        std::string path;     // includes ?q=... for GET
-        std::string body;     // form body for POST
-        bool        post;
-        Parser      parse;
-    };
-    std::string q_esc = url_escape(a.query);
-    const Engine chain[] = {
-        {"Brave",      "search.brave.com",
-         "/search?q=" + q_esc + "&source=web", "",
-         false, parse_brave},
-        {"DuckDuckGo", "html.duckduckgo.com",
-         "/html/",
-         "q=" + q_esc + "&kl=us-en",
-         true,  parse_ddg},
-        {"Startpage",  "www.startpage.com",
-         "/sp/search?query=" + q_esc, "",
-         false, parse_startpage},
-    };
-
+ExecResult run_web_search(HttpClient& client, const WebSearchPlan& plan,
+                          const WebSearchArgs& a) {
     std::vector<std::pair<std::string, std::string>> diagnostics;
     std::vector<SearchHit> hits;
     std::string used_engine;
 
-    for (const auto& e : chain) {
-        std::vector<std::pair<std::string,std::string>> headers;
-        headers.push_back({"user-agent",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"});
-        headers.push_back({"accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"});
-        headers.push_back({"accept-language", "en-US,en;q=0.9"});
-        if (e.post)
-            headers.push_back({"content-type", "application/x-www-form-urlencoded"});
-        headers.push_back({"referer", std::string{"https://"} + e.host + "/"});
+    // A plan names at most three services; extra slots are ignored so a
+    // hand-edited settings file cannot turn one search into a dozen requests.
+    constexpr std::size_t kMaxSlots = 3;
+    std::size_t tried = 0;
+    for (const auto& slot : plan.slots) {
+        if (slot.service.empty()) continue;
+        if (++tried > kMaxSlots) break;
 
-        std::string url = "https://" + e.host + e.path;
-        auto resp = http_send(client, e.post ? "POST" : "GET", url, headers, e.body);
+        const WebSearchService* svc = find_web_search_service(slot.service);
+        if (!svc) {
+            diagnostics.emplace_back(slot.service, "not a known search service");
+            continue;
+        }
+        std::string key;
+        if (svc->needs_key) {
+            key = clean_api_key(slot.api_key);
+            if (key.empty()) {
+                diagnostics.emplace_back(svc->label,
+                    "no API key set (add one in Settings, or choose a Free service)");
+                continue;
+            }
+        }
+
+        WebSearchQuery q;
+        q.text = a.query;
+        if (has_native_exclude(svc->id)) {
+            auto split = split_site_exclusions(a.query);
+            q.text = std::move(split.query);
+            q.exclude = std::move(split.exclude);
+        }
+        q.count = std::clamp(a.count, 1, svc->max_count);
+        if (svc->language && plan.language.size() == 2) q.language = plan.language;
+        q.dials = validate_dials(*svc, slot);
+        q.now = plan.now;
+
+        HttpRequest req = build_web_search_request(*svc, key, q);
+        auto resp = http_send(client, req.method, req.url, req.headers, req.body);
         if (!resp.ok) {
-            diagnostics.emplace_back(e.name, "transport: " + resp.err);
+            diagnostics.emplace_back(svc->label, "transport: " + resp.err);
             continue;
         }
-        if (resp.status >= 400) {
-            diagnostics.emplace_back(e.name,
-                "HTTP " + std::to_string(resp.status));
+        // 2xx with a real result page is the only path forward. A challenge
+        // page is often served as 200 or 202, so judge the body too.
+        if (resp.status < 200 || resp.status >= 300 || resp.status == 202) {
+            diagnostics.emplace_back(svc->label,
+                describe_failure(classify_http(*svc, resp.status, resp.body),
+                                 resp.status));
             continue;
         }
-        auto parsed = e.parse(resp.body, a.count);
-        if (parsed.empty()) {
-            diagnostics.emplace_back(e.name,
-                "parser found 0 results (" + std::to_string(resp.body.size())
-                + " bytes; layout may have changed)");
-            continue;
+        std::vector<SearchHit> parsed;
+        if (is_html_service(svc->id)) {
+            parsed = svc->id == "brave-free" ? parse_brave(resp.body, q.count)
+                                             : parse_ddg(resp.body, q.count);
+            if (parsed.empty()) {
+                const auto why = classify_http(*svc, resp.status, resp.body);
+                diagnostics.emplace_back(svc->label,
+                    why == WebSearchFailure::Blocked
+                        ? describe_failure(why, resp.status)
+                        : "parser found 0 results (" + std::to_string(resp.body.size())
+                          + " bytes; layout may have changed)");
+                continue;
+            }
+        } else {
+            auto jr = parse_json_hits(svc->id, resp.body, q.count);
+            if (!jr.ok) {
+                diagnostics.emplace_back(svc->label,
+                    describe_failure(WebSearchFailure::Unreadable, resp.status));
+                continue;
+            }
+            if (jr.hits.empty()) {
+                diagnostics.emplace_back(svc->label,
+                    describe_failure(WebSearchFailure::Empty, 0));
+                continue;
+            }
+            parsed = std::move(jr.hits);
         }
         hits = std::move(parsed);
-        used_engine = e.name;
+        used_engine = svc->label;
         break;
     }
 
@@ -1517,7 +1512,8 @@ json web_search_schema() {
 
 } // namespace
 
-void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http) {
+void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http, bool jina,
+                        const std::shared_ptr<WebSearchPlanSource>& plans) {
     if (!http) return;   // no transport → no web tools
 
     sh.add("web_fetch",
@@ -1527,26 +1523,29 @@ void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http) {
         "Supports #fragment to clip the output to that section. "
         "JS/SPA pages are auto-rendered via r.jina.ai when the primary "
         "fetch returns a near-empty shell (disable per-request by sending "
-        "a `x-no-jina: 1` header, or globally by setting AGENTTY_NO_JINA=1).",
+        "a `x-no-jina: 1` header).",
         web_fetch_schema(), EffectSet{Effect::Net},
-        [http](const json& args) -> mcp::cap::Result {
+        [http, jina](const json& args) -> mcp::cap::Result {
             auto parsed = parse_web_fetch_args(args);
             if (!parsed) return mcp::cap::Result::error(parsed.error().render());
-            return lower(run_web_fetch(*http, *parsed));
+            return lower(run_web_fetch(*http, *parsed, jina));
         }, 20'000);
 
     sh.add("web_search",
-        "Search the web. Tries Brave → DuckDuckGo → Startpage until one "
+        "Search the web. Tries the configured search services in order until one "
         "returns results. Output is `[via ENGINE]` followed by numbered "
         "title / URL / snippet for each hit. Use web_fetch on a result URL "
         "to read the page. Standard search operators work in the query: "
         "`site:docs.python.org`, `\"exact phrase\"`, `-exclude`. Duplicate "
         "URLs (AMP / mobile / archive mirrors) are auto-deduped.",
         web_search_schema(), EffectSet{Effect::Net},
-        [http](const json& args) -> mcp::cap::Result {
+        [http, plans](const json& args) -> mcp::cap::Result {
             auto parsed = parse_web_search_args(args);
             if (!parsed) return mcp::cap::Result::error(parsed.error().render());
-            return lower(run_web_search(*http, *parsed));
+            // Read the plan per call so a change in the host's settings reaches
+            // the very next search. No source means the key-less default chain.
+            const WebSearchPlan plan = plans ? plans->plan() : default_web_search_plan();
+            return lower(run_web_search(*http, plan, *parsed));
         }, 0);
 }
 

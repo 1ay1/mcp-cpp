@@ -30,18 +30,16 @@
 // re-stats every call (cheap), the parse+graph only rebuilds on change.
 
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 
 #include <mcp/tools/util/fs_helpers.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
-#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -204,17 +202,16 @@ bool is_stopword(const std::string& s) {
 // catch vendored non-git trees. The workspace root itself is exempt (checked
 // by the caller via depth>0), so the top-level project's own `.git` never
 // stops the walk before it starts.
-bool is_nested_project_root(const fs::path& dir) {
-    std::error_code ec;
+bool is_nested_project_root(const FileSystem& files, const fs::path& dir) {
     // `.git` as either a directory (normal repo) or a file (submodule/worktree
     // gitlink) marks a distinct repository boundary.
-    if (fs::exists(dir / ".git", ec)) return true;
+    if (files.stat(dir / ".git").exists) return true;
     // Other unambiguous project-root markers for vendored/non-git trees.
     static constexpr std::string_view kMarkers[] = {
         ".hg", ".svn", ".jj",           // other VCS roots
     };
     for (auto m : kMarkers)
-        if (fs::exists(dir / fs::path{m}, ec)) return true;
+        if (files.stat(dir / fs::path{m}).exists) return true;
     return false;
 }
 
@@ -224,80 +221,80 @@ bool is_nested_project_root(const fs::path& dir) {
 // two projects in one session) doesn't force a full re-parse each call —
 // the single-slot cache it replaced thrashed to zero hit-rate the moment a
 // second root appeared. LRU eviction keeps the memory bounded.
-const RepoGraph& build_graph(const fs::path& root) {
-    struct CacheSlot { std::string root; RepoGraph graph; std::uint64_t seq; };
-    static std::vector<CacheSlot> cache;
-    static std::uint64_t seq_counter = 0;
-    constexpr std::size_t kCacheSlots = 4;
+// Built graphs, kept in the tool state (ToolState::repo_graphs) so a repeat
+// call on an unchanged tree skips the parse. A few roots, least recently
+// used evicted.
+struct GraphCache {
+    struct Slot { std::string root; std::shared_ptr<const RepoGraph> graph; std::uint64_t seq = 0; };
+    std::vector<Slot> slots;
+    std::uint64_t     seq = 0;
+};
+constexpr std::size_t kCacheSlots = 4;
 
+GraphCache& graph_cache(ToolState& s) {
+    if (!s.repo_graphs) s.repo_graphs = std::make_shared<GraphCache>();
+    return *static_cast<GraphCache*>(s.repo_graphs.get());
+}
+
+std::shared_ptr<const RepoGraph> build_graph(const Call& call, const fs::path& root,
+                                             const util::Bounds& b) {
     const std::string root_key = root.string();
 
     // Walk pass 1: enumerate files + stat signature.
     struct Cand { fs::path abs; std::string rel; std::uint64_t sig; };
     std::vector<Cand> cands;
     std::uint64_t sig = 0;
-    std::error_code ec;
     constexpr std::size_t kMaxFiles = 5000;
-    for (auto it = fs::recursive_directory_iterator(
-             root, fs::directory_options::skip_permission_denied, ec);
-         it != fs::recursive_directory_iterator() && cands.size() < kMaxFiles;
-         it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        const auto& entry = *it;
-        std::error_code e2;
-        // SYMLINK LOOP GUARD: recursive_directory_iterator follows directory
-        // symlinks by default, so a cyclic link (a/link -> a, or two dirs
-        // pointing at each other) makes the walk run forever and re-parse
-        // the same files. Never recurse THROUGH a symlinked directory, and
-        // never treat a symlinked file as a source node (it would be counted
-        // twice — once at the link, once at the target inside the tree).
-        if (entry.is_symlink(e2)) {
-            if (entry.is_directory(e2)) it.disable_recursion_pending();
-            continue;
-        }
-        if (entry.is_directory(e2)) {
-            auto name = entry.path().filename().string();
+    // The walk never recurses THROUGH a symlinked directory (a cyclic link
+    // would run forever); a symlinked file isn't a source node either (it'd
+    // be counted twice, once at the link and once at its target).
+    call.fs().walk(root, [&](const DirEntry& entry) {
+        if (cands.size() >= kMaxFiles) return WalkStep::stop;
+        if (entry.symlink) return entry.directory ? WalkStep::skip_dir : WalkStep::next;
+        if (entry.directory) {
+            auto name = entry.path.filename().string();
             if (util::should_skip_dir(name)
-                || (it.depth() > 0 && name.starts_with("."))
+                || (entry.depth > 0 && name.starts_with("."))
                 // NESTED-PROJECT BOUNDARY: never descend into a submodule /
                 // vendored checkout / unrelated nested repo. This is the hard
                 // stop that keeps sibling-project files (maya-py/, mcp-cpp/,
                 // …) out of the map no matter how the workspace is laid out.
-                || is_nested_project_root(entry.path()))
-                it.disable_recursion_pending();
-            continue;
+                || is_nested_project_root(call.fs(), entry.path))
+                return WalkStep::skip_dir;
+            return WalkStep::next;
         }
-        if (!entry.is_regular_file(e2)) continue;
-        if (!is_map_source(entry.path())) continue;
-        // CONTAINMENT BACKSTOP: belt-and-suspenders re-assert that this file
-        // really is under the workspace root. The walk root was already gated
-        // by make_workspace_path_checked, and we never recurse through symlinks
-        // — but a `path=` subdir arg, a hardlink, or a future walk change could
-        // in principle surface a path outside the boundary. One cheap check per
-        // accepted source file makes the map pollution-proof unconditionally.
-        if (!util::is_within_workspace(entry.path())) continue;
-        auto sz = entry.file_size(e2);
+        if (!entry.regular) return WalkStep::next;
+        if (!is_map_source(entry.path)) return WalkStep::next;
+        // CONTAINMENT BACKSTOP: re-assert this file really is under the
+        // workspace root. The walk root was already gated and we never recurse
+        // through symlinks, but a `path=` subdir, a hardlink or a future walk
+        // change could surface a path outside. One cheap check per file.
+        if (!util::is_within_workspace(entry.path, b)) return WalkStep::next;
+        const auto sz = entry.size;
         // Skip empty files (no defs, no refs) and minified/generated blobs
         // (a 400KB single-line bundle is all noise and blows the parse time).
-        if (e2 || sz == 0 || sz > 512 * 1024) continue;
-        auto mt = fs::last_write_time(entry.path(), e2);
+        if (sz == 0 || sz > 512 * 1024) return WalkStep::next;
         std::uint64_t fsig = static_cast<std::uint64_t>(sz)
-            ^ static_cast<std::uint64_t>(mt.time_since_epoch().count());
+            ^ static_cast<std::uint64_t>(entry.mtime.time_since_epoch().count());
         sig = sig * 1099511628211ull + fsig;
-        auto rel = fs::relative(entry.path(), root, e2).string();
-        if (rel.empty()) rel = entry.path().filename().string();
-        cands.push_back({entry.path(), std::move(rel), fsig});
-    }
+        auto rel = entry.path.lexically_relative(root).string();   // walked from root
+        if (rel.empty()) rel = entry.path.filename().string();
+        cands.push_back({entry.path, std::move(rel), fsig});
+        return WalkStep::next;
+    });
 
     // Cache lookup: a slot with the same root AND an unchanged stat
     // signature is an exact hit. Touch its LRU seq and return it.
-    for (auto& slot : cache) {
-        if (slot.root == root_key && slot.graph.signature == sig
-            && !slot.graph.files.empty()) {
-            slot.seq = ++seq_counter;
-            return slot.graph;
-        }
-    }
+    if (auto hit = call.with([&](ToolState& s) -> std::shared_ptr<const RepoGraph> {
+            auto& c = graph_cache(s);
+            for (auto& slot : c.slots)
+                if (slot.root == root_key && slot.graph->signature == sig && !slot.graph->files.empty()) {
+                    slot.seq = ++c.seq;
+                    return slot.graph;
+                }
+            return nullptr;
+        }))
+        return hit;
 
     // Miss (new root, or the tree changed). Parse into a fresh graph.
     RepoGraph g;
@@ -305,13 +302,11 @@ const RepoGraph& build_graph(const fs::path& root) {
     std::vector<std::string> bodies;
     bodies.reserve(cands.size());
     const auto& pats = def_patterns();
-    // Walltime budget: on a pathological tree (thousands of large files, a
-    // slow network mount) the regex parse could stall the whole turn. Cap the
-    // parse pass; whatever was parsed before the deadline still yields a
-    // useful (if partial) map rather than a hang. Generous — a normal repo
-    // parses in tens of ms.
-    const auto parse_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    // On a pathological tree (thousands of large files, a slow network
+    // mount) the regex parse could stall the whole turn. The candidate cap
+    // bounds the work, and the parse stops early when the caller cancels
+    // (the host's timeout for the tool call, or the user); whatever parsed
+    // by then still yields a useful, partial map.
 
     // Parse each candidate file into a (FileNode, body) pair. The read +
     // per-line def regex scan is by FAR the dominant cost of build_graph
@@ -325,10 +320,9 @@ const RepoGraph& build_graph(const fs::path& root) {
     // reach on normal repos.
     auto parse_one = [&](const Cand& c,
                          FileNode& node_out, std::string& body_out) -> bool {
-        std::ifstream in(c.abs, std::ios::binary);
-        if (!in) return false;
-        std::string body((std::istreambuf_iterator<char>(in)),
-                          std::istreambuf_iterator<char>());
+        auto read = call.fs().read(c.abs);
+        if (!read) return false;
+        std::string body = std::move(*read);
         // Binary/blob guard: a NUL byte in the first 512 bytes means this is
         // not text the def regexes can meaningfully parse (a mis-extensioned
         // binary, a UTF-16 file). Skip it — running regex over binary is both
@@ -385,40 +379,19 @@ const RepoGraph& build_graph(const fs::path& root) {
         std::vector<FileNode>    parsed(cands.size());
         std::vector<std::string> parsed_bodies(cands.size());
         std::vector<char>        ok(cands.size(), 0);
-        std::atomic<std::size_t> next_idx{0};
-        std::atomic<bool>        past_deadline{false};
 
-        unsigned nthreads = std::thread::hardware_concurrency();
-        if (nthreads == 0) nthreads = 2;
-        nthreads = std::min<unsigned>(nthreads, 16);
-        // Small trees don't benefit from the thread spin-up; run inline.
-        if (cands.size() < 32) nthreads = 1;
-
-        auto worker = [&] {
-            for (;;) {
-                std::size_t i = next_idx.fetch_add(1, std::memory_order_relaxed);
-                if (i >= cands.size()) break;
-                // Check the shared deadline every 64 files (cheap; a steady
-                // clock read per file would add up on a huge tree).
-                if ((i & 63) == 0
-                    && std::chrono::steady_clock::now() > parse_deadline) {
-                    past_deadline.store(true, std::memory_order_relaxed);
-                    break;
-                }
-                if (past_deadline.load(std::memory_order_relaxed)) break;
-                if (parse_one(cands[i], parsed[i], parsed_bodies[i]))
-                    ok[i] = 1;
+        // The host's splitter decides the threads; we only choose how many
+        // shares. Share k parses candidates k, k+n, … into its own slots.
+        // Small trees don't benefit from fanning out; run inline.
+        std::size_t nshares = std::min<std::size_t>(call.width(), 16);
+        if (cands.size() < 32) nshares = 1;
+        auto worker = [&](std::size_t k) {
+            for (std::size_t i = k, n = 0; i < cands.size(); i += nshares, ++n) {
+                if ((n & 63) == 63 && call.cancel_requested()) break;
+                if (parse_one(cands[i], parsed[i], parsed_bodies[i])) ok[i] = 1;
             }
         };
-
-        if (nthreads <= 1) {
-            worker();
-        } else {
-            std::vector<std::thread> pool;
-            pool.reserve(nthreads);
-            for (unsigned t = 0; t < nthreads; ++t) pool.emplace_back(worker);
-            for (auto& th : pool) th.join();
-        }
+        call.split(nshares, worker);
 
         // Merge in index order — deterministic regardless of which thread got
         // which file.
@@ -487,25 +460,27 @@ const RepoGraph& build_graph(const fs::path& root) {
         }
     }
 
-    // Install into the cache under root_key. Reuse an existing slot for the
-    // same root (tree changed) if present; else evict the LRU slot once full.
-    CacheSlot* dst = nullptr;
-    for (auto& slot : cache)
-        if (slot.root == root_key) { dst = &slot; break; }
-    if (!dst) {
-        if (cache.size() < kCacheSlots) {
-            cache.push_back(CacheSlot{});
-            dst = &cache.back();
-        } else {
-            dst = &*std::min_element(
-                cache.begin(), cache.end(),
-                [](const CacheSlot& a, const CacheSlot& b) { return a.seq < b.seq; });
+    // Install under root_key. Reuse the slot for the same root (tree
+    // changed) if present; else evict the least recently used once full.
+    auto built = std::make_shared<const RepoGraph>(std::move(g));
+    call.with([&](ToolState& s) {
+        auto& c = graph_cache(s);
+        GraphCache::Slot* dst = nullptr;
+        for (auto& slot : c.slots)
+            if (slot.root == root_key) { dst = &slot; break; }
+        if (!dst) {
+            if (c.slots.size() < kCacheSlots) {
+                dst = &c.slots.emplace_back();
+            } else {
+                dst = &*std::min_element(c.slots.begin(), c.slots.end(),
+                    [](const auto& x, const auto& y) { return x.seq < y.seq; });
+            }
         }
-    }
-    dst->root = root_key;
-    dst->graph = std::move(g);
-    dst->seq = ++seq_counter;
-    return dst->graph;
+        dst->root  = root_key;
+        dst->graph = built;
+        dst->seq   = ++c.seq;
+    });
+    return built;
 }
 
 // PageRank with optional personalization. Damping 0.85. Iterates until the
@@ -576,7 +551,7 @@ struct RepoMapArgs {
     int         budget = 8000;   // bytes (~2000 tokens)
 };
 
-mcp::cap::Result run_repo_map(const Json& args) {
+mcp::cap::Result run_repo_map(const Call& call, const Json& args) {
     RepoMapArgs a;
     if (args.is_object()) {
         a.focus  = args.value("focus", std::string{});
@@ -593,18 +568,16 @@ mcp::cap::Result run_repo_map(const Json& args) {
     // subdirectory (or cwd was later changed), which is exactly the FIRST
     // call a fresh session makes on a big repo. An explicit relative `path`
     // still resolves against cwd as usual.
+    const auto b = bounds(call);
     if (a.root.empty() || a.root == ".")
-        a.root = util::project_root().string();
+        a.root = util::project_root(b).string();
 
-    auto wp = util::make_workspace_path_checked(a.root, "repo_map");
+    auto wp = util::make_workspace_path_checked(a.root, "repo_map", b);
     if (!wp) return mcp::cap::Result::error(wp.error().detail);
 
-    static std::mutex mu;
-    std::lock_guard<std::mutex> lock(mu);
-
-    // The cached graph is mutated by pagerank (rank field) — take a working
-    // copy of the const cache so personalization doesn't leak across calls.
-    RepoGraph g = build_graph(wp->path());
+    // The cached graph is shared and const; pagerank writes ranks, so work
+    // on a copy and personalisation doesn't leak across calls.
+    RepoGraph g = *build_graph(call, wp->path(), b);
     if (g.files.empty())
         return mcp::cap::Result::error(
             "repo_map: no source files found under " + wp->path().string());

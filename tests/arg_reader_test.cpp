@@ -15,6 +15,8 @@
 //
 // Run: build mcp_arg_reader_test, execute. Exit 0 = pass.
 
+#include "agtest.hpp"
+
 #include <mcp/tools/util/arg_reader.hpp>
 
 #include <cstdio>
@@ -24,17 +26,9 @@
 using mcp::tools::util::ArgReader;
 using nlohmann::json;
 
-static int g_failures = 0;
-#define CHECK(cond)                                                            \
-    do {                                                                       \
-        if (!(cond)) {                                                         \
-            std::fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); \
-            ++g_failures;                                                      \
-        }                                                                      \
-    } while (0)
 
 // ── 1. integer() coercion ───────────────────────────────────────────────────
-static void test_integer_coercion() {
+TEST_CASE("integer coercion") {
     CHECK(ArgReader(json{{"offset", 7}}).integer("offset", 1) == 7);          // native int
     CHECK(ArgReader(json{{"offset", "7"}}).integer("offset", 1) == 7);        // "7" string → 7
     CHECK(ArgReader(json{{"offset", 7.9}}).integer("offset", 1) == 7);        // float → truncated
@@ -58,7 +52,7 @@ static void test_integer_coercion() {
 }
 
 // ── 2. boolean() coercion ───────────────────────────────────────────────────
-static void test_boolean_coercion() {
+TEST_CASE("boolean coercion") {
     CHECK(ArgReader(json{{"replace_all", true}}).boolean("replace_all", false) == true);
     CHECK(ArgReader(json{{"replace_all", "true"}}).boolean("replace_all", false) == true);
     CHECK(ArgReader(json{{"replace_all", "True"}}).boolean("replace_all", false) == true); // case-insens
@@ -72,7 +66,7 @@ static void test_boolean_coercion() {
 }
 
 // ── 3. str() coercion (array-join, non-string dump) ──────────────────────────
-static void test_str_coercion() {
+TEST_CASE("str coercion") {
     CHECK(ArgReader(json{{"content", "hi"}}).str("content") == "hi");
     // Array of strings → newline-joined (weak model split a command/body).
     CHECK(ArgReader(json{{"content", json::array({"a", "b", "c"})}}).str("content")
@@ -84,7 +78,7 @@ static void test_str_coercion() {
 }
 
 // ── 4. key aliasing (the widened weak-model vocabulary) ──────────────────────
-static void test_command_aliases() {
+TEST_CASE("command aliases") {
     // bash: cmd / shell / script / run / cmdline / shell_command → command
     for (const char* k : {"cmd", "shell", "script", "run", "cmdline", "shell_command"}) {
         json j; j[k] = "ls -la";
@@ -94,7 +88,7 @@ static void test_command_aliases() {
     CHECK(ArgReader(json{{"command", "right"}, {"cmd", "wrong"}}).str("command") == "right");
 }
 
-static void test_path_aliases() {
+TEST_CASE("path aliases") {
     for (const char* k : {"file", "filepath", "filename", "file_path",
                           "dir", "directory", "target", "pathname"}) {
         json j; j[k] = "/tmp/x";
@@ -105,7 +99,7 @@ static void test_path_aliases() {
     CHECK(ArgReader(json{{"file", "/b"}}).str("file_path") == "/b");
 }
 
-static void test_edit_aliases() {
+TEST_CASE("edit aliases") {
     // old_string canonical ← old_text / old / search / find / from
     for (const char* k : {"old_text", "old", "search", "find", "from", "old_str"}) {
         json j; j[k] = "needle";
@@ -117,7 +111,7 @@ static void test_edit_aliases() {
     }
 }
 
-static void test_search_aliases() {
+TEST_CASE("search aliases") {
     // grep/glob pattern ← query / q / regex / search / term / glob / match / pat
     for (const char* k : {"query", "q", "regex", "search", "term", "glob", "match", "pat"}) {
         json j; j[k] = "foo.*";
@@ -136,7 +130,7 @@ static void test_search_aliases() {
 }
 
 // ── 5. coercion + aliasing COMPOSE (the real weak-model failure) ─────────────
-static void test_alias_and_coercion_compose() {
+TEST_CASE("alias and coercion compose") {
     // read with offset under the `start_line` alias AND as a string.
     CHECK(ArgReader(json{{"start_line", "12"}}).integer("offset", 1) == 12);
     // bash command split into an array under the `cmd` alias.
@@ -144,20 +138,3 @@ static void test_alias_and_coercion_compose() {
           == "echo\nhi");
 }
 
-int main() {
-    test_integer_coercion();
-    test_boolean_coercion();
-    test_str_coercion();
-    test_command_aliases();
-    test_path_aliases();
-    test_edit_aliases();
-    test_search_aliases();
-    test_alias_and_coercion_compose();
-
-    if (g_failures == 0) {
-        std::printf("arg_reader_test: all checks passed\n");
-        return 0;
-    }
-    std::fprintf(stderr, "arg_reader_test: %d check(s) failed\n", g_failures);
-    return 1;
-}

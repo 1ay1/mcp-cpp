@@ -1,48 +1,116 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// mcp/protocol.hpp — the JSON-RPC envelope algebra + the message-level sums.
+// mcp/protocol.hpp — every MCP method, declared once, as a type.
 //
-//   schema.ts closes with seven discriminated unions describing the entire
-//   message graph:
+//   A method's name, params and result live in exactly one place. The
+//   engine's request<M>, reply<M>, result<M> decoding and a Router's on<M>
+//   handler are all checked against these, so a call site, a handler and the
+//   wire format can't disagree about a method's shape.
 //
-//     JSONRPCMessage   = Request | Notification | Response
-//     ClientRequest    = Ping | Initialize | … | CancelTask
-//     ClientNotification / ServerNotification
-//     ClientResult / ServerResult / ServerRequest
+//   Direction is part of the namespace:
 //
-//   We model them faithfully, AND we go one step further: a compile-time
-//   *method dictionary* pairs every wire method with its (Params, Result)
-//   types. The unions are then a fold over that one source of truth, and a
-//   typed peer can dispatch `request<dict::CallTool>(params)` with the result
-//   type deduced — there is no place to get the pairing wrong.
+//     to_server::  the client calls these on the server
+//     to_client::  the server calls these on the client
 //
+//   There is no connection class here and no runtime; the host drives a
+//   jsonrpc::Engine and dispatches with a jsonrpc::Router (see
+//   docs/PROTOCOL_LIBRARIES.md in agentty).
 #pragma once
+
+#include <jsonrpc/engine.hpp>
+#include <jsonrpc/method.hpp>
+#include <jsonrpc/router.hpp>
 
 #include <mcp/methods.hpp>
 
 namespace mcp {
 
-//==============================================================================
-//  Error — the JSON-RPC 2.0 error object (schema.ts Error).
-//==============================================================================
-struct Error {
-    int         code = 0;
-    std::string message;
-    Maybe<Json> data;
-};
-template <> struct CodecOf<Error> {
-    static Codec<Error> get() {
-        return record<Error>(
-            required("code",    &Error::code),
-            required("message", &Error::message),
-            optional("data",    &Error::data));
-    }
-};
+using jsonrpc::Method;
+using jsonrpc::Note;
 
-//==============================================================================
-//  URLElicitationRequiredError — the structured -32042 payload (schema.ts).
-//==============================================================================
-inline constexpr int kUrlElicitationRequired = -32042;
+//  EmptyResult ≅ Unit  (the schema's `EmptyResult = Result` with no fields).
+using EmptyResult = Unit;
+
+// ── The client calls these on the server ────────────────────────────────────
+namespace to_server {
+using Ping                  = Method<"ping",                      Unit,                        EmptyResult>;
+using Initialize            = Method<"initialize",                InitializeParams,            InitializeResult>;
+using Discover              = Method<"server/discover",           DiscoverParams,              DiscoverResult>;
+using Complete              = Method<"completion/complete",       CompleteParams,              CompleteResult>;
+using SetLevel              = Method<"logging/setLevel",          SetLevelParams,              EmptyResult>;
+using GetPrompt             = Method<"prompts/get",               GetPromptParams,             GetPromptResult>;
+using ListPrompts           = Method<"prompts/list",              ListPromptsParams,           ListPromptsResult>;
+using ListResources         = Method<"resources/list",            ListResourcesParams,         ListResourcesResult>;
+using ListResourceTemplates = Method<"resources/templates/list",  ListResourceTemplatesParams, ListResourceTemplatesResult>;
+using ReadResource          = Method<"resources/read",            ReadResourceParams,          ReadResourceResult>;
+using Subscribe             = Method<"resources/subscribe",       SubscribeParams,             EmptyResult>;
+using Unsubscribe           = Method<"resources/unsubscribe",     UnsubscribeParams,           EmptyResult>;
+using CallTool              = Method<"tools/call",                CallToolParams,              CallToolResult>;
+using ListTools             = Method<"tools/list",                ListToolsParams,             ListToolsResult>;
+using GetTask               = Method<"tasks/get",                 TaskIdParams,                GetTaskResult>;
+using GetTaskPayload        = Method<"tasks/result",              TaskIdParams,                GetTaskPayloadResult>;
+using ListTasks             = Method<"tasks/list",                PaginatedParams,             ListTasksResult>;
+using CancelTask            = Method<"tasks/cancel",              TaskIdParams,                CancelTaskResult>;
+using UpdateTask            = Method<"tasks/update",              UpdateTaskParams,            UpdateTaskResult>;
+using SubscriptionsListen   = Method<"subscriptions/listen",      SubscriptionsListenParams,   EmptyResult>;
+
+using Initialized           = Note<"notifications/initialized",         Unit>;
+using RootsListChanged      = Note<"notifications/roots/list_changed",  Unit>;
+}  // namespace to_server
+
+// ── The server calls these on the client ────────────────────────────────────
+namespace to_client {
+using CreateMessage         = Method<"sampling/createMessage",    CreateMessageParams,         CreateMessageResult>;
+using ListRoots             = Method<"roots/list",                Unit,                        ListRootsResult>;
+using Elicit                = Method<"elicitation/create",        ElicitParams,                ElicitResult>;
+using Ping                  = Method<"ping",                      Unit,                        EmptyResult>;
+
+using LoggingMessage        = Note<"notifications/message",                LoggingMessageParams>;
+using ResourceUpdated       = Note<"notifications/resources/updated",      ResourceUpdatedParams>;
+using ResourcesListChanged  = Note<"notifications/resources/list_changed", Unit>;
+using ToolsListChanged      = Note<"notifications/tools/list_changed",     Unit>;
+using PromptsListChanged    = Note<"notifications/prompts/list_changed",   Unit>;
+using ElicitationComplete   = Note<"notifications/elicitation/complete",   ElicitationCompleteParams>;
+}  // namespace to_client
+
+// ── Either side ─────────────────────────────────────────────────────────────
+using Cancelled         = Note<"notifications/cancelled",    CancelledParams>;
+using Progress          = Note<"notifications/progress",     ProgressParams>;
+using TaskStatusChanged = Note<"notifications/tasks/status", TaskStatusParams>;
+
+// The engine and its vocabulary, under mcp:: for protocol code.
+using jsonrpc::Engine;
+using jsonrpc::Router;
+using jsonrpc::Effects;
+using jsonrpc::Event;
+using jsonrpc::Received;
+using jsonrpc::Tick;
+using jsonrpc::Cancel;
+using jsonrpc::Closed;
+using jsonrpc::Completed;
+using jsonrpc::Call;
+using jsonrpc::Notification;
+using jsonrpc::Id;
+using jsonrpc::RpcError;
+using jsonrpc::Deadline;
+using jsonrpc::step;
+using jsonrpc::request;
+using jsonrpc::request_raw;
+using jsonrpc::reply;
+using jsonrpc::result;
+using jsonrpc::notify;
+using jsonrpc::notify_raw;
+
+namespace errc {
+using namespace jsonrpc::errc;
+// MCP's own codes, in the implementation-defined range.
+inline constexpr int UrlElicitationRequired          = -32042;
+inline constexpr int UnsupportedProtocolVersion      = -32020;
+inline constexpr int MissingRequiredClientCapability = -32021;
+}  // namespace errc
+
+// ── URLElicitationRequiredError: the structured -32042 payload ──────────────
+inline constexpr int kUrlElicitationRequired = errc::UrlElicitationRequired;
 
 struct UrlElicitationRequiredErrorData {
     List<ElicitUrlParams> elicitations;
@@ -68,297 +136,4 @@ template <> struct CodecOf<UrlElicitationRequiredErrorData> {
     }
 };
 
-//==============================================================================
-//  The JSON-RPC envelope as a tagged algebra.
-//==============================================================================
-struct JsonRpcRequest {
-    RpcId       id;
-    std::string method;
-    Json        params = Json::object();
-};
-template <> struct CodecOf<JsonRpcRequest> {
-    static Codec<JsonRpcRequest> get() {
-        return {
-            [](const JsonRpcRequest& r) -> Json {
-                Json j = {{"jsonrpc", "2.0"}, {"id", r.id}, {"method", r.method}};
-                if (!(r.params.is_object() && r.params.empty()) && !r.params.is_null())
-                    j["params"] = r.params;
-                return j;
-            },
-            [](const Json& j) -> JsonRpcRequest {
-                JsonRpcRequest r;
-                r.id     = j.at("id");
-                r.method = j.at("method").get<std::string>();
-                r.params = j.value("params", Json::object());
-                return r;
-            }};
-    }
-};
-
-struct JsonRpcNotification {
-    std::string method;
-    Json        params = Json::object();
-};
-template <> struct CodecOf<JsonRpcNotification> {
-    static Codec<JsonRpcNotification> get() {
-        return {
-            [](const JsonRpcNotification& n) -> Json {
-                Json j = {{"jsonrpc", "2.0"}, {"method", n.method}};
-                if (!(n.params.is_object() && n.params.empty()) && !n.params.is_null())
-                    j["params"] = n.params;
-                return j;
-            },
-            [](const Json& j) -> JsonRpcNotification {
-                JsonRpcNotification n;
-                n.method = j.at("method").get<std::string>();
-                n.params = j.value("params", Json::object());
-                return n;
-            }};
-    }
-};
-
-struct JsonRpcResult {
-    RpcId id;
-    Json  result = Json::object();
-};
-template <> struct CodecOf<JsonRpcResult> {
-    static Codec<JsonRpcResult> get() {
-        return {
-            [](const JsonRpcResult& r) -> Json {
-                return Json{{"jsonrpc", "2.0"}, {"id", r.id}, {"result", r.result}};
-            },
-            [](const Json& j) -> JsonRpcResult {
-                return JsonRpcResult{j.at("id"), j.value("result", Json::object())};
-            }};
-    }
-};
-
-struct JsonRpcError {
-    Maybe<RpcId> id;        // may be null when the request id is unknown
-    Error        error;
-};
-template <> struct CodecOf<JsonRpcError> {
-    static Codec<JsonRpcError> get() {
-        return {
-            [](const JsonRpcError& e) -> Json {
-                Json j = {{"jsonrpc", "2.0"}, {"error", to_json(e.error)}};
-                j["id"] = e.id ? *e.id : Json(nullptr);
-                return j;
-            },
-            [](const Json& j) -> JsonRpcError {
-                JsonRpcError e;
-                if (auto it = j.find("id"); it != j.end() && !it->is_null()) e.id = *it;
-                e.error = from_json<Error>(j.at("error"));
-                return e;
-            }};
-    }
-};
-
-//  Response = Result + Error  (disambiguated by which key is present).
-using JsonRpcResponse = Sum<JsonRpcResult, JsonRpcError>;
-template <> struct CodecOf<JsonRpcResponse> {
-    static Codec<JsonRpcResponse> get() {
-        return {
-            [](const JsonRpcResponse& r) -> Json {
-                return std::visit([](const auto& x) { return to_json(x); }, r);
-            },
-            [](const Json& j) -> JsonRpcResponse {
-                if (j.contains("error")) return JsonRpcResponse{from_json<JsonRpcError>(j)};
-                return JsonRpcResponse{from_json<JsonRpcResult>(j)};
-            }};
-    }
-};
-
-//  JsonRpcMessage = Request + Notification + Response  (schema.ts JSONRPCMessage).
-using JsonRpcMessage = Sum<JsonRpcRequest, JsonRpcNotification, JsonRpcResponse>;
-template <> struct CodecOf<JsonRpcMessage> {
-    static Codec<JsonRpcMessage> get() {
-        return {
-            [](const JsonRpcMessage& m) -> Json {
-                return std::visit([](const auto& x) { return to_json(x); }, m);
-            },
-            [](const Json& j) -> JsonRpcMessage {
-                const bool has_method = j.contains("method");
-                const bool has_id     = j.contains("id");
-                if (has_method && has_id) return JsonRpcMessage{from_json<JsonRpcRequest>(j)};
-                if (has_method)           return JsonRpcMessage{from_json<JsonRpcNotification>(j)};
-                return JsonRpcMessage{from_json<JsonRpcResponse>(j)};
-            }};
-    }
-};
-
-//==============================================================================
-//  EmptyResult ≅ Unit  (the schema's `EmptyResult = Result` with no fields).
-//==============================================================================
-using EmptyResult = Unit;
-
-//==============================================================================
-//  RpcId constructors — RpcId is raw Json (string | number per JSON-RPC 2.0).
-//  Use these instead of brace-init: `Json{1}` is an ARRAY `[1]`, a classic
-//  nlohmann pitfall; `id(1)` always yields the scalar `1`.
-//==============================================================================
-inline RpcId id(std::int64_t n) { return RpcId(n); }
-inline RpcId id(std::string s) { return RpcId(std::move(s)); }
-inline RpcId id(const char* s)  { return RpcId(std::string(s)); }
-
-//==============================================================================
-//  The method dictionary — one descriptor per wire method, pairing the params
-//  type with the result type (or marking it a notification). This is the
-//  single source of truth the ClientRequest / ServerRequest unions fold over.
-//==============================================================================
-template <StaticString M, class P, class R>
-struct Rpc {
-    using Params = P;
-    using Result = R;
-    static constexpr std::string_view method = M.view();
-};
-template <StaticString M, class P>
-struct Note {
-    using Params = P;
-    static constexpr std::string_view method = M.view();
-};
-
-namespace dict {
-    // ── Client → Server requests (schema.ts ClientRequest) ─────────────────
-    using Ping                  = Rpc<"ping",                         Unit,                         EmptyResult>;
-    using Initialize            = Rpc<"initialize",                   InitializeParams,             InitializeResult>;
-    using Discover              = Rpc<"server/discover",             DiscoverParams,               DiscoverResult>;
-    using Complete              = Rpc<"completion/complete",          CompleteParams,               CompleteResult>;
-    using SetLevel              = Rpc<"logging/setLevel",             SetLevelParams,               EmptyResult>;
-    using GetPrompt             = Rpc<"prompts/get",                  GetPromptParams,              GetPromptResult>;
-    using ListPrompts           = Rpc<"prompts/list",                 ListPromptsParams,            ListPromptsResult>;
-    using ListResources         = Rpc<"resources/list",              ListResourcesParams,          ListResourcesResult>;
-    using ListResourceTemplates = Rpc<"resources/templates/list",    ListResourceTemplatesParams,  ListResourceTemplatesResult>;
-    using ReadResource          = Rpc<"resources/read",              ReadResourceParams,           ReadResourceResult>;
-    using Subscribe             = Rpc<"resources/subscribe",         SubscribeParams,              EmptyResult>;
-    using Unsubscribe           = Rpc<"resources/unsubscribe",       UnsubscribeParams,            EmptyResult>;
-    using CallTool              = Rpc<"tools/call",                   CallToolParams,               CallToolResult>;
-    using ListTools             = Rpc<"tools/list",                   ListToolsParams,              ListToolsResult>;
-    using GetTask               = Rpc<"tasks/get",                    TaskIdParams,                 GetTaskResult>;
-    using GetTaskPayload        = Rpc<"tasks/result",                 TaskIdParams,                 GetTaskPayloadResult>;
-    using ListTasks             = Rpc<"tasks/list",                   PaginatedParams,              ListTasksResult>;
-    using CancelTask            = Rpc<"tasks/cancel",                 TaskIdParams,                 CancelTaskResult>;
-    using UpdateTask            = Rpc<"tasks/update",                 UpdateTaskParams,             UpdateTaskResult>;
-    using SubscriptionsListen   = Rpc<"subscriptions/listen",        SubscriptionsListenParams,    EmptyResult>;
-
-    // ── Server → Client requests (schema.ts ServerRequest) ──────────────────
-    using CreateMessage         = Rpc<"sampling/createMessage",      CreateMessageParams,          CreateMessageResult>;
-    using ListRoots             = Rpc<"roots/list",                   Unit,                         ListRootsResult>;
-    using Elicit                = Rpc<"elicitation/create",          ElicitParams,                 ElicitResult>;
-
-    // ── Client → Server notifications (schema.ts ClientNotification) ────────
-    using Cancelled             = Note<"notifications/cancelled",            CancelledParams>;
-    using Progress              = Note<"notifications/progress",             ProgressParams>;
-    using Initialized           = Note<"notifications/initialized",          Unit>;
-    using RootsListChanged      = Note<"notifications/roots/list_changed",    Unit>;
-    using TaskStatus            = Note<"notifications/tasks/status",          TaskStatusParams>;
-
-    // ── Server → Client notifications (schema.ts ServerNotification) ────────
-    using LoggingMessage        = Note<"notifications/message",                  LoggingMessageParams>;
-    using ResourceUpdated       = Note<"notifications/resources/updated",        ResourceUpdatedParams>;
-    using ResourcesListChanged  = Note<"notifications/resources/list_changed",   Unit>;
-    using ToolsListChanged      = Note<"notifications/tools/list_changed",       Unit>;
-    using PromptsListChanged    = Note<"notifications/prompts/list_changed",     Unit>;
-    using ElicitationComplete   = Note<"notifications/elicitation/complete",     ElicitationCompleteParams>;
-} // namespace dict
-
-//==============================================================================
-//  method_v<Desc> — the wire method literal carried by the descriptor itself.
-//  (Each Rpc/Note bakes its method in as an NTTP, so the pairing of method ↔
-//  params ↔ result is a single indivisible token.)
-//==============================================================================
-template <class Desc>
-inline constexpr std::string_view method_v = Desc::method;
-
-//==============================================================================
-//  Message-level sums (schema.ts ClientRequest / ServerRequest / … / *Result).
-//
-//      These mirror the spec's closing discriminated unions exactly. They are
-//      method-tagged: encode prepends jsonrpc+method, decode reads `method`.
-//      The engine itself dispatches by method string for speed; these typed
-//      sums exist for callers who want an exhaustively-matchable value.
-//==============================================================================
-
-//  A request union arm: a typed Params wrapped with its method literal.
-template <class P>
-struct MethodReq { std::string_view method; P params; };
-template <class P>
-struct MethodNote { std::string_view method; P params; };
-
-//  ClientRequest — every request the client may send.
-using ClientRequest = Sum<
-    MethodReq<InitializeParams>, MethodReq<CompleteParams>, MethodReq<SetLevelParams>,
-    MethodReq<GetPromptParams>, MethodReq<ListPromptsParams>, MethodReq<ListResourcesParams>,
-    MethodReq<ListResourceTemplatesParams>, MethodReq<ReadResourceParams>,
-    MethodReq<SubscribeParams>, MethodReq<UnsubscribeParams>, MethodReq<CallToolParams>,
-    MethodReq<ListToolsParams>, MethodReq<TaskIdParams>, MethodReq<PaginatedParams>,
-    MethodReq<Unit>>;   // Unit arm covers ping
-
-//  ServerRequest — every request the server may send back.
-using ServerRequest = Sum<
-    MethodReq<CreateMessageParams>, MethodReq<ElicitParams>, MethodReq<TaskIdParams>,
-    MethodReq<PaginatedParams>, MethodReq<Unit>>;   // Unit covers ping / roots/list
-
-//  ClientResult — every result the client may return (schema.ts ClientResult).
-using ClientResult = Sum<
-    EmptyResult, CreateMessageResult, ListRootsResult, ElicitResult,
-    GetTaskResult, GetTaskPayloadResult, ListTasksResult, CancelTaskResult>;
-
-//  ServerResult — every result the server may return (schema.ts ServerResult).
-using ServerResult = Sum<
-    EmptyResult, InitializeResult, CompleteResult, GetPromptResult, ListPromptsResult,
-    ListResourceTemplatesResult, ListResourcesResult, ReadResourceResult,
-    CallToolResult, ListToolsResult, GetTaskResult, GetTaskPayloadResult,
-    ListTasksResult, CancelTaskResult>;
-
-//  ClientNotification / ServerNotification — method-tagged notification sums.
-using ClientNotification = Sum<
-    MethodNote<CancelledParams>, MethodNote<ProgressParams>,
-    MethodNote<TaskStatusParams>, MethodNote<Unit>>;   // Unit covers initialized / roots changed
-using ServerNotification = Sum<
-    MethodNote<CancelledParams>, MethodNote<ProgressParams>,
-    MethodNote<LoggingMessageParams>, MethodNote<ResourceUpdatedParams>,
-    MethodNote<ElicitationCompleteParams>, MethodNote<TaskStatusParams>,
-    MethodNote<Unit>>;   // Unit covers the three *_list_changed notifications
-
-//==============================================================================
-//  Typed descriptor dispatch — the payoff of the method dictionary.
-//
-//      call<Desc>(engine, params)   → std::future<Desc::Result>
-//      send<Desc>(engine, params)   fire-and-forget notification
-//      handle<Desc>(engine, fn)     register a typed request handler
-//      observe<Desc>(engine, fn)    register a typed notification handler
-//
-//   The method string AND the result type are both derived from `Desc`, so a
-//   mismatched pairing is impossible to express. (RpcEngine is defined in
-//   rpc.hpp, included transitively; these are thin free functions over it.)
-//==============================================================================
-template <class Desc, class E>
-[[nodiscard]] auto call(E& engine, const typename Desc::Params& p) {
-    return engine.template request<typename Desc::Result, typename Desc::Params>(
-        method_v<Desc>, p);
-}
-template <class Desc, class E>
-[[nodiscard]] auto call(E& engine) {
-    return engine.template request<typename Desc::Result>(method_v<Desc>);
-}
-template <class Desc, class E>
-void send(E& engine, const typename Desc::Params& p) {
-    engine.notify(method_v<Desc>, p);
-}
-template <class Desc, class E>
-void send(E& engine) {
-    engine.notify_raw(method_v<Desc>, Json::object());
-}
-template <class Desc, class E, class F>
-void handle(E& engine, F fn) {
-    engine.template on<typename Desc::Params, typename Desc::Result>(
-        std::string(method_v<Desc>), std::move(fn));
-}
-template <class Desc, class E, class F>
-void observe(E& engine, F fn) {
-    engine.template on_note<typename Desc::Params>(
-        std::string(method_v<Desc>), std::move(fn));
-}
-
-} // namespace mcp
+}  // namespace mcp

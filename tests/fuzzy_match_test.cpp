@@ -17,31 +17,30 @@
 //
 // Run: build mcp_fuzzy_match_test, execute. Exit 0 = pass.
 
+#include "agtest.hpp"
+
+static int g_failures = 0;
+
 #include <mcp/tools/util/fuzzy_match.hpp>
 
 #include <cstdio>
 #include <limits>
+#include <chrono>
+#include <random>
+#include <vector>
 #include <string>
 #include <string_view>
 
 using mcp::tools::util::fuzzy_find;
 using mcp::tools::util::FuzzyMatch;
 
-static int g_failures = 0;
-#define CHECK(cond)                                                            \
-    do {                                                                       \
-        if (!(cond)) {                                                         \
-            std::fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); \
-            ++g_failures;                                                      \
-        }                                                                      \
-    } while (0)
 
 // Convenience: the substring of `file` that a match selected.
 static std::string_view matched(std::string_view file, const FuzzyMatch& m) {
     return file.substr(m.pos, m.len);
 }
 
-int main() {
+TEST_CASE("fuzzy_match") {
     // ── 1. exact unique match ────────────────────────────────────────────
     {
         std::string file = "line one\nline two\nline three\n";
@@ -133,6 +132,41 @@ int main() {
         auto m = fuzzy_find(file, "completely unrelated content here\nand more\n");
         CHECK(!m.ok);
         CHECK(m.pos == 0 && m.len == 0);
+    }
+
+    // ── 6b. RELAXED acceptance: a UNIQUE block that drifted below the strict
+    //        0.8 ratio still applies (previously reported "not found even
+    //        fuzzily"). Here a 3-line block has one reworded line + one
+    //        reflowed line — ratio dips under 0.8 but stays above the 0.6
+    //        relaxed floor, and the location is unambiguous. ────────────────
+    {
+        std::string file =
+            "void setup() {\n"
+            "    // initialise the widget registry\n"
+            "    registry.init();\n"
+            "    log.info(\"ready\");\n"
+            "}\n";
+        // Model's copy drifted: comment reworded, spacing changed. Only
+        // `registry.init();` survives verbatim, but the block is unique.
+        auto m = fuzzy_find(file,
+            "    // init the widget registry\n"
+            "    registry.init();\n"
+            "    log.info( \"ready\" );\n");
+        CHECK(m.ok);
+        CHECK(m.count == 1);
+        CHECK(matched(file, m).find("registry.init();") != std::string_view::npos);
+    }
+
+    // ── 6c. RELAXED floor still rejects half-garbage: a 2-line needle where
+    //        one line matches and the other is absent is exactly 0.5 ratio —
+    //        below the 0.6 floor — so it must stay an honest no-match (this is
+    //        the invariant patch atomicity relies on). ─────────────────────
+    {
+        std::string file =
+            "line one\nline two\nline three\nline four\nline five\n";
+        auto m = fuzzy_find(file,
+            "line four\nthis line does not exist anywhere\n");
+        CHECK(!m.ok);
     }
 
     // ── 7. indent re-basing of new_text ──────────────────────────────────
@@ -227,10 +261,70 @@ int main() {
         CHECK(m.count >= 2);
     }
 
-    if (g_failures == 0) {
-        std::puts("fuzzy_match_test: all checks passed");
-        return 0;
+    // ── 11. DoS BOUND (algorithmic-complexity guard). A large multi-line
+    //     needle against a big, highly-repetitive file used to spend SECONDS
+    //     in the banded DP (each cell runs an O(L²) levenshtein via fuzzy_eq),
+    //     reachable from a single edit/apply_patch call. MAX_DP_CELLS now caps
+    //     the total work: such an input must bail to "no match" quickly rather
+    //     than wedge the tool. We assert BOTH the verdict and a generous wall-
+    //     clock ceiling so a future cap regression trips this test.
+    {
+        std::string file;
+        for (int i = 0; i < 2'000; ++i)
+            file += "  func item_" + std::to_string(i % 37) + "(a, b) { return a; }\n";
+        std::string needle;                       // ~400-line fuzzy needle
+        for (int i = 0; i < 400; ++i)
+            needle += "  func item_" + std::to_string(i % 37) + "(a,b){ return b; }\n";
+
+        const auto t0 = std::chrono::steady_clock::now();
+        auto m = fuzzy_find(file, needle);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        CHECK(!m.ok);                             // over-cap input bails cleanly
+        // 1 s is ~50× the post-fix time and far under the pre-fix seconds; it
+        // catches a cap regression without flaking on a slow/loaded CI box.
+        CHECK(elapsed < 1'000);
     }
-    std::fprintf(stderr, "fuzzy_match_test: %d failure(s)\n", g_failures);
-    return 1;
+
+    // ── 12. Myers bit-parallel Levenshtein == reference matrix. The fuzzy
+    //     locator's inner term is a hand-written bit-vector kernel (easy to get
+    //     subtly wrong); pin it against an obviously-correct full-matrix
+    //     Levenshtein over many random pairs, including the word boundaries
+    //     (len 0, exactly 64, > 64 fallback) and multi-byte UTF-8 bytes.
+    {
+        auto ref = [](std::string_view a, std::string_view b) -> std::size_t {
+            std::vector<std::size_t> prev(b.size() + 1), curr(b.size() + 1);
+            for (std::size_t j = 0; j <= b.size(); ++j) prev[j] = j;
+            for (std::size_t i = 1; i <= a.size(); ++i) {
+                curr[0] = i;
+                for (std::size_t j = 1; j <= b.size(); ++j)
+                    curr[j] = std::min({prev[j] + 1, curr[j - 1] + 1,
+                                        prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)});
+                std::swap(prev, curr);
+            }
+            return prev[b.size()];
+        };
+        const char alpha[] = "ab \t{}();=x\xe2\x80\x98";   // incl. a UTF-8 char
+        const int A = sizeof(alpha) - 1;
+        std::mt19937_64 rng(0xBEEF);
+        std::size_t mism = 0;
+        for (int trial = 0; trial < 60'000; ++trial) {
+            // Bias lengths around the 64-bit word boundary.
+            std::uniform_int_distribution<int> la(0, 70), lb(0, 70);
+            std::string a, b;
+            std::uniform_int_distribution<int> pick(0, A - 1);
+            for (int i = 0, na = la(rng); i < na; ++i) a += alpha[pick(rng)];
+            for (int i = 0, nb = lb(rng); i < nb; ++i) b += alpha[pick(rng)];
+            if (mcp::tools::util::levenshtein(a, b) != ref(a, b)) ++mism;
+        }
+        CHECK(mism == 0);
+        // Spot-check exact values so a build that silently returns 0 still fails.
+        CHECK(mcp::tools::util::levenshtein("kitten", "sitting") == 3);
+        CHECK(mcp::tools::util::levenshtein("", "abc") == 3);
+        CHECK(mcp::tools::util::levenshtein("abc", "abc") == 0);
+        CHECK(mcp::tools::util::levenshtein(std::string(64, 'a'),
+                                            std::string(64, 'b')) == 64);
+    }
+    CHECK(g_failures == 0);
 }

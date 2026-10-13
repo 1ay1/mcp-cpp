@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // client_example.cpp — spawn the example server and drive it over stdio,
-// written in straight-line async style with coroutines (mcp/coro.hpp).
+// one request at a time on this thread, with a bare jsonrpc engine.
 //
 //   Usage:  mcp_client_example /path/to/mcp_server_example
 //
@@ -9,7 +9,6 @@
 //     initialize → list_tools → call_tool(add) → read_resource → get_prompt.
 //
 #include <mcp/mcp.hpp>
-#include <mcp/coro.hpp>
 
 #include <cstdio>
 #include <cstdlib>
@@ -87,6 +86,42 @@ static Child spawn(const char* path) {
     return {pid, in_pipe[1], out_pipe[0]};
 }
 
+// One request, waited for on this thread: send it, then read lines and step
+// the engine until its completion comes back. The engine is the whole
+// client; there is no thread or transport in mcp-cpp.
+struct Session {
+    Engine        engine;
+    ClientHandlers handlers;   // the server's callbacks (none needed here)
+    std::istream& in;
+    std::ostream& out;
+
+    void send(const std::string& frame) { out << frame << '\n' << std::flush; }
+
+    void perform(Effects& fx) {
+        for (auto& f : fx.send) send(f);
+        for (auto& c : fx.calls) send(handlers.handle(c));
+        for (auto& n : fx.notifications) handlers.handle(n);
+    }
+
+    template <jsonrpc::IsMethod M>
+    typename M::result call(const typename M::params& p) {
+        auto [id, fx] = request<M>(engine, p);
+        perform(fx);
+        std::string line;
+        while (std::getline(in, line)) {
+            Effects got = step(engine, Received{line});
+            perform(got);
+            for (auto& c : got.completed) {
+                if (c.id != id) continue;
+                auto r = result<M>(c);
+                if (!r) throw r.error();
+                return std::move(*r);
+            }
+        }
+        throw RpcError(errc::ConnectionLost, "server closed the connection");
+    }
+};
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0] << " <path-to-mcp_server_example>\n";
@@ -100,53 +135,49 @@ int main(int argc, char** argv) {
     std::istream child_out(&in_buf);
     std::ostream child_in(&out_buf);
 
-    StdioTransport transport(child_out, child_in);
-    Client client(transport.sink());
-    transport.start(client.engine());
-
-    using mcp::co::Task;
-    using mcp::co::operator co_await;
-
-    auto drive = [&]() -> Task<int> {
-        auto init = co_await client.initialize(
-            Implementation{"mcp-cpp-client", std::string(kLibraryVersion), Nothing, Nothing, Nothing, Nothing});
+    Session s{Engine{}, ClientHandlers{}, child_out, child_in};
+    int rc = 0;
+    try {
+        InitializeParams ip;
+        ip.protocolVersion = std::string(kProtocolVersion);
+        ip.clientInfo = Implementation{"mcp-cpp-client", std::string(kLibraryVersion), Nothing, Nothing, Nothing, Nothing};
+        auto init = s.call<to_server::Initialize>(ip);
         std::cout << "✓ initialized with " << init.serverInfo.name
                   << " (protocol " << init.protocolVersion << ")\n";
         if (init.instructions) std::cout << "  instructions: " << *init.instructions << "\n";
-        client.initialized();
+        s.send(notify<to_server::Initialized>(Unit{}));
 
-        auto tools = co_await client.list_tools();
+        auto tools = s.call<to_server::ListTools>(ListToolsParams{});
         std::cout << "✓ tools:";
         for (const auto& t : tools.tools) std::cout << " " << t.name;
         std::cout << "\n";
 
-        auto add = co_await client.call_tool("add", Json{{"a", 17}, {"b", 25}});
+        auto add = s.call<to_server::CallTool>(
+            CallToolParams{"add", Json{{"a", 17}, {"b", 25}}, Nothing, Json::object()});
         std::cout << "✓ add(17,25): ";
         if (!add.content.empty() && std::holds_alternative<TextContent>(add.content[0]))
             std::cout << std::get<TextContent>(add.content[0]).text;
         if (add.structuredContent) std::cout << "  | structured=" << add.structuredContent->dump();
         std::cout << "\n";
 
-        auto res = co_await client.read_resource("file:///motd");
+        auto res = s.call<to_server::ReadResource>(ReadResourceParams{"file:///motd", Json::object()});
         if (!res.contents.empty() && std::holds_alternative<TextResourceContents>(res.contents[0]))
             std::cout << "✓ motd: " << std::get<TextResourceContents>(res.contents[0]).text << "\n";
 
         GetPromptParams gp;
         gp.name = "summarize";
         gp.arguments = std::vector<std::pair<std::string,std::string>>{{"text", "MCP is a protocol."}};
-        auto prompt = co_await client.get_prompt(gp);
+        auto prompt = s.call<to_server::GetPrompt>(gp);
         std::cout << "✓ prompt 'summarize' produced " << prompt.messages.size() << " message(s)\n";
-
-        co_return 0;
-    };
-
-    int rc = drive().get();
+    } catch (const std::exception& e) {
+        std::cerr << "✗ " << e.what() << "\n";
+        rc = 1;
+    }
 
     // Tear down: close child stdin → server sees EOF and exits.
     child_in.flush();
     ::close(child.to_child);
     int status = 0;
     waitpid(child.pid, &status, 0);
-    transport.stop();
     return rc;
 }

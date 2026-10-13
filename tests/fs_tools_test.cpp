@@ -4,20 +4,25 @@
 // edit / list_dir) end-to-end through make_provider(), proving the ported
 // bodies behave and that write/edit carry a FileChange back via the meta.
 
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
+#include "../src/tools/diff.hpp"
 #include <mcp/cap/local.hpp>
 
-#include <cassert>
+#include "agtest.hpp"
+#include "test_state.hpp"
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <filesystem>
 #include <string>
 
 #ifdef _WIN32
 #  include <process.h>   // _getpid
+#  include <io.h>        // _chsize_s, _fileno
 #  define mcp_getpid _getpid
 #else
 #  include <unistd.h>    // getpid
@@ -28,18 +33,116 @@ using namespace mcp::tools;
 namespace fs = std::filesystem;
 
 static mcp::cap::Result call(mcp::cap::CapabilityProvider& p,
-                             const std::string& name, mcp::Json args) {
-    return p.execute(mcp::cap::Request{name, std::move(args)});
+                             const std::string& name, mcp::Json args,
+                             std::string reader = {}) {
+    mcp::cap::Request req{name, std::move(args)};
+    req.reader = std::move(reader);
+    return p.execute(req);
 }
 
 static mcp::Json obj() { return mcp::Json::object(); }
 
-int main() {
+// Regression: a small edit must produce a MINIMAL diff (not every line as '-'),
+// even on a large file or a CRLF file. Reproduces the reported "edit shows all
+// - lines" symptom. FileChange.before/after are diffed through the same engine
+// the card uses.// Tests stand in for the host; they write fixtures through the same disk.
+inline mcp::tools::NativeFileSystem& test_fs() {
+    static mcp::tools::NativeFileSystem f;
+    return f;
+}
+
+
+TEST_CASE("edit diff stays minimal on large + CRLF files") {
+    namespace diff = mcp::tools::detail::diff;
+    auto root = fs::temp_directory_path() /
+        ("mcp_editmin_" + std::to_string(mcp_getpid()));
+    fs::create_directories(root);
+    auto ws_state = mcp::test::state_at(root);
+    HostServices svc;
+    svc.files = std::make_shared<NativeFileSystem>();
+    svc.state = ws_state;
+    auto provider = make_provider(svc, ToolsetConfig{}, "local");
+
+    auto edit_and_diff = [&](const std::string& fname, const std::string& body,
+                             const std::string& oldt, const std::string& newt,
+                             int& added, int& removed) {
+        auto p = (root / fname).string();
+        (void)util::write_file(test_fs(), root / fname, body);
+        auto e = obj(); e["old_text"] = oldt; e["new_text"] = newt;
+        auto args = obj(); args["path"] = p;
+        args["edits"] = mcp::Json::array({e});
+        auto r = call(*provider, "edit", args);
+        assert(!r.is_error);
+        auto ch = read_change(r);
+        assert(ch.has_value());
+        auto d = diff::compute(p, ch->before, ch->after);
+        added = d.added; removed = d.removed;
+    };
+
+    // (1) Large LF file, change one line in the middle.
+    {
+        std::string body;
+        for (int i = 0; i < 6000; ++i) body += "line " + std::to_string(i) + "\n";
+        int a = -1, rmv = -1;
+        edit_and_diff("big.c", body, "line 3000\n", "CHANGED 3000\n", a, rmv);
+        assert(a == 1);
+        assert(rmv == 1);   // NOT 6000 — the all-'-' bug
+        std::puts("edit-min: 6000-line file, 1-line edit -> +1/-1 (not all-)");
+    }
+
+    // (2) CRLF file, change one line. The CRLF splice must NOT LF-normalize
+    //     the whole buffer (which would make every line differ => all '-').
+    {
+        std::string body;
+        for (int i = 0; i < 3000; ++i) body += "row " + std::to_string(i) + "\r\n";
+        int a = -1, rmv = -1;
+        edit_and_diff("win.c", body, "row 1500", "ROW-1500", a, rmv);
+        assert(a <= 2);      // one changed line (allow ±1 for CRLF boundary)
+        assert(rmv <= 2);    // NOT ~3000
+        std::printf("edit-min: 3000-line CRLF file, 1-line edit -> +%d/-%d\n",
+                    a, rmv);
+    }
+
+    // (3) HANG GUARD: an edit whose old_text does NOT match must fail FAST on
+    //     a large file — the failure path (full fuzzy scan + squashed-
+    //     whitespace search + "did you mean" hint) must stay bounded, not
+    //     spin O(file × needle). Reported as the edit tool "getting stuck".
+    {
+        std::string body;
+        for (int i = 0; i < 20000; ++i)
+            body += "source line number " + std::to_string(i) +
+                    " with some real content here\n";
+        auto p = (root / "huge.c").string();
+        (void)util::write_file(test_fs(), root / "huge.c", body);
+        auto e = obj();
+        e["old_text"] = "this block absolutely does not exist anywhere in\n"
+                        "the file even fuzzily so the matcher scans + fails";
+        e["new_text"] = "whatever";
+        auto args = obj(); args["path"] = p;
+        args["edits"] = mcp::Json::array({e});
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = call(*provider, "edit", args);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::printf("edit-min: no-match on 20000-line file -> %.1f ms "
+                    "(is_error=%d)\n", ms, r.is_error);
+        assert(r.is_error);           // it must report a miss
+        assert(ms < 3000.0);          // and it must NOT hang (generous 3s cap)
+    }
+
+    fs::remove_all(root);
+}
+
+TEST_CASE("fs_tools") {
     auto root = fs::temp_directory_path() / ("mcp_fs_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
-    util::set_workspace_root(root);
+    auto ws_state = mcp::test::state_at(root);
 
     HostServices svc;  // no host backends needed — Tier-1 is self-contained
+
+    svc.files = std::make_shared<NativeFileSystem>();
+    svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
     // ── write creates a file and carries a FileChange ────────────────────
@@ -70,13 +173,194 @@ int main() {
         std::puts("read: ok");
     }
 
-    // ── read again (unchanged) returns the stale-read sentinel ───────────
+    // ── read again (unchanged) SERVES the cached content ────────────────
+    //
+    // It used to answer with a bare "File unchanged since last read" and no
+    // bytes -- a pointer into the caller's context. That is only sound while
+    // the thing it points at is still there, and compaction, a host-side
+    // read-collapse and subagent boundaries all break that. When it breaks the
+    // caller is told to consult content that exists nowhere and cannot
+    // recover, so it falls back to `cat`.
+    //
+    // Now the entry holds the text it served and replays it under a tag. The
+    // token saving is intact (no file re-read, no second line scan) and the
+    // answer is unconditional.
     {
         auto args = obj(); args["path"] = wpath;
         auto rd2 = call(*provider, "read", args);
         assert(!rd2.is_error);
-        assert(rd2.text.find("File unchanged since last read") != std::string::npos);
-        std::puts("read: stale-read sentinel ok");
+        // Tagged, so a careful model knows not to re-reason over it...
+        assert(rd2.text.find("[cached") != std::string::npos);
+        // ...and carrying the real content, so a confused one still gets it.
+        assert(rd2.text.find("line1") != std::string::npos);
+        assert(rd2.text.find("line3") != std::string::npos);
+        std::puts("read: cache hit serves content ok");
+    }
+
+    // ── paging must never deadlock against the sentinel ─────────────────
+    //
+    // THE BUG: the cache used to key on (path, offset, limit) and refuse any
+    // repeat of a range it had served. That is only safe if every earlier
+    // result is still in the caller's context — and on agentty it is not:
+    // wire::superseded_read_ids keeps only the MOST RECENT read of a file and
+    // replaces the rest with "refer to the more recent tool result".
+    //
+    // So the two sentinels pointed at each other. Read a file at range A,
+    // then range B, then ask for A again: the transcript no longer has A's
+    // bytes, and the cache refuses to re-send them. There is no way out
+    // except to stop using `read` — which is what was observed in the wild,
+    // models falling back to `sed`/`cat` or rewriting a file they never
+    // managed to see.
+    //
+    // Reproduced against a real 600-line file at offsets 1 / 310 / 1 / 251.
+    {
+        const auto paged = root / "paged.txt";
+        {
+            auto args = obj();
+            args["file_path"] = paged.string();
+            std::string body;
+            for (int i = 1; i <= 600; ++i)
+                body += "line " + std::to_string(i) + "\n";
+            args["content"] = body;
+            auto wr = call(*provider, "write", args);
+            assert(!wr.is_error);
+        }
+        const std::string pp = paged.string();
+        auto at = [&](int off) {
+            auto args = obj(); args["path"] = pp; args["offset"] = off;
+            return call(*provider, "read", args);
+        };
+        // A cache HIT now carries the content too, so "did I get bytes" no
+        // longer distinguishes the two paths -- the tag does. `fresh` means
+        // the file was actually read; `cached` means the entry was replayed.
+        // Both deliver content, which is the whole point of the change; what
+        // the dedup still has to get right is WHICH of the two happens.
+        auto cached = [](const auto& r) {
+            return r.text.find("[cached") != std::string::npos;
+        };
+        auto fresh = [&](const auto& r) { return !cached(r); };
+
+        auto a1 = at(1);     assert(!a1.is_error && fresh(a1));
+        auto b  = at(310);   assert(!b.is_error  && fresh(b));
+        // The one that used to deadlock: its bytes were collapsed out of the
+        // transcript by the newer read, and the cache refused to re-send them.
+        // It must be read from disk again, because the live entry covers a
+        // different range.
+        auto a2 = at(1);
+        assert(!a2.is_error);
+        assert(fresh(a2) && "a range the newest read does not cover must be re-read");
+        assert(a2.text.find("line 1\n") != std::string::npos);
+        // A fresh range is likewise never a repeat.
+        auto c = at(251);
+        assert(!c.is_error && fresh(c));
+        assert(c.text.find("line 251") != std::string::npos);
+
+        // The dedup still has to WORK, or this is just a revert: asking for
+        // exactly what the live entry holds is served FROM CACHE, tagged, and
+        // without touching the disk.
+        auto c_again = at(251);
+        assert(!c_again.is_error && cached(c_again));
+        // ...and it is the real text, not a pointer to it. This is the
+        // property whose absence sent models to `cat`.
+        assert(c_again.text.find("line 251") != std::string::npos);
+
+        // A sub-range of the live entry is covered too — those bytes really
+        // are in the caller's context.
+        {
+            auto args = obj(); args["path"] = pp;
+            args["offset"] = 260; args["limit"] = 10;   // inside [251,500]
+            auto sub = call(*provider, "read", args);
+            assert(!sub.is_error && cached(sub));
+        }
+        // ... but one that runs past its end is not.
+        {
+            auto args = obj(); args["path"] = pp;
+            args["offset"] = 495; args["limit"] = 50;   // spills past 500
+            auto over = call(*provider, "read", args);
+            assert(!over.is_error && fresh(over));
+        }
+        std::puts("read: paging serves every range, cached or fresh ok");
+    }
+
+    // ── the outline prefilter must never drop a real definition ────────
+    //
+    // outline runs std::regex per line and that IS its cost (measured 17–26
+    // MB/s), so a cheap "could this line possibly match" test runs first.
+    // The danger is entirely one-sided: a prefilter that wrongly SKIPS a
+    // line makes that definition vanish from every outline, and nothing
+    // downstream can tell the difference between "not found" and "never
+    // looked". A wrong ACCEPT just costs a regex call.
+    //
+    // Writing it caught this for real — the first version allowed only
+    // letters/_/#/@/~ and silently dropped 3,424 definitions in this tree,
+    // every `[[nodiscard]]`-prefixed function, because those start with '['.
+    // A second round found digit-led lines. Both are pinned below.
+    //
+    // The full check is a differential over the whole tree (2.19M lines, 0
+    // drops); this is the cheap standing version of it.
+    {
+        const auto lines = std::vector<std::string>{
+            // The two the differential caught — both MATCH the outline regex,
+            // so dropping them in the prefilter loses a real definition.
+            "[[nodiscard]] inline bool owes_paint(const C& c) noexcept {",
+            "    [[nodiscard]] static consteval Refined make_unchecked(T v) {",
+            "      59 lines (37 sloc)",
+            // Template-leading signature.
+            "<T> generic_thing(T v) {",
+            // The ordinary shapes, which must obviously survive.
+            "int main(int argc, char** argv) {",
+            "class Foo {",
+            "    def method(self):",
+            "# A markdown heading",
+            "_leading_underscore(int a) {",
+        };
+        // NOTE on what is NOT here. `*ptr(int){`, `&ref(int){`,
+        // `::qualified::name(int){` and `~Destructor(){` are all REJECTED by
+        // outline_pattern() itself — its signature alternative needs the
+        // optional type prefix to end in whitespace, so a line opening with
+        // the sigil never matched, before or after the prefilter. They were
+        // in an earlier draft of this list and failed here, which is the
+        // test doing its job: asserting behaviour the tool never had would
+        // have frozen a bug as a requirement. The prefilter still ACCEPTS
+        // those characters (cheap, and they can lead a matching line), it
+        // just cannot be tested through outline.
+        const auto f = (root / "prefilter_probe.txt").string();
+        for (const auto& L : lines) {
+            // Drive it through the real tool: write a file whose ONLY
+            // definition-shaped line is this one, outline it, and require
+            // the line to appear. That exercises the shipped prefilter
+            // rather than a copy of it.
+            auto w = obj();
+            w["file_path"] = f;
+            // Pad past kAutoOutlineSize so the outline path is taken.
+            std::string body;
+            body.reserve(40 * 1024);
+            body += L;
+            body += "\n";
+            while (body.size() < 40u * 1024u) body += "    // padding\n";
+            w["content"] = body;
+            auto wr = call(*provider, "write", w);
+            assert(!wr.is_error);
+
+            static int ctx = 0;
+            const std::string reader = "prefilter" + std::to_string(++ctx);
+            auto a = obj(); a["path"] = f;
+            auto r = call(*provider, "outline", a, reader);
+            assert(!r.is_error);
+            // Require the DEFINITION ITSELF in the output, not merely a
+            // non-empty answer. An earlier draft tested for the absence of
+            // the substring "o definition" — which also matches the SUCCESS
+            // line "1 definition", so it passed even with the bug
+            // deliberately reintroduced. Verified by re-breaking the
+            // prefilter: this form fails, that one did not.
+            const auto trimmed = L.substr(L.find_first_not_of(" \t"));
+            if (r.text.find(trimmed) == std::string::npos) {
+                std::printf("prefilter DROPPED: |%s|\noutline said: %s\n",
+                            L.c_str(), r.text.c_str());
+                assert(false && "outline prefilter dropped a real definition");
+            }
+        }
+        std::puts("outline: prefilter keeps every definition shape ok");
     }
 
     // ── read past EOF gives a clear message, not a broken range ──────────
@@ -91,6 +375,215 @@ int main() {
         assert(rd.text.find("past the end of the file") != std::string::npos);
         assert(rd.text.find("1000-999") == std::string::npos);
         std::puts("read: past-EOF offset gives a clear message");
+    }
+
+    // ── read symbol= returns just the named function's body (sed-killer) ──
+    {
+        auto code = (root / "lib.cpp").string();
+        auto wargs = obj();
+        wargs["file_path"] = code;
+        wargs["content"] =
+            "#include <cstdio>\n"                       // L1
+            "int helper(int a) {\n"                     // L2
+            "    return a + 1;\n"                        // L3
+            "}\n"                                       // L4
+            "int compute(int x, int y) {\n"             // L5  <-- target
+            "    int t = helper(x);\n"                   // L6
+            "    return t * y;\n"                        // L7
+            "}\n"                                       // L8
+            "int main() { return compute(2, 3); }\n";   // L9
+        call(*provider, "write", wargs);
+
+        auto args = obj();
+        args["path"]   = code;
+        args["symbol"] = "compute";
+        auto rd = call(*provider, "read", args);
+        assert(!rd.is_error);
+        // Header names the location.
+        assert(rd.text.find("`compute` defined at") != std::string::npos);
+        // Body of compute is present…
+        assert(rd.text.find("int compute(int x, int y)") != std::string::npos);
+        assert(rd.text.find("return t * y;") != std::string::npos);
+        // …and the UNRELATED helper() body is NOT (we scoped to one symbol).
+        assert(rd.text.find("return a + 1;") == std::string::npos);
+        std::puts("read: symbol= returns just that function's body");
+    }
+
+    // ── read symbol= for a missing symbol errors clearly ───────────────
+    {
+        auto args = obj();
+        args["path"]   = (root / "lib.cpp").string();
+        args["symbol"] = "no_such_symbol";
+        auto rd = call(*provider, "read", args);
+        assert(rd.is_error);
+        assert(rd.text.find("no definition of") != std::string::npos);
+        std::puts("read: symbol= missing symbol errors cleanly");
+    }
+
+    // ── read symbol= is INDENT-scoped for Python (braces in the body, e.g.
+    //    a dict, must NOT close the block early) ─────────────────────────
+    {
+        auto py = (root / "mod.py").string();
+        auto wargs = obj();
+        wargs["file_path"] = py;
+        wargs["content"] =
+            "def build():\n"            // L1  <-- target
+            "    config = {\n"          // L2  multi-line dict opens a brace
+            "        'a': 1,\n"         // L3
+            "    }\n"                    // L4  dict close — must NOT end the def
+            "    return config\n"        // L5  <-- must be included
+            "def sibling():\n"          // L6  <-- must NOT be included
+            "    return 0\n";           // L7
+        call(*provider, "write", wargs);
+
+        auto args = obj();
+        args["path"]   = py;
+        args["symbol"] = "build";
+        auto rd = call(*provider, "read", args);
+        assert(!rd.is_error);
+        assert(rd.text.find("def build():") != std::string::npos);
+        assert(rd.text.find("return config") != std::string::npos);  // full body
+        assert(rd.text.find("def sibling") == std::string::npos);    // stops at next def
+        std::puts("read: symbol= indent-scoped for Python (dict braces ignored)");
+    }
+
+    // ── read symbol= handles C++ raw strings (a `"` or `}` inside R"(…)" must
+    //    not mis-balance the brace scan) ───────────────────────────────
+    {
+        auto cc = (root / "raw.cpp").string();
+        auto wargs = obj();
+        wargs["file_path"] = cc;
+        wargs["content"] =
+            "int f() {\n"                                    // L1
+            "    auto re = R\"(a \" quote and } brace)\";\n"  // L2 traps: quote+brace in raw string
+            "    return 1;\n"                                // L3 must be included
+            "}\n"                                            // L4
+            "int g() { return 2; }\n";                       // L5 must NOT be included
+        call(*provider, "write", wargs);
+
+        auto args = obj();
+        args["path"]   = cc;
+        args["symbol"] = "f";
+        auto rd = call(*provider, "read", args);
+        assert(!rd.is_error);
+        assert(rd.text.find("return 1;") != std::string::npos);   // full body
+        assert(rd.text.find("int g()") == std::string::npos);     // didn't over-capture
+        std::puts("read: symbol= handles C++ raw strings ok");
+    }
+
+    // ── read symbol= resolves signatures with TRAILING specifiers ───────
+    //    (noexcept / const / override / trailing return type). The outline
+    //    def-pattern used to require `)` be followed only by an optional
+    //    `const` then `{`, so `int f() noexcept {` — and every function in
+    //    catalog.hpp — failed to resolve ("no definition of ... found").
+    {
+        auto sp = (root / "specifiers.cpp").string();
+        auto wargs = obj();
+        wargs["file_path"] = sp;
+        wargs["content"] =
+            "#include <string_view>\n"                                   // L1
+            "inline int max_output_tokens_for(std::string_view m) noexcept {\n" // L2 target
+            "    return m.empty() ? 0 : 64000;\n"                        // L3
+            "}\n"                                                        // L4
+            "struct S {\n"                                               // L5
+            "    int value() const noexcept { return v_; }\n"            // L6
+            "    void step() override final {\n"                         // L7 target
+            "        ++v_;\n"                                            // L8
+            "    }\n"                                                    // L9
+            "    int v_ = 0;\n"                                          // L10
+            "};\n"                                                       // L11
+            "auto trailing() -> int {\n"                                 // L12 target
+            "    return 7;\n"                                            // L13
+            "}\n";                                                       // L14
+        call(*provider, "write", wargs);
+
+        auto want = [&](const char* sym, const char* needle) {
+            auto args = obj();
+            args["path"]   = sp;
+            args["symbol"] = sym;
+            auto rd = call(*provider, "read", args);
+            assert(!rd.is_error);
+            assert(rd.text.find("defined at") != std::string::npos);
+            assert(rd.text.find(needle) != std::string::npos);
+        };
+        want("max_output_tokens_for", "return m.empty()");  // noexcept
+        want("step", "++v_;");                              // override final
+        want("trailing", "return 7;");                      // -> trailing return
+        std::puts("read: symbol= resolves noexcept/override/trailing-return sigs");
+    }
+
+    // ── read symbol= on the shapes that failed in real sessions ─────────
+    //    (71 of 73 mined lookups missed before): wrapped parameter lists,
+    //    return type on the line above, Class::method, a CALL of the name
+    //    before its definition, a C++14 digit separator in the signature,
+    //    and a `/*` inside a `//` comment above the definition.
+    {
+        auto sp = (root / "shapes.cpp").string();
+        auto wargs = obj();
+        wargs["file_path"] = sp;
+        wargs["content"] =
+            "// helpers for agents/*.md discovery\n"                         // `/*` in a // comment
+            "int use_it() { return wrapped(1, 2); }\n"                        // call BEFORE def
+            "auth::Header wrapped(int spec,\n"                                // wrapped params
+            "                     int creds) {\n"
+            "    return {spec + creds};\n"
+            "}\n"
+            "std::expected<std::string, Error>\n"                              // return type above
+            "run_git(const std::vector<std::string>& argv,\n"
+            "        std::size_t max_bytes = 30'000) {\n"                     // digit separator
+            "    return argv.front();\n"
+            "}\n"
+            "Panel::Body Panel::measure_body() const {\n"                      // Class::method
+            "    return body_;\n"
+            "}\n";
+        call(*provider, "write", wargs);
+        auto want = [&](const char* sym, const char* needle, const char* not_needle) {
+            auto args = obj();
+            args["path"]   = sp;
+            args["symbol"] = sym;
+            auto rd = call(*provider, "read", args);
+            assert(!rd.is_error);
+            assert(rd.text.find(needle) != std::string::npos);
+            if (not_needle) assert(rd.text.find(not_needle) == std::string::npos);
+        };
+        want("wrapped", "return {spec + creds};", "use_it");   // the def, not the call
+        want("run_git", "return argv.front();", nullptr);
+        want("measure_body", "return body_;", nullptr);
+        want("Panel::measure_body", "return body_;", nullptr);
+        std::puts("read: symbol= resolves wrapped / qualified / call-first shapes");
+    }
+
+    // ── read symbol= falls back to the paired source when the model names
+    //    the header (declaration only) and the body lives in the .cpp.
+    {
+        auto h = (root / "pair.hpp").string();
+        auto c = (root / "pair.cpp").string();
+        auto wh = obj(); wh["file_path"] = h;
+        wh["content"] = "#pragma once\nint paired_fn(int x);\n";
+        call(*provider, "write", wh);
+        auto wc = obj(); wc["file_path"] = c;
+        wc["content"] = "#include \"pair.hpp\"\nint paired_fn(int x) {\n    return x * 3;\n}\n";
+        call(*provider, "write", wc);
+        // The header only declares paired_fn; read symbol= on the header
+        // should land on pair.cpp's body. A name only in a sibling resolves
+        // via the same fallback and says where it went.
+        auto wo = obj(); wo["file_path"] = (root / "other.cpp").string();
+        wo["content"] = "static int sibling_only(int y) {\n    return y + 9;\n}\n";
+        call(*provider, "write", wo);
+        auto args = obj();
+        args["path"] = h;
+        args["symbol"] = "sibling_only";
+        auto rd = call(*provider, "read", args);
+        assert(!rd.is_error);
+        assert(rd.text.find("return y + 9;") != std::string::npos);
+        assert(rd.text.find("other.cpp") != std::string::npos);
+        // Header has only `int paired_fn(int x);` — the body in pair.cpp wins.
+        auto ah = obj(); ah["path"] = h; ah["symbol"] = "paired_fn";
+        auto rh = call(*provider, "read", ah);
+        assert(!rh.is_error);
+        assert(rh.text.find("return x * 3;") != std::string::npos);
+        assert(rh.text.find("only declared") != std::string::npos);
+        std::puts("read: symbol= falls back to paired/sibling files");
     }
 
     // ── edit applies a fuzzy splice and carries a FileChange ─────────────
@@ -167,7 +660,7 @@ int main() {
         std::puts("list_dir: ok");
     }
 
-    // ── workspace boundary refuses outside paths ─────────────────────────
+    // ── workspace boundary refuses outside paths ─────────────────
     {
         auto args = obj(); args["path"] = "/etc/hostname";
         auto esc = call(*provider, "read", args);
@@ -175,7 +668,253 @@ int main() {
         std::puts("workspace boundary: outside path refused");
     }
 
+    // ── read with NEGATIVE offset = tail -n semantics ─────────────────
+    {
+        std::string body;
+        for (int i = 1; i <= 100; ++i)
+            body += "line_" + std::to_string(i) + "\n";
+        (void)util::write_file(test_fs(), root / "tail.log", body);
+        auto args = obj();
+        args["path"]   = (root / "tail.log").string();
+        args["offset"] = -5;
+        auto r = call(*provider, "read", args);
+        assert(!r.is_error);
+        assert(r.text.find("line_96") != std::string::npos);   // first of last 5
+        assert(r.text.find("line_100") != std::string::npos);  // last line
+        assert(r.text.find("line_95\n") == std::string::npos); // bounded
+        // Tail bigger than the file clamps to the whole file.
+        args["offset"] = -5000;
+        auto r2 = call(*provider, "read", args);
+        assert(!r2.is_error);
+        assert(r2.text.find("line_1") != std::string::npos);
+        std::puts("read: negative offset tail ok");
+    }
+
+    // ── read on an IMAGE file returns it as a vision image, not a binary
+    //    refusal. The picture rides the structured-meta channel (read_images);
+    //    the text carries a compact [image …] note for non-vision models. ──
+    {
+        // Minimal but valid PNG header (8-byte signature + a stub IHDR start).
+        // sniff_image_media_type keys on the 8-byte signature only.
+        std::string png;
+        const unsigned char sig[8] = {0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A};
+        png.append(reinterpret_cast<const char*>(sig), 8);
+        png.append("\x00\x00\x00\x0DIHDR", 8);      // length + "IHDR"
+        png.append(64, '\x00');                       // some body bytes
+        (void)util::write_file(test_fs(), root / "pic.png", png);
+
+        auto args = obj();
+        args["path"] = (root / "pic.png").string();
+        auto r = call(*provider, "read", args);
+        assert(!r.is_error);                          // NOT refused as binary
+        assert(r.text.find("[image") != std::string::npos);
+        assert(r.text.find("image/png") != std::string::npos);
+
+        auto imgs = read_images(r);
+        assert(imgs.size() == 1);
+        assert(imgs[0].media_type == "image/png");
+        assert(imgs[0].bytes == png);                 // exact bytes round-trip
+        std::puts("read: image file returns a vision image, not a binary refusal");
+    }
+
+    // A file that is NOT an image still refuses as binary (with the shell hint).
+    {
+        std::string blob(64, '\x00');
+        blob[0] = 'M'; blob[1] = 'Z';                 // DOS/PE header, not an image
+        (void)util::write_file(test_fs(), root / "prog.bin", blob);
+        auto args = obj();
+        args["path"] = (root / "prog.bin").string();
+        auto r = call(*provider, "read", args);
+        assert(r.is_error);
+        assert(r.text.find("binary") != std::string::npos);
+        assert(read_images(r).empty());
+        std::puts("read: non-image binary still refused");
+    }
+
+    // ── read paging: offset WITHOUT a limit returns a FOCUSED window, not
+    //    the whole rest of the file (the "why is every read huge" fix). ──
+    {
+        std::string body;
+        for (int i = 1; i <= 1000; ++i)
+            body += "L" + std::to_string(i) + "\n";
+        (void)util::write_file(test_fs(), root / "big.txt", body);
+        const auto bp = (root / "big.txt").string();
+
+        // offset only, no limit → ~250-line window (not 1000).
+        auto a1 = obj(); a1["path"] = bp; a1["offset"] = 100;
+        auto r1 = call(*provider, "read", a1);
+        assert(!r1.is_error);
+        assert(r1.text.find("L100\n") != std::string::npos);   // window start
+        assert(r1.text.find("L349\n") != std::string::npos);   // 250th line in
+        assert(r1.text.find("L350\n") == std::string::npos);   // window ENDS
+        assert(r1.text.find("651 more") != std::string::npos); // pages onward
+        assert(r1.text.find("offset=350") != std::string::npos);
+
+        // start_line (alias) behaves identically. Use a DIFFERENT start so the
+        // (path,offset,limit) read-cache key doesn't collide with a1 above and
+        // return the "unchanged" sentinel instead of content.
+        auto a1b = obj(); a1b["path"] = bp; a1b["start_line"] = 200;
+        auto r1b = call(*provider, "read", a1b);
+        assert(!r1b.is_error);
+        assert(r1b.text.find("L449\n") != std::string::npos);   // 250th from 200
+        assert(r1b.text.find("L450\n") == std::string::npos);
+
+        // end_line is an END POSITION, not a line count: [120,180] = 61 lines.
+        auto a2 = obj(); a2["path"] = bp; a2["start_line"] = 120; a2["end_line"] = 180;
+        auto r2 = call(*provider, "read", a2);
+        assert(!r2.is_error);
+        assert(r2.text.find("L120\n") != std::string::npos);
+        assert(r2.text.find("L180\n") != std::string::npos);   // inclusive end
+        assert(r2.text.find("L181\n") == std::string::npos);   // stops AT end_line
+        assert(r2.text.find("L119\n") == std::string::npos);
+
+        // An explicit limit still wins verbatim (a real count).
+        auto a3 = obj(); a3["path"] = bp; a3["offset"] = 100; a3["limit"] = 10;
+        auto r3 = call(*provider, "read", a3);
+        assert(!r3.is_error);
+        assert(r3.text.find("L109\n") != std::string::npos);
+        assert(r3.text.find("L110\n") == std::string::npos);
+        std::puts("read: offset-only pages a focused window; end_line is a position");
+    }
+
+    // ── edit regex mode: capture-group rename across the file ─────────
+    {
+        (void)util::write_file(test_fs(), root / "log.c",
+            "void f() {\n"
+            "    log_info(\"a\");\n"
+            "    log_warn(\"b\");\n"
+            "    log_error(\"c\");\n"
+            "    not_log_stay(1);\n"
+            "}\n");
+        auto args = obj();
+        args["path"] = (root / "log.c").string();
+        mcp::Json ed = mcp::Json::array();
+        ed.push_back({{"old_text", "\\blog_(\\w+)\\("},
+                      {"new_text", "logger.$1("},
+                      {"regex", true},
+                      {"replace_all", true}});
+        args["edits"] = ed;
+        auto r = call(*provider, "edit", args);
+        assert(!r.is_error);
+        std::string disk = util::read_file(test_fs(), root / "log.c");
+        assert(disk.find("logger.info(\"a\")") != std::string::npos);
+        assert(disk.find("logger.warn(\"b\")") != std::string::npos);
+        assert(disk.find("logger.error(\"c\")") != std::string::npos);
+        assert(disk.find("not_log_stay(1)") != std::string::npos); // untouched
+        std::puts("edit: regex capture-group rename ok");
+    }
+
+    // ── edit regex: multi-hit without replace_all is refused ──────────
+    {
+        (void)util::write_file(test_fs(), root / "multi.c", "int a = old(1);\nint b = old(2);\n");
+        auto args = obj();
+        args["path"] = (root / "multi.c").string();
+        mcp::Json ed = mcp::Json::array();
+        ed.push_back({{"old_text", "old\\((\\d)\\)"},
+                      {"new_text", "fresh($1)"},
+                      {"regex", true}});
+        args["edits"] = ed;
+        auto r = call(*provider, "edit", args);
+        assert(r.is_error);   // ambiguous without replace_all
+        // With expected_replacements the exact count is enforced + applied.
+        mcp::Json ed2 = mcp::Json::array();
+        ed2.push_back({{"old_text", "old\\((\\d)\\)"},
+                       {"new_text", "fresh($1)"},
+                       {"regex", true},
+                       {"expected_replacements", 2}});
+        args["edits"] = ed2;
+        auto r2 = call(*provider, "edit", args);
+        assert(!r2.is_error);
+        std::string disk = util::read_file(test_fs(), root / "multi.c");
+        assert(disk.find("fresh(1)") != std::string::npos);
+        assert(disk.find("fresh(2)") != std::string::npos);
+        std::puts("edit: regex ambiguity + expected count ok");
+    }
+
+    // ── edit regex: invalid pattern and empty-match pattern are refused ─
+    {
+        auto args = obj();
+        args["path"] = (root / "multi.c").string();
+        mcp::Json ed = mcp::Json::array();
+        ed.push_back({{"old_text", "(unclosed"},
+                      {"new_text", "x"},
+                      {"regex", true}});
+        args["edits"] = ed;
+        auto r = call(*provider, "edit", args);
+        assert(r.is_error);
+        mcp::Json ed2 = mcp::Json::array();
+        ed2.push_back({{"old_text", "z*"},
+                       {"new_text", "x"},
+                       {"regex", true},
+                       {"replace_all", true}});
+        args["edits"] = ed2;
+        auto r2 = call(*provider, "edit", args);
+        assert(r2.is_error);   // empty-match rejected
+        std::puts("edit: regex invalid/empty-match refused ok");
+    }
+
+    // ── edit regex on a CRLF file: matches via LF-normalize, CRLF restored ─
+    {
+        (void)util::write_file(test_fs(), root / "win.c",
+            "int a = legacy(1);\r\nint b = keep(2);\r\n");
+        auto args = obj();
+        args["path"] = (root / "win.c").string();
+        mcp::Json ed = mcp::Json::array();
+        // `legacy\(1\);$` needs the $ anchor — on the raw CRLF buffer the \r
+        // blocks it; the LF-normalized fallback must kick in.
+        ed.push_back({{"old_text", "legacy\\((\\d)\\);$"},
+                      {"new_text", "modern($1);"},
+                      {"regex", true}});
+        args["edits"] = ed;
+        auto r = call(*provider, "edit", args);
+        assert(!r.is_error);
+        std::string disk = util::read_file(test_fs(), root / "win.c");
+        assert(disk.find("modern(1);") != std::string::npos);
+        assert(disk.find("keep(2);\r\n") != std::string::npos);  // CRLF intact
+        std::puts("edit: regex CRLF fallback ok");
+    }
+
+    // ── outline: nested symbol tree with line numbers, no bodies ─────────
+    {
+        (void)util::write_file(test_fs(), root / "shape.py",
+            "import os\n"
+            "\n"
+            "class Widget:\n"
+            "    def __init__(self):\n"
+            "        self.x = 1\n"
+            "    def render(self):\n"
+            "        return self.x\n"
+            "\n"
+            "def top_level():\n"
+            "    return Widget()\n");
+        auto args = obj(); args["path"] = (root / "shape.py").string();
+        auto r = call(*provider, "outline", args);
+        assert(!r.is_error);
+        assert(r.text.find("class Widget") != std::string::npos);
+        assert(r.text.find("def __init__") != std::string::npos);
+        assert(r.text.find("def render") != std::string::npos);
+        assert(r.text.find("def top_level") != std::string::npos);
+        // Bodies excluded — the assignment inside __init__ must NOT appear.
+        assert(r.text.find("self.x = 1") == std::string::npos);
+        // Nesting: the method line is indented deeper than the class line.
+        auto cls = r.text.find("class Widget");
+        auto ren = r.text.find("def render");
+        assert(cls != std::string::npos && ren != std::string::npos && cls < ren);
+        auto lstart = [&](std::size_t p){ auto n = r.text.rfind('\n', p);
+                                          return n == std::string::npos ? 0 : n + 1; };
+        assert((ren - lstart(ren)) > (cls - lstart(cls)));  // render nested under Widget
+        std::puts("outline: nested tree, bodies excluded");
+    }
+
+    // ── outline: file with no defs degrades gracefully ──────────────────
+    {
+        (void)util::write_file(test_fs(), root / "plain.txt", "just\nsome\nprose\n");
+        auto args = obj(); args["path"] = (root / "plain.txt").string();
+        auto r = call(*provider, "outline", args);
+        assert(!r.is_error);
+        assert(r.text.find("no top-level definitions") != std::string::npos);
+        std::puts("outline: no-defs file handled");
+    }
+
     fs::remove_all(root);
-    std::puts("ALL FS TOOL TESTS PASSED");
-    return 0;
 }

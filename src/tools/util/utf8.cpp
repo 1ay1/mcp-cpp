@@ -108,6 +108,16 @@ std::string to_valid_utf8(std::string s) {
 }
 
 std::string strip_terminal_controls(std::string_view in) {
+    // Nothing to strip is the overwhelmingly common case (rg --json, git,
+    // compilers with NO_COLOR): one tight scan, then return a plain copy.
+    auto is_plain = [](unsigned char c) noexcept {
+        return (c >= 0x20 && c != 0x7f) || c == '\t' || c == '\n';
+    };
+    {
+        std::size_t k = 0;
+        while (k < in.size() && is_plain(static_cast<unsigned char>(in[k]))) ++k;
+        if (k == in.size()) return std::string{in};
+    }
     std::string out;
     out.reserve(in.size());
     // Byte offset in `out` where the CURRENT (unterminated) line starts.
@@ -116,6 +126,21 @@ std::string strip_terminal_controls(std::string_view in) {
 
     for (std::size_t i = 0; i < in.size(); ) {
         const unsigned char b = static_cast<unsigned char>(in[i]);
+
+        // Fast path: append the whole run of plain bytes (anything that is
+        // not ESC / CR / BS / other C0 / DEL) in one go. `\n` is plain but
+        // moves line_start, so it ends a run and is handled below.
+        if (b >= 0x20 && b != 0x7f) {
+            std::size_t j = i + 1;
+            while (j < in.size()) {
+                const unsigned char c = static_cast<unsigned char>(in[j]);
+                if (c < 0x20 || c == 0x7f) break;
+                ++j;
+            }
+            out.append(in.data() + i, j - i);
+            i = j;
+            continue;
+        }
 
         if (b == 0x1b) {                               // ESC — classify
             if (i + 1 >= in.size()) break;             // dangling ESC at end: drop

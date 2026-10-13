@@ -5,12 +5,13 @@
 // registration (gated on svc.http), SSRF refusal, HTML→text extraction,
 // the multi-engine search fallback chain, and Net effects.
 
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
 #include <mcp/cap/local.hpp>
 
-#include <cassert>
+#include "agtest.hpp"
 #include <cstdio>
 #include <string>
 
@@ -45,7 +46,7 @@ static HttpResponse html_resp(std::string body) {
     return r;
 }
 
-int main() {
+TEST_CASE("web_tools") {
     auto fake = std::make_shared<FakeHttp>();
 
     // web_fetch: a simple HTML page → cleaned text with the heading + link.
@@ -67,6 +68,8 @@ int main() {
                   "</div>")});
 
     HostServices svc;
+
+    svc.files = std::make_shared<NativeFileSystem>();
     svc.http = fake;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
@@ -146,7 +149,7 @@ int main() {
         auto args = obj(); args["query"] = "test query";
         auto r = call(*provider, "web_search", args);
         assert(!r.is_error);
-        assert(r.text.find("[via Brave]") != std::string::npos);
+        assert(r.text.find("[via Brave Free]") != std::string::npos);
         assert(r.text.find("Result Title") != std::string::npos);
         assert(r.text.find("https://result.test/page") != std::string::npos);
         assert(read_effects(r).has(Effect::Net));
@@ -163,7 +166,4 @@ int main() {
         assert(r.is_error);
         std::puts("web tools: absent without HttpClient");
     }
-
-    std::puts("ALL WEB TOOL TESTS PASSED");
-    return 0;
 }

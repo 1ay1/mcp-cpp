@@ -1,0 +1,3 @@
+# Vendored, generated tree-sitter grammar: not ours, not reviewable, huge.
+third_party/tree-sitter-bash/src/parser.c  linguist-vendored linguist-generated -diff
+third_party/**                             linguist-vendored

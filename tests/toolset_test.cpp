@@ -8,13 +8,14 @@
 //   • effects ride back in the Result meta;
 //   • the host backend receives exactly the parsed request.
 
+#include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/meta.hpp>
 #include <mcp/cap/local.hpp>
 
 #include <algorithm>
-#include <cassert>
+#include "agtest.hpp"
 #include <cstdio>
 #include <map>
 #include <string>
@@ -83,7 +84,7 @@ public:
 
 class FakeSkills : public SkillResolver {
 public:
-    std::optional<std::string> load(const std::string& name, std::string& err) override {
+    std::optional<std::string> load(const Call&, const std::string& name, std::string& err) override {
         if (name == "known") return std::string{"# Known skill body"};
         err = "no such skill"; return std::nullopt;
     }
@@ -109,18 +110,15 @@ public:
 class FakeRunner : public SubagentRunner {
 public:
     bool ok = true;
-    std::string unavailable_reason() const override {
+    std::string unavailable_reason(const Call&) const override {
         return ok ? std::string{} : "test backend is offline";
     }
-    std::string run(const SubagentRequest& r, bool& is_error) override {
+    std::string run(const Call&, const SubagentRequest& r, bool& is_error) override {
         is_error = false; return "report for: " + r.prompt;
     }
 };
 
 int fails = 0;
-void check(bool c, const char* what) {
-    if (!c) { std::fprintf(stderr, "FAIL: %s\n", what); ++fails; }
-}
 
 mcp::cap::Result call(mcp::cap::CapabilityProvider& p, const std::string& tool, mcp::Json args) {
     return p.execute(mcp::cap::Request{tool, std::move(args)});
@@ -128,7 +126,7 @@ mcp::cap::Result call(mcp::cap::CapabilityProvider& p, const std::string& tool, 
 
 } // namespace
 
-int main() {
+TEST_CASE("toolset") {
     // ── backend absent → no memory tools registered ──────────────────────
     {
         HostServices empty;
@@ -141,6 +139,7 @@ int main() {
     // ── backend present → tools registered + driven end to end ───────────
     auto store = std::make_shared<FakeStore>();
     HostServices svc; svc.memory = store;
+    svc.files = std::make_shared<NativeFileSystem>();
     auto p = make_provider(svc);
 
     // remember + forget + wipe_memory all advertised
@@ -291,6 +290,5 @@ int main() {
               "task reports exact unavailability reason");
     }
 
-    if (fails == 0) std::printf("mcp_toolset_test: all checks passed\n");
-    return fails == 0 ? 0 : 1;
+    (void)fails;
 }

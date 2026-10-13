@@ -35,9 +35,9 @@
 //     4. a Write with NO extractable path — unknown blast radius; conflicts
 //        with every other fs-touching call. (Net-only peers still parallelise.)
 //
-//   This is a PURE planner (plan_waves) plus a thin std::async executor
-//   (run / run_on). The planner has no I/O and is unit-testable in isolation;
-//   the executor is opt-in and lives behind the same one-call surface a host
+//   This is a PURE planner (plan_waves) plus a thin runner (run / run_plan)
+//   that takes the caller's Splitter. The planner has no I/O and is unit-testable in isolation;
+//   the runner is opt-in and lives behind the same one-call surface a host
 //   already uses (Registry::dispatch), so adopting it is a one-line change.
 //
 //   Header-only, core layer: it depends only on the cap abstraction and an
@@ -54,7 +54,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -254,47 +253,49 @@ struct Plan {
     return plan_waves(facts);
 }
 
-// ── The executor ────────────────────────────────────────────────────────────
-// Run a batch against any dispatcher, parallelising within each wave via
-// std::async. `dispatch` MUST be safe to call concurrently from multiple
-// threads for the calls the planner placed in the same wave — which, by the
-// conflict model, never touch overlapping fs state and never exec. Returns
-// results 1:1 with `batch` (original order), so the caller treats it exactly
-// like a sequential run.
+// ── The runner ───────────────────────────────────────────────────────────────
+// Run a batch against any dispatcher, one wave after another. Calls within a
+// wave go through `split`, which may run them in parallel: the planner has
+// made sure they never touch overlapping fs state and never exec, so
+// `dispatch` only has to be safe for those. Results come back 1:1 with
+// `batch`, in its order, so the caller treats it like a sequential run.
 //
-// `dispatch` is a std::function<Result(const Request&)> — typically
-// [&reg](const Request& r){ return reg.dispatch(r); }. Kept generic so a host
-// can wrap dispatch with its own per-call instrumentation / permission gate.
+// The library never decides parallelism itself; the default splitter runs
+// the wave in order on the caller's thread.
 using DispatchFn = std::function<Result(const Request&)>;
+using Splitter   = std::function<void(std::size_t n, const std::function<void(std::size_t)>& fn)>;
+
+[[nodiscard]] inline Splitter serial_splitter() {
+    return [](std::size_t n, const std::function<void(std::size_t)>& fn) {
+        for (std::size_t i = 0; i < n; ++i) fn(i);
+    };
+}
 
 [[nodiscard]] inline std::vector<Result>
 run_plan(const std::vector<Request>& batch, const Plan& plan,
-         const DispatchFn& dispatch) {
+         const DispatchFn& dispatch, const Splitter& split = serial_splitter()) {
     std::vector<Result> out(batch.size());
     for (const auto& wave : plan.waves) {
         if (wave.size() == 1) {
-            // Singleton wave: run inline, no thread spin-up cost.
             const std::size_t i = wave[0];
             out[i] = dispatch(batch[i]);
             continue;
         }
-        std::vector<std::future<Result>> futs;
-        futs.reserve(wave.size());
-        for (std::size_t i : wave)
-            futs.push_back(std::async(std::launch::async,
-                [&dispatch, &batch, i] { return dispatch(batch[i]); }));
-        for (std::size_t k = 0; k < wave.size(); ++k)
-            out[wave[k]] = futs[k].get();
+        split(wave.size(), [&](std::size_t k) {
+            const std::size_t i = wave[k];
+            out[i] = dispatch(batch[i]);
+        });
     }
     return out;
 }
 
 // One-call convenience: plan + run against a Registry with a given EffectFn.
 [[nodiscard]] inline std::vector<Result>
-run(Registry& reg, const std::vector<Request>& batch, const EffectFn& fn) {
+run(Registry& reg, const std::vector<Request>& batch, const EffectFn& fn,
+    const Splitter& split = serial_splitter()) {
     Plan plan = plan_waves(batch, fn);
     return run_plan(batch, plan,
-                    [&reg](const Request& r) { return reg.dispatch(r); });
+                    [&reg](const Request& r) { return reg.dispatch(r); }, split);
 }
 
 // Same, defaulting the EffectFn to the standard-annotation reader.

@@ -5,12 +5,12 @@
 // agentty's src/tool/tools/diagnostics.cpp.
 
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 #include "tool_body.hpp"
 
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
-#include <mcp/tools/util/sandbox.hpp>
-#include <mcp/tools/util/subprocess.hpp>
+#include <mcp/tools/util/utf8.hpp>
 #include <mcp/tools/util/error.hpp>
 
 #include <algorithm>
@@ -36,30 +36,27 @@ namespace {
 struct DiagnosticsArgs {
     std::string command;  // empty means auto-detect
     std::string display_description;
-    int timeout_seconds = 120;
 };
 
 enum class BuildSystem { None, CMake, Cargo, Go, Node, Make };
 
-[[nodiscard]] BuildSystem detect_build_system() noexcept {
-    std::error_code ec;
-    const auto root = util::project_root();
-    if (fs::exists(root / "build/build.ninja", ec) || fs::exists(root / "build/Makefile", ec)) return BuildSystem::CMake;
-    if (fs::exists(root / "Cargo.toml", ec))    return BuildSystem::Cargo;
-    if (fs::exists(root / "go.mod", ec))        return BuildSystem::Go;
-    if (fs::exists(root / "package.json", ec))  return BuildSystem::Node;
-    if (fs::exists(root / "Makefile", ec))      return BuildSystem::Make;
+[[nodiscard]] BuildSystem detect_build_system(const FileSystem& files, const fs::path& root) noexcept {
+    if (files.stat(root / "build/build.ninja").exists || files.stat(root / "build/Makefile").exists) return BuildSystem::CMake;
+    if (files.stat(root / "Cargo.toml").exists)    return BuildSystem::Cargo;
+    if (files.stat(root / "go.mod").exists)        return BuildSystem::Go;
+    if (files.stat(root / "package.json").exists)  return BuildSystem::Node;
+    if (files.stat(root / "Makefile").exists)      return BuildSystem::Make;
     return BuildSystem::None;
 }
 
-[[nodiscard]] std::vector<std::string> build_argv_for(BuildSystem bs) {
+[[nodiscard]] std::vector<std::string> build_argv_for(BuildSystem bs, const fs::path& project) {
     // The ACTIVE PROJECT (cwd clamped inside the boundary), not the raw
     // access boundary: under `--workspace /` the boundary is `/`, and
     // `cmake --build /build` / `--manifest-path /Cargo.toml` are wrong.
-    const auto root = util::project_root().string();
+    const auto root = project.string();
     switch (bs) {
-        case BuildSystem::CMake: return {"cmake", "--build", (util::project_root() / "build").string()};
-        case BuildSystem::Cargo: return {"cargo", "check", "--manifest-path", (util::project_root() / "Cargo.toml").string()};
+        case BuildSystem::CMake: return {"cmake", "--build", (project / "build").string()};
+        case BuildSystem::Cargo: return {"cargo", "check", "--manifest-path", (project / "Cargo.toml").string()};
         case BuildSystem::Go:    return {"go", "-C", root, "build", "./..."};
         case BuildSystem::Node:  return {"npm", "--prefix", root, "exec", "--", "tsc", "--noEmit"};
         case BuildSystem::Make:  return {"make", "-C", root, "-n"};
@@ -73,22 +70,57 @@ std::expected<DiagnosticsArgs, ToolError> parse_diagnostics_args(const json& j) 
     return DiagnosticsArgs{
         ar.str("command", ""),
         ar.str("display_description", ""),
-        std::clamp(ar.integer("timeout_seconds", 120), 1, 1800),
     };
 }
 
-ExecResult run_diagnostics(const DiagnosticsArgs& a) {
+// One shape for "run this and give me the bytes", whether the caller has an
+// argv or a command line. The shell is just another program you name.
+[[nodiscard]] RunResult run_via(
+        CallExec& exec, const std::vector<std::string>& argv,
+        std::string_view shell_cmd, std::size_t max_bytes,
+        std::chrono::seconds timeout) {
+    ExecRequest req;
+    if (!argv.empty())
+        req.program = {argv.front(), {argv.begin() + 1, argv.end()}};
+    else
+#ifdef _WIN32
+        req.program = {"cmd.exe", {"/c", std::string{shell_cmd}}};
+#else
+        req.program = {"/bin/sh", {"-c", std::string{shell_cmd}}};
+#endif
+    req.budgets.idle     = timeout;
+    req.max_output_bytes = max_bytes;
+    const auto res = exec.run(req);
+
+    RunResult out;
+    out.output    = util::strip_terminal_controls(res.output);
+    out.truncated = res.truncated;
+    std::visit([&]<class T>(const T& o) {
+        if constexpr (std::is_same_v<T, Exited>)         out.exit_code = o.code;
+        else if constexpr (std::is_same_v<T, Signalled>) out.exit_code = 128 + o.signal;
+        else if constexpr (std::is_same_v<T, StartFailed>) {
+            out.started = false; out.start_error = o.reason;
+        } else if constexpr (std::is_same_v<T, Cancelled>) out.exit_code = 130;
+        else if constexpr (std::is_same_v<T, StoppedEarly>) { /* enough */ }
+        else {
+            static_assert(std::is_same_v<T, TimedOut>, "unhandled ExecOutcome arm");
+            out.timed_out = true;
+        }
+    }, res.outcome);
+    return out;
+}
+
+ExecResult run_diagnostics(const Call& call, const DiagnosticsArgs& a, CallExec& exec) {
     std::vector<std::string> auto_argv;
     if (a.command.empty()) {
-        auto_argv = build_argv_for(detect_build_system());
+        const auto project = util::project_root(bounds(call));
+        auto_argv = build_argv_for(detect_build_system(call.fs(), project), project);
         if (auto_argv.empty())
             return std::unexpected(ToolError::not_found("no build system detected; pass a command"));
     }
-    const auto timeout = std::chrono::seconds{a.timeout_seconds};
-    auto sub = auto_argv.empty()
-        ? util::sandbox::run_shell_command(a.command, /*max_bytes*/100'000, timeout)
-        : util::sandbox::run_argv(auto_argv, /*max_bytes*/100'000, timeout);
-    auto output = util::legacy_format(sub, timeout);
+    auto sub = run_via(exec, auto_argv, a.command, /*max_bytes*/100'000,
+                       std::chrono::seconds{120});
+    auto output = format_run(sub, std::chrono::seconds{120});
     if (output.empty()) return ToolOutput{"no diagnostics (clean build)", std::nullopt};
 
     int errors = 0, warnings = 0;
@@ -115,7 +147,15 @@ ExecResult run_diagnostics(const DiagnosticsArgs& a) {
 
     std::ostringstream result;
     if (errors > 0 || warnings > 0) {
-        result << "\xe2\x9d\x8c " << errors << " error(s), " << warnings << " warning(s)\n\n";
+        // Status glyph reflects severity: warnings alone don't mean the build
+        // failed, so don't cry ❌ for a clean-but-noisy compile.
+        const char* glyph = errors > 0 ? "\xe2\x9d\x8c"          // ❌
+                                       : "\xe2\x9a\xa0\xef\xb8\x8f"; // ⚠️
+        result << glyph << " " << errors << " error(s), "
+               << warnings << " warning(s)";
+        if (errors == 0)
+            result << " — built OK, warnings only";
+        result << "\n\n";
         if (!error_lines.empty()) {
             result << "First errors:\n";
             for (const auto& el : error_lines) {
@@ -150,17 +190,17 @@ std::expected<TestArgs, ToolError> parse_test_args(const json& j) {
     };
 }
 
-std::vector<std::string> test_argv_for(BuildSystem bs, const TestArgs& a) {
+std::vector<std::string> test_argv_for(BuildSystem bs, const TestArgs& a, const fs::path& project) {
     std::vector<std::string> argv;
-    const auto root = util::project_root().string();
+    const auto root = project.string();
     switch (bs) {
         case BuildSystem::CMake:
-            argv = {"ctest", "--test-dir", (util::project_root() / "build").string(), "--output-on-failure"};
+            argv = {"ctest", "--test-dir", (project / "build").string(), "--output-on-failure"};
             if (!a.filter.empty()) argv.insert(argv.end(), {"-R", a.filter});
             if (a.repeat > 1) argv.insert(argv.end(), {"--repeat", "until-fail:" + std::to_string(a.repeat)});
             break;
         case BuildSystem::Cargo:
-            argv = {"cargo", "test", "--manifest-path", (util::project_root() / "Cargo.toml").string()};
+            argv = {"cargo", "test", "--manifest-path", (project / "Cargo.toml").string()};
             if (!a.filter.empty()) argv.push_back(a.filter);
             break;
         case BuildSystem::Go:
@@ -181,9 +221,44 @@ std::vector<std::string> test_argv_for(BuildSystem bs, const TestArgs& a) {
     return argv;
 }
 
-ExecResult run_tests(const TestArgs& a) {
-    const auto bs = a.command.empty() ? detect_build_system() : BuildSystem::None;
-    auto argv = a.command.empty() ? test_argv_for(bs, a)
+// On a failing test run, pull the lines that name a failing test so the model
+// sees WHICH test broke before the full log. Covers the common runners:
+// CTest ("***Failed" / "(Failed)"), Cargo/rustc ("test x ... FAILED"),
+// Go ("--- FAIL:"), GoogleTest ("[  FAILED  ]"), and jest/mocha ("✕"/"✗").
+// Deduped, order-preserving, capped.
+std::vector<std::string> failing_test_lines(std::string_view output,
+                                            std::size_t max_lines = 15) {
+    static constexpr std::string_view kMarkers[] = {
+        "--- FAIL", "[  FAILED  ]", "***Failed", "***Not Run", "(Failed)",
+        "assertion failed", "panicked at", "\xe2\x9c\x95", "\xe2\x9c\x97",
+        "AssertionError", "... FAILED", "not ok ",
+    };
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    while (pos < output.size() && out.size() < max_lines) {
+        std::size_t eol = output.find('\n', pos);
+        if (eol == std::string_view::npos) eol = output.size();
+        std::string_view line{output.data() + pos, eol - pos};
+        for (auto m : kMarkers) {
+            if (line.find(m) != std::string_view::npos) {
+                std::string_view t = line;
+                while (!t.empty() && (t.front() == ' ' || t.front() == '\t'))
+                    t.remove_prefix(1);
+                if (!t.empty()
+                    && std::find(out.begin(), out.end(), std::string{t}) == out.end())
+                    out.emplace_back(t);
+                break;
+            }
+        }
+        pos = eol + 1;
+    }
+    return out;
+}
+
+ExecResult run_tests(const Call& call, const TestArgs& a, CallExec& exec) {
+    const auto project = util::project_root(bounds(call));
+    const auto bs = a.command.empty() ? detect_build_system(call.fs(), project) : BuildSystem::None;
+    auto argv = a.command.empty() ? test_argv_for(bs, a, project)
                                   : std::vector<std::string>{};
     if (a.command.empty() && argv.empty())
         return std::unexpected(ToolError::not_found(
@@ -198,17 +273,16 @@ ExecResult run_tests(const TestArgs& a) {
     const bool native_repeat = (bs == BuildSystem::CMake || bs == BuildSystem::Go);
     const int loops = (a.repeat > 1 && !native_repeat) ? a.repeat : 1;
 
-    util::SubprocessResult sub;
+    RunResult sub;
     int run_no = 0;
     for (; run_no < loops; ++run_no) {
-        sub = a.command.empty()
-            ? util::sandbox::run_argv(argv, 200'000, timeout)
-            : util::sandbox::run_shell_command(a.command, 200'000, timeout);
+        sub = run_via(exec, a.command.empty() ? argv : std::vector<std::string>{},
+                      a.command, 200'000, timeout);
         if (sub.exit_code != 0 || sub.timed_out) break;
     }
     const int runs_done = std::min(run_no + 1, loops);
 
-    std::string output = util::legacy_format(sub, timeout);
+    std::string output = format_run(sub, timeout);
     std::ostringstream summary;
     summary << (sub.exit_code == 0 && !sub.timed_out ? "PASS" : "FAIL")
             << " exit=" << sub.exit_code;
@@ -217,6 +291,17 @@ ExecResult run_tests(const TestArgs& a) {
         summary << " (run " << runs_done << "/" << loops
                 << (sub.exit_code == 0 && !sub.timed_out ? " all passed" : " — stopped on failure") << ")";
     summary << '\n';
+    // On failure, lead with a digest of the failing-test lines so the model
+    // sees WHICH tests broke without scanning the whole runner log.
+    if ((sub.exit_code != 0 || sub.timed_out) && !output.empty()) {
+        auto fails = failing_test_lines(output);
+        if (!fails.empty()) {
+            summary << "\xe2\x9d\x8c Failing test"
+                    << (fails.size() == 1 ? "" : "s") << ":\n";
+            for (const auto& f : fails) summary << "  " << f << "\n";
+            summary << '\n';
+        }
+    }
     if (!output.empty()) summary << output;
     return ToolOutput{summary.str(), std::nullopt};
 }
@@ -239,31 +324,30 @@ json diagnostics_schema() {
                 {"description","One-line summary shown in the UI. Optional."}}},
             {"command", {{"type","string"}, {"description",
                 "Custom build command. If omitted, auto-detects."}}},
-            {"timeout_seconds", {{"type","integer"}, {"minimum",1}, {"maximum",1800}, {"default",120},
-                {"description","Kill the build/lint after this many seconds (default 120). Raise it for a large project whose build exceeds 2 minutes."}}},
         }},
     };
 }
 
 } // namespace
 
-void register_diagnostics_tool(Shells& sh) {
+void register_diagnostics_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
+    if (!exec) return;
+
     sh.add("diagnostics",
         "Run the project's build or lint command and return errors/warnings. "
-        "Auto-detects build system (CMake, cargo, go, npm, make). Runs to "
-        "completion in ONE call (blocks up to timeout_seconds); raise "
-        "timeout_seconds for a slow build instead of getting a spurious timeout.",
+        "Auto-detects build system (CMake, cargo, go, npm, make).",
         diagnostics_schema(), EffectSet{Effect::Exec},
-        body<DiagnosticsArgs>(run_diagnostics, parse_diagnostics_args), 30'000);
+        body_with<DiagnosticsArgs>([exec](const Call& c, const DiagnosticsArgs& a) { CallExec ce{*exec, c}; return run_diagnostics(c, a, ce); }, parse_diagnostics_args), 30'000);
 }
 
-void register_test_tool(Shells& sh) {
+void register_test_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
+    if (!exec) return;
+
     sh.add("test",
         "Run focused project tests with structured pass/fail status, live output, filtering, repetition, and timeout. "
-        "Runs to completion in ONE call (blocks up to timeout_seconds, default 120, max 1800) — raise timeout_seconds for a long suite instead of getting a spurious timeout. "
         "Auto-detects CTest, Cargo, Go, npm, or Make; pass command for custom runners.",
         test_schema(), EffectSet{Effect::Exec},
-        body<TestArgs>(run_tests, parse_test_args), 40'000);
+        body_with<TestArgs>([exec](const Call& c, const TestArgs& a) { CallExec ce{*exec, c}; return run_tests(c, a, ce); }, parse_test_args), 40'000);
 }
 
 } // namespace mcp::tools::detail

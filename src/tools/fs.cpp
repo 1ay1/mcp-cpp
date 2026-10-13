@@ -6,10 +6,12 @@
 // FileChange (write) is carried via the detail::lower() meta bridge.
 
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 #include "tool_body.hpp"
 
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
+#include <mcp/tools/util/utf8.hpp>
 #include <mcp/tools/util/error.hpp>
 
 #include <algorithm>
@@ -18,7 +20,6 @@
 #include <expected>
 #include <filesystem>
 #include <format>
-#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -46,30 +47,70 @@ namespace {
 //  read
 // ─────────────────────────────────────────────────────────────────────────
 
-struct ReadCacheKey {
-    std::string canonical_path;
-    int offset = 1;
-    int limit  = 2000;
-    bool operator==(const ReadCacheKey&) const noexcept = default;
-};
-struct ReadCacheKeyHash {
-    [[nodiscard]] std::size_t operator()(const ReadCacheKey& k) const noexcept {
-        std::size_t h = std::hash<std::string>{}(k.canonical_path);
-        h = h * 31u + static_cast<std::size_t>(k.offset);
-        h = h * 31u + static_cast<std::size_t>(k.limit);
-        return h;
-    }
-};
-struct ReadCache {
-    std::mutex mu;
-    std::unordered_map<ReadCacheKey, fs::file_time_type, ReadCacheKeyHash> seen;
-};
-[[nodiscard]] ReadCache& read_cache() {
-    static ReadCache c;
-    return c;
+// `read`'s memory: what the caller still HAS, per (reader, file). It lives
+// in the tool state (ToolState::reads) so the host owns it.
+//
+// mtime alone is not enough: the sentinel says "refer to the earlier
+// tool_result", which is a lie unless that result is still in the
+// conversation AND covered the range now being asked for. agentty collapses
+// every read of a file except the most recent one, and a cache that refused
+// any repeat of a range it had ever served pointed callers at bytes that
+// existed nowhere. So mirror supersession: ONE live range per file,
+// overwritten on every read. A repeat is answered from the entry only when
+// it asks for the same mtime AND a range the live entry actually covers.
+//
+// The reader is part of the key: a fresh subagent must not be told it
+// already has a file its parent read.
+using ReadCacheEntry = state::ReadSeen;
+
+// Does the range still in context contain the range being asked for?
+//
+// Conservative on purpose: anything we cannot prove is covered gets served.
+// A wrong "yes" is unrecoverable (the caller is told to look at bytes that
+// do not exist), a wrong "no" costs one re-read. That asymmetry decides
+// every ambiguous case here.
+//
+// A NEGATIVE offset is a tail request ("last N lines"), which resolves
+// against the line count and cannot be compared without reading the file.
+// Never refuse one.
+//
+// `total_lines` is the file's real length, used for one case the range
+// arithmetic alone gets wrong: a request starting past EOF. The earlier
+// whole-file read technically "covers" line 1000 of a 3-line file, but the
+// caller asking for it has made a mistake and needs the diagnostic
+// ("offset 1000 is past the end of the file, which has 3 lines"), not a
+// pointer back to a result that cannot answer them. Pass 0 when unknown.
+[[nodiscard]] inline bool covers(const ReadCacheEntry& e,
+                                int want_offset, int want_limit,
+                                int total_lines = 0) noexcept {
+    if (want_offset < 0 || e.offset < 0) return false;   // tail: always serve
+    if (total_lines > 0 && want_offset > total_lines)
+        return false;                                    // past EOF: diagnose
+    if (e.limit <= 0) return true;                       // held the whole file
+    if (want_limit <= 0) return false;                   // wants whole, held part
+    const long long have_lo = e.offset;
+    const long long have_hi = have_lo + e.limit - 1;
+    const long long want_lo = want_offset;
+    const long long want_hi = want_lo + want_limit - 1;
+    return want_lo >= have_lo && want_hi <= have_hi;
 }
 
+
 constexpr std::size_t kAutoOutlineSize = 32 * 1024;
+
+// How much to reserve for a windowed read's output.
+//
+// Not the file size: a 250-line window of a 900 KiB file emits a few KiB, so
+// reserving the whole file is a large allocation to hold a small answer.
+// Guess ~120 bytes per requested line (generous for source; long-line files
+// just grow the string a few times), clamped so a huge `limit` cannot ask
+// for more than the file could possibly contain.
+[[nodiscard]] inline std::size_t N_reserve_hint(std::size_t file_size,
+                                               int limit) noexcept {
+    if (limit <= 0) return file_size;
+    const std::size_t guess = static_cast<std::size_t>(limit) * 120u;
+    return guess < file_size ? guess : file_size;
+}
 
 [[nodiscard]] inline const std::regex& outline_pattern() {
     static const std::regex re(
@@ -81,9 +122,81 @@ constexpr std::size_t kAutoOutlineSize = 32 * 1024;
         R"(function|module|component|service|directive)\b[^=]*)|)"
         R"((?:const|let|var)\s+\w+\s*(?:=|:)|)"
         R"(\w+\s*=\s*(?:async\s+)?(?:function|\([^)]*\)\s*=>)|)"
-        R"((?:[\w:~<>\[\]&*\s,]+\s+)?\w+\s*\([^)]*\)\s*(?:const\s*)?\{?\s*$))",
+        R"((?:[\w:~<>\[\]&*\s,]+\s+)?\w+\s*\([^)]*\))"
+        R"((?:\s*(?:const|noexcept(?:\s*\([^)]*\))?|override|final|mutable|)"
+        R"(=\s*(?:default|delete|0)|->\s*[\w:~<>\[\]&*\s,]+))*)"
+        R"(\s*\{?\s*$))",
         std::regex::ECMAScript | std::regex::optimize);
     return re;
+}
+
+// Cheap NECESSARY condition for "this line could be a definition".
+//
+// std::regex is a backtracker and running it per line is the whole cost of
+// outline: measured 17–26 MB/s, ~50x off memory bandwidth, and it runs on
+// every read of a file over 32 KiB. Most lines cannot possibly match, so
+// rejecting those without entering the engine is most of the win.
+//
+// WHAT CANNOT MATCH: the pattern's alternatives all begin, after the
+// `^(\s*)` indent, with either `#` (markdown heading) or a character that
+// can open an identifier / type expression. The C++-signature alternative
+// is `(?:[\w:~<>\[\]&*\s,]+\s+)?\w+\s*\(`, whose optional leading class
+// admits `[`, `]`, `&`, `*`, `<`, `>`, `:`, `,` — so those must pass too.
+//
+// This list is NOT guesswork: a differential run over 2,194,256 lines of
+// this tree (8,743 files, 161,970 real matches) is what produced it, and
+// it is exact — zero true matches dropped. Two rounds were needed:
+//   * letters/_/#/@/~ only          → dropped 3,424 (every `[[nodiscard]]`)
+//   * adding []&*<>:,               → dropped 8 (`59 lines (37 sloc)`,
+//                                      digit-led, matched as a signature)
+// Hence digits too. If you touch this, RE-RUN that differential: a
+// prefilter that drops a match makes definitions silently vanish from
+// outlines, and nothing downstream can tell.
+[[nodiscard]] inline bool outline_plausible(std::string_view line) noexcept {
+    // A definition never sits on a line this long; a minified or generated
+    // line does, and the backtracking regex would spend seconds on it.
+    if (line.size() > 4096) return false;
+    std::size_t k = 0;
+    while (k < line.size() && (line[k] == ' ' || line[k] == '\t')) ++k;
+    if (k >= line.size()) return false;
+    const unsigned char c = static_cast<unsigned char>(line[k]);
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+        || (c >= '0' && c <= '9')) return true;
+    switch (c) {
+        case '_': case '#': case '@': case '~':   // ident / heading / attr
+        case '[': case ']':                       // [[nodiscard]], subscripts
+        case '&': case '*':                       // ref / pointer returns
+        case '<': case '>': case ':': case ',':   // template + qualified types
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Does `line` look like a definition? Same answer as running outline_pattern
+// on the whole line, but the leading indent is skipped first. The pattern
+// starts with `^(\s*)` and every alternative after it also allows leading
+// space via `\s+` / `[\w\s...]` classes, so std::regex (a backtracker) tried
+// every split of the indent between those — quadratic in the indent. A deeply
+// indented continuation line cost ~2 ms each. Checked identical on 381k lines
+// of C++/Rust/TS/Python/Markdown; ~12x faster in total.
+[[nodiscard]] inline bool outline_line_matches(std::string_view line) {
+    if (!outline_plausible(line)) return false;
+    std::size_t k = 0;
+    while (k < line.size() && (line[k] == ' ' || line[k] == '\t')) ++k;
+    return std::regex_search(line.data() + k, line.data() + line.size(),
+                             outline_pattern());
+}
+
+// Whole-line variant (regex_match semantics) for the callers that used it.
+// Same indent skip; `^(\s*)` accepts the empty indent, so matching the
+// de-indented tail as a whole is the same as matching the full line.
+[[nodiscard]] inline bool outline_line_is_def(std::string_view line) {
+    if (!outline_plausible(line)) return false;
+    std::size_t k = 0;
+    while (k < line.size() && (line[k] == ' ' || line[k] == '\t')) ++k;
+    return std::regex_match(line.data() + k, line.data() + line.size(),
+                            outline_pattern());
 }
 
 [[nodiscard]] std::string render_outline(std::string_view content) {
@@ -118,8 +231,7 @@ constexpr std::size_t kAutoOutlineSize = 32 * 1024;
                 bool maybe = (c0 != '}' && c0 != ')' && c0 != ']'
                               && c0 != ';' && c0 != '/');
                 if (maybe) {
-                    std::cmatch m;
-                    if (std::regex_match(line.data(), line.data() + line.size(), m, re))
+                    if (outline_line_is_def(line))
                         emit_line(line);
                 }
             }
@@ -134,70 +246,806 @@ constexpr std::size_t kAutoOutlineSize = 32 * 1024;
     return out;
 }
 
+// Find the 1-based line where `symbol` is DEFINED, or -1.
+//
+// The old matcher required the whole definition to fit on ONE line that the
+// outline regex accepts. Real C++ signatures usually wrap:
+//     auth::AuthHeader resolve_auth_for(std::string_view spec,
+//                                       const auth::AuthHeader& creds) {
+// so `read symbol=` missed 71 of 73 real lookups mined from saved sessions.
+//
+// Here a line is a candidate when the symbol appears as a whole word (or as
+// the tail of a `Qualified::name`, so `Runtime::render` and `render` both
+// work) and is not inside a comment. What follows the name decides:
+//   name(...) <quals> {        → definition with a body   (best)
+//   name(...) <quals> ;        → declaration              (fallback)
+//   class|struct|enum|... name → type definition
+//   using name = / name = ...  → alias / variable / lambda
+// The `(...)` group may span lines; parentheses are balanced across lines,
+// skipping string and char literals. Calls are rejected because a call
+// site's `(...)` is followed by `;` `,` `)` `.` `->` or an operator, and
+// its line also has code BEFORE the name that is not a type (e.g. `return`,
+// `=`, `(`).
+[[nodiscard]] static int find_definition_line(
+        const std::vector<std::string_view>& lines, std::string_view symbol,
+        bool* decl_only = nullptr) {
+    if (decl_only) *decl_only = false;
+    if (symbol.empty()) return -1;
+    const int n = static_cast<int>(lines.size());
+    auto is_ident = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    };
+    // Leaf name + optional qualifier the caller asked for (`A::b` → "b", "A::").
+    std::string_view leaf = symbol, qual;
+    if (auto p = symbol.rfind("::"); p != std::string_view::npos) {
+        leaf = symbol.substr(p + 2);
+        qual = symbol.substr(0, p + 2);
+    } else if (auto d = symbol.rfind('.'); d != std::string_view::npos) {
+        leaf = symbol.substr(d + 1);   // Python / JS `Class.method`
+    }
+    if (leaf.empty()) return -1;
+
+    // Strip // and # comments and blank out string literal contents so a name
+    // mentioned in a comment or a string is never taken as a definition.
+    auto code_of = [](std::string_view s) {
+        std::string out{s};
+        bool in_str = false; char q = 0;
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            char c = out[i];
+            if (in_str) {
+                if (c == '\\') { out[i] = ' '; if (i + 1 < out.size()) out[++i] = ' '; continue; }
+                if (c == q) { in_str = false; continue; }
+                out[i] = ' ';
+                continue;
+            }
+            if (c == '"' || c == '`') { in_str = true; q = c; continue; }
+            if (c == '\'') {
+                // C++14 digit separator (30'000) — not a char literal.
+                if (i > 0 && std::isxdigit(static_cast<unsigned char>(out[i - 1]))
+                    && i + 1 < out.size()
+                    && std::isxdigit(static_cast<unsigned char>(out[i + 1])))
+                    continue;
+                in_str = true; q = c; continue;
+            }
+            if (c == '/' && i + 1 < out.size() && out[i + 1] == '/') { out.resize(i); break; }
+            if (c == '/' && i + 1 < out.size() && out[i + 1] == '*') {
+                auto e = out.find("*/", i + 2);
+                std::size_t stop = e == std::string::npos ? out.size() : e + 2;
+                for (std::size_t k = i; k < stop; ++k) out[k] = ' ';
+                i = stop - 1;
+                continue;
+            }
+        }
+        return out;
+    };
+    // Lines inside /* ... */ blocks that span lines. Scan the real code of
+    // each line (a `/*` inside a `//` comment or a string literal — e.g.
+    // `// agents/*.md` — must NOT open a block).
+    std::vector<char> in_block(static_cast<std::size_t>(n), 0);
+    {
+        bool open = false;
+        for (int i = 0; i < n; ++i) {
+            std::string_view s = lines[i];
+            std::size_t k = 0;
+            if (open) {
+                auto e = s.find("*/");
+                if (e == std::string_view::npos) { in_block[i] = 1; continue; }
+                open = false;
+                if (s.find_first_not_of(" \t*/", e + 2) == std::string_view::npos)
+                    in_block[i] = 1;
+                k = e + 2;
+            }
+            // Walk the rest honouring strings and `//`.
+            bool in_str = false; char q = 0;
+            for (; k < s.size(); ++k) {
+                char c = s[k];
+                if (in_str) {
+                    if (c == '\\') { ++k; continue; }
+                    if (c == q) in_str = false;
+                    continue;
+                }
+                if (c == '"') { in_str = true; q = c; continue; }
+                if (c == '\'') {
+                    if (k > 0 && std::isxdigit(static_cast<unsigned char>(s[k - 1]))
+                        && k + 1 < s.size()
+                        && std::isxdigit(static_cast<unsigned char>(s[k + 1])))
+                        continue;               // digit separator
+                    in_str = true; q = c; continue;
+                }
+                if (c == '/' && k + 1 < s.size() && s[k + 1] == '/') break;
+                if (c == '/' && k + 1 < s.size() && s[k + 1] == '*') {
+                    auto e = s.find("*/", k + 2);
+                    if (e == std::string_view::npos) {
+                        if (s.find_first_not_of(" \t") == k) in_block[i] = 1;
+                        open = true;
+                        break;
+                    }
+                    k = e + 1;
+                }
+            }
+        }
+    }
+
+    // Keywords that, sitting right before the name, make it a type definition.
+    static constexpr std::string_view kTypeKw[] = {
+        "class", "struct", "enum", "union", "namespace", "concept",
+        "interface", "trait", "impl", "type", "typedef", "def", "fn",
+        "func", "function", "module", "mod", "record", "object",
+    };
+    // Tokens that, right before the name, mean it's an expression (a call,
+    // a use) and not a declarator.
+    static constexpr std::string_view kExprKw[] = {
+        "return", "co_return", "co_await", "throw", "case", "new",
+        "delete", "sizeof", "decltype", "if", "while", "for", "switch",
+        "await", "yield", "not", "and", "or", "in", "is", "else", "do",
+    };
+
+    // Scan forward from (line i, col c) across lines, balancing (), until the
+    // closing paren of the group that starts at c. Returns {line, col-after}.
+    auto close_parens = [&](int i, std::size_t c) -> std::pair<int, std::size_t> {
+        int depth = 0;
+        for (int li = i; li < n && li < i + 40; ++li) {
+            const std::string code = code_of(lines[li]);
+            for (std::size_t k = (li == i ? c : 0); k < code.size(); ++k) {
+                if (code[k] == '(') ++depth;
+                else if (code[k] == ')' && --depth == 0) return {li, k + 1};
+            }
+        }
+        return {-1, 0};
+    };
+    // First significant character after (line, col), skipping blank space,
+    // trailing qualifiers (const, noexcept(...), override, -> Ret, etc.).
+    auto after_signature = [&](int li, std::size_t col) -> char {
+        for (int l = li; l < n && l < li + 8; ++l) {
+            const std::string code = code_of(lines[l]);
+            std::size_t k = (l == li ? col : 0);
+            while (k < code.size()) {
+                char ch = code[k];
+                if (ch == ' ' || ch == '\t') { ++k; continue; }
+                if (is_ident(ch)) {                     // const / noexcept / override / final / mutable / throws
+                    std::size_t e = k;
+                    while (e < code.size() && (is_ident(code[e]) || code[e] == ':')) ++e;
+                    std::string_view w{code.data() + k, e - k};
+                    if (w == "const" || w == "noexcept" || w == "override" || w == "final"
+                        || w == "mutable" || w == "volatile" || w == "throws"
+                        || w == "try" || w == "requires" || w == "where" || w == "async") {
+                        k = e;
+                        if (k < code.size() && code[k] == '(') {    // noexcept(...) / requires(...)
+                            int d = 0;
+                            for (; k < code.size(); ++k) {
+                                if (code[k] == '(') ++d;
+                                else if (code[k] == ')' && --d == 0) { ++k; break; }
+                            }
+                        }
+                        continue;
+                    }
+                    return 'w';                              // some other word: e.g. `-> Ret` body, K&R
+                }
+                if (ch == '-' && k + 1 < code.size() && code[k + 1] == '>') {   // trailing return type
+                    k += 2;
+                    while (k < code.size() && code[k] != '{' && code[k] != ';' && code[k] != '=') ++k;
+                    continue;
+                }
+                if (ch == '&' ) { ++k; continue; }           // ref-qualifier
+                if (ch == '[' && k + 1 < code.size() && code[k + 1] == '[') {  // attribute
+                    auto e = code.find("]]", k);
+                    k = e == std::string::npos ? code.size() : e + 2;
+                    continue;
+                }
+                return ch;
+            }
+        }
+        return 0;
+    };
+
+    int best_body = -1, best_type = -1, best_decl = -1, best_assign = -1;
+    for (int i = 0; i < n; ++i) {
+        if (in_block[i]) continue;
+        std::string_view raw = lines[i];
+        auto lead = raw.find_first_not_of(" \t");
+        if (lead == std::string_view::npos) continue;
+        if (raw.substr(lead).starts_with("*") || raw.substr(lead).starts_with("///")) continue;
+        const std::string code = code_of(raw);
+        for (std::size_t pos = code.find(leaf); pos != std::string::npos;
+             pos = code.find(leaf, pos + 1)) {
+            const std::size_t end = pos + leaf.size();
+            if (pos > 0 && is_ident(code[pos - 1])) continue;
+            if (end < code.size() && is_ident(code[end])) continue;
+            // Qualifier the caller gave must match what precedes the name.
+            std::size_t name_start = pos;
+            while (name_start >= 2 && code[name_start - 1] == ':' && code[name_start - 2] == ':') {
+                std::size_t q = name_start - 2;
+                while (q > 0 && (is_ident(code[q - 1]) || code[q - 1] == '<' || code[q - 1] == '>')) --q;
+                name_start = q;
+            }
+            if (!qual.empty()) {
+                std::string_view have{code.data() + name_start, pos - name_start};
+                if (!have.ends_with(qual)) continue;
+            }
+            // What sits before the (qualified) name on this line.
+            std::string_view before{code.data(), name_start};
+            while (!before.empty() && (before.back() == ' ' || before.back() == '\t')) before.remove_suffix(1);
+            std::string_view prev_word;
+            {
+                std::size_t e = before.size(), b = e;
+                while (b > 0 && is_ident(before[b - 1])) --b;
+                prev_word = before.substr(b, e - b);
+            }
+            const char prev_ch = before.empty() ? 0 : before.back();
+            bool type_kw = false;
+            for (auto k : kTypeKw) if (prev_word == k) type_kw = true;
+            bool expr_ctx = false;
+            for (auto k : kExprKw) if (prev_word == k) expr_ctx = true;
+            if (prev_ch == '.' || (prev_ch == '>' && before.size() >= 2 && before[before.size() - 2] == '-'))
+                expr_ctx = true;                          // obj.name / ptr->name
+            if (prev_ch == '=' || prev_ch == '(' || prev_ch == ',' || prev_ch == '!'
+                || prev_ch == '+' || prev_ch == '|' || prev_ch == '?' || prev_ch == '{'
+                || prev_ch == '[' || prev_ch == ';')
+                expr_ctx = true;
+            // Skip `name` used as a macro argument etc.
+            std::size_t k = end;
+            while (k < code.size() && (code[k] == ' ' || code[k] == '\t')) ++k;
+            // Template args right after the name: name<T>(...)
+            if (k < code.size() && code[k] == '<' && !type_kw) {
+                int d = 0; std::size_t t = k;
+                for (; t < code.size(); ++t) {
+                    if (code[t] == '<') ++d;
+                    else if (code[t] == '>' && --d == 0) { ++t; break; }
+                }
+                k = t;
+                while (k < code.size() && (code[k] == ' ' || code[k] == '\t')) ++k;
+            }
+
+            if (type_kw) {
+                if (best_type < 0) best_type = i + 1;
+                break;
+            }
+            if (prev_word == "using" || prev_word == "alias") {
+                if (best_type < 0) best_type = i + 1;
+                break;
+            }
+            if (expr_ctx) continue;
+
+            if (k < code.size() && code[k] == '(') {
+                // Something must precede a C-family definition's name (a
+                // return type / qualifier) unless it's a constructor-ish
+                // `Class::name(` or a line-leading K&R / Go-style name.
+                const bool has_decl_prefix = !before.empty() || name_start != pos
+                                             || name_start == lead;
+                if (!has_decl_prefix) continue;
+                auto [cl, cc] = close_parens(i, k);
+                if (cl < 0) continue;
+                const char nx = after_signature(cl, cc);
+                if (nx == '{' || nx == ':' ) {          // body, ctor init list, or Python `def f(...):`
+                    if (best_body < 0) best_body = i + 1;
+                    break;
+                }
+                if (nx == '=') {                        // = default / = delete / = 0 / => expr
+                    if (best_body < 0) best_body = i + 1;
+                    break;
+                }
+                if (nx == ';') {
+                    if (!before.empty() && best_decl < 0) best_decl = i + 1;
+                    break;
+                }
+                if (nx == 'w' && !before.empty()) {     // `-> Ret {` split oddly, K&R
+                    if (best_decl < 0) best_decl = i + 1;
+                    break;
+                }
+                continue;
+            }
+            // `name = ...` / `name := ...` / `name: Type =` (vars, consts,
+            // JS arrow functions, lambdas, Python assignments).
+            if (k < code.size() && (code[k] == '=' || code[k] == ':')
+                && !(k + 1 < code.size() && code[k + 1] == '=')
+                && !(code[k] == ':' && k + 1 < code.size() && code[k + 1] == ':')) {
+                if (best_assign < 0) best_assign = i + 1;
+                break;
+            }
+        }
+        if (best_body > 0) break;          // earliest definition-with-body wins
+    }
+    if (best_body > 0) return best_body;
+    if (best_type > 0) return best_type;
+
+    // Fallback: the original whole-line outline match (covers shapes the
+    // scanner above doesn't model, e.g. markdown headings).
+    for (int i = 0; i < n; ++i) {
+        const auto& ln = lines[i];
+        if (ln.empty() || in_block[i]) continue;
+        auto pos = ln.find(leaf);
+        bool whole = false;
+        while (pos != std::string_view::npos) {
+            bool lok = pos == 0 || !is_ident(ln[pos - 1]);
+            std::size_t after = pos + leaf.size();
+            bool rok = after >= ln.size() || !is_ident(ln[after]);
+            if (lok && rok) { whole = true; break; }
+            pos = ln.find(leaf, pos + 1);
+        }
+        if (!whole) continue;
+        char c0 = ln.front();
+        if (c0 == '}' || c0 == ')' || c0 == ']' || c0 == ';' || c0 == '/') continue;
+        if (outline_line_is_def(ln)) return i + 1;
+    }
+    if (best_decl > 0) { if (decl_only) *decl_only = true; return best_decl; }
+    if (best_assign > 0) return best_assign;
+    return -1;
+}
+
+// Resolve `symbol` to a [start,end] 1-based line range within `content`: find
+// the line that DEFINES it (via the outline def-pattern, whole-word) and return
+// its enclosing brace scope. Powers `read(path, symbol=)` — so the model can
+// pull exactly one function's body without line arithmetic or `sed`. Returns
+// nullopt when the symbol has no definition line here. Brace scan skips // and
+// # line comments and quoted strings.
+[[nodiscard]] std::optional<std::pair<int,int>>
+resolve_symbol_range(std::string_view content, std::string_view symbol,
+                     bool* decl_only = nullptr) {
+    std::vector<std::string_view> lines;
+    {
+        std::size_t start = 0;
+        for (std::size_t i = 0; i <= content.size(); ++i) {
+            if (i == content.size() || content[i] == '\n') {
+                auto ln = content.substr(start, i - start);
+                if (!ln.empty() && ln.back() == '\r') ln.remove_suffix(1);
+                lines.push_back(ln);
+                start = i + 1;
+            }
+        }
+    }
+    int def_line = find_definition_line(lines, symbol, decl_only);
+    if (def_line < 0) return std::nullopt;
+
+    // Multi-line signatures: the outline regex matches the line with the NAME,
+    // but the return type / attributes / template head may sit on the lines
+    // ABOVE (e.g. `[[nodiscard]] std::optional<Foo>` \n `bar(...) {`). Back up
+    // over those continuation lines so the returned range starts at the real
+    // declaration. A line is a continuation of the def below it when it is
+    // non-empty, not itself a statement/block end, and reads as a type head:
+    // ends in one of  , < & * :  or is a bare template/attribute/qualifier.
+    {
+        auto is_sig_head = [](std::string_view s) {
+            // trim trailing spaces
+            std::size_t e = s.find_last_not_of(" \t");
+            if (e == std::string_view::npos) return false;   // blank
+            s = s.substr(0, e + 1);
+            char last = s.back();
+            if (last == ';' || last == '{' || last == '}' || last == ':')
+                return false;   // statement / block / label end
+            std::size_t b = s.find_first_not_of(" \t");
+            std::string_view t = s.substr(b);
+            // Attribute or template head, or a return-type/qualifier line that
+            // flows into the signature (ends in a type-continuation char).
+            if (t.rfind("[[", 0) == 0) return true;
+            if (t.rfind("template", 0) == 0) return true;
+            if (last == ',' || last == '<' || last == '&' || last == '*'
+                || last == '>' ) return true;
+            static constexpr std::string_view kQual[] = {
+                "static", "inline", "constexpr", "const", "virtual",
+                "explicit", "friend", "[[nodiscard]]", "pub", "async",
+                "public", "private", "protected", "export",
+            };
+            for (auto q : kQual)
+                if (t.rfind(q, 0) == 0 && t.find('(') == std::string_view::npos)
+                    return true;
+            return false;
+        };
+        int start = def_line;
+        while (start > 1 && is_sig_head(lines[start - 2])) --start;
+        def_line = start;
+    }
+
+    const int n = static_cast<int>(lines.size());
+    constexpr int kMaxSpan = 400;
+
+    // Decide brace-scope vs indent-scope. A def is INDENT-scoped (Python /
+    // Ruby / YAML-ish) when its signature line(s) open the block with `:`
+    // rather than `{` — brace-counting there is wrong because the body's
+    // dicts/sets `{...}` would close the "block" early. Scan the def line and
+    // its immediate continuations for the first block-opener.
+    auto trailing = [](std::string_view s) -> char {
+        std::size_t e = s.find_last_not_of(" \t");
+        // ignore a trailing line comment
+        if (auto h = s.find('#'); h != std::string_view::npos) {
+            std::size_t e2 = s.find_last_not_of(" \t", h ? h - 1 : 0);
+            if (e2 != std::string_view::npos && e2 < h) e = e2;
+        }
+        return e == std::string_view::npos ? '\0' : s[e];
+    };
+    bool indent_scoped = false;
+    for (int ln = def_line; ln <= n && ln - def_line < 6; ++ln) {
+        const auto& s = lines[ln - 1];
+        if (s.find('{') != std::string_view::npos) { indent_scoped = false; break; }
+        if (trailing(s) == ':') { indent_scoped = true; break; }
+    }
+
+    // Enclosing brace scope from the def line downward (brace-language path).
+    auto delta = [](std::string_view s) {
+        int d = 0; bool in_str = false; char q = 0;
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (in_str) { if (c == '\\') { ++i; continue; } if (c == q) in_str = false; continue; }
+            // C++ raw string R"delim( ... )delim" (incl. u8R/uR/UR/LR): the body
+            // is literal, so skip to the matching )delim" to avoid counting
+            // braces (or a stray ") inside it. Single-line handling covers the
+            // common regex/SQL literal case.
+            if ((c == 'R' || c == 'u' || c == 'U' || c == 'L')) {
+                std::size_t j = i;
+                if (c == 'u' && j + 1 < s.size() && s[j+1] == '8') j += 2;
+                else if (c == 'u' || c == 'U' || c == 'L') j += 1;
+                if (j + 1 < s.size() && s[j] == 'R' && s[j+1] == '"') {
+                    std::size_t k = j + 2; std::string delim;
+                    while (k < s.size() && s[k] != '(' && delim.size() < 16
+                           && s[k] != ' ' && s[k] != ')' && s[k] != '\\')
+                        delim.push_back(s[k++]);
+                    if (k < s.size() && s[k] == '(') {
+                        std::string term = ")" + delim + "\"";
+                        std::size_t close = s.find(term, k + 1);
+                        // Skip the whole raw string (to line end if unterminated).
+                        i = (close == std::string_view::npos) ? s.size() - 1
+                                                              : close + term.size() - 1;
+                        continue;
+                    }
+                }
+            }
+            // Apostrophe: only a quote if it CLOSES on this line (char
+            // literal or short string). An unpaired ' is a Rust lifetime
+            // ('a) or an identifier apostrophe — treating it as an open
+            // would hide every brace after it on the line.
+            if (c == '\'') {
+                std::size_t k = i + 1;
+                while (k < s.size() && s[k] != '\'') { if (s[k] == '\\') ++k; ++k; }
+                if (k < s.size()) i = k;   // skip the closed literal wholesale
+                continue;                  // else: ordinary byte
+            }
+            if (c == '"' || c == '`') { in_str = true; q = c; continue; }
+            if (c == '/' && i + 1 < s.size() && s[i+1] == '/') break;
+            if (c == '#') break;
+            if (c == '{') ++d; else if (c == '}') --d;
+        }
+        return d;
+    };
+    int hi = def_line, fd = 0; bool started = false;
+    if (!indent_scoped) {
+        for (int ln = def_line; ln <= n && ln - def_line < kMaxSpan; ++ln) {
+            fd += delta(lines[ln - 1]); if (fd > 0) started = true; hi = ln;
+            if (started && fd <= 0) break;
+        }
+    }
+    // Indent-scoped def, OR a brace-less prototype (never opened a block):
+    // include the indented body until the indentation returns to the def's
+    // level or shallower.
+    if (indent_scoped || !started) {
+        std::size_t base_indent = lines[def_line-1].find_first_not_of(" \t");
+        hi = def_line;
+        for (int ln = def_line + 1; ln <= n && ln - def_line < kMaxSpan; ++ln) {
+            const auto& s = lines[ln-1];
+            std::size_t ind = s.find_first_not_of(" \t");
+            if (ind == std::string_view::npos) { hi = ln; continue; }   // blank
+            if (base_indent != std::string_view::npos && ind <= base_indent) break;
+            hi = ln;
+        }
+        // Trim trailing blank lines that the indent walk swallowed.
+        while (hi > def_line && lines[hi-1].find_first_not_of(" \t")
+                                    == std::string_view::npos) --hi;
+    }
+    return std::make_pair(def_line, hi);
+}
+
 struct ReadArgs {
     util::WorkspacePath path;
     int                 offset;
     int                 limit;
+    std::string         symbol;   // read just this symbol's definition + body
     std::string         display_description;
     bool                no_explicit_range = true;
 };
 
-std::expected<ReadArgs, ToolError> parse_read_args(const json& j) {
+// Defined further down with the write-arg helpers. Declared here because both
+// read and write want it in their "path required" message, and a caller who
+// cannot see which keys arrived has no way to tell a typo from a dropped
+// argument object.
+std::string describe_keys(const json& j);
+
+// A range written as "10-20", "10:20", "10", [10,20] or {start,end}.
+// Returns {from, to}; to is 0 when open-ended.
+std::optional<std::pair<int, int>> parse_line_range(const json& v) {
+    auto as_int = [](const json& x) -> std::optional<int> {
+        if (x.is_number_integer()) return x.get<int>();
+        if (x.is_string()) {
+            try { return std::stoi(x.get<std::string>()); } catch (...) {}
+        }
+        return std::nullopt;
+    };
+    if (v.is_array() && !v.empty()) {
+        auto a = as_int(v[0]);
+        if (!a) return std::nullopt;
+        auto z = v.size() > 1 ? as_int(v[1]) : std::nullopt;
+        return std::pair{*a, z.value_or(0)};
+    }
+    if (v.is_object()) {
+        for (auto [s, e] : {std::pair{"start", "end"}, std::pair{"from", "to"}})
+            if (v.contains(s))
+                if (auto a = as_int(v[s])) {
+                    auto z = v.contains(e) ? as_int(v[e]) : std::nullopt;
+                    return std::pair{*a, z.value_or(0)};
+                }
+        return std::nullopt;
+    }
+    if (v.is_number_integer()) return std::pair{v.get<int>(), 0};
+    if (!v.is_string()) return std::nullopt;
+    std::string s = v.get<std::string>();
+    std::erase_if(s, [](char c) { return c == ' ' || c == 'L' || c == 'l'; });
+    const auto sep = s.find_first_of("-:,");
+    try {
+        if (sep == std::string::npos) return std::pair{std::stoi(s), 0};
+        const int a = std::stoi(s.substr(0, sep));
+        const std::string rest = s.substr(sep + 1);
+        return std::pair{a, rest.empty() ? 0 : std::stoi(rest)};
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+// The shapes models send instead of path/offset/end_line, folded into those:
+// a quoted path, "file:10-20" / "file#L10-L20", lines:"10-20",
+// line_range:[10,20], and a one-entry paths:[...] array.
+json tidy_read_args(const json& j, const util::Bounds& b) {
+    if (!j.is_object()) return j;
+    json out = j;
+    if (!out.contains("path")) {
+        for (const char* k : {"paths", "files", "file_paths"})
+            if (auto it = out.find(k); it != out.end() && it->is_array() && it->size() == 1
+                && (*it)[0].is_string()) {
+                out["path"] = (*it)[0];
+                break;
+            }
+    }
+    bool has_range = out.contains("offset") || out.contains("start_line")
+                  || out.contains("end_line") || out.contains("limit");
+    if (!has_range)
+        for (const char* k : {"lines", "line_range", "range", "line"})
+            if (auto it = out.find(k); it != out.end())
+                if (auto r = parse_line_range(*it); r && r->first > 0) {
+                    if (std::string_view{k} == "line" && r->second == 0) {
+                        // One line asked for: show it with some context.
+                        out["offset"] = std::max(1, r->first - 20);
+                        out["end_line"] = r->first + 40;
+                    } else {
+                        out["offset"] = r->first;
+                        if (r->second >= r->first) out["end_line"] = r->second;
+                    }
+                    has_range = true;
+                    break;
+                }
+    // Path under whatever key the model used.
+    const char* pkey = "path";
+    for (const char* k : {"path", "file_path", "file", "filename", "filepath", "filePath"})
+        if (out.contains(k)) { pkey = k; break; }
+    if (auto it = out.find(pkey); it != out.end() && it->is_string() && b.files) {
+        auto t = util::tidy_model_path(*b.files, b, it->get<std::string>());
+        *it = t.path;
+        if (t.line_from > 0 && !has_range) {
+            out["offset"] = t.line_from;
+            if (t.line_to >= t.line_from) out["end_line"] = t.line_to;
+        }
+    }
+    return out;
+}
+
+std::expected<ReadArgs, ToolError> parse_read_args(const json& raw_j, const util::Bounds& b) {
+    const json j = tidy_read_args(raw_j, b);
     util::ArgReader ar(j);
     auto path_opt = ar.require_str("path");
+    if (!path_opt && j.is_object())
+        for (const char* k : {"paths", "files", "file_paths"})
+            if (auto it = j.find(k); it != j.end() && it->is_array() && it->size() > 1)
+                return std::unexpected(ToolError::invalid_args(std::format(
+                    "read takes one `path`; got {} in `{}`. Make one read call per file "
+                    "(they run in parallel).", it->size(), k)));
     if (!path_opt)
-        return std::unexpected(ToolError::invalid_args("path required"));
-    auto wp = util::make_readable_path_checked(*path_opt, "read");
+        // Name the keys we DID receive, the way parse_write_args does.
+        //
+        // A bare "path required" tells the caller nothing about why: a typo in
+        // the key, a path nested one level too deep, a null, or an argument
+        // object that got dropped entirely all produce the identical message.
+        // A model that cannot see the difference retries the same broken call,
+        // which is exactly what happened -- three identical failures in a row
+        // before the loop-breaker stepped in.
+        //
+        // The received-keys list makes the two common cases self-evident:
+        // an empty list means the arguments never arrived, and a list
+        // containing `file`/`filename`/`file_path` means the key was wrong.
+        return std::unexpected(ToolError::invalid_args(
+            std::format("path required (received keys: {})", describe_keys(j))));
+    auto wp = util::make_readable_path_checked(*path_opt, "read", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
     int offset = ar.integer("offset", 1);
-    if (offset < 1) offset = 1;
-    int limit = ar.integer("limit", 2000);
-    if (ar.has("end_line") && !ar.has("limit")) {
-        int end_line = ar.integer("end_line", 0);
+    // NEGATIVE offset = tail semantics: offset:-50 means "the last 50
+    // lines" (like `tail -n 50`) — the shape every log/build-output check
+    // wants, without a bash round-trip or knowing the file's length first.
+    // Resolved against the real line count in run_read.
+    if (offset == 0) offset = 1;
+    // Did the caller pin a START but leave the END open? Paging with only an
+    // `offset`/`start_line` and no `limit`/`end_line` is the common case, and
+    // defaulting `limit` to 2000 there dumps the ENTIRE rest of the file into
+    // context — the "why is every read huge" footgun. A start-anchored read
+    // wants a FOCUSED window, so default it to kPageWindow lines. A read with
+    // NO position at all (`read(path)`) keeps the whole-file default (2000,
+    // or the >32 KiB auto-outline) — that's the deliberate "show me the file"
+    // request. An explicit `limit`/`end_line` always wins.
+    constexpr int kPageWindow = 250;
+    // has() is alias-aware (raw() consults the synonym tables), so has("offset")
+    // already covers start_line/start/from_line and has("limit") covers
+    // end_line/num_lines/max_lines/count — no need to spell the aliases out.
+    const bool anchored_start = ar.has("offset");
+    // `end_line` is an END POSITION, not a line count. It's aliased to `limit`
+    // in the arg tables (so has("limit") sees it), but its VALUE must be
+    // converted (end_line − offset + 1), not used raw — otherwise
+    // end_line=180 with offset=120 reads 180 lines (120..299) instead of the
+    // 60-line window 120..180 the outline tells the model to ask for. Detect
+    // a raw, literal `end_line`/`to_line` key and honour it as a position.
+    const bool has_end_line =
+        j.contains("end_line") || j.contains("to_line") || j.contains("endLine");
+    const bool explicit_end = ar.has("limit");
+    const int default_limit = (anchored_start && !explicit_end)
+                                  ? kPageWindow : 2000;
+    int limit = ar.integer("limit", default_limit);
+    // A literal end_line= wins and is interpreted as a position: window is
+    // [offset, end_line] inclusive. (A raw `limit`/`num_lines`/`count` stays a
+    // count and is already in `limit` above — we only remap the true end key.)
+    if (has_end_line) {
+        int end_line = 0;
+        for (const char* k : {"end_line", "to_line", "endLine"}) {
+            auto it = j.find(k);
+            if (it != j.end() && it->is_number()) {
+                end_line = it->get<int>();
+                break;
+            }
+        }
         if (end_line >= offset) limit = end_line - offset + 1;
     }
-    if (limit <= 0) limit = 2000;
+    if (limit <= 0) limit = default_limit;
+    const std::string symbol = ar.str("symbol", "");
+    // symbol= is itself an explicit selection, so it must NOT trigger the
+    // whole-file auto-outline path.
     bool explicit_range = ar.has("offset") || ar.has("limit")
-                       || ar.has("start_line") || ar.has("end_line");
+                       || ar.has("start_line") || ar.has("end_line")
+                       || !symbol.empty();
     return ReadArgs{
-        std::move(*wp), offset, limit,
+        std::move(*wp), offset, limit, symbol,
         ar.str("display_description", ""),
         /*no_explicit_range=*/ !explicit_range,
     };
 }
 
-ExecResult run_read(const ReadArgs& a) {
+ExecResult run_read(const Call& call, const ReadArgs& a) {
     const auto& p = a.path.path();
     std::error_code ec;
-    if (!fs::exists(p, ec))
+    if (!call.fs().stat(p).exists) {
+        // Same name somewhere else in the parent, or a different case/extension.
+        std::string near;
+        const auto parent = p.parent_path();
+        const auto want = p.filename().string();
+        auto lower = [](std::string s) {
+            for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return s;
+        };
+        if (call.fs().stat(parent).directory) {
+            int shown = 0;
+            for (const auto& e : call.fs().list(parent, ec)) {
+                const auto name = e.path.filename().string();
+                const bool close = lower(name) == lower(want)
+                    || e.path.stem() == p.stem()
+                    || (want.size() >= 4 && lower(name).find(lower(p.stem().string())) != std::string::npos);
+                if (!close) continue;
+                near += (shown++ ? ", " : "") + name;
+                if (shown == 5) break;
+            }
+        }
         return std::unexpected(ToolError::not_found("file not found: " + a.path.string()
-            + ". Run `list_dir` on the parent directory or `glob` by name to verify."));
-    if (!fs::is_regular_file(p, ec))
+            + (near.empty() ? std::string{". Run `list_dir` on the parent directory or `glob` by name to verify."}
+                            : ". Similar names in " + parent.string() + ": " + near + ".")));
+    }
+    if (call.fs().stat(p).directory) {
+        // A directory: show what's in it rather than fail.
+        auto entries = call.fs().list(p, ec);
+        std::ranges::sort(entries, [](const DirEntry& x, const DirEntry& y) {
+            return x.directory != y.directory ? x.directory : x.path.filename() < y.path.filename();
+        });
+        std::string out = a.path.string() + " is a directory. Its entries:\n";
+        std::size_t n = 0;
+        for (const auto& e : entries) {
+            if (++n > 200) { out += "... (" + std::to_string(entries.size() - 200) + " more)\n"; break; }
+            out += "  " + e.path.filename().string() + (e.directory ? "/" : "") + "\n";
+        }
+        out += "Read a file by its full path.";
+        return ToolOutput{std::move(out), std::nullopt};
+    }
+    if (!call.fs().stat(p).regular)
         return std::unexpected(ToolError::not_a_file("not a regular file: " + a.path.string()));
 
     fs::file_time_type current_mtime{};
     {
         std::error_code mtime_ec;
-        current_mtime = fs::last_write_time(p, mtime_ec);
-        if (!mtime_ec) {
+        current_mtime = call.fs().stat(p).mtime;
+        if (!mtime_ec && a.symbol.empty()) {
             std::error_code canon_ec;
-            auto canon = fs::weakly_canonical(p, canon_ec);
+            auto canon = call.fs().canonical(p, canon_ec);
             if (!canon_ec) {
-                ReadCacheKey key{canon.string(), a.offset, a.limit};
-                std::lock_guard lk{read_cache().mu};
-                auto it = read_cache().seen.find(key);
-                if (it != read_cache().seen.end() && it->second == current_mtime) {
+                auto seen = call.with([&](ToolState& st) -> std::optional<ReadCacheEntry> {
+                    auto it = st.reads.find({call.reader, canon.string()});
+                    if (it == st.reads.end()) return std::nullopt;
+                    return it->second;
+                });
+                // Refuse ONLY when the live entry still covers what is being
+                // asked for. Same file, same mtime, but a range the earlier
+                // result did not include means those bytes are nowhere in
+                // the caller's context, and the sentinel would be a lie that
+                // no retry can get past. Coverage is computed against the
+                // RAW args, before symbol/tail resolution, because that is
+                // what the caller can see and reason about.
+                if (seen
+                    && seen->mtime == current_mtime
+                    && covers(*seen, a.offset, a.limit, seen->total)
+                    && !seen->content.empty()) {
+                    // SERVE, don't refuse.
+                    //
+                    // This used to return a bare "refer to the earlier
+                    // tool_result instead" and nothing else, which is a
+                    // pointer into the caller's context -- sound only while
+                    // that result is still there. Compaction, a wire-level
+                    // read-collapse and subagent boundaries all break that
+                    // assumption, and when it breaks the caller is told to
+                    // consult bytes that exist nowhere. Measured outcome: the
+                    // model falls back to `cat`, which is the read-loop
+                    // KhazAkar reported and the same failure Claude Code has
+                    // open as issues #53578 and #60684.
+                    //
+                    // Annotating rather than refusing keeps the token saving
+                    // that motivated the cache (no re-read of the file, no
+                    // second line scan) while making the answer unconditional.
+                    // The tag is for the MODEL: it says "you have seen this,
+                    // it has not changed" so a careful one does not re-reason
+                    // over it, and a confused one still gets the content.
                     return ToolOutput{
-                        "File unchanged since last read. The content from the "
-                        "earlier Read tool_result in this conversation is still "
-                        "current \xe2\x80\x94 refer to that instead of re-reading.",
+                        "[cached \xe2\x80\x94 unchanged since your last read of this "
+                        "file]\n" + seen->content,
                         std::nullopt};
                 }
             }
         }
     }
     constexpr uintmax_t kMaxBytes = 1024u * 1024u;
-    uintmax_t sz = fs::file_size(p, ec);
+    uintmax_t sz = call.fs().stat(p).size;
+
+    // Image files: hand the picture to a vision model instead of refusing it
+    // as binary. Sniffed by magic bytes (extension-agnostic), capped larger
+    // than text since a screenshot is legitimately a few MiB. The host maps
+    // ToolOutput.images onto this call's tool_result image blocks; a non-vision
+    // model just sees the text note. Checked BEFORE the 1 MiB text cap so a
+    // normal-sized image isn't rejected for being "too large".
+    if (a.symbol.empty()) {
+        if (auto mime = util::sniff_image_media_type(call.fs(), p); !mime.empty()) {
+            constexpr uintmax_t kMaxImageBytes = 8u * 1024u * 1024u;
+            if (!ec && sz > kMaxImageBytes)
+                return std::unexpected(ToolError::too_large(std::format(
+                    "image is {} KiB (> 8 MiB cap): {}",
+                    sz / 1024, a.path.string())));
+            std::string raw = util::read_file(a.path);
+            if (raw.empty())
+                return std::unexpected(ToolError::io(
+                    "cannot read image " + a.path.string()));
+            ToolOutput out;
+            out.text = std::format(
+                "[image {} \xc2\xb7 {} \xc2\xb7 {} KiB] attached to this "
+                "result; if you can see images it is shown above.",
+                a.path.string(), mime, raw.size() / 1024);
+            out.images.push_back(util::ToolImage{std::move(mime), std::move(raw)});
+            return out;
+        }
+    }
+
     if (!ec && sz > kMaxBytes) {
         return std::unexpected(ToolError::too_large(std::format(
             "file is {} KiB (> 1 MiB cap). "
@@ -206,13 +1054,143 @@ ExecResult run_read(const ReadArgs& a) {
             "For a structural overview, run `grep` for the symbols you need.",
             sz / 1024, a.path.string())));
     }
-    if (util::is_binary_file(p)) {
+    if (util::is_binary_file(call.fs(), p)) {
         return std::unexpected(ToolError::binary(std::format(
             "cannot read binary file: {} ({} bytes). "
-            "Use the bash tool with `file`, `hexdump`, or similar.",
+            "Use the `shell` tool with `file`, `hexdump`, or similar.",
             a.path.string(), static_cast<uintmax_t>(ec ? 0 : sz))));
     }
     auto content = util::read_file(a.path);
+
+    // symbol=: resolve to the defining line + enclosing block, then read just
+    // that range — no `sed`, no line arithmetic. Overrides offset/limit.
+    int eff_offset = a.offset;
+    int eff_limit  = a.limit;
+    // Tail semantics: offset:-N = the last N lines (limit is ignored — the
+    // request IS the window). Count lines once, then convert to a normal
+    // forward range.
+    //
+    // std::count, not a hand-rolled loop and not memchr: this one needs ONLY
+    // a count (no line_start to carry), which is exactly the shape the
+    // library can vectorise best — 0.15 ms vs 0.24 for memchr and 0.46 for
+    // a byte loop that also tracks a position, over an 889 KiB span.
+    // Contrast the count phase further down, which does need the position
+    // and therefore uses memchr.
+    if (eff_offset < 0) {
+        int total = static_cast<int>(
+            std::count(content.begin(), content.end(), '\n'));
+        if (!content.empty() && content.back() != '\n') ++total;
+        int want = -eff_offset;
+        if (want > total) want = total;
+        eff_offset = total - want + 1;
+        eff_limit  = want;
+    }
+    std::string symbol_header;
+    if (!a.symbol.empty()) {
+        bool decl_only = false;
+        auto rng = resolve_symbol_range(content, a.symbol, &decl_only);
+        // Found only a declaration (`int f(int);` in a header): the body the
+        // model wants is usually in the paired source — try there first and
+        // fall back to the declaration if it isn't.
+        if (!rng || decl_only) {
+            // Common miss: the model names the header but the body is in the
+            // .cpp (or the reverse), or it's in a sibling file of the same
+            // directory. Look there before giving up, and say where we went.
+            // Only files next to / paired with the named one: cheap, bounded,
+            // and never wanders the tree.
+            std::vector<fs::path> near;
+            {
+                static constexpr std::string_view kSrc[] = {".cpp", ".cc", ".cxx", ".c", ".mm"};
+                static constexpr std::string_view kHdr[] = {".hpp", ".h", ".hh", ".hxx"};
+                const auto stem = p.stem().string();
+                const auto dir  = p.parent_path();
+                const auto ext  = p.extension().string();
+                auto push = [&](const fs::path& q) {
+                    std::error_code qec;
+                    if (q != p && call.fs().stat(q).regular
+                        && std::find(near.begin(), near.end(), q) == near.end())
+                        near.push_back(q);
+                };
+                const bool is_hdr = std::ranges::find(kHdr, ext) != std::end(kHdr);
+                const bool is_src = std::ranges::find(kSrc, ext) != std::end(kSrc);
+                // Pair across include/ <-> src/ too: include/x/y/z.hpp <-> src/y/z.cpp
+                auto swap_root = [&](std::string_view from, std::string_view to) {
+                    std::string s = dir.string();
+                    auto at = s.find(std::string{"/"} + std::string{from} + "/");
+                    if (at == std::string::npos) return fs::path{};
+                    std::string rest = s.substr(at + from.size() + 2);
+                    fs::path base = fs::path{s.substr(0, at)} / std::string{to};
+                    // include/<project>/a/b -> src/a/b (drop the project dir)
+                    if (from == "include") {
+                        auto slash = rest.find('/');
+                        rest = slash == std::string::npos ? std::string{} : rest.substr(slash + 1);
+                    }
+                    return rest.empty() ? base : base / rest;
+                };
+                if (is_hdr) {
+                    for (auto e : kSrc) push(dir / (stem + std::string{e}));
+                    if (auto d2 = swap_root("include", "src"); !d2.empty())
+                        for (auto e : kSrc) push(d2 / (stem + std::string{e}));
+                }
+                if (is_src) {
+                    for (auto e : kHdr) push(dir / (stem + std::string{e}));
+                }
+                // Siblings with the same extension family, capped.
+                std::error_code dec;
+                int budget = 60;
+                for (const auto& e : call.fs().list(dir, dec)) {
+                    if (--budget < 0) break;
+                    if (!e.regular) continue;
+                    const auto x = e.path.extension().string();
+                    if (std::ranges::find(kSrc, x) != std::end(kSrc)
+                        || std::ranges::find(kHdr, x) != std::end(kHdr)
+                        || x == ext)
+                        push(e.path);
+                }
+            }
+            for (const auto& q : near) {
+                if (call.fs().stat(q).size > kMaxBytes) continue;
+                std::string other;
+                try { other = util::read_file(call.fs(), q); } catch (...) { continue; }
+                bool other_decl = false;
+                auto r2 = resolve_symbol_range(other, a.symbol, &other_decl);
+                if (!r2 || (rng && other_decl)) continue;
+                // Render the span from that file, same plain-lines shape as
+                // a normal read.
+                std::string body;
+                int ln = 1; std::size_t st = 0;
+                for (std::size_t i = 0; i <= other.size(); ++i) {
+                    if (i == other.size() || other[i] == '\n') {
+                        if (ln >= r2->first && ln <= r2->second) {
+                            std::size_t e = i;
+                            if (e > st && other[e - 1] == '\r') --e;
+                            body.append(other, st, e - st);
+                            body.push_back('\n');
+                        }
+                        if (ln > r2->second) break;
+                        ++ln; st = i + 1;
+                    }
+                }
+                return ToolOutput{util::to_valid_utf8(std::format(
+                    "SUCCESS: `{}` is {} in {}; its definition is in {}:{} "
+                    "(lines {}\xe2\x80\x93{}).\n\n{}",
+                    a.symbol, rng ? "only declared" : "not defined",
+                    a.path.string(), q.string(), r2->first,
+                    r2->first, r2->second, body)), std::nullopt};
+            }
+            if (!rng)
+            return std::unexpected(ToolError::not_found(std::format(
+                "no definition of `{}` found in {} (or its paired header/source "
+                "and sibling files). Use `find_definition` to search the "
+                "whole tree, or drop `symbol` to read the whole file.",
+                a.symbol, a.path.string())));
+        }
+        eff_offset = rng->first;
+        eff_limit  = rng->second - rng->first + 1;
+        symbol_header = std::format(
+            "SUCCESS: `{}` defined at {}:{} (lines {}\xe2\x80\x93{}).\n\n",
+            a.symbol, a.path.string(), rng->first, rng->first, rng->second);
+    }
 
     if (a.no_explicit_range && content.size() > kAutoOutlineSize) {
         std::size_t kib = content.size() / 1024;
@@ -262,25 +1240,41 @@ ExecResult run_read(const ReadArgs& a) {
             out = a.display_description + "\n" + out;
         if (current_mtime.time_since_epoch().count() != 0) {
             std::error_code canon_ec;
-            auto canon = fs::weakly_canonical(p, canon_ec);
+            auto canon = call.fs().canonical(p, canon_ec);
             if (!canon_ec) {
-                ReadCacheKey key{canon.string(), a.offset, a.limit};
-                std::lock_guard lk{read_cache().mu};
-                read_cache().seen[std::move(key)] = current_mtime;
+                // The OUTLINE path: the caller got a symbol map of the whole
+                // file, not its text. Record it as covering nothing, so any
+                // later request for actual lines is served. Refusing one
+                // with "you already read this" would be answering a request
+                // for content with a table of contents.
+                call.with([&](ToolState& st) {
+                    st.reads[{call.reader, canon.string()}] = ReadCacheEntry{current_mtime, 1, 1, 0, {}};
+                });
             }
         }
-        util::record_file_seen(p, current_mtime,
+        record_seen(call, p, current_mtime,
                                static_cast<std::uintmax_t>(content.size()),
-                               util::content_fnv1a(content));
+                               util::cheap_content_hash(content));
         return ToolOutput{std::move(out), std::nullopt};
     }
     std::string out;
-    out.reserve(content.size() < 1024 * 1024 ? content.size() : 1024 * 1024);
+    // Reserve for the WINDOW, not the whole file. A 250-line window of a
+    // 900 KiB file asked for ~900 KiB here to emit ~9 KiB.
+    out.reserve(N_reserve_hint(content.size(), eff_limit));
     int total_lines = 0;
     int shown = 0;
     size_t line_start = 0;
     const size_t N = content.size();
-    for (size_t i = 0; i < N; ++i) {
+    // ── Emit phase ──────────────────────────────────────────────────────
+    // Byte-at-a-time, but ONLY while output is still being produced.
+    //
+    // This loop used to run to EOF on every read, because the footer needs
+    // total_lines ("of N", "pass offset=..."). So a 250-line window of a
+    // 900 KiB file scanned all 900 KiB one byte at a time: measured 1.66 ms,
+    // ~92% of the whole call, and IDENTICAL to reading the entire file.
+    // Paging a big file cost exactly as much as not paging it.
+    size_t i = 0;
+    for (; i < N; ++i) {
         char c = content[i];
         if (c == '\0') {
             return std::unexpected(ToolError::binary(std::format(
@@ -292,7 +1286,7 @@ ExecResult run_read(const ReadArgs& a) {
         if (c == '\n') {
             ++total_lines;
             int n = total_lines;
-            if (n >= a.offset && shown < a.limit) {
+            if (n >= eff_offset && shown < eff_limit) {
                 size_t end = i;
                 if (end > line_start && content[end - 1] == '\r') --end;
                 out.append(content.data() + line_start, end - line_start);
@@ -300,12 +1294,50 @@ ExecResult run_read(const ReadArgs& a) {
                 ++shown;
             }
             line_start = i + 1;
+            // Window filled: stop emitting and switch to counting.
+            if (shown >= eff_limit) { ++i; break; }
+        }
+    }
+    // ── Count phase ─────────────────────────────────────────────────────
+    // Past the window every remaining line only contributes to total_lines
+    // (and to line_start, for the trailing-line handler below), so this half
+    // does no formatting and no appending.
+    //
+    // memchr, measured 0.24 ms vs 0.46 ms for a byte loop over an 889 KiB
+    // tail. Worth stating how that number was nearly got wrong: an isolated
+    // microbenchmark said the byte loop was 3x FASTER, because it dropped
+    // the line_start bookkeeping and the compiler then vectorised the whole
+    // loop into something this code cannot use. Benchmark the work the
+    // function actually does, not a simplified version of it.
+    //
+    // (std::count is faster still at 0.15 ms, but it only returns a count
+    // and cannot report where the last newline was.)
+    //
+    // The NUL scan covers the same span — a file can be text for 250 lines
+    // and binary after — and NULs are genuinely sparse there, which is the
+    // case memchr is best at.
+    if (i < N) {
+        const char* base = content.data();
+        if (std::memchr(base + i, '\0', N - i) != nullptr) {
+            return std::unexpected(ToolError::binary(std::format(
+                "cannot read binary file: {} ({} bytes). "
+                "Use the bash tool with `file`, `hexdump`, or similar "
+                "if you need to inspect it.",
+                a.path.string(), N)));
+        }
+        const char* s = base + i;
+        const char* e = base + N;
+        while (const char* nl = static_cast<const char*>(
+                   std::memchr(s, '\n', static_cast<std::size_t>(e - s)))) {
+            ++total_lines;
+            s = nl + 1;
+            line_start = static_cast<std::size_t>(s - base);
         }
     }
     if (line_start < N) {
         ++total_lines;
         int n = total_lines;
-        if (n >= a.offset && shown < a.limit) {
+        if (n >= eff_offset && shown < eff_limit) {
             size_t end = N;
             if (end > line_start && content[end - 1] == '\r') --end;
             out.append(content.data() + line_start, end - line_start);
@@ -313,44 +1345,79 @@ ExecResult run_read(const ReadArgs& a) {
             ++shown;
         }
     }
-    if (a.offset > 1 || shown < total_lines) {
+    if (eff_offset > 1 || shown < total_lines) {
         std::string hint;
         if (shown == 0) {
-            // offset landed past the end of the file — the old code rendered a
-            // nonsensical inverted range like "[showing lines 1000-999 of 1]".
-            // Tell the model plainly where the end is so it can re-request a
-            // valid range instead of guessing.
             hint = std::format(
                 "\n[offset {} is past the end of the file, which has {} line{} "
                 "— nothing to show. Re-read with an offset ≤ {}.]",
-                a.offset, total_lines, total_lines == 1 ? "" : "s",
+                eff_offset, total_lines, total_lines == 1 ? "" : "s",
                 total_lines);
         } else {
             hint = std::format("\n[showing lines {}-{} of {}",
-                               a.offset, a.offset + shown - 1, total_lines);
-            int remaining = total_lines - (a.offset + shown - 1);
-            if (remaining > 0)
+                               eff_offset, eff_offset + shown - 1, total_lines);
+            int remaining = total_lines - (eff_offset + shown - 1);
+            if (remaining > 0 && a.symbol.empty())
                 hint += std::format("; {} more — pass offset={} (or start_line={}) "
                                     "for the next chunk",
-                                    remaining, a.offset + shown, a.offset + shown);
+                                    remaining, eff_offset + shown, eff_offset + shown);
             hint += "]";
         }
         out += hint;
     }
+    // Heads-up prefixes for files a model can otherwise misread as "read
+    // failed" or waste turns paging line-by-line through.
+    std::string heads_up;
+    if (N == 0) {
+        heads_up = "(file is empty — 0 bytes)\n";
+    } else if (a.symbol.empty()) {
+        // Minified / single-huge-line files (bundled JS, one-line JSON/SVG):
+        // line-based paging is nearly useless, so say so once and point at a
+        // better strategy. Trigger on a very high average line length across a
+        // non-trivial file.
+        const std::size_t avg_line = N / static_cast<std::size_t>(
+            total_lines > 0 ? total_lines : 1);
+        if (N > 4096 && avg_line > 800) {
+            heads_up = std::format(
+                "(heads-up: this file averages ~{} chars/line over {} line(s) "
+                "— it looks minified or machine-generated, so line paging is "
+                "coarse. `grep` for a token, or read a byte range, to target a "
+                "spot.)\n", avg_line, total_lines);
+        }
+    }
+    if (!heads_up.empty()) out = heads_up + out;
+    if (!symbol_header.empty()) out = symbol_header + out;
     if (!a.display_description.empty())
         out = a.display_description + "\n" + out;
     if (current_mtime.time_since_epoch().count() != 0) {
         std::error_code canon_ec;
-        auto canon = fs::weakly_canonical(p, canon_ec);
+        auto canon = call.fs().canonical(p, canon_ec);
         if (!canon_ec) {
-            ReadCacheKey key{canon.string(), a.offset, a.limit};
-            std::lock_guard lk{read_cache().mu};
-            read_cache().seen[std::move(key)] = current_mtime;
+            // OVERWRITE, never accumulate. This mirrors what the host does
+            // to the transcript: agentty keeps only the most recent read of
+            // a file and collapses the rest, so the newest range is the only
+            // one the caller still has. Keeping a union here would refuse
+            // ranges whose bytes have already been collapsed away.
+            //
+            // Stored as the RAW request (a.offset/a.limit), not the resolved
+            // eff_* — a symbol= read resolves to line numbers the caller
+            // never asked for and cannot ask for again, so recording those
+            // would refuse an unrelated later range that happens to overlap.
+            //
+            // `out` is exactly what the caller receives, headers and all, so
+            // a cache hit replays the identical answer under a [cached] tag
+            // rather than pointing at a tool_result that may be gone. Bounded
+            // by kMaxBytes per live path, and OVERWRITE means one entry per
+            // file, not a growing set.
+            call.with([&](ToolState& st) {
+                st.reads[{call.reader, canon.string()}] =
+                    ReadCacheEntry{current_mtime, a.offset, a.limit, total_lines, out};
+            });
         }
     }
-    util::record_file_seen(p, current_mtime,
+    record_seen(call, p, current_mtime,
                            static_cast<std::uintmax_t>(content.size()),
-                           util::content_fnv1a(content));
+                           util::cheap_content_hash(content));
     return ToolOutput{std::move(out), std::nullopt};
 }
 
@@ -402,13 +1469,13 @@ std::string describe_keys(const json& j) {
     return out;
 }
 
-std::expected<WriteArgs, ToolError> parse_write_args(const json& j) {
+std::expected<WriteArgs, ToolError> parse_write_args(const json& j, const util::Bounds& b) {
     util::ArgReader ar(j);
     auto raw = ar.require_str("path");
     if (!raw)
         return std::unexpected(ToolError::invalid_args(
             std::format("path required (received keys: {})", describe_keys(j))));
-    auto wp = util::make_workspace_path_checked(*raw, "write");
+    auto wp = util::make_workspace_path_checked(*raw, "write", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
     std::string note;
     std::string content;
@@ -433,7 +1500,7 @@ std::expected<WriteArgs, ToolError> parse_write_args(const json& j) {
                      ar.str("display_description", ""), std::move(note)};
 }
 
-ExecResult run_write(const WriteArgs& a) {
+ExecResult run_write(const Call& call, const WriteArgs& a) {
     const auto& p = a.path.path();
     constexpr std::size_t kMaxWriteBytes = 5u * 1024u * 1024u;
     if (a.content.size() > kMaxWriteBytes) {
@@ -444,26 +1511,26 @@ ExecResult run_write(const WriteArgs& a) {
     }
     std::string original;
     std::error_code ec;
-    bool exists = fs::exists(p, ec);
-    if (exists && fs::is_directory(p, ec))
+    bool exists = call.fs().stat(p).exists;
+    if (exists && call.fs().stat(p).directory)
         return std::unexpected(ToolError::not_a_file(
             "'" + a.path.string() + "' is a directory — write needs a file path."));
     auto parent = p.parent_path();
-    if (!parent.empty() && fs::exists(parent, ec) && !fs::is_directory(parent, ec))
+    if (!parent.empty() && call.fs().stat(parent).exists && !call.fs().stat(parent).directory)
         return std::unexpected(ToolError::not_a_directory(
             "parent of '" + a.path.string() + "' exists but is not a directory."));
     uintmax_t original_size = 0;
     if (exists) {
-        if (!fs::is_regular_file(p, ec))
+        if (!call.fs().stat(p).regular)
             return std::unexpected(ToolError::not_a_file(
                 "not a regular file: " + a.path.string()));
-        original_size = fs::file_size(p, ec);
+        original_size = call.fs().stat(p).size;
         if (ec) original_size = 0;
         if (original_size <= kMaxWriteBytes)
             original = util::read_file(a.path);
     }
     std::string staleness_warning;
-    if (exists && util::staleness_of(p) == util::StaleVerdict::Stale) {
+    if (exists && staleness(call, p) == util::StaleVerdict::Stale) {
         staleness_warning =
             "\xe2\x9a\xa0  The file has changed on disk since the last time a tool "
             "observed it this session. The write OVERWROTE those changes — "
@@ -482,11 +1549,11 @@ ExecResult run_write(const WriteArgs& a) {
         return std::unexpected(ToolError::io(err));
     {
         std::error_code mt_ec;
-        auto new_mtime = fs::last_write_time(p, mt_ec);
+        auto new_mtime = call.fs().stat(p).mtime;
         if (!mt_ec) {
-            util::record_file_seen(p, new_mtime,
+            record_seen(call, p, new_mtime,
                                    static_cast<std::uintmax_t>(a.content.size()),
-                                   util::content_fnv1a(a.content));
+                                   util::cheap_content_hash(a.content));
         }
     }
     std::string prefix;
@@ -496,6 +1563,29 @@ ExecResult run_write(const WriteArgs& a) {
                            prefix, exists ? "Overwrote" : "Created",
                            a.path.string(), change.added, change.removed,
                            a.coercion_note);
+    // Teaching nudge (never blocks — the write already succeeded): when a
+    // model OVERWRITES a substantial existing file but only changed a small
+    // fraction of its lines, `edit` would have been the better call — it
+    // ships only the changed snippet instead of the whole body, can't clobber
+    // an unseen concurrent change, and renders a tighter diff. Mirrors
+    // bash_tool_suggestion's philosophy. Silent for new files, whole-file
+    // rewrites, and small files where write is genuinely the right tool.
+    if (exists && !original.empty()) {
+        const std::size_t orig_lines =
+            static_cast<std::size_t>(
+                std::count(original.begin(), original.end(), '\n')) + 1;
+        const int churn = change.added + change.removed;
+        if (orig_lines >= 40 && churn > 0
+            && static_cast<std::size_t>(churn) * 5 < orig_lines) {
+            msg += std::format(
+                "\n\ntip: this overwrote a {}-line file but only changed ~{} "
+                "line(s). For a targeted change like this, `edit` (or "
+                "`apply_patch`) ships just the snippet instead of the whole "
+                "file, won't clobber unseen concurrent edits, and produces a "
+                "cleaner diff — prefer it over `write` when the file already "
+                "exists and you're changing part of it.", orig_lines, churn);
+        }
+    }
     return ToolOutput{std::move(msg), std::move(change)};
 }
 
@@ -521,13 +1611,13 @@ std::expected<ListDirArgs, ToolError> parse_list_dir_args(const json& j) {
     };
 }
 
-ExecResult run_list_dir(const ListDirArgs& a) {
-    auto wp = util::make_workspace_path_checked(a.root, "list_dir");
+ExecResult run_list_dir(const Call& call, const ListDirArgs& a) {
+    auto wp = util::make_workspace_path_checked(a.root, "list_dir", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
     std::error_code ec;
-    if (!fs::exists(wp->path(), ec))
+    if (!call.fs().stat(wp->path()).exists)
         return std::unexpected(ToolError::not_found("directory not found: " + a.root));
-    if (!fs::is_directory(wp->path(), ec))
+    if (!call.fs().stat(wp->path()).directory)
         return std::unexpected(ToolError::not_a_directory("not a directory: " + a.root));
 
     std::ostringstream out;
@@ -540,18 +1630,17 @@ ExecResult run_list_dir(const ListDirArgs& a) {
         if (bytes < 1024*1024*1024) { std::snprintf(buf, sizeof(buf), "%.1fM", b/(1024.0*1024.0)); return buf; }
         std::snprintf(buf, sizeof(buf), "%.1fG", b/(1024.0*1024.0*1024.0)); return buf;
     };
-    auto list_entry = [&](const fs::directory_entry& entry, int depth) {
+    auto list_entry = [&](const DirEntry& entry, int depth) {
         if (count > 1000) return;
         std::string indent(static_cast<std::size_t>(depth) * 2, ' ');
-        auto fn = entry.path().filename().string();
-        if (entry.is_directory(ec)) {
+        auto fn = entry.path.filename().string();
+        if (entry.directory) {
             out << indent << fn << "/\n";
-        } else if (entry.is_regular_file(ec)) {
-            auto sz = entry.file_size(ec);
-            out << indent << fn << "  " << format_size(ec ? 0 : sz) << "\n";
-        } else if (entry.is_symlink(ec)) {
+        } else if (entry.regular) {
+            out << indent << fn << "  " << format_size(entry.size) << "\n";
+        } else if (entry.symlink) {
             std::error_code link_ec;
-            auto target = fs::read_symlink(entry.path(), link_ec);
+            auto target = call.fs().read_symlink(entry.path, link_ec);
             if (link_ec)
                 out << indent << fn << " -> <unreadable: " << link_ec.message() << ">\n";
             else
@@ -560,37 +1649,33 @@ ExecResult run_list_dir(const ListDirArgs& a) {
         count++;
     };
     if (a.recursive) {
-        for (auto it = fs::recursive_directory_iterator(wp->path(),
-                    fs::directory_options::skip_permission_denied, ec);
-             it != fs::recursive_directory_iterator(); it.increment(ec)) {
-            if (ec) { ec.clear(); continue; }
-            if (it.depth() > a.max_depth) { it.disable_recursion_pending(); continue; }
-            const auto& entry = *it;
-            auto fn = entry.path().filename().string();
-            const bool is_dir = entry.is_directory(ec);
-            if (is_dir && util::should_skip_dir(fn)) {
-                list_entry(entry, it.depth());
-                it.disable_recursion_pending();
-                if (count > 1000) { out << "[>1000 entries, truncated]\n"; break; }
-                continue;
+        call.fs().walk(wp->path(), [&](const DirEntry& entry) {
+            if (entry.depth > a.max_depth) return WalkStep::skip_dir;
+            auto fn = entry.path.filename().string();
+            if (entry.directory && util::should_skip_dir(fn)) {
+                list_entry(entry, entry.depth);
+                if (count > 1000) { out << "[>1000 entries, truncated]\n"; return WalkStep::stop; }
+                return WalkStep::skip_dir;
             }
-            if (is_dir && it.depth() > 0 && fn.starts_with(".")) {
-                it.disable_recursion_pending();
-                continue;
-            }
-            list_entry(*it, it.depth());
-            if (count > 1000) { out << "[>1000 entries, truncated]\n"; break; }
-        }
+            if (entry.directory && entry.depth > 0 && fn.starts_with("."))
+                return WalkStep::skip_dir;
+            list_entry(entry, entry.depth);
+            if (count > 1000) { out << "[>1000 entries, truncated]\n"; return WalkStep::stop; }
+            return WalkStep::next;
+        });
     } else {
-        std::vector<fs::directory_entry> entries;
-        for (auto& e : fs::directory_iterator(wp->path(), ec))
-            entries.push_back(e);
+        std::vector<DirEntry> entries = call.fs().list(wp->path(), ec);
         std::sort(entries.begin(), entries.end(), [](const auto& x, const auto& y) {
-            bool da = x.is_directory(), db = y.is_directory();
+            bool da = x.directory, db = y.directory;
             if (da != db) return da > db;
-            return x.path().filename() < y.path().filename();
+            return x.path.filename() < y.path.filename();
         });
         for (auto& e : entries) list_entry(e, 0);
+        // list_entry stops appending AND counting past the cap — signal
+        // truncation without claiming an exact remainder.
+        if (count > 1000)
+            out << "[>1000 entries, truncated — use glob with a narrower "
+                   "pattern]\n";
     }
     if (count == 0) return ToolOutput{"empty directory", std::nullopt};
     std::string body = out.str();
@@ -607,7 +1692,7 @@ ExecResult run_list_dir(const ListDirArgs& a) {
 
 struct MoveArgs { fs::path source; fs::path destination; bool overwrite = false; };
 
-std::expected<MoveArgs, ToolError> parse_move_args(const json& j) {
+std::expected<MoveArgs, ToolError> parse_move_args(const json& j, const util::Bounds& b) {
     util::ArgReader r{j};
     auto source = r.require_str("source");
     if (!source || source->empty())
@@ -615,62 +1700,82 @@ std::expected<MoveArgs, ToolError> parse_move_args(const json& j) {
     auto destination = r.require_str("destination");
     if (!destination || destination->empty())
         return std::unexpected(ToolError::invalid_args("destination is required"));
-    auto src = util::make_workspace_path_checked(*source, "move");
+    auto src = util::make_workspace_path_checked(*source, "move", b);
     if (!src) return std::unexpected(src.error());
-    auto dst = util::make_workspace_path_checked(*destination, "move");
+    auto dst = util::make_workspace_path_checked(*destination, "move", b);
     if (!dst) return std::unexpected(dst.error());
     return MoveArgs{src->path(), dst->path(), r.boolean("overwrite", false)};
 }
 
-ExecResult run_move(const MoveArgs& a) {
+ExecResult run_move(const Call& call, const MoveArgs& a) {
     std::error_code ec;
-    if (!fs::exists(a.source, ec))
+    if (!call.fs().stat(a.source).exists)
         return std::unexpected(ToolError::not_found(a.source.string()));
-    if (fs::exists(a.destination, ec)) {
+    if (call.fs().stat(a.destination).exists) {
         if (!a.overwrite)
             return std::unexpected(ToolError::ambiguous(
                 "destination exists; pass overwrite:true to replace it"));
-        if (fs::is_directory(a.destination, ec) && !fs::is_empty(a.destination, ec))
+        if (call.fs().stat(a.destination).directory && !call.fs().list(a.destination, ec).empty())
             return std::unexpected(ToolError::invalid_args(
                 "refusing to replace a non-empty destination directory"));
-        fs::remove(a.destination, ec);
+        call.fs().remove(a.destination, ec);
         if (ec) return std::unexpected(ToolError::io(ec.message()));
     }
-    fs::create_directories(a.destination.parent_path(), ec);
+    call.fs().create_directories(a.destination.parent_path(), ec);
     if (ec) return std::unexpected(ToolError::io(ec.message()));
-    fs::rename(a.source, a.destination, ec);
-    if (ec) return std::unexpected(ToolError::io("move failed: " + ec.message()));
+    call.fs().rename(a.source, a.destination, ec);
+    if (ec) {
+        // Cross-filesystem/device rename (EXDEV: different volume, tmpfs,
+        // bind mount) can't be a rename(2). Fall back to copy+delete — the
+        // semantics the caller asked for — instead of surfacing a cryptic
+        // "Invalid cross-device link".
+        std::error_code copy_ec;
+        call.fs().copy(a.source, a.destination, copy_ec);
+        if (copy_ec)
+            return std::unexpected(ToolError::io(
+                "move failed: " + ec.message()
+                + "; copy fallback also failed: " + copy_ec.message()));
+        call.fs().remove_all(a.source, copy_ec);
+        if (copy_ec)
+            return std::unexpected(ToolError::io(
+                "moved (copied) to " + a.destination.string()
+                + " but could not remove the source: " + copy_ec.message()));
+    }
     return ToolOutput{std::format("Moved {} -> {}", a.source.string(), a.destination.string()), std::nullopt};
 }
 
 struct RemoveArgs { fs::path path; bool recursive = false; };
 
-std::expected<RemoveArgs, ToolError> parse_remove_args(const json& j) {
+std::expected<RemoveArgs, ToolError> parse_remove_args(const json& j, const util::Bounds& b) {
     util::ArgReader r{j};
     auto path = r.require_str("path");
     if (!path || path->empty())
         return std::unexpected(ToolError::invalid_args("path is required"));
-    auto checked = util::make_workspace_path_checked(*path, "remove");
+    auto checked = util::make_workspace_path_checked(*path, "remove", b);
     if (!checked) return std::unexpected(checked.error());
-    if (checked->path() == util::workspace_root())
+    if (checked->path() == b.workspace)
         return std::unexpected(ToolError::invalid_args("refusing to remove the workspace root"));
     return RemoveArgs{checked->path(), r.boolean("recursive", false)};
 }
 
-ExecResult run_remove(const RemoveArgs& a) {
+ExecResult run_remove(const Call& call, const RemoveArgs& a) {
     std::error_code ec;
-    if (!fs::exists(a.path, ec))
-        return std::unexpected(ToolError::not_found(
-            "nothing to remove at " + a.path.string()
-            + " — it doesn't exist (already deleted, or a wrong path). If you "
-              "intended it gone, the desired state is already met; otherwise "
-              "`list_dir` the parent to check the name."));
-    const bool directory = fs::is_directory(a.path, ec);
-    if (directory && !a.recursive && !fs::is_empty(a.path, ec))
+    // Already gone = the desired state, so SUCCESS (like `rm -f`). It was a
+    // red [not found] failure, which a weak model (#91: gpt-oss) read as
+    // "the job is blocked" and gave up on the whole task instead of moving
+    // on to writing the new files. A wrong path still shows: the output says
+    // nothing was there, so a model that meant something else can check.
+    if (!call.fs().stat(a.path).exists)
+        return ToolOutput{"Nothing to remove: " + a.path.string()
+                          + " does not exist (already gone). Desired state met "
+                            "\xe2\x80\x94 continue with the next step.",
+                          std::nullopt};
+    const bool directory = call.fs().stat(a.path).directory;
+    if (directory && !a.recursive && !call.fs().list(a.path, ec).empty())
         return std::unexpected(ToolError::invalid_args(
             "directory is not empty; pass recursive:true to remove its contents"));
-    const auto count = a.recursive ? fs::remove_all(a.path, ec)
-                                   : static_cast<std::uintmax_t>(fs::remove(a.path, ec));
+    const auto count = a.recursive ? call.fs().remove_all(a.path, ec)
+                                   : static_cast<std::uintmax_t>(call.fs().remove(a.path, ec));
     if (ec) return std::unexpected(ToolError::io("remove failed: " + ec.message()));
     return ToolOutput{std::format("Removed {} ({} filesystem entr{})", a.path.string(), count,
                                   count == 1 ? "y" : "ies"), std::nullopt};
@@ -702,7 +1807,8 @@ json read_schema() {
             {"display_description", {{"type","string"},
                 {"description","One-line summary shown in the UI. Optional."}}},
             {"path",       {{"type","string"}, {"description","Absolute or relative path"}}},
-            {"offset",     {{"type","integer"}, {"description","Start line (1-based)"}}},
+            {"symbol",     {{"type","string"}, {"description","Read ONLY this symbol's definition + body (function/class/etc.), resolved to its enclosing block — no line numbers or `sed` needed. e.g. symbol=\"parse_args\"."}}},
+            {"offset",     {{"type","integer"}, {"description","Start line (1-based). NEGATIVE = tail: offset:-50 returns the LAST 50 lines (like tail -n 50) — ideal for logs and build output, no need to know the file length."}}},
             {"limit",      {{"type","integer"}, {"description","Max lines"}}},
             {"start_line", {{"type","integer"}, {"description","Alias for offset (Zed-style)"}}},
             {"end_line",   {{"type","integer"}, {"description","Inclusive last line (Zed-style)"}}},
@@ -739,18 +1845,155 @@ json list_dir_schema() {
 
 } // namespace
 
+// ─────────────────────────────────────────────────────────────────────────
+//  outline — a nested symbol tree for ONE file (no bodies).
+// ─────────────────────────────────────────────────────────────────────────
+// `read` emits a FLAT outline as a side effect for files >32 KiB; this is the
+// first-class, intentional "show me this file's SHAPE" tool: works at any
+// size, and NESTS entries by leading-indent depth so a class's methods sit
+// under it. Reuses the same def/heading pattern read's outline uses, so what
+// you see here is exactly what read would surface — just structured, with a
+// line number you can jump to via read(symbol=) or read(offset=).
+
+struct OutlineArgs {
+    util::WorkspacePath path;
+    int  max_entries = 400;
+    std::string display_description;
+};
+
+[[nodiscard]] std::string render_outline_nested(std::string_view content,
+                                                std::size_t max_entries,
+                                                int& total_defs) {
+    const auto& re = outline_pattern();
+    // Collect (indent_cols, line_no, signature) for each matching line.
+    struct Row { int cols; int line; std::string sig; };
+    std::vector<Row> rows;
+    int line_no = 0;
+    std::size_t start = 0;
+    total_defs = 0;
+    while (start <= content.size()) {
+        std::size_t nl = content.find('\n', start);
+        std::string_view line = content.substr(
+            start, (nl == std::string_view::npos ? content.size() : nl) - start);
+        ++line_no;
+        if (outline_line_matches(line)) {
+            // indent width in columns (tab = 4) for depth bucketing
+            int cols = 0;
+            for (char c : line) {
+                if (c == ' ') ++cols;
+                else if (c == '\t') cols += 4;
+                else break;
+            }
+            std::size_t l = 0;
+            while (l < line.size() && (line[l] == ' ' || line[l] == '\t')) ++l;
+            auto trimmed = line.substr(l);
+            while (!trimmed.empty() && (trimmed.back() == ' '
+                       || trimmed.back() == '\t' || trimmed.back() == '\r'))
+                trimmed.remove_suffix(1);
+            if (!trimmed.empty()) {
+                ++total_defs;
+                if (rows.size() < max_entries)
+                    rows.push_back({cols, line_no, std::string{trimmed}});
+            }
+        }
+        if (nl == std::string_view::npos) break;
+        start = nl + 1;
+    }
+
+    // Map distinct indent-column values → tree depth (0,1,2,…) so mixed
+    // 2-space / 4-space files still nest sanely: depth = rank of this row's
+    // indent among the indents of its enclosing (smaller-indent) ancestors.
+    std::string out;
+    std::vector<int> stack;   // indent cols of open ancestors
+    for (auto& r : rows) {
+        while (!stack.empty() && stack.back() >= r.cols) stack.pop_back();
+        int depth = static_cast<int>(stack.size());
+        stack.push_back(r.cols);
+        for (int i = 0; i < depth; ++i) out += "  ";
+        std::format_to(std::back_inserter(out), "L{}: {}\n", r.line, r.sig);
+    }
+    return out;
+}
+
+ExecResult run_outline(const Call& call, const OutlineArgs& a) {
+    const auto& p = a.path.path();
+    std::error_code ec;
+    if (!call.fs().stat(p).exists)
+        return std::unexpected(ToolError::not_found(a.path.string()));
+    if (!call.fs().stat(p).regular)
+        return std::unexpected(ToolError::not_a_file(a.path.string()));
+    constexpr std::uintmax_t kMaxBytes = 8u * 1024u * 1024u;
+    if (auto sz = call.fs().stat(p).size; !ec && sz > kMaxBytes)
+        return std::unexpected(ToolError::too_large(std::format(
+            "file is {} KiB (> 8 MiB outline cap).", sz / 1024)));
+
+    std::string content;
+    try { content = util::read_file(a.path); }
+    catch (...) { return std::unexpected(ToolError::io("cannot read " + a.path.string())); }
+    if (content.find('\0') != std::string::npos)
+        return std::unexpected(ToolError::binary(a.path.string()));
+
+    int total = 0;
+    std::string tree = render_outline_nested(
+        content, static_cast<std::size_t>(a.max_entries), total);
+
+    int lines = static_cast<int>(std::count(content.begin(), content.end(), '\n')) + 1;
+    std::ostringstream out;
+    if (!a.display_description.empty()) out << a.display_description << "\n";
+    if (total == 0)
+        return ToolOutput{a.path.string() + " (" + std::to_string(lines)
+            + " lines): no top-level definitions or headings detected — "
+            "read it directly.", std::nullopt};
+    out << a.path.string() << " — " << total << " definition"
+        << (total==1?"":"s") << " across " << lines << " lines:\n\n" << tree;
+    if (total > a.max_entries)
+        out << "\n[" << (total - a.max_entries)
+            << " more — raise max_entries]";
+    return ToolOutput{util::to_valid_utf8(out.str()), std::nullopt};
+}
+
+std::expected<OutlineArgs, ToolError> parse_outline_args(const json& j, const util::Bounds& b) {
+    util::ArgReader r(j);
+    if (!r.is_object())
+        return std::unexpected(ToolError::invalid_args("expected a JSON object"));
+    auto path = r.require_str("path");
+    if (!path || path->empty())
+        return std::unexpected(ToolError::invalid_args("`path` is required"));
+    auto wp = util::make_readable_path_checked(*path, "outline", b);
+    if (!wp) return std::unexpected(std::move(wp.error()));
+    OutlineArgs a{std::move(*wp),
+                  std::clamp(r.integer("max_entries", 400), 1, 2000),
+                  r.str("display_description")};
+    return a;
+}
+
+json outline_schema() {
+    return json{{"type","object"},{"required",{"path"}},{"properties",{
+        {"path",{{"type","string"},{"description","File to outline."}}},
+        {"display_description",{{"type","string"},{"description","One-line summary shown in the UI. Optional."}}},
+        {"max_entries",{{"type","integer"},{"description","Max symbols shown (default 400)."}}},
+    }}};
+}
+
 void register_fs_tools(Shells& sh) {
     sh.add("read",
-        "Read a file from the filesystem. Returns up to 2000 lines "
-        "starting at an optional offset. For files over 32 KiB, "
+        "Read a file from the filesystem. A plain read (no line range) "
+        "returns up to 2000 lines from the top; but when you pass a START "
+        "position (offset / start_line) WITHOUT an end, it returns a "
+        "FOCUSED ~250-line window (not the whole rest of the file) and the "
+        "footer tells you how many lines remain + the exact offset to page "
+        "\xe2\x80\x94 so paging stays cheap. For files over 32 KiB, "
         "reading without an explicit line range returns a SYMBOL "
         "OUTLINE (function / class / heading names with line "
         "numbers) \xe2\x80\x94 or, if the file has no code "
         "structure, its first 1 KiB \xe2\x80\x94 instead of the "
         "full content; use start_line + end_line (or offset + "
         "limit) on a follow-up read to fetch the specific section "
-        "you want. Include a brief `display_description` so the "
-        "user sees why you're reading.",
+        "you want. Best of all, pass `symbol` to read exactly one "
+        "function/class/type's definition and body (resolved to its "
+        "enclosing block) with no line arithmetic — use that instead "
+        "of computing ranges or shelling out to sed/head/tail. Include "
+        "a brief `display_description` so the user sees why you're reading.",
         read_schema(), EffectSet{Effect::ReadFs},
         body<ReadArgs>(run_read, parse_read_args), 80'000);
 
@@ -772,6 +2015,17 @@ void register_fs_tools(Shells& sh) {
         "Use this to explore project structure before reading files.",
         list_dir_schema(), EffectSet{Effect::ReadFs},
         body<ListDirArgs>(run_list_dir, parse_list_dir_args), 25'000);
+
+    sh.add("outline",
+        "Show a file's SHAPE \xe2\x80\x94 a nested tree of its definitions "
+        "(functions / classes / structs / headings) with line numbers, and "
+        "NO bodies. The cheap \"what's in this file\" probe before reading: "
+        "one call maps a 2000-line source at a fraction of the context cost, "
+        "then jump to a symbol with read(symbol=) or read(offset=). Unlike "
+        "read's size-triggered outline, this works at any size and nests "
+        "methods under their class by indent depth.",
+        outline_schema(), EffectSet{Effect::ReadFs},
+        body<OutlineArgs>(run_outline, parse_outline_args), 25'000);
 
     sh.add("move",
         "Move or rename a file or directory within the workspace without invoking a shell. "

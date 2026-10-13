@@ -6,24 +6,23 @@
 // string/int; the parsers enforce the same invariants up front.
 
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 #include "tool_body.hpp"
 
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/glob.hpp>
-#include <mcp/tools/util/subprocess.hpp>
 #include <mcp/tools/util/utf8.hpp>
 #include <mcp/tools/util/error.hpp>
+#include <mcp/tools/util/regex_guard.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <expected>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -75,8 +74,8 @@ std::expected<GlobArgs, ToolError> parse_glob_args(const json& j) {
     };
 }
 
-ExecResult run_glob(const GlobArgs& a) {
-    auto wp = util::make_workspace_path_checked(a.root, "glob");
+ExecResult run_glob(const Call& call, const GlobArgs& a) {
+    auto wp = util::make_workspace_path_checked(a.root, "glob", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
 
     const auto& pat = a.pattern;
@@ -87,57 +86,59 @@ ExecResult run_glob(const GlobArgs& a) {
         bool is_dir;
         bool is_link;
         uintmax_t size;
+        std::int64_t mtime = 0;   // ns since epoch — recency ranking
     };
     std::vector<Entry> entries;
     entries.reserve(512);
 
-    std::error_code ec;
-    for (auto it = fs::recursive_directory_iterator(wp->path(),
-                fs::directory_options::skip_permission_denied, ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        auto fn = it->path().filename().string();
-        bool is_dir_entry = it->is_directory(ec);
-        // Symlink-loop guard: don't recurse THROUGH a symlinked directory
-        // (a cyclic link makes recursive_directory_iterator spin forever).
-        // Symlinked entries are still reported below via the is_symlink flag
-        // when they match, but we never descend into them.
-        {
-            std::error_code lec;
-            if (it->is_symlink(lec) && is_dir_entry) {
-                it.disable_recursion_pending();
-                continue;
-            }
-        }
-        if (is_dir_entry) {
-            if (util::should_skip_dir(fn)) { it.disable_recursion_pending(); continue; }
-        }
+    // The walk never descends through a symlinked directory (a cyclic link
+    // would never end); those entries aren't reported either.
+    call.fs().walk(wp->path(), [&](const DirEntry& e) {
+        auto fn = e.path.filename().string();
+        const bool is_dir_entry = e.directory;
+        if (e.symlink && is_dir_entry) return WalkStep::skip_dir;
+        if (is_dir_entry && util::should_skip_dir(fn)) return WalkStep::skip_dir;
         bool hit = has_glob ? util::glob_match(pat, fn)
                             : fn.find(pat) != std::string::npos;
         // Slash-bearing patterns ('src/*.cpp', '**/util/*.hpp') are PATH
         // patterns — match them against the workspace-relative path, not
         // just the basename, so directory-scoped globs work as users expect.
         if (!hit && has_glob && pat.find('/') != std::string::npos)
-            hit = glob_hit(pat, it->path(), wp->path());
+            hit = glob_hit(pat, e.path, wp->path());
         if (hit) {
-            bool is_link = it->is_symlink(ec);
+            const bool is_link = e.symlink;
             uintmax_t sz = 0;
+            std::int64_t mt = 0;
             if (!is_dir_entry && !is_link) {
-                std::error_code sec;
-                sz = it->file_size(sec);
+                sz = e.size;
+                mt = e.mtime.time_since_epoch().count();
             }
-            entries.push_back({it->path().string(), is_dir_entry, is_link, sz});
-            if (entries.size() > 500) break;
+            // Workspace-relative path: denser output, and the model feeds
+            // these straight back into read/edit which resolve relative
+            // paths against the project root anyway.
+            // Lexical: the walk yields paths under the root as given.
+            auto rel = e.path.lexically_relative(wp->path());
+            entries.push_back({
+                rel.empty() ? e.path.string() : rel.generic_string(),
+                is_dir_entry, is_link, sz, mt});
+            if (entries.size() > 500) return WalkStep::stop;
         }
-    }
+        return WalkStep::next;
+    });
 
     if (entries.empty())
         return ToolOutput{"no matches. Try a different pattern, or `list_dir` "
                           "on parent directories to see what exists.",
                           std::nullopt};
 
+    // Recency-first (Claude Code's Glob contract: sorted by modification
+    // time) — when a pattern hits 40 files, the recently-touched one is
+    // almost always the one the task is about. Directories keep a stable
+    // alphabetical block at the end (they carry no useful mtime signal).
     std::sort(entries.begin(), entries.end(), [](const Entry& x, const Entry& y) {
-        if (x.is_dir != y.is_dir) return x.is_dir > y.is_dir;
+        if (x.is_dir != y.is_dir) return x.is_dir < y.is_dir;   // files first
+        if (x.is_dir) return x.path < y.path;                    // dirs: alpha
+        if (x.mtime != y.mtime) return x.mtime > y.mtime;        // newest first
         return x.path < y.path;
     });
 
@@ -187,8 +188,43 @@ std::expected<FindDefinitionArgs, ToolError> parse_find_definition_args(const js
     };
 }
 
-ExecResult run_find_definition(const FindDefinitionArgs& a) {
-    auto wp = util::make_workspace_path_checked(a.root, "find_definition");
+// Run a program through the host. Shaped like SubprocessResult so the
+// parsing below is untouched; `stop_when` is forwarded because only this
+// file knows when it has seen enough matches.
+[[nodiscard]] RunResult run_prog(
+        CallExec& exec, std::vector<std::string> argv,
+        std::chrono::seconds timeout, std::size_t max_bytes,
+        std::function<bool(std::string_view)> stop_when = {}) {
+    ExecRequest req;
+    if (!argv.empty())
+        req.program = {argv.front(), {argv.begin() + 1, argv.end()}};
+    req.budgets.idle     = timeout;
+    req.max_output_bytes = max_bytes;
+    req.stop_when        = std::move(stop_when);
+    const auto res = exec.run(req);
+
+    RunResult out;
+    out.output    = res.output;
+    out.truncated = res.truncated;
+    std::visit([&]<class T>(const T& o) {
+        if constexpr (std::is_same_v<T, Exited>)         out.exit_code = o.code;
+        else if constexpr (std::is_same_v<T, Signalled>) out.exit_code = 128 + o.signal;
+        else if constexpr (std::is_same_v<T, StartFailed>) {
+            out.started = false; out.start_error = o.reason;
+        } else if constexpr (std::is_same_v<T, Cancelled>) out.exit_code = 130;
+        else if constexpr (std::is_same_v<T, StoppedEarly>) out.stopped_early = true;
+        else {
+            static_assert(std::is_same_v<T, TimedOut>, "unhandled ExecOutcome arm");
+            out.timed_out = true;
+        }
+    }, res.outcome);
+    return out;
+}
+
+[[nodiscard]] bool have_rg(const Call& call, CallExec& exec);
+
+ExecResult run_find_definition(const Call& call, const FindDefinitionArgs& a, CallExec& exec) {
+    auto wp = util::make_workspace_path_checked(a.root, "find_definition", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
 
     std::string esc;
@@ -209,17 +245,7 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
         "const|let|var|type|interface|export|func|fn|trait|mod|static)\\s+"
         + esc + "\\b|#define\\s+" + esc + "\\b|\\b\\w[\\w:*&<> ]*\\s+" + esc + "\\s*\\(";
 
-    static int rg_available = -1;
-    if (rg_available < 0) {
-        auto probe = util::Subprocess::run(util::SubprocessOptions{
-            .argv      = std::vector<std::string>{"rg", "--version"},
-            .timeout   = std::chrono::seconds(2),
-            .max_bytes = 1024,
-        });
-        rg_available = (probe.started && probe.exit_code == 0) ? 1 : 0;
-    }
-
-    if (rg_available == 1) {
+    if (have_rg(call, exec)) {
         // Pass every argument via argv — the pattern contains regex meta
         // (|, (), \b, <, >, *) that a shell string would mangle or, worse,
         // interpret. argv form reaches rg byte-for-byte.
@@ -232,11 +258,7 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
         };
         // Prune build / vendor / _deps so rg doesn't crawl generated trees.
         for (const auto& g : util::skip_dir_rg_globs()) argv.push_back(g);
-        auto r = util::Subprocess::run(util::SubprocessOptions{
-            .argv      = std::move(argv),
-            .timeout   = std::chrono::seconds(30),
-            .max_bytes = 100000,
-        });
+        auto r = run_prog(exec, std::move(argv), std::chrono::seconds(30), 100000);
         if (r.started && (r.exit_code == 0 || r.exit_code == 1)) {
             if (r.output.empty() || r.exit_code == 1) {
                 return ToolOutput{"no definitions found for '" + a.symbol + "'", std::nullopt};
@@ -264,35 +286,16 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
 
     std::ostringstream out;
     int matches = 0;
-    std::error_code ec;
     constexpr uintmax_t kMaxFileBytes = 512u * 1024u;
-    for (auto it = fs::recursive_directory_iterator(wp->path(),
-                fs::directory_options::skip_permission_denied, ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        const auto& entry = *it;
-        auto fn = entry.path().filename().string();
-        const bool is_dir = entry.is_directory(ec);
-
-        // Symlink-loop guard: never descend into a symlinked directory.
-        {
-            std::error_code lec;
-            if (is_dir && entry.is_symlink(lec)) {
-                it.disable_recursion_pending();
-                continue;
-            }
-        }
-        if (is_dir && util::should_skip_dir(fn)) {
-            it.disable_recursion_pending();
-            continue;
-        }
-        if (fn.starts_with(".")) {
-            if (is_dir) it.disable_recursion_pending();
-            continue;
-        }
-        if (is_dir) continue;
-        if (!entry.is_regular_file(ec)) continue;
-        auto ext = entry.path().extension().string();
+    call.fs().walk(wp->path(), [&](const DirEntry& entry) {
+        auto fn = entry.path.filename().string();
+        const bool is_dir = entry.directory;
+        // Never descend into a symlinked directory (the walk won't either).
+        if (is_dir && entry.symlink) return WalkStep::skip_dir;
+        if (is_dir && util::should_skip_dir(fn)) return WalkStep::skip_dir;
+        if (fn.starts_with(".")) return is_dir ? WalkStep::skip_dir : WalkStep::next;
+        if (is_dir || !entry.regular) return WalkStep::next;
+        auto ext = entry.path.extension().string();
         static const std::vector<std::string> code_exts = {
             ".cpp", ".hpp", ".c", ".h", ".cc", ".hh", ".cxx", ".hxx",
             ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs",
@@ -302,27 +305,26 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
         };
         bool is_code = false;
         for (const auto& e : code_exts) { if (ext == e) { is_code = true; break; } }
-        if (!is_code) continue;
-        std::error_code sec;
-        auto sz = entry.file_size(sec);
-        if (!sec && (sz == 0 || sz > kMaxFileBytes)) continue;
+        if (!is_code) return WalkStep::next;
+        if (entry.size == 0 || entry.size > kMaxFileBytes) return WalkStep::next;
 
-        std::ifstream ifs(entry.path());
-        if (!ifs) continue;
+        const auto text = call.fs().read(entry.path);
+        if (!text) return WalkStep::next;
+        std::istringstream ifs(*text);
         std::string line;
         int n = 1;
         while (std::getline(ifs, line)) {
             for (const auto& re : patterns) {
                 if (std::regex_search(line, re)) {
-                    out << entry.path().string() << ":" << n << ": " << line << "\n";
-                    if (++matches > 50) goto done;
+                    out << entry.path.string() << ":" << n << ": " << line << "\n";
+                    if (++matches > 50) return WalkStep::stop;
                     break;
                 }
             }
             n++;
         }
-    }
-    done:
+        return WalkStep::next;
+    });
     if (matches == 0) return ToolOutput{"no definitions found for '" + a.symbol + "'", std::nullopt};
     if (matches > 50) out << "[>50 definitions, truncated]\n";
     std::string body = out.str();
@@ -337,7 +339,11 @@ ExecResult run_find_definition(const FindDefinitionArgs& a) {
 
 constexpr std::size_t kMaxFileBytes = 8 * 1024 * 1024;
 constexpr int         kPerPage      = 20;
+constexpr int         kMaxPage      = 200;
 constexpr int         kContext      = 2;
+// Real `grep -A/-B/-C` use goes to 60 (a third are over 10), so the native
+// window has to reach that far or the shell stays the better tool.
+constexpr int         kMaxContext   = 60;
 constexpr int         kMaxScanned   = 500;
 constexpr std::size_t kMaxOutputBytes = 20'000;
 // File-parallel scan scales with cores; cap high enough to saturate a big
@@ -349,9 +355,68 @@ struct GrepArgs {
     std::string root;
     std::string file_glob;
     bool        case_sensitive;
+    bool        word;      // whole-word match (absorbs find_references)
+    bool        block;     // return the whole enclosing function/block per hit
+    int         context_lines = kContext;  // ±N lines (context:"N")
     int         offset;    // ≥ 0
+    // Matches per page. `limit` lets a caller ask for fewer (or more, up to
+    // kMaxPage) instead of piping to `| head -N`, which is what the prompt
+    // and the shell tip tell the model to do.
+    int         per_page = kPerPage;
+    // Drop hits whose line matches this regex (like `| grep -v PAT`). The
+    // line stays as context, so the block around a kept hit is unchanged.
+    std::string exclude;
+    // Output mode: Content (default) renders matching lines w/ context;
+    // FilesOnly renders one path + match-count per line (rg -l — the survey
+    // shape: "which files touch X" without the line noise); Count renders
+    // ONLY the total + per-file counts (rg -c — the cheapest possible probe
+    // for "how widespread is X", perfect before a rewrite).
+    enum class Mode { Content, FilesOnly, Count };
+    Mode        mode = Mode::Content;
     std::string display_description;
+    bool        literal = false;   // the escaped retry of a bad regex
 };
+
+// A pattern that failed as a regex, made into one that can't fail: each
+// `|` branch is taken as plain text ("\\[" and "\[" mean "[") and escaped,
+// so "foo(|bar" still finds either word.
+std::string literal_alternation(std::string_view p) {
+    auto plain = [](std::string_view s) {
+        std::string out;
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '\\' && i + 1 < s.size()) {
+                std::size_t j = i;
+                while (j < s.size() && s[j] == '\\') ++j;
+                if (j < s.size() && std::ispunct(static_cast<unsigned char>(s[j]))) {
+                    out += s[j];
+                    i = j;
+                    continue;
+                }
+            }
+            out += s[i];
+        }
+        return out;
+    };
+    auto escape = [](std::string_view s) {
+        std::string out;
+        for (char c : s) {
+            if (std::strchr("\\.^$|?*+()[]{}", c)) out += '\\';
+            out += c;
+        }
+        return out;
+    };
+    std::string out;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= p.size(); ++i) {
+        if (i < p.size() && p[i] != '|') continue;
+        if (!out.empty() || i > start) {
+            if (start > 0) out += '|';
+            out += escape(plain(p.substr(start, i - start)));
+        }
+        start = i + 1;
+    }
+    return out;
+}
 
 std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
     util::ArgReader ar(j);
@@ -364,19 +429,75 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
             "pattern must not be blank (received only whitespace)"));
     int offset = ar.integer("offset", 0);
     if (offset < 0) offset = 0;
-    return GrepArgs{
+    const int per_page = std::clamp(ar.integer("limit", kPerPage), 1, kMaxPage);
+    // `context`: "block" returns the enclosing scope; a NUMBER ("0".."60",
+    // or a bare integer) sets the ±N window; anything else is the default ±2.
+    bool block = false;
+    int  ctx_lines = kContext;
+    {
+        std::string ctx = ar.str("context", "");
+        if (ctx.empty() && ar.has("context")) {
+            // Model sent a bare integer (context: 5) — ArgReader.str returns
+            // "" for non-strings; read it as an integer instead.
+            ctx_lines = std::clamp(ar.integer("context", kContext), 0, kMaxContext);
+        } else if (ctx == "block") {
+            block = true;
+        } else if (!ctx.empty()
+                   && ctx.find_first_not_of("0123456789") == std::string::npos) {
+            ctx_lines = std::clamp(std::atoi(ctx.c_str()), 0, kMaxContext);
+        }
+    }
+    GrepArgs::Mode mode = GrepArgs::Mode::Content;
+    {
+        std::string o = ar.str("output", "");
+        if (o == "files") mode = GrepArgs::Mode::FilesOnly;
+        else if (o == "count") mode = GrepArgs::Mode::Count;
+    }
+    // A bad exclude regex is a caller error, not a silent no-op.
+    if (auto ex = ar.str("exclude", ""); !ex.empty()) {
+        if (util::has_nested_quantifier(ex))
+            return std::unexpected(ToolError::invalid_args(
+                "exclude has a nested unbounded quantifier (e.g. (a+)+) that "
+                "can cause catastrophic backtracking; rewrite it."));
+        try { std::regex probe{ex}; (void)probe; }
+        catch (const std::regex_error&) {
+            return std::unexpected(ToolError::invalid_args(
+                "exclude is not a valid regex (ECMAScript): " + ex));
+        }
+    }
+    GrepArgs g{
         std::move(pat),
         ar.str("path", "."),
         ar.str("glob", ""),
         ar.boolean("case_sensitive", false),
+        ar.boolean("word", false),
+        block,
+        ctx_lines,
         offset,
+        per_page,
+        ar.str("exclude", ""),
+        mode,
         ar.str("display_description", ""),
     };
+    return g;
 }
 
 [[nodiscard]] bool is_literal_pattern(std::string_view p) noexcept {
     constexpr std::string_view meta{".^$*+?()[]{}|\\"};
     return p.find_first_of(meta) == std::string_view::npos;
+}
+
+// Escape ECMAScript regex metacharacters so a literal string can be embedded
+// in a regex (used by grep's word-boundary path). One backslash per meta char.
+[[nodiscard]] std::string regex_escape(std::string_view text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (char c : text) {
+        if (std::string_view{".^$|()[]{}*+?\\"}.find(c) != std::string_view::npos)
+            out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
 }
 
 // Match a glob against a file, choosing filename-vs-path semantics from the
@@ -394,9 +515,9 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
     if (pattern.find('/') == std::string_view::npos)
         return util::glob_match(pattern, file.filename().string());
 
-    std::error_code rec;
-    fs::path rel = fs::relative(file, root, rec);
-    std::string rp = (rec || rel.empty() ? file : rel).generic_string();
+    // Lexical: `file` came from walking `root`, so it's under it as given.
+    fs::path rel = file.lexically_relative(root);
+    std::string rp = (rel.empty() ? file : rel).generic_string();
     while (rp.starts_with("./")) rp.erase(0, 2);
 
     if (util::glob_match(pattern, rp)) return true;
@@ -427,11 +548,11 @@ std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
 
 void scan_literal(std::string_view content, std::string_view needle,
                   bool case_insensitive, std::vector<std::size_t>& out,
-                  std::atomic<int>& total) {
+                  int& total, int cap) {
     if (needle.empty()) return;
     auto record = [&](std::size_t pos) -> bool {
         out.push_back(pos);
-        return total.fetch_add(1, std::memory_order_relaxed) + 1 < kMaxScanned;
+        return ++total < cap;
     };
     if (!case_insensitive) {
         std::size_t pos = 0;
@@ -501,14 +622,13 @@ void scan_literal(std::string_view content, std::string_view needle,
 }
 
 void scan_regex(std::string_view content, const std::regex& re,
-                std::vector<std::size_t>& out, std::atomic<int>& total) {
+                std::vector<std::size_t>& out, int& total, int cap) {
     auto begin = std::cregex_iterator(content.data(),
                                        content.data() + content.size(), re);
     auto end = std::cregex_iterator();
     for (auto it = begin; it != end; ++it) {
         out.push_back(static_cast<std::size_t>(it->position(0)));
-        if (total.fetch_add(1, std::memory_order_relaxed) + 1 >= kMaxScanned)
-            return;
+        if (++total >= cap) return;
     }
 }
 
@@ -550,17 +670,18 @@ struct FileHit {
 
 enum class Backend { Ripgrep, BuiltIn };
 
-[[nodiscard]] Backend detect_backend() {
-    static const Backend cached = []{
-        auto r = util::Subprocess::run(util::SubprocessOptions{
-            .argv     = std::vector<std::string>{"rg", "--version"},
-            .timeout  = std::chrono::seconds(3),
-            .max_bytes = 1024,
-        });
-        return (r.started && r.exit_code == 0)
-                ? Backend::Ripgrep : Backend::BuiltIn;
-    }();
-    return cached;
+// Is rg on the host's PATH? Remembered in the tool state: it doesn't change
+// under us, and probing per grep would cost a spawn on every call.
+[[nodiscard]] bool have_rg(const Call& call, CallExec& exec) {
+    if (auto known = call.with([](ToolState& s) { return s.have_rg; })) return *known;
+    auto r = run_prog(exec, {"rg", "--version"}, std::chrono::seconds(3), 1024);
+    const bool yes = r.started && r.exit_code == 0;
+    call.with([&](ToolState& s) { s.have_rg = yes; });
+    return yes;
+}
+
+[[nodiscard]] Backend detect_backend(const Call& call, CallExec& exec) {
+    return have_rg(call, exec) ? Backend::Ripgrep : Backend::BuiltIn;
 }
 
 [[nodiscard]] std::string enclosing_symbol(std::string_view content,
@@ -633,13 +754,13 @@ enum class Backend { Ripgrep, BuiltIn };
         int kind = classify(s);
         if (kind == 2) {
             std::string out{s};
-            if (out.size() > 100) { out.resize(99); out += "\xe2\x80\xa6"; }
+            if (out.size() > 100) { out.resize(util::safe_utf8_cut(out, 99)); out += "\xe2\x80\xa6"; }
             return out;
         }
         if (kind == 1) {
             if (fallback.empty()) {
                 fallback.assign(s);
-                if (fallback.size() > 100) { fallback.resize(99); fallback += "\xe2\x80\xa6"; }
+                if (fallback.size() > 100) { fallback.resize(util::safe_utf8_cut(fallback, 99)); fallback += "\xe2\x80\xa6"; }
             }
             best_indent = ind;
             continue;
@@ -649,12 +770,180 @@ enum class Backend { Ripgrep, BuiltIn };
     return fallback;
 }
 
-ExecResult run_ripgrep(const GrepArgs& a) {
+// Split content into lines (LF, tolerant of CRLF) — used by block-context mode.
+[[nodiscard]] std::vector<std::string> split_content_lines(std::string_view s) {
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\n') {
+            std::size_t end = i;
+            if (end > start && s[end-1] == '\r') --end;
+            out.emplace_back(s.substr(start, end - start));
+            start = i + 1;
+        }
+    }
+    if (start < s.size()) out.emplace_back(s.substr(start));
+    return out;
+}
+
+// Find the enclosing brace scope [lo,hi] (1-based, inclusive) of `line` for
+// grep's context:"block" mode — so a hit returns the whole function/block it
+// lives in and the model needs no follow-up `read`. Lightweight per-line brace
+// counting that skips // and # line comments and quoted strings. Clamped to
+// `max_span` so a giant function can't blow the budget.
+[[nodiscard]] std::pair<int,int> brace_block_range(
+    const std::vector<std::string>& lines, int line, int max_span = 120) {
+    auto delta = [](const std::string& s) {
+        int d = 0; bool in_str = false; char q = 0;
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (in_str) { if (c == '\\') { ++i; continue; } if (c == q) in_str = false; continue; }
+            // C++ raw string R"delim( ... )delim" (incl. u8R/uR/UR/LR): body is
+            // literal, so skip it whole — embedded quotes/braces are just bytes.
+            if (c == 'R' || c == 'u' || c == 'U' || c == 'L') {
+                std::size_t j = i;
+                if (c == 'u' && j + 1 < s.size() && s[j+1] == '8') j += 2;
+                else if (c == 'u' || c == 'U' || c == 'L') j += 1;
+                if (j + 1 < s.size() && s[j] == 'R' && s[j+1] == '"') {
+                    std::size_t k = j + 2; std::string delim;
+                    while (k < s.size() && s[k] != '(' && delim.size() < 16
+                           && s[k] != ' ' && s[k] != ')' && s[k] != '\\')
+                        delim.push_back(s[k++]);
+                    if (k < s.size() && s[k] == '(') {
+                        std::string term = ")" + delim + "\"";
+                        std::size_t close = s.find(term, k + 1);
+                        i = (close == std::string::npos) ? s.size() - 1
+                                                         : close + term.size() - 1;
+                        continue;
+                    }
+                }
+            }
+            // Apostrophe: only a quote if it CLOSES on this line (char
+            // literal or short string). An unpaired ' is a Rust lifetime
+            // ('a) — treating it as an open would hide every brace after it.
+            if (c == '\'') {
+                std::size_t k = i + 1;
+                while (k < s.size() && s[k] != '\'') { if (s[k] == '\\') ++k; ++k; }
+                if (k < s.size()) i = k;   // skip the closed literal wholesale
+                continue;                  // else: ordinary byte
+            }
+            if (c == '"' || c == '`') { in_str = true; q = c; continue; }
+            if (c == '/' && i + 1 < s.size() && s[i+1] == '/') break;
+            if (c == '#') break;
+            if (c == '{') ++d; else if (c == '}') --d;
+        }
+        return d;
+    };
+    const int n = static_cast<int>(lines.size());
+    if (line < 1 || line > n) return {line, line};
+    int lo = line, depth = 0;
+    for (int ln = line; ln >= 1 && line - ln < max_span; --ln) {
+        depth += delta(lines[ln - 1]); lo = ln;
+        if (depth > 0) break;                 // opened our enclosing block
+    }
+    int hi = line, fd = 0; bool started = false;
+    for (int ln = lo; ln <= n && ln - lo < max_span; ++ln) {
+        fd += delta(lines[ln - 1]); if (fd > 0) started = true; hi = ln;
+        if (started && fd <= 0) break;         // matching close brace
+    }
+    if (hi < line) hi = line;
+    return {lo, hi};
+}
+
+// context:"block" for INDENT-scoped languages (Python/Ruby), where braces
+// don't delimit scope. Walk backward from the hit to the nearest header at
+// strictly smaller indent (Python: line ends with ':'; Ruby: def/class/
+// module), then forward while lines are blank or indented deeper than the
+// header. Mirrors structural.cpp's indent_scope. 1-based inclusive.
+[[nodiscard]] std::pair<int,int> indent_block_range(
+    const std::vector<std::string>& lines, int line, bool ruby,
+    int max_span = 120) {
+    auto indent_of = [](const std::string& s) -> int {
+        int w = 0;
+        for (char c : s) {
+            if (c == ' ') ++w;
+            else if (c == '\t') w += 8;
+            else return w;
+        }
+        return -1;                                 // blank line
+    };
+    auto is_header = [&](const std::string& s) {
+        if (ruby) {
+            std::size_t b = s.find_first_not_of(" \t");
+            if (b == std::string::npos) return false;
+            std::string_view v{s.data() + b, s.size() - b};
+            return v.starts_with("def ") || v.starts_with("class ")
+                || v.starts_with("module ");
+        }
+        std::size_t e = s.find_last_not_of(" \t\r");
+        return e != std::string::npos && s[e] == ':';
+    };
+    const int n = static_cast<int>(lines.size());
+    if (line < 1 || line > n) return {line, line};
+
+    int hit_ind = indent_of(lines[line - 1]);
+    if (hit_ind < 0) hit_ind = 0;
+
+    int lo = line, hdr_ind = -1;
+    for (int ln = line; ln >= 1 && line - ln <= max_span; --ln) {
+        int ind = indent_of(lines[ln - 1]);
+        if (ind < 0) continue;
+        if (ind < hit_ind && is_header(lines[ln - 1])) { lo = ln; hdr_ind = ind; break; }
+        if (ind == 0 && ln < line) break;          // top-level non-header: stop
+    }
+    if (hdr_ind < 0) return {line, line};          // module-level hit: bare
+
+    int hi = line;
+    for (int ln = line; ln <= n && ln - lo <= max_span; ++ln) {
+        int ind = indent_of(lines[ln - 1]);
+        if (ind < 0) continue;                     // blank: tentative
+        if (ind <= hdr_ind && ln > lo) break;
+        hi = ln;
+    }
+    return {lo, hi};
+}
+
+// A dead-end "No matches found." costs the model a turn guessing why. Build a
+// short, PRIORITISED hint from the actual args: the causes that most often
+// turn a real hit into zero, in the order worth trying.
+std::string grep_no_match_hint(const GrepArgs& a) {
+    std::string h = "No matches for '" + a.pattern + "'";
+    if (!a.file_glob.empty()) h += " in files matching '" + a.file_glob + "'";
+    h += ".";
+    std::vector<std::string> tips;
+    if (a.case_sensitive)
+        tips.emplace_back("drop case_sensitive (search is case-insensitive by "
+                          "default) if the casing might differ");
+    if (!a.file_glob.empty())
+        tips.emplace_back("widen or remove `glob` — it may be filtering out the "
+                          "files that contain it");
+    if (a.word)
+        tips.emplace_back("drop `word` if the term appears as part of a larger "
+                          "identifier");
+    // Always-useful escalation paths.
+    tips.emplace_back("loosen the regex (fewer anchors / a substring)");
+    tips.emplace_back("use `search_code` for a meaning-based search when you "
+                      "don't know the exact spelling");
+    h += " Try: ";
+    for (std::size_t i = 0; i < tips.size(); ++i)
+        h += (i ? "; " : "") + tips[i];
+    h += ".";
+    return h;
+}
+
+ExecResult run_ripgrep(const GrepArgs& a, CallExec& exec) {
     std::vector<std::string> argv = {"rg", "--json", "--no-config"};
     if (!a.case_sensitive) argv.push_back("-i");
-    if (is_literal_pattern(a.pattern)) argv.push_back("-F");
+    if (a.word) argv.push_back("-w");           // whole-word match
+    if (!a.literal && is_literal_pattern(a.pattern)) argv.push_back("-F");
+    // A pattern spanning lines (a real newline or a `\n` escape) needs
+    // multiline mode; rg refuses it otherwise.
+    if (a.pattern.find('\n') != std::string::npos || a.pattern.find("\\n") != std::string::npos)
+        argv.push_back("-U");
     argv.push_back("-C");
-    argv.push_back(std::to_string(kContext));
+    // Summary modes never render lines — context bytes are pure waste.
+    argv.push_back(std::to_string(
+        a.mode == GrepArgs::Mode::Content ? a.context_lines : 0));
     // Prune the build / vendor / _deps trees the built-in walker also skips.
     // Without these, ripgrep still stat + gitignore-checks every generated
     // file (tens of thousands in a repo with out-of-source build dirs) on a
@@ -669,21 +958,52 @@ ExecResult run_ripgrep(const GrepArgs& a) {
     argv.push_back(a.pattern);
     argv.push_back(a.root.empty() ? std::string{"."} : a.root);
 
-    auto r = util::Subprocess::run(util::SubprocessOptions{
-        .argv      = std::move(argv),
-        .timeout   = std::chrono::seconds(60),
-        .max_bytes = 8 * 1024 * 1024,
-    });
+    // rg streams every match in the tree, but we only ever use the first
+    // kMaxScanned. Stop it as soon as we have them; the count shown is then
+    // "500+" exactly as before. Counting the `"type":"match"` marker is
+    // exact: rg escapes the same text inside JSON strings.
+    std::size_t seen_upto = 0;
+    int seen_matches = 0;
+    auto enough = [&](std::string_view cap) {
+        constexpr std::string_view kMark = "{\"type\":\"match\"";
+        for (std::size_t p = cap.find(kMark, seen_upto);
+             p != std::string_view::npos; p = cap.find(kMark, p + 1)) {
+            if (++seen_matches > kMaxScanned) return true;
+            seen_upto = p + 1;
+        }
+        if (cap.size() > kMark.size()) seen_upto = std::max(seen_upto, cap.size() - kMark.size());
+        return false;
+    };
+    auto r = run_prog(exec, std::move(argv), std::chrono::seconds(60),
+                      8 * 1024 * 1024, enough);
     if (!r.started)
         return std::unexpected(ToolError::spawn(
             "rg failed to start: " + r.start_error));
-    if (r.exit_code == 1)
-        return ToolOutput{"No matches found.", std::nullopt};
-    if (r.exit_code != 0)
+    if (r.exit_code == 1 && !r.stopped_early)
+        return ToolOutput{grep_no_match_hint(a), std::nullopt};
+    // A pattern rg can't parse (`foo(`, a literal \n, a stray escape) was
+    // almost always meant as text: search it literally and say so.
+    if (r.exit_code == 2 && !a.literal
+        && (r.output.find("regex parse error") != std::string::npos
+            || r.output.find("is not allowed in a regex") != std::string::npos)) {
+        GrepArgs lit = a;
+        lit.pattern = literal_alternation(a.pattern);
+        lit.literal = true;   // escaped already; marks the one retry
+        auto again = run_ripgrep(lit, exec);
+        if (again) again->text = "[note: pattern isn't a valid regex, searched it as plain text]\n"
+                                 + std::move(again->text);
+        return again;
+    }
+    // rg exits 2 for any unreadable file (a /sys node, a dangling symlink)
+    // even when it found matches. Only fail when nothing came back.
+    const bool any_match = r.output.find("{\"type\":\"match\"") != std::string::npos;
+    if (r.exit_code != 0 && !(r.exit_code == 2 && any_match))
         return std::unexpected(ToolError::subprocess(
             "rg exited " + std::to_string(r.exit_code) + ":\n"
             + r.output.substr(0, 1024)));
 
+    std::optional<std::regex> exclude_re;
+    if (!a.exclude.empty()) exclude_re.emplace(a.exclude, std::regex::ECMAScript | std::regex::optimize);
     struct LineRow { int line_no; std::string text; bool is_match; };
     struct FileRows { std::string path; std::vector<LineRow> rows; int matches = 0; };
     std::vector<FileRows> files;
@@ -699,17 +1019,29 @@ ExecResult run_ripgrep(const GrepArgs& a) {
             json j = json::parse(line, nullptr, false);
             if (j.is_discarded() || !j.is_object()) continue;
             auto type = j.value("type", "");
+            // rg reports a line or path that isn't valid UTF-8 as base64
+            // under "bytes" instead of "text"; decode it and make it valid.
+            auto text_of = [](const json& o) -> std::string {
+                if (!o.is_object()) return {};
+                if (auto t = o.find("text"); t != o.end() && t->is_string()) return t->get<std::string>();
+                if (auto b = o.find("bytes"); b != o.end() && b->is_string())
+                    return util::to_valid_utf8(util::b64_decode(b->get<std::string>()));
+                return {};
+            };
             if (type == "begin") {
-                auto path = j["data"]["path"].value("text", "");
+                auto path = text_of(j["data"]["path"]);
                 files.push_back({std::move(path), {}, 0});
             } else if ((type == "context" || type == "match") && !files.empty()) {
                 auto& d = j["data"];
                 int ln = d.value("line_number", 0);
-                std::string text = d.contains("lines")
-                    ? d["lines"].value("text", std::string{}) : std::string{};
+                std::string text = d.contains("lines") ? text_of(d["lines"]) : std::string{};
                 while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
                     text.pop_back();
                 bool is_match = (type == "match");
+                // exclude: the hit is dropped but its line stays as context,
+                // so `| grep -v` semantics without losing the surroundings.
+                if (is_match && exclude_re && std::regex_search(text, *exclude_re))
+                    is_match = false;
                 files.back().rows.push_back({ln, std::move(text), is_match});
                 if (is_match) {
                     ++files.back().matches;
@@ -722,7 +1054,33 @@ ExecResult run_ripgrep(const GrepArgs& a) {
     std::erase_if(files, [](const FileRows& f){ return f.matches == 0; });
 
     if (total_matches == 0)
-        return ToolOutput{"No matches found.", std::nullopt};
+        return ToolOutput{grep_no_match_hint(a), std::nullopt};
+
+    // Summary modes: no line bodies at all — the cheapest useful answer.
+    if (a.mode != GrepArgs::Mode::Content) {
+        std::ostringstream out;
+        out << "Found " << total_matches << " match"
+            << (total_matches == 1 ? "" : "es")
+            << (total_matches >= kMaxScanned ? "+" : "")
+            << " across " << files.size()
+            << " file" << (files.size() == 1 ? "" : "s") << ".\n\n";
+        if (a.mode == GrepArgs::Mode::FilesOnly) {
+            std::size_t listed = 0;
+            for (const auto& f : files) {
+                out << f.path << "  (" << f.matches
+                    << (f.matches == 1 ? " match)" : " matches)") << "\n";
+                if (++listed >= 200) {
+                    out << "[" << (files.size() - listed)
+                        << " more files — narrow with `glob` or `path`]\n";
+                    break;
+                }
+            }
+        } else {   // Count — per-file counts, densest form
+            for (const auto& f : files)
+                out << f.matches << "\t" << f.path << "\n";
+        }
+        return ToolOutput{out.str(), std::nullopt};
+    }
 
     std::ostringstream out;
     out << "Found " << total_matches << " match"
@@ -734,7 +1092,7 @@ ExecResult run_ripgrep(const GrepArgs& a) {
     int shown = 0, skipped = 0;
     bool size_capped = false;
     for (auto& f : files) {
-        if (shown >= kPerPage || size_capped) break;
+        if (shown >= a.per_page || size_capped) break;
         struct Block { int s, e; std::vector<const LineRow*> rows; int matches; };
         std::vector<Block> blocks;
         for (const auto& row : f.rows) {
@@ -751,7 +1109,7 @@ ExecResult run_ripgrep(const GrepArgs& a) {
         bool body_loaded = false;
         auto breadcrumb_for = [&](int match_line) -> std::string {
             if (!body_loaded) {
-                file_body = util::read_file(fs::path{f.path});
+                file_body = util::read_file(exec.call().fs(), fs::path{f.path});
                 body_loaded = true;
             }
             if (file_body.empty()) return {};
@@ -765,7 +1123,7 @@ ExecResult run_ripgrep(const GrepArgs& a) {
                 skipped += b.matches;
                 continue;
             }
-            if (shown >= kPerPage) break;
+            if (shown >= a.per_page) break;
             if (static_cast<std::size_t>(out.tellp()) >= kMaxOutputBytes) {
                 size_capped = true;
                 break;
@@ -796,7 +1154,7 @@ ExecResult run_ripgrep(const GrepArgs& a) {
         out << "Showing matches " << (a.offset + 1) << "-"
             << (a.offset + shown) << " of " << total_matches
             << (total_matches >= kMaxScanned ? "+ (scan limit reached)" : "")
-            << ". Use offset: " << (a.offset + kPerPage)
+            << ". Use offset: " << (a.offset + a.per_page)
             << " to see the next page.";
     } else if (shown == 0) {
         return ToolOutput{
@@ -812,44 +1170,69 @@ ExecResult run_ripgrep(const GrepArgs& a) {
     return ToolOutput{std::move(body), std::nullopt};
 }
 
-ExecResult run_builtin(const GrepArgs& a) {
-    const bool literal = is_literal_pattern(a.pattern);
+ExecResult run_builtin(const Call& call, const GrepArgs& a) {
+    // word=true forces whole-word matching. We compile a regex with \b anchors
+    // around the (escaped-if-literal) pattern, so the fast literal path is
+    // bypassed — correctness (no `foo` inside `foobar`) beats the micro-opt.
+    const bool literal = !a.word && !a.literal && is_literal_pattern(a.pattern);
     std::regex re;
     if (!literal) {
+        // std::regex is an uninterruptible backtracker; a nested unbounded
+        // quantifier (e.g. `(a+)+`) against a long non-matching line hangs for
+        // seconds–minutes, and the per-file exception wall below does
+        // NOT catch it (catastrophic backtracking hangs, it doesn't throw).
+        // Refuse the structural cause up front — same guard as textproc /
+        // extract — so this backend (used when ripgrep is absent) can't be
+        // wedged by one model-supplied pattern.
+        if (util::has_nested_quantifier(a.pattern))
+            return std::unexpected(ToolError::invalid_regex(
+                "regex '" + a.pattern + "' has a nested unbounded quantifier "
+                "(e.g. (a+)+) that can cause catastrophic backtracking — "
+                "rewrite it without the nested +/*, or search a plain "
+                "substring."));
         auto flags = std::regex::ECMAScript | std::regex::optimize;
         if (!a.case_sensitive) flags = flags | std::regex::icase;
-        try { re = std::regex(a.pattern, flags); }
+        std::string src = a.pattern;
+        if (a.word) {
+            // Escape when the pattern is a plain literal so a word search for
+            // e.g. "a.b" is treated literally; otherwise honour the user regex.
+            if (is_literal_pattern(a.pattern)) src = regex_escape(a.pattern);
+            src = "\\b(?:" + src + ")\\b";
+        }
+        try { re = std::regex(src, flags); }
         catch (const std::regex_error& e) {
-            return std::unexpected(ToolError::invalid_regex(
-                std::string{"invalid regex '"} + a.pattern + "': " + e.what()));
+            if (a.literal)   // already the escaped retry
+                return std::unexpected(ToolError::invalid_regex(
+                    std::string{"invalid regex '"} + a.pattern + "': " + e.what()));
+            // Not a regex: search it as text, like the rg path does.
+            GrepArgs lit = a;
+            lit.word = false;
+            lit.pattern = literal_alternation(a.pattern);
+            lit.literal = true;
+            auto again = run_builtin(call, lit);
+            if (again) again->text = "[note: pattern isn't a valid regex, searched it as plain text]\n"
+                                     + std::move(again->text);
+            return again;
         }
     }
 
     std::vector<fs::path> candidates;
     {
-        std::error_code ec;
-        for (auto it = fs::recursive_directory_iterator(a.root,
-                    fs::directory_options::skip_permission_denied, ec);
-             it != fs::recursive_directory_iterator(); it.increment(ec)) {
-            if (ec) { ec.clear(); continue; }
-            const auto& entry = *it;
-            auto fn = entry.path().filename().string();
-            if (entry.is_directory(ec)) {
-                std::error_code lec;
-                if (entry.is_symlink(lec)) { it.disable_recursion_pending(); continue; }
-                if (util::should_skip_dir(fn)) it.disable_recursion_pending();
-                continue;
+        call.fs().walk(fs::path{a.root}, [&](const DirEntry& entry) {
+            auto fn = entry.path.filename().string();
+            if (entry.directory) {
+                if (entry.symlink || util::should_skip_dir(fn)) return WalkStep::skip_dir;
+                return WalkStep::next;
             }
-            if (!entry.is_regular_file(ec)) continue;
-            if (fn.starts_with(".")) continue;
+            if (!entry.regular) return WalkStep::next;
+            if (fn.starts_with(".")) return WalkStep::next;
             if (!a.file_glob.empty()
-                && !glob_hit(a.file_glob, entry.path(), fs::path{a.root})) continue;
-            if (likely_binary_ext(entry.path())) continue;
-            std::error_code sec;
-            auto sz = entry.file_size(sec);
-            if (sec || sz == 0 || sz > kMaxFileBytes) { sec.clear(); continue; }
-            candidates.push_back(entry.path());
-        }
+                && !glob_hit(a.file_glob, entry.path, fs::path{a.root})) return WalkStep::next;
+            if (likely_binary_ext(entry.path)) return WalkStep::next;
+            if (entry.size == 0 || entry.size > kMaxFileBytes) return WalkStep::next;
+            candidates.push_back(entry.path);
+            return WalkStep::next;
+        });
     }
 
     if (candidates.empty()) {
@@ -859,60 +1242,118 @@ ExecResult run_builtin(const GrepArgs& a) {
     }
 
     std::vector<FileHit>  hits(candidates.size());
-    std::atomic<std::size_t> next{0};
-    std::atomic<int>      total_matches{0};
+    std::optional<std::regex> exclude_re;
+    if (!a.exclude.empty()) exclude_re.emplace(a.exclude, std::regex::ECMAScript | std::regex::optimize);
 
-    auto worker = [&] {
-        while (true) {
-            if (total_matches.load(std::memory_order_relaxed) >= kMaxScanned)
-                return;
-            std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-            if (i >= candidates.size()) return;
+    // Shares, not threads: the host's splitter runs them. Share k scans
+    // candidates k, k+n, … and counts its own matches against its slice of
+    // the cap, so the shares share nothing while they run.
+    std::size_t nshares = std::min<std::size_t>(call.width(), kMaxWorkers);
+    nshares = std::max<std::size_t>(1, std::min(nshares, candidates.size()));
+    const int share_cap = std::max<int>(1, kMaxScanned / static_cast<int>(nshares));
+    std::vector<int> counted(nshares, 0);
+
+    auto worker = [&](std::size_t k) {
+        int& total_matches = counted[k];
+        for (std::size_t i = k; i < candidates.size() && total_matches < share_cap; i += nshares) {
             const auto& path = candidates[i];
 
-            std::string content = util::read_file(path);
-            if (content.empty()) continue;
-            auto head = std::min<std::size_t>(content.size(), 4096);
-            if (std::memchr(content.data(), '\0', head)) continue;
+            // EXCEPTION WALL. std::regex throws error_complexity/error_stack
+            // AT MATCH TIME on catastrophic backtracking (e.g. `(a+)+b`
+            // against a large file) — and an exception escaping a share is
+            // std::terminate: one bad model-supplied pattern would kill the
+            // whole process. A file that blows the matcher is skipped, the
+            // rest of the scan completes.
+            try {
+                std::string content = util::read_file(call.fs(), path);
+                if (content.empty()) continue;
+                auto head = std::min<std::size_t>(content.size(), 4096);
+                if (std::memchr(content.data(), '\0', head)) continue;
 
-            std::vector<std::size_t> offsets;
-            if (literal) {
-                scan_literal(content, a.pattern, !a.case_sensitive,
-                             offsets, total_matches);
-            } else {
-                scan_regex(content, re, offsets, total_matches);
+                std::vector<std::size_t> offsets;
+                if (literal) {
+                    scan_literal(content, a.pattern, !a.case_sensitive,
+                                 offsets, total_matches, share_cap);
+                } else {
+                    scan_regex(content, re, offsets, total_matches, share_cap);
+                }
+                // exclude: drop hits whose line matches (like `| grep -v`).
+                if (exclude_re && !offsets.empty()) {
+                    std::vector<std::size_t> kept;
+                    kept.reserve(offsets.size());
+                    for (auto off : offsets) {
+                        const auto ls = content.rfind('\n', off == 0 ? 0 : off - 1);
+                        const std::size_t b0 = (off == 0 || ls == std::string::npos) ? 0 : ls + 1;
+                        auto le = content.find('\n', off);
+                        if (le == std::string::npos) le = content.size();
+                        const std::string_view line{content.data() + b0, le - b0};
+                        if (!std::regex_search(line.begin(), line.end(), *exclude_re)) kept.push_back(off);
+                    }
+                    // The scan already counted these; un-count what exclude
+                    // drops, or the summary says "Found 3" over 2 listed
+                    // lines (and a fully-excluded file still adds to it).
+                    total_matches -= static_cast<int>(offsets.size() - kept.size());
+                    offsets.swap(kept);
+                }
+                if (offsets.empty()) continue;
+                hits[i].path = path;
+                hits[i].content = std::move(content);
+                hits[i].match_offsets = std::move(offsets);
+            } catch (...) {
+                // regex blow-up or I/O race — skip this file, keep scanning.
             }
-            if (offsets.empty()) continue;
-            hits[i].path = path;
-            hits[i].content = std::move(content);
-            hits[i].match_offsets = std::move(offsets);
         }
     };
 
-    unsigned nthreads = std::thread::hardware_concurrency();
-    if (nthreads == 0) nthreads = 2;
-    nthreads = std::min(nthreads, kMaxWorkers);
-    nthreads = std::min(nthreads, static_cast<unsigned>(candidates.size()));
-    {
-        std::vector<std::jthread> pool;
-        pool.reserve(nthreads);
-        for (unsigned t = 0; t < nthreads; ++t) pool.emplace_back(worker);
-    }
+    call.split(nshares, worker);
 
-    int total = total_matches.load();
+    int total = 0;
+    bool share_capped = false;
+    for (int c : counted) { total += c; share_capped = share_capped || c >= share_cap; }
     if (total == 0)
+        // Same actionable hint the ripgrep backend emits (names the pattern +
+        // prioritised next steps incl. `search_code`) so grep's zero-match
+        // output is identical whichever backend served it. Append the builtin-
+        // specific ECMAScript-vs-PCRE note, which only applies to this path.
         return ToolOutput{
-            "No matches found. Check the pattern syntax (this is ECMAScript "
-            "regex, not PCRE — no look-behind, no named groups), try a "
-            "broader pattern, or use `glob` first to narrow the file set.",
+            grep_no_match_hint(a)
+            + " (Builtin backend: pattern is ECMAScript regex, not PCRE — no "
+              "look-behind or named groups.)",
             std::nullopt};
 
     std::size_t files_with_hits = 0;
     for (const auto& h : hits) if (!h.path.empty()) ++files_with_hits;
 
+    // Summary modes: path + count only, no line bodies.
+    if (a.mode != GrepArgs::Mode::Content) {
+        std::ostringstream out;
+        out << "Found " << total << " match" << (total == 1 ? "" : "es")
+            << (share_capped ? "+" : "")
+            << " across " << files_with_hits
+            << " file" << (files_with_hits == 1 ? "" : "s") << ".\n\n";
+        std::size_t listed = 0;
+        for (const auto& h : hits) {
+            if (h.path.empty()) continue;
+            auto rel = h.path.lexically_relative(a.root);   // walked from root
+            std::string rp = (rel.empty() ? h.path : rel).generic_string();
+            auto n = h.match_offsets.size();
+            if (a.mode == GrepArgs::Mode::FilesOnly) {
+                out << rp << "  (" << n << (n == 1 ? " match)" : " matches)") << "\n";
+                if (++listed >= 200) {
+                    out << "[" << (files_with_hits - listed)
+                        << " more files — narrow with `glob` or `path`]\n";
+                    break;
+                }
+            } else {
+                out << n << "\t" << rp << "\n";
+            }
+        }
+        return ToolOutput{out.str(), std::nullopt};
+    }
+
     std::ostringstream out;
     out << "Found " << total << " match" << (total == 1 ? "" : "es")
-        << (total >= kMaxScanned ? "+" : "")
+        << (share_capped ? "+" : "")
         << " across " << files_with_hits
         << " file" << (files_with_hits == 1 ? "" : "s") << ".\n\n";
 
@@ -920,7 +1361,7 @@ ExecResult run_builtin(const GrepArgs& a) {
     bool size_capped = false;
     for (const auto& h : hits) {
         if (h.path.empty()) continue;
-        if (shown >= kPerPage || size_capped) break;
+        if (shown >= a.per_page || size_capped) break;
         if (static_cast<std::size_t>(out.tellp()) >= kMaxOutputBytes) {
             size_capped = true;
             break;
@@ -928,13 +1369,35 @@ ExecResult run_builtin(const GrepArgs& a) {
 
         auto lines = offsets_to_lines(h.content, h.match_offsets);
 
+        // In block mode, precompute the file's line vector once so each hit's
+        // range can be expanded to its enclosing brace scope. Indent-scoped
+        // languages (Python/Ruby) have no brace scope — walk indentation.
+        std::vector<std::string> file_lines;
+        bool indent_scoped = false;
+        bool ruby = false;
+        if (a.block) {
+            file_lines = split_content_lines(h.content);
+            auto ext = h.path.extension().string();
+            for (auto& ch : ext) ch = static_cast<char>(std::tolower((unsigned char)ch));
+            indent_scoped = (ext == ".py" || ext == ".pyi" || ext == ".rb");
+            ruby = (ext == ".rb");
+        }
+
         std::vector<std::pair<int,int>> page_ranges;
         for (const auto& li : lines) {
             if (skipped < a.offset) { ++skipped; continue; }
-            if (shown >= kPerPage) break;
+            if (shown >= a.per_page) break;
             int row = li.line_no - 1;
-            int start = std::max(0, row - kContext);
-            int end   = row + kContext;
+            int start, end;
+            if (a.block) {
+                auto [lo, hi] = indent_scoped
+                    ? indent_block_range(file_lines, li.line_no, ruby)
+                    : brace_block_range(file_lines, li.line_no);
+                start = lo - 1; end = hi - 1;
+            } else {
+                start = std::max(0, row - a.context_lines);
+                end   = row + a.context_lines;
+            }
             if (!page_ranges.empty()
                 && start <= page_ranges.back().second + 1) {
                 page_ranges.back().second =
@@ -987,8 +1450,8 @@ ExecResult run_builtin(const GrepArgs& a) {
     if (remaining > 0) {
         out << "Showing matches " << (a.offset + 1) << "-"
             << (a.offset + shown) << " of " << total
-            << (total >= kMaxScanned ? "+ (scan limit reached)" : "")
-            << ". Use offset: " << (a.offset + kPerPage)
+            << (share_capped ? "+ (scan limit reached)" : "")
+            << ". Use offset: " << (a.offset + a.per_page)
             << " to see the next page.";
     } else if (shown == 0) {
         return ToolOutput{
@@ -1004,62 +1467,33 @@ ExecResult run_builtin(const GrepArgs& a) {
     return ToolOutput{std::move(body), std::nullopt};
 }
 
-ExecResult run_grep(const GrepArgs& a) {
-    auto wp = util::make_workspace_path_checked(a.root, "grep");
+// `exec` may be null (a host that runs no programs): then the builtin
+// scanner does the search instead of ripgrep.
+ExecResult run_grep(const Call& call, const GrepArgs& a, Exec* exec) {
+    // "src/foo.cpp:120" or a quoted path: search the file itself.
+    GrepArgs tidy = a;
+    if (!a.root.empty() && a.root != ".")
+        tidy.root = util::tidy_model_path(call.fs(), bounds(call), a.root).path;
+    auto wp = util::make_workspace_path_checked(tidy.root, "grep", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
-    GrepArgs gated = a;
+    if (!call.fs().stat(wp->path()).exists)
+        return std::unexpected(ToolError::not_found(
+            "path not found: " + wp->string() + ". Use glob or list_dir to find it"
+            + (tidy.root.find(' ') != std::string::npos
+                   ? std::string{"; for several paths, make one grep call per path"} : std::string{})
+            + "."));
+    GrepArgs gated = std::move(tidy);
     gated.root = wp->string();
 
-    auto r = (detect_backend() == Backend::Ripgrep) ? run_ripgrep(gated)
-                                                    : run_builtin(gated);
+    // Block mode (context:"block") needs the file content in hand to expand a
+    // hit to its enclosing brace scope — the builtin scanner always has it, so
+    // force that path (ripgrep's --json gives only ±C fixed context).
+    std::optional<CallExec> ce;
+    if (exec) ce.emplace(*exec, call);
+    const bool use_builtin = a.block || !ce || detect_backend(call, *ce) != Backend::Ripgrep;
+    auto r = use_builtin ? run_builtin(call, gated) : run_ripgrep(gated, *ce);
     if (r.has_value()) r->text = util::to_valid_utf8(std::move(r->text));
     return r;
-}
-
-struct FindReferencesArgs {
-    std::string symbol;
-    std::string path;
-    std::string glob;
-    int offset = 0;
-};
-
-std::expected<FindReferencesArgs, ToolError> parse_find_references_args(const json& j) {
-    util::ArgReader ar(j);
-    auto symbol = ar.require_str("symbol");
-    if (!symbol || symbol->empty())
-        return std::unexpected(ToolError::invalid_args("symbol is required"));
-    return FindReferencesArgs{*symbol, ar.str("path", "."), ar.str("glob", ""),
-                              std::max(0, ar.integer("offset", 0))};
-}
-
-std::string regex_escape(std::string_view text) {
-    std::string out;
-    out.reserve(text.size() * 2);
-    constexpr std::string_view special = R"(\.^$|()[]{}*+?)";
-    for (char c : text) {
-        if (special.find(c) != std::string_view::npos) out.push_back('\\');
-        out.push_back(c);
-    }
-    return out;
-}
-
-ExecResult run_find_references(const FindReferencesArgs& a) {
-    const std::string escaped = regex_escape(a.symbol);
-    GrepArgs grep{
-        "(^|[^A-Za-z0-9_])" + escaped + "([^A-Za-z0-9_]|$)",
-        a.path, a.glob, true, a.offset,
-        "References to " + a.symbol,
-    };
-    return run_grep(grep);
-}
-
-json find_references_schema() {
-    return json{{"type","object"}, {"required", {"symbol"}}, {"properties", {
-        {"symbol", {{"type","string"}, {"description","Exact identifier to find."}}},
-        {"path", {{"type","string"}, {"description","Directory to search (default workspace)."}}},
-        {"glob", {{"type","string"}, {"description","Optional file glob."}}},
-        {"offset", {{"type","integer"}, {"minimum",0}, {"description","Pagination offset."}}}
-    }}};
 }
 
 // ── Schemas ──────────────────────────────────────────────────────────────
@@ -1101,22 +1535,27 @@ json grep_schema() {
             {"path",           {{"type","string"}, {"description","Directory to search (default: cwd)"}}},
             {"glob",           {{"type","string"}, {"description","Filter files by glob. A bare pattern like `*.cpp` matches the filename anywhere; a slash pattern like `src/*.ts` or `**/test/*.py` matches the workspace-relative path."}}},
             {"case_sensitive", {{"type","boolean"}, {"description","Case-sensitive match (default: false)"}}},
+            {"word",           {{"type","boolean"}, {"description","Whole-word match: `foo` won't match `foobar` or `do_foo`. Use for finding all USES of an identifier."}}},
+            {"context",        {{"type","string"}, {"description","`line` (default) = ±2 lines around each hit. `block` = the WHOLE enclosing function/block, so you rarely need a follow-up `read`. A number `0`-`60` = ±N lines (like grep -C N) (use `0` for match lines only — densest content view)."}}},
+            {"output",         {{"type","string"}, {"enum", {"content","files","count"}}, {"description","`content` (default) = matching lines with context. `files` = one path + match-count per line, no line bodies (the survey view: WHICH files touch X). `count` = per-file match counts only (the cheapest probe: HOW WIDESPREAD is X — run this before a bulk rewrite)."}}},
             {"offset",         {{"type","integer"}, {"description","Skip this many matches (for pagination)"}}},
+            {"limit",          {{"type","integer"}, {"description","Matches per page (default 20, max 200). Use this instead of piping to `head`."}}},
+            {"exclude",        {{"type","string"},  {"description","Drop hits whose line matches this regex (ECMAScript). Use this instead of piping to `grep -v`."}}},
         }},
     };
 }
 
 } // namespace
 
-void register_search_tools(Shells& sh) {
+void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
     sh.add("grep",
         "Search for a regex pattern across files. Returns matches grouped by "
         "file with 2 lines of context, each block headed by the enclosing "
         "function/class when detectable (e.g. `### fn foo \xe2\x80\xba L12-14`). "
-        "Paginated 20 results per page. Case-insensitive by default; pass "
+        "Paginated 20 results per page (`limit` changes that). Case-insensitive by default; pass "
         "case_sensitive=true for exact case. Use offset for subsequent pages.",
         grep_schema(), EffectSet{Effect::ReadFs},
-        body<GrepArgs>(run_grep, parse_grep_args), 30'000);
+        body_with<GrepArgs>([exec](const Call& c, const GrepArgs& a) { return run_grep(c, a, exec.get()); }, parse_grep_args), 30'000);
 
     sh.add("glob",
         "Find files by glob pattern. Supports `*` (any run), `?` (one char), "
@@ -1127,17 +1566,16 @@ void register_search_tools(Shells& sh) {
         glob_schema(), EffectSet{Effect::ReadFs},
         body<GlobArgs>(run_glob, parse_glob_args), 25'000);
 
-    sh.add("find_references",
-        "Find exact identifier references across the workspace with file, line, enclosing symbol, context, glob filtering, and pagination.",
-        find_references_schema(), EffectSet{Effect::ReadFs},
-        body<FindReferencesArgs>(run_find_references, parse_find_references_args), 30'000);
-
+    if (!exec) return;   // find_definition runs ripgrep
     sh.add("find_definition",
-        "Find the definition of a symbol (function, class, struct, enum, type) "
-        "across the codebase. Searches for common definition patterns in C/C++, "
-        "Python, JavaScript/TypeScript, Go, and Rust.",
+        "Jump to where a symbol is DEFINED (function, class, struct, enum, "
+        "type) across the codebase, using curated per-language definition "
+        "patterns for C/C++, Python, JavaScript/TypeScript, Go, and Rust — so "
+        "it returns the declaration, not a ranked overview (that's `repo_map`). "
+        "To find USES of a symbol, use `grep` with word=true; for calls with a "
+        "specific shape use `search_structural`.",
         find_definition_schema(), EffectSet{Effect::ReadFs},
-        body<FindDefinitionArgs>(run_find_definition, parse_find_definition_args), 25'000);
+        body_with<FindDefinitionArgs>([exec](const Call& c, const FindDefinitionArgs& a) { CallExec ce{*exec, c}; return run_find_definition(c, a, ce); }, parse_find_definition_args), 25'000);
 }
 
 } // namespace mcp::tools::detail

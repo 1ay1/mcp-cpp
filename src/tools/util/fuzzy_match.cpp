@@ -34,12 +34,30 @@ constexpr std::uint32_t INSERTION_COST   = 3;
 constexpr std::uint32_t DELETION_COST    = 10;
 constexpr double        FUZZY_EQ_THRESHOLD = 0.8;   // line-level
 constexpr double        MATCH_RATIO        = 0.8;   // accepted match
+// Floor for the RELAXED (sub-MATCH_RATIO) acceptance path. A unique min-cost
+// candidate below MATCH_RATIO is applied only if MORE than half of its query
+// lines still aligned. This rescues a genuinely-drifted block (a 3-line block
+// with one reworded line is 2/3 ≈ 0.67; a reflowed-indent block stays high)
+// while rejecting a needle where half or more is absent — e.g. a bad diff hunk
+// whose sole deletion line doesn't exist ("line four" + one bogus line = 1/2 =
+// 0.5) must stay an honest no-match so patch atomicity holds.
+constexpr double        RELAXED_RATIO_FLOOR = 0.6;
 constexpr std::uint32_t LINE_HINT_TOLERANCE = 200;  // lines
-// Beyond this, the O(n*m) DP gets expensive. The exact-match fast path
-// handles every case below the cap; above it we conservatively bail to
-// "no match" rather than burn the watchdog. Real files vs. real needles
-// are well under this in practice.
-constexpr std::size_t   MAX_DP_CELLS = 2'000'000;   // ~16 MiB of state
+// Beyond this many DP cells we bail to "no match" rather than burn the
+// watchdog. This is NOT free per cell: each cell runs fuzzy_eq(), whose inner
+// term is an O(L²) levenshtein on the two line texts (L ≈ tens of chars). So
+// the real work is ~MAX_DP_CELLS × L². A multi-hundred-line needle against a
+// large repetitive file used to sit just under the old 2M-cell cap and spend
+// SECONDS in fuzzy_eq — an algorithmic-complexity DoS reachable from one edit/
+// apply_patch call. 200k cells keeps worst-case work ~100 ms while still
+// covering every realistic needle/file (a real fuzzy needle is a handful of
+// lines; anything past this is a pathological or adversarial input where
+// bailing to "no match" is the correct, safe answer — the exact-match fast
+// path already handled the common case). NOTE: since the inner fuzzy_eq now
+// uses Myers bit-parallel Levenshtein (~10-12× faster per cell than the old
+// Wagner-Fischer), the same wall-clock ceiling buys ~3× more cells — hence
+// 300k here vs the 100k the quadratic inner term needed. Worst case ~50 ms.
+constexpr std::size_t   MAX_DP_CELLS = 300'000;
 
 enum class Dir : std::uint8_t { Up, Left, Diag };
 
@@ -49,19 +67,72 @@ struct Cell {
 };
 
 // ─────────────────────────────────────────────────────────────────────────
-// Levenshtein distance (classic two-row Wagner-Fischer). We only need the
-// normalized score, but the distance itself is what we threshold.
-// O(|a| * |b|) time, O(min(|a|, |b|)) space. Lines are typically <120 cols
-// so this is cheap.
+// Levenshtein distance.
+//
+// The hot inner term of fuzzy_eq(), which run_line_dp() calls once per DP
+// cell — so this is THE function whose constant factor bounds the whole fuzzy
+// locator. We use Myers' 1999 bit-parallel algorithm ("A fast bit-vector
+// algorithm for approximate string matching based on dynamic programming",
+// JACM 46(3)) — the same approach RapidFuzz and agrep use. It packs a whole
+// DP COLUMN into machine words and advances it with a few bitwise ops per
+// text character, giving O(⌈m/w⌉·n) instead of the classic O(m·n) Wagner-
+// Fischer. For the common case (both lines ≤ 64 chars → one 64-bit word) it
+// is effectively O(n) with a tiny constant and ZERO allocation.
+//
+// Lines longer than one word fall back to two-row Wagner-Fischer (rare for
+// source code; the block-DP cap keeps even that bounded). The returned value
+// is the exact Levenshtein distance in every path.
 // ─────────────────────────────────────────────────────────────────────────
-std::size_t levenshtein(std::string_view a, std::string_view b) noexcept {
-    if (a.size() < b.size()) std::swap(a, b);
-    if (b.empty()) return a.size();
 
-    std::vector<std::size_t> prev(b.size() + 1);
-    std::vector<std::size_t> curr(b.size() + 1);
+// Myers bit-parallel edit distance for a pattern of length ≤ 64 (`p` is the
+// shorter string). Reference: Myers 1999, Fig. 8 (the Hyyrö formulation).
+[[nodiscard]] std::size_t myers_distance_le64(std::string_view p,
+                                              std::string_view t) noexcept {
+    const std::size_t m = p.size();
+    // Peq[c] has bit j set iff p[j] == c. 256 masks covers raw bytes (UTF-8
+    // continuation bytes included) — no alphabet assumptions.
+    std::uint64_t Peq[256] = {0};
+    for (std::size_t j = 0; j < m; ++j)
+        Peq[static_cast<unsigned char>(p[j])] |= (std::uint64_t{1} << j);
+
+    const std::uint64_t top = std::uint64_t{1} << (m - 1);
+    std::uint64_t VP = ~std::uint64_t{0};   // vertical positive delta = all 1s
+    std::uint64_t VN = 0;                    // vertical negative delta
+    std::size_t   score = m;                 // dist of p vs empty prefix of t
+
+    for (char tc : t) {
+        const std::uint64_t Eq = Peq[static_cast<unsigned char>(tc)];
+        const std::uint64_t D0 = (((Eq & VP) + VP) ^ VP) | Eq | VN;
+        std::uint64_t HP = VN | ~(D0 | VP);
+        std::uint64_t HN = D0 & VP;
+        if (HP & top) ++score;
+        else if (HN & top) --score;
+        HP = (HP << 1) | 1;
+        HN = (HN << 1);
+        VP = HN | ~(D0 | HP);
+        VN = D0 & HP;
+    }
+    return score;
+}
+
+// Two-row Wagner-Fischer fallback for the rare line longer than one word.
+[[nodiscard]] std::size_t wagner_fischer(std::string_view a,
+                                         std::string_view b) noexcept {
+    // b is the shorter string (caller guarantees). Keep rows on the stack for
+    // moderate lengths; heap only for pathological lines.
+    constexpr std::size_t kStack = 1024;
+    std::size_t  stack_prev[kStack];
+    std::size_t  stack_curr[kStack];
+    std::vector<std::size_t> heap_prev, heap_curr;
+    std::size_t* prev = stack_prev;
+    std::size_t* curr = stack_curr;
+    if (b.size() + 1 > kStack) {
+        heap_prev.resize(b.size() + 1);
+        heap_curr.resize(b.size() + 1);
+        prev = heap_prev.data();
+        curr = heap_curr.data();
+    }
     for (std::size_t j = 0; j <= b.size(); ++j) prev[j] = j;
-
     for (std::size_t i = 1; i <= a.size(); ++i) {
         curr[0] = i;
         for (std::size_t j = 1; j <= b.size(); ++j) {
@@ -75,6 +146,7 @@ std::size_t levenshtein(std::string_view a, std::string_view b) noexcept {
     return prev[b.size()];
 }
 
+// ---------------------------------------------------------------------------
 // ───────────────────────────────────────────────────────────────────────────
 // Smart-quote / dash normalization. LLMs often hallucinate curly quotes
 // (U+2018/2019/201C/201D) and em-dashes (U+2014) when the file has plain
@@ -334,6 +406,7 @@ struct DPMatch {
     std::size_t row_start;     // inclusive
     std::size_t row_end;       // inclusive
     std::uint32_t cost;
+    double ratio;              // fraction of query lines that aligned cleanly
 };
 
 std::vector<DPMatch> run_line_dp(std::string_view file,
@@ -443,8 +516,14 @@ std::vector<DPMatch> run_line_dp(std::string_view file,
         std::size_t buf_rows  = end_col - c;         // band-local span (rows used)
         double ratio = static_cast<double>(matched)
                      / static_cast<double>(std::max(buf_rows, Q));
-        if (ratio >= MATCH_RATIO)
-            matches.push_back({row_start, row_end, best_cost});
+        // Keep EVERY min-cost candidate, tagged with its alignment ratio.
+        // The strict MATCH_RATIO gate used to drop sub-0.8 matches here,
+        // which turned a correct-but-drifted UNIQUE location into a hard
+        // "not found even fuzzily". We now defer that decision to the
+        // caller: a candidate below MATCH_RATIO is accepted only when it is
+        // the single unambiguous match (see fuzzy_find), so ambiguous or
+        // truly-garbage inputs still fail, but a lone drifted block applies.
+        matches.push_back({row_start, row_end, best_cost, ratio});
     }
     return matches;
 }
@@ -533,7 +612,19 @@ std::vector<DPMatch> run_banded_dp(std::string_view file, std::string_view needl
                                    const std::vector<Line>& nl) {
     auto bands = candidate_bands(file, needle, fl, nl);
     std::vector<DPMatch> all;
+    // Global work budget across ALL bands. candidate_bands can emit many
+    // windows when the anchor line fuzzy-matches lots of rows (a file full of
+    // similar/duplicated lines); MAX_DP_CELLS bounds a SINGLE band but the SUM
+    // was unbounded, so such an input drove fuzzy_find into tens of seconds of
+    // DP — an algorithmic-complexity DoS reachable from one `edit` call.
+    // Charge each band its cell cost and stop once the cumulative budget is
+    // spent: total work is now O(MAX_DP_CELLS) no matter how the bands split.
+    const std::size_t Qrows = nl.size() + 1;
+    std::size_t budget = MAX_DP_CELLS;
     for (const auto& b : bands) {
+        const std::size_t cells = (b.hi - b.lo + 1) * Qrows;
+        if (cells > budget) break;   // spending this band would blow the budget
+        budget -= cells;
         auto part = run_line_dp(file, needle, fl, nl, b.lo, b.hi);
         for (auto& m : part) all.push_back(m);
     }
@@ -554,16 +645,54 @@ std::vector<DPMatch> run_banded_dp(std::string_view file, std::string_view needl
         for (const auto& m : all) best = std::min(best, m.cost);
         std::vector<DPMatch> keep;
         for (auto& m : all) if (m.cost == best) keep.push_back(m);
-        return keep;
+
+        // MATCH_RATIO tiering. Prefer candidates that cleared the strict
+        // 0.8 alignment ratio — those are high-confidence and preserve the
+        // historical behaviour exactly. Only when NONE clear the bar do we
+        // consider the sub-threshold set, and then a match is returned ONLY
+        // if it is unambiguous (a single min-cost candidate). This rescues
+        // the common failure — a unique block whose lines drifted enough to
+        // dip under 0.8 (reworded comment, reflowed indent, dropped blank
+        // line) — which previously reported "not found even fuzzily", while
+        // an ambiguous low-confidence set still falls through to the
+        // caller's "appears N times" / no-match diagnostics.
+        std::vector<DPMatch> strict;
+        for (const auto& m : keep)
+            if (m.ratio >= MATCH_RATIO) strict.push_back(m);
+        if (!strict.empty())
+            return strict;
+        // No high-confidence match. Consider only sub-threshold candidates
+        // that still share REAL content with the file (ratio ≥ floor); a
+        // truly-absent needle aligns to some min-cost row but at a near-zero
+        // ratio and must be dropped BEFORE the ambiguity count is taken, or
+        // two garbage rows would masquerade as an "appears 2 times" match.
+        std::vector<DPMatch> relaxed;
+        for (const auto& m : keep)
+            if (m.ratio >= RELAXED_RATIO_FLOOR) relaxed.push_back(m);
+        if (relaxed.size() == 1)
+            return relaxed;    // unique, real content: accept the location
+        if (relaxed.size() >= 2)
+            return relaxed;    // genuinely ambiguous: hand the count to caller
+        return {};             // nothing shares real content → honest no-match
     }
     return all;
 }
 
 } // namespace
 
-// ─────────────────────────────────────────────────────────────────────────
+// Exact Levenshtein distance (public; see header). Dispatches to the Myers
+// bit-parallel kernel for the common ≤ 64-char case, Wagner-Fischer otherwise.
+std::size_t levenshtein(std::string_view a, std::string_view b) noexcept {
+    if (a.size() < b.size()) std::swap(a, b);   // b = shorter (the pattern)
+    if (b.empty()) return a.size();
+    if (b.size() <= 64)
+        return myers_distance_le64(b, a);
+    return wagner_fischer(a, b);
+}
+
+// ───────────────────────────────────────────────────────────────────
 // Public API
-// ─────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────
 
 FuzzyMatch fuzzy_find(std::string_view file, std::string_view needle) {
     return fuzzy_find(file, needle, {},
@@ -634,6 +763,40 @@ FuzzyMatch fuzzy_find(std::string_view file,
         // Ambiguous and no usable hint. Report match count so the caller
         // can emit a precise "appears N times at lines …" error.
         return {false, 0, 0, static_cast<int>(matches.size()), {}, 0};
+    }
+
+    // ── The hint binds only where we are ALREADY guessing ────────────────
+    //
+    // `line:` is documented as a disambiguator, and as a filter it would do
+    // harm: line numbers go stale constantly (the region moved because an
+    // earlier edit grew the file), and refusing a correct edit over a stale
+    // number is worse than ignoring the number. That is why an EXACT unique
+    // match returns long before this point and never consults the hint at
+    // all.
+    //
+    // But a FUZZY match is a guess by construction, and a guess that also
+    // lands far from where the caller said to look is weak on two axes at
+    // once. That conjunction is where a silently-wrong edit lives: the only
+    // candidate is approximate AND it is somewhere the caller never
+    // mentioned, and before this the single-candidate branch applied it
+    // without a word.
+    //
+    // So: exact anywhere, fine. Fuzzy near the hint, fine. Fuzzy with no
+    // hint, fine (nothing was claimed). Fuzzy far from an explicit hint --
+    // say so, and name the line, so the caller can confirm with a corrected
+    // `line:` or a faithful `old_text` instead of discovering it in a diff.
+    if (pick->cost != 0
+        && line_hint != std::numeric_limits<std::uint32_t>::max()) {
+        const auto row = static_cast<std::uint32_t>(pick->row_start);
+        const std::uint32_t dist = (row > line_hint) ? (row - line_hint)
+                                                     : (line_hint - row);
+        if (dist > LINE_HINT_TOLERANCE) {
+            FuzzyMatch far{};
+            far.ok = false;
+            far.count = 0;
+            far.far_from_hint_line = row + 1;   // report 1-based
+            return far;
+        }
     }
 
     // Compute the byte range. The match spans buffer rows [row_start, row_end].

@@ -35,13 +35,20 @@
 
 #pragma once
 
+#include <mcp/tools/web_search.hpp>
+#include <chrono>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
+
+#include <mcp/tools/files.hpp>
+#include <mcp/tools/state.hpp>
 
 namespace mcp::tools {
 
@@ -139,8 +146,9 @@ public:
     virtual ~SkillResolver() = default;
     // Resolve a skill name to its full instruction body. On success returns
     // the body and leaves `err` empty; on failure returns nullopt + `err`.
+    // `call` is the tool call asking (its host data, reader, cancel).
     [[nodiscard]] virtual std::optional<std::string>
-        load(const std::string& name, std::string& err) = 0;
+        load(const Call& call, const std::string& name, std::string& err) = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -168,6 +176,15 @@ public:
     // ("hybrid" / "BM25-only") for the result header; `err` empty ⇒ success.
     [[nodiscard]] virtual std::vector<DocPassage>
         retrieve(const DocQuery&, std::string& mode, std::string& err) = 0;
+
+    // Whether the retriever can answer an OPPORTUNISTIC query — one issued
+    // as a side-effect of another tool (e.g. search_structural's zero-hit
+    // leads / over-budget ordering) rather than an explicit search — without
+    // paying a heavy cold start (index build, embedder round-trips). Hosts
+    // with a lazily-built index should return true only once it's warm.
+    // Explicit tools (search_code / search_docs) ignore this and always call
+    // retrieve(). Default: always ready.
+    [[nodiscard]] virtual bool warm() const { return true; }
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -185,12 +202,20 @@ public:
     virtual ~SubagentRunner() = default;
     // Empty when a subagent can run right now; otherwise an actionable reason
     // suitable for returning directly as a tool execution error.
-    [[nodiscard]] virtual std::string unavailable_reason() const = 0;
-    [[nodiscard]] bool available() const { return unavailable_reason().empty(); }
+    [[nodiscard]] virtual std::string unavailable_reason(const Call& call) const = 0;
+    [[nodiscard]] bool available(const Call& call) const { return unavailable_reason(call).empty(); }
     // Run a subagent to completion and return its condensed report. On
-    // failure returns the error text and sets `is_error`.
+    // failure returns the error text and sets `is_error`. `call` is the task
+    // tool call (its progress sink, cancel, host data).
     [[nodiscard]] virtual std::string
-        run(const SubagentRequest&, bool& is_error) = 0;
+        run(const Call& call, const SubagentRequest&, bool& is_error) = 0;
+    // Host-defined EXTRA agent types beyond the built-in five (user-authored
+    // .agentty/agents/*.md in agentty). Merged into the task tool's
+    // agent_type enum at registration so the model can discover them.
+    // Default: none.
+    [[nodiscard]] virtual std::vector<std::string> extra_agent_types() const {
+        return {};
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -227,6 +252,224 @@ public:
 //  search/git) need no host service and are always available (subject to
 //  ToolsetConfig toggles). The web tools need an HttpClient.
 // ─────────────────────────────────────────────────────────────────────────
+// ── Exec: running another program ───────────────────────────────────────
+//
+// mcp-cpp does not run processes. It asks.
+//
+// This is the same decision already made for HttpClient one field below:
+// web_fetch does not own a socket, a TLS stack or a redirect policy, it
+// states what it wants and the host does it. Exec is the same shape for the
+// same reason, and the reason is worth writing down because the library got
+// it wrong for exec first.
+//
+// Owning the exec path meant owning a poll loop, deadline arithmetic, pipe
+// draining, signal escalation and fd lifetime -- in a library that also has
+// a host doing all of that for its own purposes. Two implementations of one
+// thing, and they drifted exactly as you would expect: one grew an absolute
+// wall-clock ceiling and the other kept only an idle one, so a command that
+// never stopped printing was never reaped in the configuration that shipped.
+// The bug was not in either loop. It was in there being two.
+//
+// So: no loop here, no threads, no file descriptors, no OS headers. A tool
+// says what to run and what it is willing to wait for; the host runs it on
+// whatever its platform layer is (for agentty, jaal's reactor, clock and
+// process capability) and hands back the bytes.
+//
+// NO DEFAULT, AND NO FALLBACK. A default implementation is a second
+// implementation, which is the thing being removed. When `exec` is null the
+// tools that need it (shell, diagnostics, git_*, process_*) are simply NOT
+// ADVERTISED -- the same rule `code_retriever` already follows. That failure
+// mode is the honest one: today a host that installs no sandbox still gets a
+// working `shell`, it just runs unconfined. Absence you can see beats a
+// capability that quietly degrades.
+// A program to run. `exe` is separate from `args` so "argv is non-empty" is
+// a property of the TYPE: there is no way to construct a request with no
+// program, and so no boundary check to forget. argv[0] is synthesised from
+// `exe` by the host.
+struct Program {
+    std::string              exe;
+    std::vector<std::string> args;
+};
+
+// What a tool is willing to wait for.
+//
+// Two clocks, because they answer different questions and a caller almost
+// always wants both. `idle` bounds SILENCE: a build that keeps printing is
+// never cut off, however long it runs. `wall` bounds total elapsed time and
+// never resets, which is the only thing that catches a runaway that stays
+// chatty. nullopt is "host's default", not zero -- a budget of zero seconds
+// is a meaningful thing to ask for and must not collide with "unset".
+//
+// Named fields rather than two positional `seconds`, because the one bug
+// this shape invites is passing them the other way round.
+struct Budgets {
+    std::optional<std::chrono::seconds> idle;
+    std::optional<std::chrono::seconds> wall;
+};
+
+struct ExecRequest {
+    Program                  program;
+    std::optional<std::string> cwd;        // nullopt ⇒ the host's choice
+    std::vector<std::pair<std::string, std::string>> env;   // layered on top
+    Budgets                  budgets;
+    std::optional<std::size_t> max_output_bytes;
+
+    // No progress sink and no cancellation probe in the request. Both
+    // describe the tool CALL, not the program, and the call already carries
+    // them: Exec::run takes the Call alongside this request.
+
+    /// Stop once the output so far is enough. Called with everything
+    /// captured to that point; true means stop.
+    ///
+    /// This IS a callback, and the distinction from the two above is the
+    /// whole reason it is allowed: the host cannot know when enough is
+    /// enough, because "enough" is a property of what the caller asked for.
+    /// `grep` wanting its first N matches out of a repo-wide ripgrep is the
+    /// case -- bounding bytes would not do it, since the predicate is about
+    /// content, and waiting for exit throws away the latency win entirely.
+    ///
+    /// Empty is the common case and means "run to completion". The host
+    /// checks before calling.
+    std::function<bool(std::string_view)> stop_when;
+};
+
+// ── how it ended ────────────────────────────────────────────────────────
+//
+// A sum, not a bag of flags. The previous shape had five independent bools
+// and an exit code that was present even when nothing had run: thirty-two
+// representable states for five real ones, and the nonsense combinations
+// ("never started, but hit the wall clock") were reachable by a typo.
+//
+// Each arm carries exactly what that outcome means and nothing else, so
+// reading an exit code off a program that never started is not a mistake you
+// can make -- it is a case you did not handle, and the compiler says so.
+
+struct Exited      { int code = 0; };            ///< ran, returned this
+struct Signalled   { int signal = 0; };          ///< killed by the OS
+struct StartFailed { std::string reason; };      ///< never ran at all
+struct Cancelled   {};                           ///< the host asked to stop
+
+/// `stop_when` fired: the caller had what it needed and the rest was stopped.
+/// A success, not a failure -- distinct from Signalled, which would be true
+/// of the mechanism and misleading about the meaning.
+struct StoppedEarly {};
+
+/// Stopped by a budget. WHICH one matters: idle means "it hung, go look at
+/// why", wall means "it was working fine and wants longer or a background
+/// run". A single `timed_out` flag forces the caller to guess, and the two
+/// deserve opposite advice.
+struct TimedOut {
+    enum class budget : std::uint8_t { idle, wall };
+    budget which = budget::idle;
+};
+
+using ExecOutcome =
+    std::variant<Exited, Signalled, StartFailed, TimedOut, Cancelled,
+                 StoppedEarly>;
+
+struct ExecResult {
+    std::string output;        ///< stdout+stderr interleaved, UTF-8 valid
+    ExecOutcome outcome;
+
+    /// Beside the outcome, not inside it: truncation is ORTHOGONAL. A
+    /// command can fill the cap and then exit 0, or fill it and then be
+    /// killed. That it does not belong to any one arm is exactly why it is
+    /// a field and the rest are cases.
+    bool truncated = false;
+
+    /// How long it ran, by the host's clock (the library reads none).
+    std::chrono::milliseconds elapsed{0};
+
+    [[nodiscard]] bool ok() const noexcept {
+        const auto* e = std::get_if<Exited>(&outcome);
+        return e && e->code == 0;
+    }
+};
+
+/// A program that outlives the call which started it: a dev server, a file
+/// watcher, a log tail.
+///
+/// The tool layer used to own these -- a thread per session draining a pipe
+/// into a buffer, two mutexes guarding it, and a global map of them. That is
+/// concurrency, which is the host's, and it was the last of it in here.
+struct Session {
+    virtual ~Session() = default;
+
+    struct Update {
+        /// Produced since the previous poll. Empty is normal and means
+        /// "nothing new", not "finished" -- check `running` for that.
+        std::string output;
+        bool        running   = true;
+        bool        truncated = false;
+        /// Set exactly once, on the poll that observes the end.
+        std::optional<ExecOutcome> outcome;
+        /// How long it has been running, by the host's clock.
+        std::chrono::seconds uptime{0};
+    };
+
+    /// Wait up to `wait` for new output, then return whatever there is.
+    /// Blocking only for that long: a tool call must not hang on a server
+    /// that has gone quiet, because quiet is the normal state of a server.
+    [[nodiscard]] virtual Update poll(std::chrono::milliseconds wait) = 0;
+
+    /// Ask it to stop, then insist. Idempotent.
+    virtual void stop() = 0;
+};
+
+/// How a scan splits its work. mcp-cpp owns no threads: the scan tools
+/// (grep, structural search, repo map, extract/aggregate) cut a file list
+/// into shares and hand them to `run`, which the host supplies. Empty `run`
+/// means inline.
+struct Splitter {
+    /// Run fn(i) for every i in [0, n) and return when all have finished.
+    /// Calls may run concurrently; the tools are correct either way.
+    std::function<void(std::size_t n, const std::function<void(std::size_t)>& fn)> run;
+    /// How many shares are worth making. 1 means "run inline".
+    std::size_t width = 1;
+};
+
+/// Run one program to completion. Blocking from the caller's point of view;
+/// how the host achieves that is the host's business.
+struct Exec {
+    Exec()                       = default;
+    Exec(const Exec&)            = delete;
+    Exec& operator=(const Exec&) = delete;
+    virtual ~Exec()              = default;
+
+    /// `call` is the tool call this runs for: the host streams output to its
+    /// progress sink and stops when it is cancelled.
+    [[nodiscard]] virtual ExecResult run(const Call& call, const ExecRequest&) = 0;
+
+    /// Start one and come back for it later. Same request type, because it
+    /// is the same question asked with a different lifetime -- budgets still
+    /// apply, and a session that goes silent past its idle budget is as dead
+    /// as a command that does.
+    [[nodiscard]] virtual std::expected<std::shared_ptr<Session>, std::string>
+    start(const ExecRequest&) = 0;
+
+    /// Can the host stop a whole process tree, or only the leader? A tool
+    /// that reports what confinement is in force needs to ask rather than
+    /// assume. (A descendant that calls setsid() escapes a process group.)
+    [[nodiscard]] virtual bool stops_whole_tree() const noexcept = 0;
+};
+
+/// The host's Exec as one tool call sees it: run() carries that call, so its
+/// output streams to the call's progress sink and stops when it is
+/// cancelled. Tool bodies hold this, never the bare Exec. Lives on the
+/// tool body's stack; neither pointer is owned.
+class CallExec {
+public:
+    CallExec(Exec& exec, const Call& call) noexcept : exec_(&exec), call_(&call) {}
+    [[nodiscard]] ExecResult run(const ExecRequest& r) { return exec_->run(*call_, r); }
+    [[nodiscard]] std::expected<std::shared_ptr<Session>, std::string>
+    start(const ExecRequest& r) { return exec_->start(r); }
+    [[nodiscard]] bool stops_whole_tree() const noexcept { return exec_->stops_whole_tree(); }
+    [[nodiscard]] const Call& call() const noexcept { return *call_; }
+private:
+    Exec*       exec_;
+    const Call* call_;
+};
+
 struct HostServices {
     std::shared_ptr<MemoryStore>    memory;     // remember / forget / wipe
     std::shared_ptr<TodoSink>       todo;       // todo
@@ -240,6 +483,23 @@ struct HostServices {
     std::shared_ptr<DocRetriever>   code_retriever;  // search_code
     std::shared_ptr<SubagentRunner> subagent;   // task
     std::shared_ptr<HttpClient>     http;       // web_fetch / web_search
+    // Which services web_search tries, in what order, with what key. Null
+    // means the key-less default chain (see default_web_search_plan()). Read on
+    // every call, so the host can change it while running.
+    std::shared_ptr<WebSearchPlanSource> web_search_plan;
+    // Null ⇒ no shell / diagnostics / git_* / process_* tools. See Exec.
+    std::shared_ptr<Exec>           exec;
+    // How scans split their work; empty runs them inline.
+    Splitter                        split;
+    // What the tools remember between calls (workspace, caches, background
+    // processes). Null ⇒ make_provider makes a SoleStateAccess, fine for a
+    // host that runs one call at a time. See state.hpp.
+    std::shared_ptr<StateAccess>    state;
+    // Every file the tools read, write, list or stat goes through this; the
+    // library itself does no IO. Null ⇒ no filesystem, search or edit tools
+    // (they can't run). mcp/tools/native_files.hpp has a ready-made one.
+    std::shared_ptr<FileSystem>     files;
 };
+
 
 } // namespace mcp::tools

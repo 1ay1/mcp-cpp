@@ -2,22 +2,22 @@
 // Long-running process sessions for dev servers, watchers, and log tails.
 
 #include "tool_shell.hpp"
+#include "call_state.hpp"
 #include "tool_body.hpp"
 
-#include <mcp/cap/process.hpp>
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
-#include <mcp/tools/util/sandbox.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <memory>
-#include <mutex>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <string>
-#include <thread>
+#include <tuple>
+#include <utility>
 #include <unordered_map>
 
 namespace mcp::tools::detail {
@@ -30,222 +30,171 @@ using util::ToolOutput;
 namespace {
 
 constexpr std::size_t kRollingBytes = 128 * 1024;
+constexpr std::size_t kMaxSessions  = 32;
 
-struct Session {
-    std::string id;
-    std::string command;
-    std::unique_ptr<mcp::cap::ChildProcess> child;
-    std::thread reader;
-    std::mutex output_mu;
-    std::mutex stop_mu;
-    std::string output;
-    std::size_t output_base = 0;
-    std::size_t delivered = 0;
-    std::size_t dropped_unseen = 0;   // bytes evicted before any poll saw them
-    std::optional<int> cached_exit_;  // exit code captured before child.reset()
-    std::chrono::steady_clock::time_point started_at =
-        std::chrono::steady_clock::now();
-    bool stopped = false;
+// The sessions live in the tool state (ToolState::procs). The host's
+// Session owns the process, the pipe and whatever keeps the pipe drained;
+// a state::Proc is this layer's rolling buffer and the bookkeeping of what a
+// caller has already been shown. Every touch of it is one short with(): the
+// waiting (poll) happens on the host's Session, outside the state.
 
-    void append(std::string_view text) {
-        std::lock_guard<std::mutex> lock(output_mu);
-        output.append(text);
-        if (output.size() > kRollingBytes) {
-            const auto erased = output.size() - kRollingBytes;
-            // If the rolling buffer evicts bytes the caller never polled,
-            // remember how many so the next poll can honestly say output was
-            // dropped rather than silently losing the head of a burst.
-            if (output_base + erased > delivered)
-                dropped_unseen += (output_base + erased) - std::max(delivered, output_base);
-            output.erase(0, erased);
-            output_base += erased;
-        }
+void append(state::Proc& p, std::string_view text) {
+    p.output.append(text);
+    if (p.output.size() > kRollingBytes) {
+        const auto erased = p.output.size() - kRollingBytes;
+        // Evicting bytes no poll saw: remember how many, so the next poll
+        // can say output was dropped instead of silently losing it.
+        if (p.output_base + erased > p.delivered)
+            p.dropped_unseen += (p.output_base + erased) - std::max(p.delivered, p.output_base);
+        p.output.erase(0, erased);
+        p.output_base += erased;
     }
-
-    // Returns freshly-produced output plus, via `dropped`, the count of bytes
-    // that scrolled out of the rolling buffer before this poll could see them.
-    std::string take_new(std::size_t max_chars, std::size_t* dropped = nullptr) {
-        std::lock_guard<std::mutex> lock(output_mu);
-        if (dropped) { *dropped = dropped_unseen; dropped_unseen = 0; }
-        const auto end = output_base + output.size();
-        auto begin = std::max(delivered, output_base);
-        std::size_t clipped = 0;
-        if (end - begin > max_chars) { clipped = (end - begin) - max_chars; begin = end - max_chars; }
-        if (dropped) *dropped += clipped;   // over-budget bytes are also unseen
-        std::string result = output.substr(begin - output_base, end - begin);
-        delivered = end;
-        return result;
-    }
-
-    bool running() {
-        std::lock_guard<std::mutex> lock(stop_mu);
-        return !stopped && child && child->alive();
-    }
-
-    // Exit code once the child has been reaped (running() observed false).
-    // 128+N encodes death by signal N. nullopt while still running. Cached so
-    // it survives stop() tearing the child down (child.reset()).
-    std::optional<int> exit_code() {
-        std::lock_guard<std::mutex> lock(stop_mu);
-        if (!cached_exit_ && child) cached_exit_ = child->exit_code();
-        return cached_exit_;
-    }
-
-    std::chrono::seconds age() const {
-        return std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - started_at);
-    }
-
-    // True if any produced output has not yet been handed to a poll caller.
-    // Used to keep an exited-but-unread session alive so its tail isn't lost.
-    bool has_pending_output() {
-        std::lock_guard<std::mutex> lock(output_mu);
-        return delivered < output_base + output.size();
-    }
-
-    void stop() noexcept {
-        std::lock_guard<std::mutex> lock(stop_mu);
-        if (stopped) return;
-        stopped = true;
-        if (child) {
-            child->terminate();
-            if (!cached_exit_) cached_exit_ = child->exit_code();
-            // A failed session/group setup or unrelated inherited descriptor
-            // must not leave process_stop blocked forever in stream.get().
-            // POSIX fd_streambuf uses a wake pipe, so this does not close an
-            // FD underneath the reader thread.
-            child->interrupt_output();
-        }
-        if (reader.joinable()) reader.join();
-        child.reset();
-    }
-
-    ~Session() { stop(); }
-};
-
-struct ProcessManager {
-    std::mutex mu;
-    std::unordered_map<std::string, std::shared_ptr<Session>> sessions;
-    std::atomic<unsigned long long> sequence{1};
-
-    static ProcessManager& instance() {
-        static ProcessManager manager;
-        return manager;
-    }
-};
-
-std::shared_ptr<Session> find_session(const std::string& id) {
-    auto& manager = ProcessManager::instance();
-    std::lock_guard<std::mutex> lock(manager.mu);
-    if (auto it = manager.sessions.find(id); it != manager.sessions.end()) return it->second;
-    return {};
 }
+
+// Fresh output, and via `dropped` the bytes that scrolled away unseen.
+std::string take_new(state::Proc& p, std::size_t max_chars, std::size_t* dropped = nullptr) {
+    if (dropped) { *dropped = p.dropped_unseen; p.dropped_unseen = 0; }
+    const auto end = p.output_base + p.output.size();
+    auto begin = std::max(p.delivered, p.output_base);
+    std::size_t clipped = 0;
+    if (end - begin > max_chars) { clipped = (end - begin) - max_chars; begin = end - max_chars; }
+    if (dropped) *dropped += clipped;   // over-budget bytes are also unseen
+    std::string result = p.output.substr(begin - p.output_base, end - begin);
+    p.delivered = end;
+    return result;
+}
+
+// Fold one host update into the session.
+void fold(state::Proc& p, const Session::Update& u) {
+    if (!u.output.empty()) append(p, u.output);
+    p.uptime  = u.uptime;
+    p.running = u.running && !p.stopped;
+    if (u.outcome && !p.exit_code) {
+        std::visit([&]<class T>(const T& o) {
+            if constexpr (std::is_same_v<T, Exited>)           p.exit_code = o.code;
+            else if constexpr (std::is_same_v<T, Signalled>)   p.exit_code = 128 + o.signal;
+            else if constexpr (std::is_same_v<T, StartFailed>) p.exit_code = 127;
+            else p.exit_code = 0;
+        }, *u.outcome);
+    }
+    if (!u.running) p.eof = true;
+}
+
+// Ask the host for news (waiting up to `wait`), then fold it in.
+void ingest(const Call& call, const std::shared_ptr<state::Proc>& p, std::chrono::milliseconds wait) {
+    auto handle = call.with([&](ToolState&) { return p->stopped ? nullptr : p->proc; });
+    if (!handle) return;
+    auto u = handle->poll(wait);
+    call.with([&](ToolState&) { fold(*p, u); });
+}
+
+std::shared_ptr<state::Proc> find_proc(const Call& call, const std::string& id) {
+    return call.with([&](ToolState& s) -> std::shared_ptr<state::Proc> {
+        auto it = s.procs.find(id);
+        return it == s.procs.end() ? nullptr : it->second;
+    });
+}
+
+// " (live sessions: …)" for recovery hints.
+std::string live_session_hint(const Call& call) {
+    return call.with([](ToolState& s) {
+        if (s.procs.empty()) return std::string{" (no live sessions)"};
+        std::string out = " (live sessions:";
+        for (const auto& [id, _] : s.procs) out += " " + id;
+        return out + ")";
+    });
+}
+
+// Stop the host's process (once) and mark the session stopped.
+void stop_proc(const Call& call, const std::shared_ptr<state::Proc>& p) {
+    auto handle = call.with([&](ToolState&) {
+        if (p->stopped) return std::shared_ptr<Session>{};
+        p->stopped = true;
+        p->running = false;
+        return p->proc;
+    });
+    if (handle) handle->stop();   // outside the state: the host may wait
+}
+
+}  // namespace
+
+namespace {
 
 struct StartArgs { std::string command; std::string cwd; };
 
-std::expected<StartArgs, ToolError> parse_start(const json& args) {
+std::expected<StartArgs, ToolError> parse_start(const json& args, const util::Bounds& b) {
     util::ArgReader reader(args);
     auto command = reader.require_str("command");
     if (!command || command->empty())
         return std::unexpected(ToolError::invalid_args("command is required"));
     auto cwd = reader.str("cwd", ".");
-    auto checked = util::make_workspace_path_checked(cwd, "process_start");
+    auto checked = util::make_workspace_path_checked(cwd, "process_start", b);
     if (!checked) return std::unexpected(checked.error());
     return StartArgs{*command, checked->string()};
 }
 
-ExecResult run_start(const StartArgs& args) {
-    auto& manager = ProcessManager::instance();
-    {
-        std::lock_guard<std::mutex> lock(manager.mu);
-        // Garbage-collect sessions whose child already exited and whose
-        // output has been fully drained by a prior poll — a model that
-        // starts many short-lived processes and never calls process_stop
-        // would otherwise wedge at the cap with a confusing error.
-        for (auto it = manager.sessions.begin(); it != manager.sessions.end();) {
-            if (!it->second->running() && !it->second->has_pending_output())
-                it = manager.sessions.erase(it);
-            else
+ExecResult run_start(const Call& call, const StartArgs& args, CallExec& exec) {
+    // Drop sessions whose child exited and whose output a poll has fully
+    // drained — a model that starts many short-lived processes and never
+    // calls process_stop would otherwise hit the cap with a confusing error.
+    // The dropped ones are moved out and destroyed AFTER the lock: the host's
+    // session takes its own lock in its destructor, and nesting the two aborts.
+    auto [full, dropped] = call.with([](ToolState& s) {
+        std::vector<std::shared_ptr<state::Proc>> gone;
+        for (auto it = s.procs.begin(); it != s.procs.end();) {
+            const auto& p = *it->second;
+            if (!p.running && p.delivered >= p.output_base + p.output.size()) {
+                gone.push_back(std::move(it->second));
+                it = s.procs.erase(it);
+            } else {
                 ++it;
-        }
-        if (manager.sessions.size() >= 32)
-            return std::unexpected(ToolError::invalid_args(
-                "process session limit reached (32 live sessions); call "
-                "process_stop on one before starting another"));
-    }
-
-#ifdef _WIN32
-    // Build the payload for `cmd.exe /d /s /c "<payload>"`.
-    //
-    // cmd.exe does NOT understand backslash-escaped quotes: the previous
-    // `cd /d \"<cwd>\"` produced a literal backslash in the path and every
-    // process_start died with "The filename, directory name, or volume
-    // label syntax is incorrect." With /s, cmd strips exactly the first
-    // and last quote of the payload and runs the rest VERBATIM, so the
-    // inner quotes around the path must be plain, unescaped quotes.
-    //
-    // A cwd containing a quote can't be expressed this way at all (cmd has
-    // no escape for it) — but such a path also can't exist on Windows,
-    // where " is an illegal filename character. Reject it explicitly
-    // instead of emitting a command line that would re-parse into
-    // something else.
-    if (args.cwd.find('"') != std::string::npos)
-        return std::unexpected(ToolError::invalid_args(
-            "cwd contains a quote character, which cmd.exe cannot escape"));
-    const std::string command = "cd /d \"" + args.cwd + "\" && " + args.command;
-#else
-    auto quote = [](std::string_view value) {
-        std::string out{"'"};
-        for (char c : value) {
-            if (c == '\'') out += "'\\''";
-            else out.push_back(c);
-        }
-        out.push_back('\'');
-        return out;
-    };
-    const std::string command = "cd -- " + quote(args.cwd)
-        + " && exec /bin/sh -c " + quote(args.command);
-#endif
-    auto argv = util::sandbox::prepare_shell_argv(command);
-    if (argv.empty())
-        return std::unexpected(ToolError::spawn("sandbox produced an empty process argv"));
-
-    mcp::cap::ChildProcess::Spawn spawn;
-    spawn.command = argv.front();
-    spawn.args.assign(argv.begin() + 1, argv.end());
-    spawn.cwd = args.cwd;
-    spawn.merge_stderr = true;
-
-    auto session = std::make_shared<Session>();
-    session->id = "proc-" + std::to_string(manager.sequence.fetch_add(1));
-    session->command = args.command;
-    try {
-        session->child = std::make_unique<mcp::cap::ChildProcess>(spawn);
-    } catch (const std::exception& error) {
-        return std::unexpected(ToolError::spawn(error.what()));
-    }
-
-    Session* raw = session.get();
-    raw->reader = std::thread([raw] {
-        auto& stream = raw->child->out();
-        char buffer[4096];
-        while (stream.good()) {
-            const int first = stream.get(); // blocks until one byte or EOF
-            if (first == std::char_traits<char>::eof()) break;
-            const char byte = static_cast<char>(first);
-            raw->append(std::string_view{&byte, 1});
-            const auto available = stream.rdbuf()->in_avail();
-            if (available > 0) {
-                const auto count = stream.rdbuf()->sgetn(
-                    buffer, std::min<std::streamsize>(available, sizeof(buffer)));
-                if (count > 0) raw->append(std::string_view{buffer, static_cast<std::size_t>(count)});
             }
         }
+        return std::pair{s.procs.size() >= kMaxSessions, std::move(gone)};
     });
-    {
-        std::lock_guard<std::mutex> lock(manager.mu);
-        manager.sessions.emplace(session->id, session);
-    }
+    dropped.clear();   // sessions die here, with no lock held
+    if (full)
+        return std::unexpected(ToolError::invalid_args(
+            "process session limit reached (32 live sessions); call "
+            "process_stop on one before starting another"));
+
+    // The cwd is DATA, not a shell prefix.
+    //
+    // This used to build `cd -- '<cwd>' && exec /bin/sh -c '<cmd>'`, plus a
+    // cmd.exe equivalent whose quoting had already caused one "volume label
+    // syntax is incorrect" bug. Under a sandbox the prefix is also a path
+    // the boundary must permit, and when it did not the session died with
+    // "cd: Operation not permitted" before the command ran at all.
+    //
+    // As req.cwd it is a real chdir in the child: nothing to re-parse, and
+    // the sandbox applies it as a workdir rather than as an access to allow.
+    const std::string& command = args.command;
+    // Name the shell; the host decides what to wrap it in.
+#ifdef _WIN32
+    const std::vector<std::string> argv{"cmd.exe", "/c", command};
+#else
+    const std::vector<std::string> argv{"/bin/sh", "-c", command};
+#endif
+
+    auto session = std::make_shared<state::Proc>();
+    session->command = args.command;
+
+    // The host starts it, inside whatever boundary it applies to everything
+    // else it runs. This used to spawn directly through cap::ChildProcess
+    // and wrap the argv itself, which meant a background process was
+    // confined by a different code path from a foreground one -- and after
+    // the bwrap removal, by nothing at all on linux.
+    ExecRequest req;
+    req.program          = {argv.front(), {argv.begin() + 1, argv.end()}};
+    if (!args.cwd.empty()) req.cwd = args.cwd;
+    req.max_output_bytes = kRollingBytes;
+    auto started = exec.start(req);
+    if (!started) return std::unexpected(ToolError::spawn(started.error()));
+    session->proc = std::move(*started);
+    call.with([&](ToolState& s) {
+        session->id = "proc-" + std::to_string(s.next_proc++);
+        s.procs.emplace(session->id, session);
+    });
 
     // Give the child a beat to either start producing output or crash on the
     // spot. A mistyped command, a missing binary, or a port-already-in-use
@@ -254,28 +203,21 @@ ExecResult run_start(const StartArgs& args) {
     // code and whatever it printed — turns a two-call surprise into one clear
     // answer.
     constexpr auto kSettleWindow = std::chrono::milliseconds{300};
-    const auto settle_deadline = std::chrono::steady_clock::now() + kSettleWindow;
-    while (std::chrono::steady_clock::now() < settle_deadline) {
-        if (!session->running()) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
-    }
+    ingest(call, session, kSettleWindow);
 
     const std::string head =
-        "Started " + session->id + " (pid "
-        + std::to_string(session->child->pid()) + "): " + args.command;
+        "Started " + session->id + " ("
+        + session->id + "): " + args.command;
 
-    if (!session->running()) {
-        // Exited within the settle window — almost always a failure. Stop()
-        // first: it joins the reader thread so every last byte is appended
-        // before we drain. Then drop the session (nothing to poll) but
-        // surface the code.
-        session->stop();
-        auto early = session->take_new(4000);
-        const auto code = session->exit_code();
-        {
-            std::lock_guard<std::mutex> lock(manager.mu);
-            manager.sessions.erase(session->id);
-        }
+    if (!call.with([&](ToolState&) { return session->running; })) {
+        // Exited within the settle window — almost always a failure. Drain
+        // what's left, drop the session (nothing to poll), surface the code.
+        ingest(call, session, std::chrono::milliseconds{0});
+        stop_proc(call, session);
+        auto [early, code] = call.with([&](ToolState& s) {
+            s.procs.erase(session->id);
+            return std::pair{take_new(*session, 4000), session->exit_code};
+        });
         std::string text = session->id + " exited immediately";
         if (code) text += " (exit " + std::to_string(*code) + ")";
         text += ": " + args.command;
@@ -302,87 +244,62 @@ ExecResult run_start(const StartArgs& args) {
 
     // Still alive: report any banner it already printed so the first poll
     // isn't wasted on the startup line.
-    std::string early = session->take_new(4000);
+    std::string early = call.with([&](ToolState&) { return take_new(*session, 4000); });
     std::string text = head + "\nStatus: running. Poll with process_poll \""
         + session->id + "\", stop with process_stop.";
     if (!early.empty()) text += "\n\n" + early;
     return ToolOutput{std::move(text), std::nullopt};
 }
 
-struct PollArgs {
-    std::string id;
-    int max_chars = 30000;
-    int wait_ms = 250;
-    bool wait_for_exit = false;
-};
+struct PollArgs { std::string id; int max_chars = 30000; int wait_ms = 250; };
 std::expected<PollArgs, ToolError> parse_poll(const json& args) {
     util::ArgReader reader(args);
     auto id = reader.require_str("id");
     if (!id || id->empty()) return std::unexpected(ToolError::invalid_args("id is required"));
-    const bool wait_for_exit = reader.boolean("wait_for_exit", false);
-    // In wait_for_exit mode the caller is parking on a long silent phase (a
-    // build link, a slow test) so allow a much longer block; otherwise keep
-    // the responsive 5s ceiling for incremental log tailing.
-    const int wait_cap = wait_for_exit ? 600000 : 5000;
-    const int wait_default = wait_for_exit ? 60000 : 250;
-    return PollArgs{*id,
-                    std::clamp(reader.integer("max_chars", 30000), 1000, 100000),
-                    std::clamp(reader.integer("wait_ms", wait_default), 0, wait_cap),
-                    wait_for_exit};
+    // wait_ms up to 300 s (matches the bash tool's max). A long block is safe:
+    // the host's poll returns the instant output arrives OR the child exits,
+    // and the wait is sliced so a cancel is noticed.
+    return PollArgs{*id, std::clamp(reader.integer("max_chars", 30000), 1000, 100000),
+                    std::clamp(reader.integer("wait_ms", 250), 0, 300000)};
 }
 
-// Human-friendly list of live session ids for recovery hints. Caller must NOT
-// already hold manager.mu.
-std::string live_session_hint_locked(ProcessManager& manager);
-std::string live_session_hint() {
-    auto& manager = ProcessManager::instance();
-    std::lock_guard<std::mutex> lock(manager.mu);
-    return live_session_hint_locked(manager);
-}
-
-// Same, for callers that already hold manager.mu.
-std::string live_session_hint_locked(ProcessManager& manager) {
-    if (manager.sessions.empty()) return " (no live sessions)";
-    std::string s = " (live sessions:";
-    for (const auto& [id, _] : manager.sessions) s += " " + id;
-    s += ")";
-    return s;
-}
-
-ExecResult run_poll(const PollArgs& args) {
-    auto session = find_session(args.id);
+ExecResult run_poll(const Call& call, const PollArgs& args, CallExec&) {
+    auto session = find_proc(call, args.id);
     if (!session)
         return std::unexpected(ToolError::not_found(
-            "unknown process session: " + args.id + live_session_hint()));
-    const auto start = std::chrono::steady_clock::now();
-    const auto deadline = start + std::chrono::milliseconds{args.wait_ms};
+            "unknown process session: " + args.id + live_session_hint(call)));
+
+    // Wait on the host's session for news, in slices so a cancel is
+    // noticed. The host's poll returns as soon as there is output or the
+    // child ends; the library keeps no clock, so the budget is counted in
+    // slices of the wait the caller asked for.
+    constexpr std::chrono::milliseconds kSlice{250};
     std::string output;
     std::size_t dropped = 0;
-    bool running = false;
+    auto left = std::chrono::milliseconds{args.wait_ms};
     do {
-        running = session->running();
-        output = session->take_new(static_cast<std::size_t>(args.max_chars), &dropped);
-        // Normal mode: return as soon as ANY output arrives. wait_for_exit
-        // mode: ignore incremental output and keep parking until the process
-        // actually exits (or the deadline hits) — one call to await a long
-        // silent phase instead of many empty polls.
-        const bool have_output_break = !output.empty() && !args.wait_for_exit;
-        if (have_output_break || !running || std::chrono::steady_clock::now() >= deadline) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds{args.wait_for_exit ? 100 : 10});
-    } while (true);
-    // Re-check liveness after draining: a process that printed its last line
-    // and THEN exited during this same poll should report "exited (code)"
-    // together with that final output, not "running" — saving the model an
-    // extra poll just to learn it's done.
-    if (running) running = session->running();
+        const auto wait = std::min(left, kSlice);
+        ingest(call, session, wait);
+        left -= wait;
+        auto [out, done] = call.with([&](ToolState&) {
+            std::size_t d = 0;
+            auto o = take_new(*session, static_cast<std::size_t>(args.max_chars), &d);
+            dropped += d;
+            return std::pair{std::move(o), !session->running && session->eof};
+        });
+        output = std::move(out);
+        if (!output.empty() || done || call.cancel_requested()) break;
+    } while (left.count() > 0);
 
+    auto [running, uptime, code, eof] = call.with([&](ToolState&) {
+        return std::tuple{session->running, session->uptime, session->exit_code, session->eof};
+    });
     std::string status = args.id;
     if (running) {
-        status += " running (" + std::to_string(session->age().count()) + "s)";
+        status += " running (" + std::to_string(uptime.count()) + "s)";
     } else {
         status += " exited";
-        if (auto code = session->exit_code())
-            status += " (exit " + std::to_string(*code) + ")";
+        if (code) status += " (exit " + std::to_string(*code) + ")";
     }
     std::string text = std::move(status) + "\n";
     if (dropped)
@@ -391,18 +308,14 @@ ExecResult run_poll(const PollArgs& args) {
     if (!output.empty()) {
         text += output;
     } else if (running) {
-        const auto waited = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - start).count();
-        if (args.wait_for_exit) {
-            text += "(still running after waiting " + std::to_string(waited)
-                  + "s with no exit — poll again with wait_for_exit to keep "
-                    "parking, or process_stop to give up)";
-        } else {
-            text += "(no new output for " + std::to_string(waited)
-                  + "s; process still running. If you're waiting for it to "
-                    "FINISH, poll with wait_for_exit=true instead of repeating "
-                    "short polls)";
-        }
+        text += "(no new output yet — process still running; poll again)";
+    } else if (!eof) {
+        // Exited but the pipe never hit EOF within the wait budget: a
+        // backgrounded descendant inherited the write end. More output may
+        // still arrive from it.
+        text += "(process exited but its output pipe is still open — a "
+                "background child likely inherited it; poll again for more, "
+                "or process_stop to force-close and reap)";
     } else {
         text += "(process has exited; no further output — call process_stop to reap it)";
     }
@@ -417,26 +330,31 @@ std::expected<StopArgs, ToolError> parse_stop(const json& args) {
     return StopArgs{*id};
 }
 
-ExecResult run_stop(const StopArgs& args) {
-    auto& manager = ProcessManager::instance();
-    std::shared_ptr<Session> session;
-    {
-        std::lock_guard<std::mutex> lock(manager.mu);
-        auto it = manager.sessions.find(args.id);
-        if (it == manager.sessions.end())
-            return std::unexpected(ToolError::not_found(
-                "unknown process session: " + args.id
-                + live_session_hint_locked(manager)));
-        session = it->second;
-        manager.sessions.erase(it);
+ExecResult run_stop(const Call& call, const StopArgs& args, CallExec&) {
+    auto session = call.with([&](ToolState& s) -> std::shared_ptr<state::Proc> {
+        auto it = s.procs.find(args.id);
+        if (it == s.procs.end()) return nullptr;
+        auto p = it->second;
+        s.procs.erase(it);
+        return p;
+    });
+    if (!session)
+        return std::unexpected(ToolError::not_found(
+            "unknown process session: " + args.id + live_session_hint(call)));
+    const bool was_running = call.with([&](ToolState&) { return session->running; });
+    auto handle = call.with([&](ToolState&) { return session->proc; });
+    stop_proc(call, session);
+    // One last look for the final output and exit code.
+    if (handle) {
+        auto u = handle->poll(std::chrono::milliseconds{0});
+        call.with([&](ToolState&) { fold(*session, u); });
     }
-    const bool was_running = session->running();
-    session->stop();
     std::size_t dropped = 0;
-    auto output = session->take_new(30000, &dropped);
+    auto [output, code] = call.with([&](ToolState&) {
+        return std::pair{take_new(*session, 30000, &dropped), session->exit_code};
+    });
     std::string text = (was_running ? "Stopped " : "Reaped ") + args.id;
-    if (auto code = session->exit_code())
-        text += " (exit " + std::to_string(*code) + ")";
+    if (code) text += " (exit " + std::to_string(*code) + ")";
     if (dropped)
         text += "\n[" + std::to_string(dropped) + " bytes of earlier output were dropped]";
     if (!output.empty()) text += "\n" + output;
@@ -459,13 +377,12 @@ json poll_schema() {
         {"id", {{"type","string"}, {"description","Session id returned by process_start."}}},
         {"max_chars", {{"type","integer"}, {"minimum",1000}, {"maximum",100000}, {"default",30000},
                        {"description","Cap on bytes of new output returned this poll (most recent kept)."}}},
-        {"wait_for_exit", {{"type","boolean"}, {"default",false},
-            {"description", "Block until the process EXITS (or wait_ms elapses) instead of returning on the first output. Use this to await a long silent phase (a build link, a slow test) in ONE call rather than many empty polls. In this mode wait_ms defaults to 60000 and may go up to 600000."}}},
-        {"wait_ms", {{"type","integer"}, {"minimum",0}, {"maximum",600000}, {"default",250},
-                     {"description","Block up to this long waiting for new output before returning "
-                                    "(returns early as soon as any arrives). Raise it when waiting on "
-                                    "a slow-to-boot server. Capped at 5000 normally; up to 600000 with "
-                                    "wait_for_exit=true."}}}
+        {"wait_ms", {{"type","integer"}, {"minimum",0}, {"maximum",300000}, {"default",250},
+                     {"description","Block up to this long (ms, max 300000 = 5 min) waiting for "
+                                    "new output before returning — returns THE INSTANT output arrives "
+                                    "or the process exits, so a big value is free for a quiet process. "
+                                    "Raise it (e.g. 60000) to wait on a slow build/boot instead of "
+                                    "busy-polling; the wait stays interruptible."}}}
     }}};
 }
 json stop_schema() {
@@ -476,7 +393,9 @@ json stop_schema() {
 
 } // namespace
 
-void register_process_tools(Shells& shells) {
+void register_process_tools(Shells& shells, const std::shared_ptr<Exec>& exec) {
+    if (!exec) return;
+
     shells.add("process_start",
         "Start a long-running background process (dev server, watcher, log tail) "
         "and return a session id. Waits ~300ms so an immediate crash is reported "
@@ -484,22 +403,19 @@ void register_process_tools(Shells& shells) {
         "process_poll (incremental output) and process_stop (cleanup). Use bash "
         "for commands that finish on their own.",
         start_schema(), EffectSet{Effect::Exec},
-        body<StartArgs>(run_start, parse_start), 4000);
+        body_with<StartArgs>([exec](const Call& c, const StartArgs& a) { CallExec ce{*exec, c}; return run_start(c, a, ce); }, parse_start), 4000);
     shells.add("process_poll",
         "Fetch output produced by a background session SINCE THE LAST POLL, plus "
         "its status (running + uptime, or exited + exit code). Blocks briefly for "
-        "new output. Reports if any output scrolled past the rolling buffer. To "
-        "await a long silent phase (a build link, a slow test) in ONE call "
-        "instead of many empty polls, pass wait_for_exit=true - it blocks until "
-        "the process exits.",
+        "new output. Reports if any output scrolled past the rolling buffer.",
         poll_schema(), EffectSet{Effect::Exec},
-        body<PollArgs>(run_poll, parse_poll), 30000);
+        body_with<PollArgs>([exec](const Call& c, const PollArgs& a) { CallExec ce{*exec, c}; return run_poll(c, a, ce); }, parse_poll), 30000);
     shells.add("process_stop",
         "Terminate (SIGTERM→SIGKILL) and reap a background session, returning its "
         "exit code and any final output not yet delivered by process_poll. Always "
         "call this to clean up a session you started.",
         stop_schema(), EffectSet{Effect::Exec},
-        body<StopArgs>(run_stop, parse_stop), 30000);
+        body_with<StopArgs>([exec](const Call& c, const StopArgs& a) { CallExec ce{*exec, c}; return run_stop(c, a, ce); }, parse_stop), 30000);
 }
 
 } // namespace mcp::tools::detail

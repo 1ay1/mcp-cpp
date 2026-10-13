@@ -19,6 +19,13 @@ struct FuzzyMatch {
     int         count;   // total matches seen (1 on ok; >1 means ambiguous)
     std::string adjusted_new_text;  // re-indented replacement, or empty
     int         strategy = 0;       // 0=none, 1=exact, 2=DP (diagnostics)
+
+    // Set (1-based) when the ONLY candidate was a fuzzy one sitting further
+    // than LINE_HINT_TOLERANCE from an explicit `line:` hint, so ok==false.
+    // Carries the line it was found at, because "no match" is unhelpful when
+    // we did find something and chose not to trust it -- the caller can name
+    // the spot and let the caller confirm or correct.
+    std::uint32_t far_from_hint_line = 0;
 };
 
 FuzzyMatch fuzzy_find(std::string_view file, std::string_view needle);
@@ -31,5 +38,12 @@ FuzzyMatch fuzzy_find(std::string_view file,
                       std::string_view needle,
                       std::string_view new_text,
                       std::uint32_t    line_hint);
+
+// Exact Levenshtein (edit) distance between two byte strings. Backed by
+// Myers' bit-parallel algorithm for the common short-string case; exported so
+// its correctness can be pinned by a differential test against a reference
+// matrix (a bit-parallel kernel is easy to get subtly wrong). Pure, noexcept.
+[[nodiscard]] std::size_t levenshtein(std::string_view a,
+                                      std::string_view b) noexcept;
 
 } // namespace mcp::tools::util

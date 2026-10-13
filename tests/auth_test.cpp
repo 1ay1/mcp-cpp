@@ -3,6 +3,8 @@
 // auth_test.cpp — MCP 2026-07-28 authorization (mcp/auth.hpp). Pure logic, no
 // network: verifies the crypto primitives and every 2026-07-28 hardening rule.
 //
+#include "agtest.hpp"
+
 #include <mcp/auth.hpp>
 
 #include <iostream>
@@ -11,14 +13,6 @@
 using namespace mcp;
 using namespace mcp::auth;
 
-static int g_failures = 0;
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::cerr << "FAIL " << __LINE__ << "  " << #cond << "\n";       \
-            ++g_failures;                                                    \
-        }                                                                    \
-    } while (0)
 
 static std::string hex(const std::array<std::uint8_t, 32>& d) {
     static constexpr char h[] = "0123456789abcdef";
@@ -27,7 +21,7 @@ static std::string hex(const std::array<std::uint8_t, 32>& d) {
     return s;
 }
 
-int main() {
+TEST_CASE("auth") {
     // ── SHA-256 known-answer vectors (FIPS 180-4) ────────────────────────
     {
         CHECK(hex(detail::sha256("")) ==
@@ -231,8 +225,4 @@ int main() {
         catch (const AuthError&) { threw = true; }
         CHECK(threw);
     }
-
-    if (g_failures == 0) { std::cout << "auth_test: ALL PASS\n"; return 0; }
-    std::cerr << "auth_test: " << g_failures << " failure(s)\n";
-    return 1;
 }

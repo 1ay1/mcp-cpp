@@ -12,6 +12,8 @@
 //
 #include <mcp/mcp.hpp>
 
+#include "serve_lines.hpp"
+
 #include <chrono>
 #include <ctime>
 #include <iostream>
@@ -19,9 +21,7 @@
 using namespace mcp;
 
 int main() {
-    StdioTransport transport(std::cin, std::cout);
-    Server server(transport.sink(),
-                  Implementation{"mcp-cpp-example", std::string(kLibraryVersion),
+    Server server(Implementation{"mcp-cpp-example", std::string(kLibraryVersion),
                                  std::string("Example Server"), Nothing, Nothing, Nothing});
     server.set_capabilities(ServerCapabilities{
         .logging = Json::object(),
@@ -102,7 +102,5 @@ int main() {
             });
     }
 
-    transport.start(server.engine());
-    transport.join();   // run until stdin closes
-    return 0;
+    return example::serve_lines(server);   // until stdin closes
 }

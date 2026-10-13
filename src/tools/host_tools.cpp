@@ -84,6 +84,14 @@ void register_todo_tool(Shells& sh, const std::shared_ptr<TodoSink>& sink) {
                 if (!set_err.empty())
                     return mcp::cap::Result::error(std::move(set_err));
             }
+            // NEVER return an empty success. An empty string back from a
+            // tool reads as "nothing happened" to many models — observed
+            // in the field as a call loop: a model (behind a compressing
+            // proxy) sent `todos: []` or malformed items, got "" back,
+            // concluded the call was dropped, and retried identically for
+            // whole turns. Say what the list now is, explicitly.
+            if (out.empty())
+                out = "(todo list is now empty — 0 items)";
             return mcp::cap::Result::ok(out);
         });
 }
@@ -105,12 +113,12 @@ void register_skill_tool(Shells& sh, const std::shared_ptr<SkillResolver>& res) 
             }},
         },
         EffectSet{},
-        [res](const Json& args) -> mcp::cap::Result {
+        [res](const Call& call, const Json& args) -> mcp::cap::Result {
             std::string name = args.value("name", std::string{});
             if (name.empty())
                 return mcp::cap::Result::error("skill: `name` is required.");
             std::string err;
-            auto body = res->load(name, err);
+            auto body = res->load(call, name, err);
             if (!body)
                 return mcp::cap::Result::error(
                     err.empty() ? ("skill: unknown skill '" + name + "'.") : err);
@@ -241,6 +249,18 @@ void register_search_code_tool(Shells& sh, const std::shared_ptr<DocRetriever>& 
 // ── task ─────────────────────────────────────────────────────────────────
 void register_task_tool(Shells& sh, const std::shared_ptr<SubagentRunner>& runner) {
     if (!runner) return;
+    // Built-in five + any host-defined types (user-authored agents). The
+    // enum makes them discoverable in the schema the model sees.
+    Json type_enum = Json::array({"explorer","reviewer","tester","coder","general"});
+    std::string type_desc = "Subagent specialisation (default general).";
+    if (auto extra = runner->extra_agent_types(); !extra.empty()) {
+        type_desc += " User-defined:";
+        for (auto& t : extra) {
+            type_enum.push_back(t);
+            type_desc += " " + t;
+        }
+        type_desc += ".";
+    }
     sh.add(
         "task",
         "Spawn an autonomous subagent to complete a self-contained task in "
@@ -252,15 +272,15 @@ void register_task_tool(Shells& sh, const std::shared_ptr<SubagentRunner>& runne
             {"properties", {
                 {"prompt", {{"type","string"}, {"description","Complete, self-contained task description."}}},
                 {"agent_type", {{"type","string"},
-                    {"enum", {"explorer","reviewer","tester","coder","general"}},
-                    {"description","Subagent specialisation (default general)."}}},
+                    {"enum", type_enum},
+                    {"description", type_desc}}},
                 {"display_description", {{"type","string"},
                     {"description","One-line summary shown in the UI. Optional."}}},
             }},
         },
         EffectSet{Effect::ReadFs, Effect::Net},
-        [runner](const Json& args) -> mcp::cap::Result {
-            if (auto reason = runner->unavailable_reason(); !reason.empty())
+        [runner](const Call& call, const Json& args) -> mcp::cap::Result {
+            if (auto reason = runner->unavailable_reason(call); !reason.empty())
                 return mcp::cap::Result::error("task: " + std::move(reason));
             SubagentRequest req;
             req.prompt = args.value("prompt", std::string{});
@@ -268,7 +288,7 @@ void register_task_tool(Shells& sh, const std::shared_ptr<SubagentRunner>& runne
                 return mcp::cap::Result::error("task: `prompt` is required.");
             req.agent_type = args.value("agent_type", std::string{"general"});
             bool is_error = false;
-            std::string report = runner->run(req, is_error);
+            std::string report = runner->run(call, req, is_error);
             return is_error ? mcp::cap::Result::error(report)
                             : mcp::cap::Result::ok(report);
         });
