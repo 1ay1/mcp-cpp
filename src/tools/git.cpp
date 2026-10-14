@@ -672,7 +672,6 @@ struct GitCommitArgs {
     std::string path;
     std::string display_description;
     std::optional<std::string> raw_message;
-    json raw_files;
 };
 
 const util::ArgSpec<GitCommitArgs> kGitCommitArgs{
@@ -680,8 +679,7 @@ const util::ArgSpec<GitCommitArgs> kGitCommitArgs{
               "One-line summary shown in the UI. Optional."),
     util::arg(&GitCommitArgs::raw_message, "message", "Commit message "
               "(required unless amend=true, where it defaults to the existing message)"),
-    util::arg(&GitCommitArgs::raw_files, "files", "Files to stage before committing")
-        .shape(json{{"type","array"}, {"items",{{"type","string"}}}}),
+    util::arg(&GitCommitArgs::files, "files", "Files to stage before committing"),
     util::arg(&GitCommitArgs::stage_all, "stage_all", "Stage all changes (default: false)"),
     util::arg(&GitCommitArgs::amend, "amend", "Amend the previous "
               "commit instead of creating a new one; omit message to keep it (default: false)"),
@@ -714,15 +712,6 @@ std::expected<GitCommitArgs, ToolError> check_git_commit(GitCommitArgs a, const 
     }
 
     a.message = std::move(msg);
-    if (const json* f = &a.raw_files; f->is_array()) {
-        a.files.reserve(f->size());
-        for (const auto& el : *f) {
-            if (el.is_string()) {
-                auto s = el.get<std::string>();
-                if (!s.empty()) a.files.push_back(std::move(s));
-            }
-        }
-    }
     return a;
 }
 
@@ -917,24 +906,17 @@ ExecResult run_git_show(const Call& call, const GitShowArgs& a, CallExec& exec) 
 
 struct GitBlameArgs {
     std::string path; std::string ref = "HEAD"; int start = 0; int end = 0;
-    json raw_start, raw_end;
 };
 
 const util::ArgSpec<GitBlameArgs> kGitBlameArgs{
     util::arg(&GitBlameArgs::path, "path", "Workspace file to annotate.").required(),
     util::arg(&GitBlameArgs::ref, "ref", "Commit/ref (default HEAD)."),
-    util::arg(&GitBlameArgs::raw_start, "start_line", "")
-        .shape(json{{"type","integer"}, {"minimum",1}}),
-    util::arg(&GitBlameArgs::raw_end, "end_line", "")
-        .shape(json{{"type","integer"}, {"minimum",1}}),
+    util::arg(&GitBlameArgs::start, "start_line", "First line to annotate (1-based)."),
+    util::arg(&GitBlameArgs::end, "end_line", "Last line to annotate (inclusive)."),
 };
 
-// Lines read leniently ("42" ok); a given range must satisfy 1 <= start <= end.
+// A given range must satisfy 1 <= start <= end.
 std::expected<GitBlameArgs, ToolError> check_git_blame(GitBlameArgs a, const util::Bounds&) {
-    const json lines{{"s", a.raw_start}, {"e", a.raw_end}};
-    util::ArgReader ar(lines);
-    a.start = ar.integer("s", 0);
-    a.end = ar.integer("e", 0);
     if ((a.start > 0 || a.end > 0) && (a.start < 1 || a.end < a.start))
         return std::unexpected(ToolError::invalid_args("line range must satisfy 1 <= start_line <= end_line"));
     return a;
@@ -1310,7 +1292,6 @@ struct GitCherryPickArgs {
     bool no_commit = false;   // stage the changes but don't commit (-n)
     std::string path;
     std::string display_description;
-    json raw_commits;
 };
 
 const util::ArgSpec<GitCherryPickArgs> kGitCherryPickArgs{
@@ -1319,32 +1300,19 @@ const util::ArgSpec<GitCherryPickArgs> kGitCherryPickArgs{
     util::arg(&GitCherryPickArgs::action, "action", "pick (default; apply `commits` onto HEAD) "
               "| continue | abort | skip")
         .one_of({"pick", "continue", "abort", "skip"}),
-    util::arg(&GitCherryPickArgs::raw_commits, "commits", "Commit ref(s) to apply (required for "
-              "action=pick); a single string is also accepted")
-        .shape(json{{"type","array"}, {"items",{{"type","string"}}}}),
+    util::arg(&GitCherryPickArgs::commits, "commits", "Commit ref(s) to apply (required for "
+              "action=pick); a single string is also accepted"),
     util::arg(&GitCherryPickArgs::no_commit, "no_commit", "Stage the changes "
               "without committing (default: false)"),
     util::arg(&GitCherryPickArgs::path, "path", "Repository path "
               "(default: the current project)"),
 };
 
-// commits: a string or an array of strings, empties dropped, each ref-checked.
+// commits are required for a pick, and each must be a plain ref.
 std::expected<GitCherryPickArgs, ToolError>
 check_git_cherry_pick(GitCherryPickArgs a, const util::Bounds&) {
     const std::string& action = a.action;
-    std::vector<std::string>& commits = a.commits;
-    if (const json* c = &a.raw_commits; !c->is_null()) {
-        if (c->is_string()) {
-            auto s = c->get<std::string>();
-            if (!s.empty()) commits.push_back(std::move(s));
-        } else if (c->is_array()) {
-            for (const auto& el : *c)
-                if (el.is_string()) {
-                    auto s = el.get<std::string>();
-                    if (!s.empty()) commits.push_back(std::move(s));
-                }
-        }
-    }
+    const std::vector<std::string>& commits = a.commits;
     if (action == "pick" && commits.empty())
         return std::unexpected(ToolError::invalid_args(
             "`commits` (one or more commit refs) is required for action=pick"));

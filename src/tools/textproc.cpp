@@ -223,7 +223,7 @@ struct ExtractArgs {
     bool        with_location = false; // annotate each value with file:line
     int         limit = 500;     // cap emitted rows
     std::string display_description;
-    json        response_format;  // "detailed" turns on with_location
+    std::string response_format;  // "detailed" turns on with_location
 };
 
 const util::ArgSpec<ExtractArgs> kExtractArgs{
@@ -253,20 +253,15 @@ const util::ArgSpec<ExtractArgs> kExtractArgs{
               "Prefix each value with file:line (same as response_format=detailed)."),
     util::arg(&ExtractArgs::response_format, "response_format",
               "concise (default) = values only; detailed = each value tagged with file:line. Ask for concise unless you need provenance — it's cheaper.")
-        .shape(json{{"type", "string"}, {"enum", {"concise", "detailed"}}}),
+        .suggest({"concise", "detailed"}),
     util::arg(&ExtractArgs::limit, "limit",
               "Max rows emitted (default 500).").range(1, 5000),
 };
 
-// A json-typed arg read the way ArgReader::str reads a string slot.
-[[nodiscard]] std::string json_str(const json& v, std::string def = {}) {
-    return util::ArgReader(json{{"v", v}}).str("v", std::move(def));
-}
-
 // Anthropic's response_format token-economy pattern: `concise` (default)
 // emits just the values; `detailed` adds file:line provenance.
 std::expected<ExtractArgs, ToolError> check_extract(ExtractArgs a, const util::Bounds&) {
-    if (json_str(a.response_format) == "detailed") a.with_location = true;
+    if (a.response_format == "detailed") a.with_location = true;
     if (a.group < 0)
         return std::unexpected(ToolError::invalid_args("`group` must be >= 0"));
     if (a.column < 0)
@@ -680,8 +675,7 @@ ExecResult run_aggregate(const Call& call, const AggregateArgs& a) {
 struct ReplaceArgs {
     std::string root = ".";
     std::string find;
-    std::string replacement;
-    json        replacement_arg;   // required but may be "" (delete matches)
+    std::string replacement;   // required, may be "" (delete matches)
     std::string file_glob;
     bool        regex = false;
     bool        case_sensitive = true;   // literal replace defaults to exact
@@ -695,9 +689,9 @@ const util::ArgSpec<ReplaceArgs> kReplaceArgs{
               "One-line summary shown in the UI. Optional."),
     util::arg(&ReplaceArgs::find, "find",
               "Literal text (default) or regex (regex:true) to find in every file.").required(),
-    util::arg(&ReplaceArgs::replacement_arg, "replacement",
+    util::arg(&ReplaceArgs::replacement, "replacement",
               "Replacement. In regex mode, $1-$9/$& insert capture groups.")
-        .shape(json{{"type", "string"}}).required(),
+        .required_present("`replacement` is required"),
     util::arg(&ReplaceArgs::root, "path",
               "Directory to scan (default: cwd)."),
     util::arg(&ReplaceArgs::file_glob, "glob",
@@ -713,7 +707,6 @@ const util::ArgSpec<ReplaceArgs> kReplaceArgs{
 };
 
 std::expected<ReplaceArgs, ToolError> check_replace(ReplaceArgs a, const util::Bounds&) {
-    a.replacement = json_str(a.replacement_arg);
     if (a.root.empty()) a.root = ".";
     return a;
 }

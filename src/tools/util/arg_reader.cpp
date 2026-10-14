@@ -95,6 +95,16 @@ std::string ArgReader::str(std::string_view key,
     return out;
 }
 
+std::string ArgReader::received_keys() const {
+    if (!args_.is_object() || args_.empty()) return "(no object / empty)";
+    std::string out;
+    for (auto it = args_.begin(); it != args_.end(); ++it) {
+        if (!out.empty()) out += ", ";
+        out += it.key();
+    }
+    return out;
+}
+
 std::optional<std::string> ArgReader::require_str(std::string_view key) const {
     const json* v = raw(key);
     if (!v || v->is_null()) return std::nullopt;

@@ -94,88 +94,77 @@ struct OneEdit {
     std::uint32_t line_hint = std::numeric_limits<std::uint32_t>::max();
 };
 
-struct EditArgs {
-    util::WorkspacePath   path;
-    std::vector<OneEdit>  edits;
-    std::string           display_description;
+// One substitution as a model writes it. The same spec reads an item of
+// `edits: [...]` and the flat single-edit form at the top level.
+struct EditItem {
+    std::string old_text;
+    std::string new_text;
+    int         expected = 0;      // expected_replacements; >=2 means replace_all
+    std::optional<int> count;      // alias of expected
+    bool        replace_all = false;
+    bool        regex = false;
+    std::optional<int> line, line_hint, at_line;   // 1-based; first one set wins
 };
 
-std::expected<EditArgs, ToolError> parse_edit_args(const json& j, const util::Bounds& b) {
-    util::ArgReader ar(j);
-    if (!ar.is_object())
-        return std::unexpected(ToolError::invalid_args("args must be an object"));
-    auto path_opt = ar.require_str("path");
-    if (!path_opt)
-        return std::unexpected(ToolError::invalid_args("path required"));
-    auto wp = util::make_workspace_path_checked(*path_opt, "edit", b);
+const util::ArgSpec<EditItem> kEditItem{
+    util::arg(&EditItem::old_text, "old_string"),   // old_text and other spellings are aliases
+    util::arg(&EditItem::new_text, "new_string"),
+    util::arg(&EditItem::expected, "expected_replacements"),
+    util::arg(&EditItem::count, "count"),
+    util::arg(&EditItem::replace_all, "replace_all"),
+    util::arg(&EditItem::regex, "regex"),
+    util::arg(&EditItem::line, "line"),
+    util::arg(&EditItem::line_hint, "line_hint"),
+    util::arg(&EditItem::at_line, "at_line"),
+};
+
+OneEdit to_one_edit(const EditItem& e) {
+    const int expected = e.expected ? e.expected : e.count.value_or(0);
+    std::uint32_t line_hint = std::numeric_limits<std::uint32_t>::max();
+    for (const auto& l : {e.line, e.line_hint, e.at_line})
+        if (l && *l > 0) { line_hint = static_cast<std::uint32_t>(*l - 1); break; }
+    return OneEdit{e.old_text, e.new_text, e.replace_all || expected >= 2, e.regex,
+                   expected, line_hint};
+}
+
+struct EditArgs {
+    std::string           raw_path;
+    std::string           display_description;
+    json                  edits_in;   // the array; each item decodes via kEditItem
+    json                  raw;        // the flat single-edit form, when no array came
+    std::optional<util::WorkspacePath> path;
+    std::vector<OneEdit>  edits;
+};
+
+// Resolve the path and turn either form into OneEdits.
+std::expected<EditArgs, ToolError> check_edit_args(EditArgs a, const util::Bounds& b) {
+    auto wp = util::make_workspace_path_checked(a.raw_path, "edit", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
-
-    std::string desc = ar.str("display_description", "");
-    std::vector<OneEdit> edits;
-
-    if (auto raw = ar.raw("edits"); raw && raw->is_array()) {
-        edits.reserve(raw->size());
-        int idx = 0;
-        for (const auto& e : *raw) {
-            ++idx;
-            if (!e.is_object())
+    if (a.edits_in.is_array()) {
+        for (std::size_t i = 0; i < a.edits_in.size(); ++i) {
+            if (!a.edits_in[i].is_object())
                 return std::unexpected(ToolError::invalid_args(
-                    std::format("edits[{}]: expected object", idx - 1)));
-            util::ArgReader sub(e);
-            auto old_opt = sub.require_str("old_text");
-            if (!old_opt) old_opt = sub.require_str("old_string");
-            if (!old_opt)
+                    std::format("edits[{}]: expected object", i)));
+            auto e = kEditItem.decode(a.edits_in[i]);
+            if (!e) return std::unexpected(std::move(e.error()));
+            if (e->old_text.empty())
                 return std::unexpected(ToolError::invalid_args(
-                    std::format("edits[{}]: old_text required", idx - 1)));
-            std::string new_text = sub.str("new_text", "");
-            if (new_text.empty() && sub.has("new_string"))
-                new_text = sub.str("new_string", "");
-            int expected = sub.integer("expected_replacements", 0);
-            if (expected == 0) expected = sub.integer("count", 0);
-            bool replace_all = sub.boolean("replace_all", false);
-            if (expected >= 2) replace_all = true;
-            bool rx = sub.boolean("regex", false);
-            std::uint32_t line_hint = std::numeric_limits<std::uint32_t>::max();
-            int ln = sub.integer("line", 0);
-            if (ln <= 0) ln = sub.integer("line_hint", 0);
-            if (ln <= 0) ln = sub.integer("at_line", 0);
-            if (ln > 0) line_hint = static_cast<std::uint32_t>(ln - 1);
-            edits.push_back(OneEdit{std::move(*old_opt), std::move(new_text),
-                                    replace_all, rx, expected, line_hint});
+                    std::format("edits[{}]: old_text required", i)));
+            a.edits.push_back(to_one_edit(*e));
         }
     } else {
-        auto old_opt = ar.require_str("old_string");
-        if (!old_opt) old_opt = ar.require_str("old_text");
-        if (!old_opt)
+        auto e = kEditItem.decode(a.raw);
+        if (!e) return std::unexpected(std::move(e.error()));
+        if (e->old_text.empty())
             return std::unexpected(ToolError::invalid_args(
                 "no edits provided — pass either `edits: [...]` or "
                 "`old_string`/`new_string` at top level"));
-        std::string new_s = ar.str("new_string", "");
-        if (new_s.empty() && ar.has("new_text"))
-            new_s = ar.str("new_text", "");
-        int expected = ar.integer("expected_replacements", 0);
-        if (expected == 0) expected = ar.integer("count", 0);
-        bool replace_all = ar.boolean("replace_all", false);
-        if (expected >= 2) replace_all = true;
-        bool rx = ar.boolean("regex", false);
-        std::uint32_t line_hint = std::numeric_limits<std::uint32_t>::max();
-        int ln = ar.integer("line", 0);
-        if (ln <= 0) ln = ar.integer("line_hint", 0);
-        if (ln <= 0) ln = ar.integer("at_line", 0);
-        if (ln > 0) line_hint = static_cast<std::uint32_t>(ln - 1);
-        edits.push_back(OneEdit{std::move(*old_opt), std::move(new_s),
-                                replace_all, rx, expected, line_hint});
+        a.edits.push_back(to_one_edit(*e));
     }
-
-    if (edits.empty())
-        return std::unexpected(ToolError::invalid_args(
-            "edits array is empty — nothing to change"));
-    for (std::size_t i = 0; i < edits.size(); ++i) {
-        if (edits[i].old_text.empty())
-            return std::unexpected(ToolError::invalid_args(
-                std::format("edits[{}]: old_text cannot be empty", i)));
-    }
-    return EditArgs{std::move(*wp), std::move(edits), std::move(desc)};
+    if (a.edits.empty())
+        return std::unexpected(ToolError::invalid_args("edits array is empty — nothing to change"));
+    a.path = std::move(*wp);
+    return a;
 }
 
 int line_of_offset(std::string_view s, std::size_t off) noexcept {
@@ -751,31 +740,31 @@ int apply_one(std::string& buf, const OneEdit& e,
 }
 
 ExecResult run_edit(const Call& call, const EditArgs& a) {
-    const auto& p = a.path.path();
+    const auto& p = a.path->path();
     std::error_code ec;
     if (!call.fs().stat(p).exists) {
         auto parent = p.parent_path();
         bool parent_ok = !parent.empty() && call.fs().stat(parent).exists;
         if (!parent_ok)
             return std::unexpected(ToolError::not_found(
-                "file not found: " + a.path.string()
+                "file not found: " + a.path->string()
                 + " (parent directory doesn't exist either). "
                   "Re-check the path — try `list_dir` on a directory you "
                   "know exists, or `glob` by filename."));
         return std::unexpected(ToolError::not_found(
-            "file not found: " + a.path.string()
+            "file not found: " + a.path->string()
             + ". To create a new file use the `write` tool; "
               "`edit` only modifies existing files."));
     }
     if (!call.fs().stat(p).regular)
         return std::unexpected(ToolError::not_a_file(
-            "not a regular file: " + a.path.string()
+            "not a regular file: " + a.path->string()
             + " (is it a directory or symlink to one?)"));
     constexpr std::uintmax_t kMaxEditBytes = 1024u * 1024u;
     const std::uintmax_t size = call.fs().stat(p).size;
     if (ec)
         return std::unexpected(ToolError::io(
-            "cannot determine file size before editing: " + a.path.string()
+            "cannot determine file size before editing: " + a.path->string()
             + " (" + ec.message() + ")"));
     if (size > kMaxEditBytes)
         return std::unexpected(ToolError::too_large(std::format(
@@ -787,7 +776,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
             size / 1024)));
     if (util::is_binary_file(call.fs(), p))
         return std::unexpected(ToolError::binary(
-            "refusing to edit binary file: " + a.path.string()
+            "refusing to edit binary file: " + a.path->string()
             + " (contains NUL bytes — likely an image, archive, or compiled "
               "artifact). If this is a text file with a stray NUL, use "
               "`write` to rewrite it whole."));
@@ -807,7 +796,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
     auto bounded = call.fs().read_prefix(p, static_cast<std::size_t>(kMaxEditBytes) + 1);
     if (!bounded)
         return std::unexpected(ToolError::io(
-            "cannot open file for bounded edit read: " + a.path.string()));
+            "cannot open file for bounded edit read: " + a.path->string()));
     std::string original = std::move(*bounded);
     if (original.size() > kMaxEditBytes)
         return std::unexpected(ToolError::too_large(
@@ -816,7 +805,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
             "a streaming transformation or split it into smaller files."));
     if (original.find('\0') != std::string::npos)
         return std::unexpected(ToolError::binary(
-            "refusing to edit binary file: " + a.path.string()
+            "refusing to edit binary file: " + a.path->string()
             + " (the bounded read contains NUL bytes)."));
     std::string updated  = original;
 
@@ -860,7 +849,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
         const auto& ed = edit_at(i);
         if (ed.old_text == ed.new_text) { ++skipped_noop; continue; }
         std::string err;
-        int n = apply_one(updated, ed, a.path.string(), err);
+        int n = apply_one(updated, ed, a.path->string(), err);
         if (n == kIdempotentNoOp) {
             ++idempotent;
             outcomes.push_back({i, kIdempotentNoOp, false, {}});
@@ -873,7 +862,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
             for (const auto& prior : outcomes) {
                 if (prior.applied <= 0) continue;
                 std::string tmp_err;
-                (void)apply_one(updated, edit_at(prior.index), a.path.string(), tmp_err);
+                (void)apply_one(updated, edit_at(prior.index), a.path->string(), tmp_err);
             }
             outcomes.push_back({i, n, true, std::format(
                 "expected_replacements={} but matched {} occurrence(s)",
@@ -949,8 +938,8 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
               "usual cause is an old_text that no longer matches what is "
               "there.", std::nullopt};
 
-    auto d = diff::compute(a.path.string(), original, updated);
-    if (auto werr = util::write_file(a.path, updated); !werr.empty())
+    auto d = diff::compute(a.path->string(), original, updated);
+    if (auto werr = util::write_file(*a.path, updated); !werr.empty())
         return std::unexpected(ToolError::io(werr));
     {
         std::error_code mt_ec;
@@ -1002,7 +991,7 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
     if (!staleness_warning.empty()) msg << staleness_warning;
     if (!a.display_description.empty())
         msg << a.display_description << "\n\n";
-    msg << "Edited " << a.path.string() << " (" << d.added << "+ "
+    msg << "Edited " << a.path->string() << " (" << d.added << "+ "
         << d.removed << "-" << where;
     if (a.edits.size() > 1) {
         msg << ", " << applied << "/" << a.edits.size() << " edits applied";
@@ -1033,25 +1022,13 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
     }
 
     // Carry the FileChange (before/after + counts) to the host diff-review UI.
-    FileChange change = make_change(a.path.string(), original, updated);
+    FileChange change = make_change(a.path->string(), original, updated);
     return ToolOutput{msg.str(), std::move(change)};
 }
 
-json edit_schema() {
+json edits_shape() {
     return json{
-        {"type","object"},
-        {"required", {"path","edits"}},
-        {"properties", {
-            {"path", {{"type","string"},
-                {"description","Absolute or relative path of the existing "
-                               "file. Stream this FIRST."}}},
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the card while "
-                               "edits stream — e.g. 'Fix null-deref in "
-                               "auth.cpp'. Stream second."}}},
-            {"edits", {
                 {"type","array"},
-                {"description","One or more edits, applied in order."},
                 {"items", {
                     {"type","object"},
                     {"required", {"old_text","new_text"}},
@@ -1103,10 +1080,24 @@ json edit_schema() {
                                 "lines) wins. Optional."}}},
                     }},
                 }},
-            }},
-        }},
     };
 }
+
+const util::ArgSpec<EditArgs> kEditArgs = [] {
+    util::ArgSpec<EditArgs> s{
+        util::arg(&EditArgs::raw_path, "path",
+                  "Absolute or relative path of the existing file. Stream this FIRST.")
+            .required("path required"),
+        util::arg(&EditArgs::display_description, "display_description",
+                  "One-line summary shown in the card while edits stream — e.g. "
+                  "'Fix null-deref in auth.cpp'. Stream second."),
+        // The flat single-edit form is accepted too (check_edit_args).
+        util::arg(&EditArgs::edits_in, "edits", "One or more edits, applied in order.")
+            .shape(edits_shape()).advertise_required(),
+    };
+    s.raw(&EditArgs::raw);
+    return s;
+}();
 
 constexpr const char* kEditDescription =
     "Modify an EXISTING file by applying one or more targeted text "
@@ -1152,9 +1143,10 @@ struct Hunk {
 };
 
 struct ApplyPatchArgs {
-    util::WorkspacePath path;
-    std::string         patch;
+    std::string         raw_path;
     std::string         display_description;
+    std::string         patch;
+    std::optional<util::WorkspacePath> path;
 };
 
 // A unified-diff body line: strip the leading marker, keep the text. Handles
@@ -1210,16 +1202,16 @@ struct ApplyPatchArgs {
 }
 
 ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
-    const auto& p = a.path.path();
+    const auto& p = a.path->path();
     std::error_code ec;
     if (!call.fs().stat(p).exists)
         return std::unexpected(ToolError::not_found(
-            "file not found: " + a.path.string()
+            "file not found: " + a.path->string()
             + ". apply_patch modifies an existing file; use `write` to create "
               "a new one."));
     if (!call.fs().stat(p).regular)
         return std::unexpected(ToolError::not_a_file(
-            "not a regular file: " + a.path.string()));
+            "not a regular file: " + a.path->string()));
     constexpr std::uintmax_t kMaxBytes = 1024u * 1024u;
     const std::uintmax_t size = call.fs().stat(p).size;
     if (!ec && size > kMaxBytes)
@@ -1227,7 +1219,7 @@ ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
             "file is {} KiB (> 1 MiB apply_patch cap).", size / 1024)));
     if (util::is_binary_file(call.fs(), p))
         return std::unexpected(ToolError::binary(
-            "refusing to patch binary file: " + a.path.string()));
+            "refusing to patch binary file: " + a.path->string()));
 
     std::string err;
     auto hunks = parse_hunks(a.patch, err);
@@ -1247,12 +1239,12 @@ ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
             "targeted changes.", hunks.size(), kMaxHunks)));
 
     std::string original;
-    try { original = util::read_file(a.path); }
+    try { original = util::read_file(*a.path); }
     catch (...) { return std::unexpected(ToolError::io(
-        "cannot read " + a.path.string())); }
+        "cannot read " + a.path->string())); }
     if (original.find('\0') != std::string::npos)
         return std::unexpected(ToolError::binary(
-            "refusing to patch binary file: " + a.path.string()));
+            "refusing to patch binary file: " + a.path->string()));
 
     std::string stale_note;
     if (staleness(call, p) == util::StaleVerdict::Stale)
@@ -1292,12 +1284,12 @@ ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
                     "the diff; if line {} really is the target, say so with an "
                     "accurate @@ header.",
                     h.index, h.old_start, fm.far_from_hint_line,
-                    a.path.string(), fm.far_from_hint_line)));
+                    a.path->string(), fm.far_from_hint_line)));
             return std::unexpected(ToolError::no_match(std::format(
                 "hunk #{} did not match the file (context/removed lines not "
                 "found, even fuzzily). The file may have moved on from the "
                 "patch's base \u2014 re-read {} and regenerate the diff.",
-                h.index, a.path.string())));
+                h.index, a.path->string())));
         }
         std::string repl = fm.adjusted_new_text.empty() ? h.after
                                                          : fm.adjusted_new_text;
@@ -1323,8 +1315,8 @@ ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
         return ToolOutput{stale_note + "Patch produced no change \u2014 the file "
             "already matches the patched state.", std::nullopt};
 
-    auto d = diff::compute(a.path.string(), original, updated);
-    if (auto werr = util::write_file(a.path, updated); !werr.empty())
+    auto d = diff::compute(a.path->string(), original, updated);
+    if (auto werr = util::write_file(*a.path, updated); !werr.empty())
         return std::unexpected(ToolError::io(werr));
     { std::error_code mt; auto nm = call.fs().stat(p).mtime;
       if (!mt) record_seen(call, p, nm,
@@ -1365,47 +1357,42 @@ ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
     std::ostringstream msg;
     if (!stale_note.empty()) msg << stale_note;
     if (!a.display_description.empty()) msg << a.display_description << "\n\n";
-    msg << "Patched " << a.path.string() << " (" << d.added << "+ "
+    msg << "Patched " << a.path->string() << " (" << d.added << "+ "
         << d.removed << "-, " << hunks.size() << " hunk"
         << (hunks.size()==1?"":"s") << where << "):\n\n```diff\n" << unified;
     if (unified.empty() || unified.back() != '\n') msg << "\n";
     msg << "```";
 
-    FileChange change = make_change(a.path.string(), original, updated);
+    FileChange change = make_change(a.path->string(), original, updated);
     return ToolOutput{msg.str(), std::move(change)};
 }
 
-std::expected<ApplyPatchArgs, ToolError> parse_apply_patch_args(const json& j, const util::Bounds& b) {
-    util::ArgReader r(j);
-    if (!r.is_object())
-        return std::unexpected(ToolError::invalid_args("expected a JSON object"));
-    auto path = r.require_str("path");
-    if (!path || path->empty())
-        return std::unexpected(ToolError::invalid_args("`path` is required"));
-    auto patch = r.require_str("patch");
-    if (!patch || patch->empty())
-        return std::unexpected(ToolError::invalid_args("`patch` is required"));
-    auto wp = util::make_workspace_path_checked(*path, "apply_patch", b);
+std::expected<ApplyPatchArgs, ToolError> check_apply_patch_args(ApplyPatchArgs a,
+                                                                const util::Bounds& b) {
+    auto wp = util::make_workspace_path_checked(a.raw_path, "apply_patch", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
-    ApplyPatchArgs a{std::move(*wp), std::move(*patch),
-                     r.str("display_description")};
+    a.path = std::move(*wp);
     return a;
 }
 
-json apply_patch_schema() {
-    return json{{"type","object"},{"required",{"path","patch"}},{"properties",{
-        {"path",{{"type","string"},{"description","Existing file to patch. Stream FIRST."}}},
-        {"display_description",{{"type","string"},{"description","One-line summary shown in the card. Stream second."}}},
-        {"patch",{{"type","string"},{"description","A unified diff for THIS file: one or more hunks starting with `@@ -a,b +c,d @@`, body lines prefixed ` ` (context), `-` (remove), `+` (add). File headers (--- / +++) are optional and ignored. Hunks are fuzzy-located (the @@ line numbers are hints), so a patch still applies after the file drifts; every hunk needs \u22651 context line and all hunks apply atomically (any miss \u2192 nothing written)."}}},
-    }}};
-}
+const util::ArgSpec<ApplyPatchArgs> kApplyPatchArgs = [] {
+    util::ArgSpec<ApplyPatchArgs> s{
+        util::arg(&ApplyPatchArgs::raw_path, "path", "Existing file to patch. Stream FIRST.")
+            .required("`path` is required"),
+        util::arg(&ApplyPatchArgs::display_description, "display_description",
+                  "One-line summary shown in the card. Stream second."),
+        util::arg(&ApplyPatchArgs::patch, "patch", "A unified diff for THIS file: one or more hunks starting with `@@ -a,b +c,d @@`, body lines prefixed ` ` (context), `-` (remove), `+` (add). File headers (--- / +++) are optional and ignored. Hunks are fuzzy-located (the @@ line numbers are hints), so a patch still applies after the file drifts; every hunk needs \u22651 context line and all hunks apply atomically (any miss \u2192 nothing written).")
+            .required("`patch` is required"),
+    };
+    return s;
+}();
 
 } // namespace
 
 void register_edit_tool(Shells& sh) {
-    sh.add("edit", kEditDescription, edit_schema(),
+    sh.add("edit", kEditDescription, kEditArgs.schema(),
            EffectSet{Effect::ReadFs, Effect::WriteFs},
-           body<EditArgs>(run_edit, parse_edit_args), 40'000);
+           body<EditArgs>(run_edit, kEditArgs, check_edit_args), 40'000);
 
     sh.add("apply_patch",
         "Apply a unified-diff PATCH to one existing file \u2014 the multi-hunk "
@@ -1417,9 +1404,9 @@ void register_edit_tool(Shells& sh) {
         "atomically: if any can't be placed unambiguously, nothing is "
         "written. Produces a reviewable diff card like `edit`. Use `edit` for "
         "a one-off substitution, `apply_patch` when you already have a diff.",
-        apply_patch_schema(),
+        kApplyPatchArgs.schema(),
         EffectSet{Effect::ReadFs, Effect::WriteFs},
-        body<ApplyPatchArgs>(run_apply_patch, parse_apply_patch_args), 40'000);
+        body<ApplyPatchArgs>(run_apply_patch, kApplyPatchArgs, check_apply_patch_args), 40'000);
 }
 
 } // namespace mcp::tools::detail

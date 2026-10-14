@@ -33,6 +33,10 @@ public:
 
     [[nodiscard]] const nlohmann::json* raw(std::string_view key) const noexcept;
 
+    /// The keys the call sent, for a "missing X" message that shows a typo
+    /// or arguments that never arrived. "(no object / empty)" when none.
+    [[nodiscard]] std::string received_keys() const;
+
 private:
     const nlohmann::json& args_;
 };

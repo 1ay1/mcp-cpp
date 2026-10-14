@@ -48,8 +48,8 @@ namespace {
 // parameter bytes mid-stream.)
 
 struct BashArgs {
-    std::string command;
-    int         timeout;   // [1, 300]
+    json        command_in;   // a string, or an argv list (normalize_command)
+    std::string command;      // the script, after normalising
     bool        timeout_given = false;  // caller set timeout/timeout_ms
     std::string cd;        // optional; empty = inherit cwd
     std::vector<std::pair<std::string, std::string>> env;  // caller overrides
@@ -62,6 +62,9 @@ struct BashArgs {
     // the model gets the slice. 0 = unbounded.
     int         head_lines = 0;
     int         tail_lines = 0;
+    int         timeout = 60;   // [1, 300]
+    std::optional<int> timeout_in, timeout_ms_in;
+    json        env_in;
 };
 
 // Keep the first `head` and/or last `tail` lines, marking what was dropped.
@@ -96,17 +99,14 @@ std::string bound_lines(const std::string& in, int head, int tail) {
 
 // What a model sends as `command` isn't always a script. Turn the common
 // shapes into one: an argv array, a ```fenced``` block, a pasted "$ cmd".
-std::string normalize_command(const json& j, std::string cmd) {
-    auto it = j.end();
-    for (const char* k : {"command", "cmd", "shell_command", "shell", "script", "run", "cmdline"})
-        if (it = j.find(k); it != j.end()) break;
-    if (it != j.end() && it->is_array() && !it->empty()
-        && std::ranges::all_of(*it, [](const json& e) { return e.is_string(); })) {
+std::string normalize_command(const json& given) {
+    if (given.is_array() && !given.empty()
+        && std::ranges::all_of(given, [](const json& e) { return e.is_string(); })) {
         // ["bash","-c","script"] is the script itself.
-        if (it->size() == 3 && ((*it)[0] == "bash" || (*it)[0] == "sh") && (*it)[1] == "-c")
-            return (*it)[2].get<std::string>();
+        if (given.size() == 3 && (given[0] == "bash" || given[0] == "sh") && given[1] == "-c")
+            return given[2].get<std::string>();
         std::string out;
-        for (const auto& e : *it) {
+        for (const auto& e : given) {
             const auto s = e.get<std::string>();
             if (!out.empty()) out += ' ';
             const bool plain = !s.empty() && std::ranges::all_of(s, [](char c) {
@@ -119,6 +119,9 @@ std::string normalize_command(const json& j, std::string cmd) {
         }
         return out;
     }
+    std::string cmd = given.is_string() ? given.get<std::string>()
+                    : given.is_null()   ? std::string{}
+                                        : given.dump();
     // ```bash ... ``` around the whole command.
     auto trim = [](std::string s) {
         while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
@@ -151,12 +154,8 @@ std::string normalize_command(const json& j, std::string cmd) {
     return cmd;
 }
 
-std::expected<BashArgs, ToolError> parse_bash_args(const json& j, const util::Bounds& b) {
-    util::ArgReader ar(j);
-    auto cmd_opt = ar.require_str("command");
-    if (!cmd_opt)
-        return std::unexpected(ToolError::invalid_args("command required"));
-    std::string cmd = normalize_command(j, *std::move(cmd_opt));
+std::expected<BashArgs, ToolError> check_bash_args(BashArgs a, const util::Bounds& b) {
+    std::string cmd = normalize_command(a.command_in);
     // AST guard: judges every command in the script (pipes, chains, $(…),
     // control flow, bash -c, sudo/env/xargs/find -exec). If the script does
     // not parse cleanly, ALSO run the legacy text validator — fail closed.
@@ -171,19 +170,16 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j, const util::Bo
     if (cmd.empty())
         return std::unexpected(ToolError::invalid_args("command must not be empty"));
 
-    int timeout_int = ar.integer("timeout", 60);
-    const bool timeout_given = ar.has("timeout") || ar.has("timeout_ms");
-    if (ar.has("timeout_ms")) {
-        int ms = ar.integer("timeout_ms", 0);
-        if (ms > 0) timeout_int = (ms + 999) / 1000;
-    }
+    int timeout_int = a.timeout_in.value_or(60);
+    const bool timeout_given = a.timeout_in.has_value() || a.timeout_ms_in.has_value();
+    if (a.timeout_ms_in && *a.timeout_ms_in > 0) timeout_int = (*a.timeout_ms_in + 999) / 1000;
     // Out-of-range: clamp UP to the max rather than silently resetting a
     // too-large request to the 60s default — a model asking for 600s wants
     // MORE time, and 60 would time out the very command it was raised for.
     if (timeout_int <= 0) timeout_int = 60;
     else if (timeout_int > 300) timeout_int = 300;
 
-    std::string cd = ar.str("cd", "");
+    std::string cd = std::move(a.cd);
     if (!cd.empty()) {
         // Relative cd is relative to the session's folder, and goes on
         // absolute: the sandbox chdirs in its own namespace, where a relative
@@ -260,7 +256,7 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j, const util::Bo
     };
 
     std::vector<std::pair<std::string, std::string>> env;
-    if (const json* e = ar.raw("env"); e && e->is_object()) {
+    if (const json* e = &a.env_in; e->is_object()) {
         std::string bad_keys;
         for (auto it = e->begin(); it != e->end(); ++it) {
             if (it.key().empty()) continue;
@@ -288,26 +284,12 @@ std::expected<BashArgs, ToolError> parse_bash_args(const json& j, const util::Bo
                 "user gave. Put what you need IN the command instead."));
     }
 
-    // Clamped: a model asking for 100k lines wants "all of it", and the
-    // spill path already handles genuinely huge output better than a slice
-    // would. Negative is meaningless, so it reads as unset.
-    auto bound = [&](const char* key) {
-        int v = ar.integer(key, 0);
-        if (v < 0) v = 0;
-        if (v > 2000) v = 2000;
-        return v;
-    };
-
-    return BashArgs{
-        std::move(cmd),
-        timeout_int,
-        timeout_given,
-        std::move(cd),
-        std::move(env),
-        ar.str("display_description", ""),
-        bound("head_lines"),
-        bound("tail_lines"),
-    };
+    a.command = std::move(cmd);
+    a.timeout = timeout_int;
+    a.timeout_given = timeout_given;
+    a.cd = std::move(cd);
+    a.env = std::move(env);
+    return a;
 }
 
 // Pull the lines that look like compiler/test/runtime errors out of captured
@@ -626,46 +608,43 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
     return ToolOutput{std::move(body), std::nullopt};
 }
 
-json bash_schema() {
-    return json{
-        {"type","object"},
-        {"required", {"command"}},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI — e.g. "
-                               "'Run the test suite'. Optional but strongly "
-                               "recommended."}}},
-            {"command", {{"type","string"}, {"description","The shell command to execute"}}},
-            {"cd",      {{"type","string"}, {"description",
+const util::ArgSpec<BashArgs> kBashArgs = [] {
+    util::ArgSpec<BashArgs> s{
+        util::arg(&BashArgs::display_description, "display_description",
+                  "One-line summary shown in the UI — e.g. 'Run the test suite'. "
+                  "Optional but strongly recommended."),
+        util::arg(&BashArgs::command_in, "command", "The shell command to execute")
+            .shape(json{{"type", "string"}, {"description", "The shell command to execute"}})
+            .required("command required"),
+        util::arg(&BashArgs::cd, "cd",
                 "Working directory to run the command in (a real chdir in the "
                 "child, so relative paths and the command's own $PWD are "
-                "correct). Must be an existing directory inside the workspace."}}},
-            {"env",     {{"type","object"},
-                {"additionalProperties", {{"type","string"}}},
-                {"description",
+                "correct). Must be an existing directory inside the workspace."),
+        util::arg(&BashArgs::env_in, "env",
                 "Extra environment variables for THIS command, e.g. "
                 "{\"CI\":\"1\",\"RUST_LOG\":\"debug\"}. Layered on top of the "
                 "inherited environment (your values win). The tool already "
                 "forces a clean non-interactive env (NO_COLOR, PAGER=cat, "
-                "GIT_TERMINAL_PROMPT=0, TERM=dumb, \u2026) so output is quiet and "
-                "nothing blocks on a prompt \u2014 only set this to add/override."}}},
-            {"timeout", {{"type","integer"}, {"description","Timeout in seconds (max 300). If set, the command is stopped after this long even while it's still printing. If omitted, it's stopped after 60s of silence."}}},
-            {"timeout_ms", {{"type","integer"}, {"description",
-                "Alternative timeout in milliseconds (rounded up to seconds)."}}},
-            {"head_lines", {{"type","integer"}, {"description",
+                "GIT_TERMINAL_PROMPT=0, TERM=dumb, …) so output is quiet and "
+                "nothing blocks on a prompt — only set this to add/override.")
+            .shape(json{{"type","object"}, {"additionalProperties", {{"type","string"}}}}),
+        util::arg(&BashArgs::timeout_in, "timeout", "Timeout in seconds (max 300). If set, the command is stopped after this long even while it's still printing. If omitted, it's stopped after 60s of silence."),
+        util::arg(&BashArgs::timeout_ms_in, "timeout_ms",
+                "Alternative timeout in milliseconds (rounded up to seconds)."),
+        util::arg(&BashArgs::head_lines, "head_lines",
                 "Return only the FIRST N lines of output to you. Use this "
                 "instead of piping to `head`: the pipe throws the rest away "
                 "before the terminal card sees it, so the user loses output "
-                "they were watching \u2014 this bounds only what reaches you, "
-                "and the card still shows everything."}}},
-            {"tail_lines", {{"type","integer"}, {"description",
+                "they were watching — this bounds only what reaches you, "
+                "and the card still shows everything.").range(0, 2000),
+        util::arg(&BashArgs::tail_lines, "tail_lines",
                 "Return only the LAST N lines of output to you (the usual "
                 "choice for build/test logs, where the failure is at the "
                 "end). Use this instead of piping to `tail`. Combine with "
-                "head_lines to get both ends with the middle elided."}}},
-        }},
+                "head_lines to get both ends with the middle elided.").range(0, 2000),
     };
-}
+    return s;
+}();
 
 } // namespace
 
@@ -686,12 +665,12 @@ void register_shell_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "Linux and macOS), not bash — keep commands portable and avoid "
         "bashisms. Output is truncated at 30k chars.",
 #endif
-        bash_schema(), EffectSet{Effect::Exec},
-        body_with<BashArgs>([exec](const Call& c, const BashArgs& a) {
+        kBashArgs.schema(), EffectSet{Effect::Exec},
+        body<BashArgs>([exec](const Call& c, const BashArgs& a) {
                 CallExec ce{*exec, c};
                 return run_bash(a, ce);
             },
-                            parse_bash_args), 30'000);
+                       kBashArgs, check_bash_args), 30'000);
 }
 
 } // namespace mcp::tools::detail

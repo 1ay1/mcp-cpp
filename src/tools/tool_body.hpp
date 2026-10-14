@@ -99,11 +99,18 @@ template <class Args, class Run, class P>
 // decoder come from the same declaration. `spec` must outlive the provider
 // (declare it as a static const). A `check` that needs the call's Bounds
 // (resolving paths) runs after decoding.
+// The call's bounds, or empty ones for a host without a filesystem (a
+// web-only provider): computing them reads the disk.
+[[nodiscard]] inline util::Bounds bounds_if_fs(const Call& call) {
+    return call.files ? detail::bounds(call) : util::Bounds{};
+}
+
 template <class Args, class Run>
 [[nodiscard]] auto body(Run run, const util::ArgSpec<Args>& spec) {
     return [run = std::move(run), &spec](const Call& call, const Json& j) mutable -> mcp::cap::Result {
-        const auto b = detail::bounds(call);
-        auto parsed = spec.decode(j, &b);
+        std::optional<util::Bounds> b;
+        if (spec.has_tidy() && call.files) b = detail::bounds(call);
+        auto parsed = spec.decode(j, b ? &*b : nullptr);
         if (!parsed) return mcp::cap::Result::error(parsed.error().render());
         return lower(run_on<Args>(run, call, *parsed));
     };
@@ -114,8 +121,8 @@ template <class Args, class Run>
 [[nodiscard]] auto body(Run run, const util::ArgSpec<Args>& spec, CheckIn<Args> check) {
     return [run = std::move(run), &spec, check](const Call& call, const Json& j) mutable
                -> mcp::cap::Result {
-        const auto b = detail::bounds(call);
-        auto parsed = spec.decode(j, &b);
+        const auto b = bounds_if_fs(call);
+        auto parsed = spec.decode(j, call.files ? &b : nullptr);
         if (parsed) parsed = check(std::move(*parsed), b);
         if (!parsed) return mcp::cap::Result::error(parsed.error().render());
         return lower(run_on<Args>(run, call, *parsed));

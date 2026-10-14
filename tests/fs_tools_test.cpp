@@ -218,6 +218,76 @@ TEST_CASE("fs tools keep data safe on edge-case paths and encodings") {
     std::puts("fs-edge: move/remove/write/edit/read_filter edge cases ok");
 }
 
+TEST_CASE("read: every window spelling lands on the same lines") {
+    auto root = fs::temp_directory_path() / ("mcp_read_win_" + std::to_string(mcp_getpid()));
+    fs::create_directories(root);
+    HostServices svc;
+    svc.files = std::make_shared<NativeFileSystem>();
+    svc.state = mcp::test::state_at(root);
+    auto provider = make_provider(svc, ToolsetConfig{}, "local");
+    std::string body;
+    for (int i = 1; i <= 600; ++i) body += "L" + std::to_string(i) + "\n";
+    const auto p = (root / "f.txt").string();
+    (void)util::write_file(test_fs(), root / "f.txt", body);
+
+    // First and last "L<n>" line in the output, and how many there were.
+    // Each read uses its own reader: the read cache rightly serves a range an
+    // earlier read already covered, which would hide the window under test.
+    int reader_n = 0;
+    auto lines = [&](mcp::Json a) {
+        a["path"] = p;
+        auto r = call(*provider, "read", std::move(a), "reader" + std::to_string(++reader_n));
+        REQUIRE(!r.is_error);
+        int first = 0, last = 0, n = 0;
+        std::size_t at = 0;
+        while ((at = r.text.find('L', at)) != std::string::npos) {
+            const bool starts = at == 0 || r.text[at - 1] == '\n' || r.text[at - 1] == '\t'
+                             || r.text[at - 1] == ' ' || r.text[at - 1] == '|';
+            const int v = std::atoi(r.text.c_str() + at + 1);
+            ++at;
+            if (!starts || v <= 0) continue;
+            if (!first) first = v;
+            last = v;
+            ++n;
+        }
+        return std::tuple{first, last, n};
+    };
+    struct W { int first, last, n; };
+    auto lines_w = [&](mcp::Json a) { auto [f, l, n] = lines(std::move(a)); return W{f, l, n}; };
+    auto same = [](W got, int f, int l, int n) { return got.first == f && got.last == l && got.n == n; };
+    // end_line is a POSITION, under every spelling.
+    CHECK(same(lines_w(mcp::Json{{"offset", 120}, {"end_line", 180}}), 120, 180, 61));
+    CHECK(same(lines_w(mcp::Json{{"start_line", 120}, {"end_line", 180}}), 120, 180, 61));
+    CHECK(same(lines_w(mcp::Json{{"offset", 120}, {"to_line", 180}}), 120, 180, 61));
+    CHECK(same(lines_w(mcp::Json{{"offset", 120}, {"endLine", 180}}), 120, 180, 61));
+    // limit is a COUNT.
+    CHECK(same(lines_w(mcp::Json{{"offset", 120}, {"limit", 10}}), 120, 129, 10));
+    // A start with no end gets a focused 250-line window.
+    CHECK(same(lines_w(mcp::Json{{"offset", 200}}), 200, 449, 250));
+    // Negative offset is a tail.
+    CHECK(same(lines_w(mcp::Json{{"offset", -5}}), 596, 600, 5));
+    // "file:10-20" in the path.
+    {
+        auto r = call(*provider, "read", mcp::Json{{"path", p + ":10-20"}});
+        REQUIRE(!r.is_error);
+        CHECK(r.text.find("L10\n") != std::string::npos);
+        CHECK(r.text.find("L21\n") == std::string::npos);
+    }
+    // Several paths: refused with the reason.
+    {
+        auto r = call(*provider, "read", mcp::Json{{"paths", {p, p}}});
+        CHECK(r.is_error);
+        CHECK(r.text.find("read takes one `path`") != std::string::npos);
+    }
+    // No path: the keys that DID arrive are named.
+    {
+        auto r = call(*provider, "read", mcp::Json{{"fil", p}});
+        CHECK(r.is_error);
+        CHECK(r.text.find("received keys: fil") != std::string::npos);
+    }
+    fs::remove_all(root);
+}
+
 TEST_CASE("fs_tools") {
     auto root = fs::temp_directory_path() / ("mcp_fs_test_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);

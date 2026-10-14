@@ -733,19 +733,18 @@ resolve_symbol_range(std::string_view content, std::string_view symbol,
 }
 
 struct ReadArgs {
-    util::WorkspacePath path;
-    int                 offset;
-    int                 limit;
-    std::string         symbol;   // read just this symbol's definition + body
+    std::string         raw_path;
+    std::optional<int>  offset_in;   // NEGATIVE = tail
+    std::optional<int>  limit_in;    // a count
+    std::optional<int>  end_line;    // a position; wins over limit_in
+    std::string         symbol;      // read just this symbol's definition + body
     std::string         display_description;
+    json                raw;         // which keys arrived (multi-path refusal)
+    std::optional<util::WorkspacePath> path;
+    int                 offset = 1;
+    int                 limit = 2000;
     bool                no_explicit_range = true;
 };
-
-// Defined further down with the write-arg helpers. Declared here because both
-// read and write want it in their "path required" message, and a caller who
-// cannot see which keys arrived has no way to tell a typo from a dropped
-// argument object.
-std::string describe_keys(const json& j);
 
 // A range written as "10-20", "10:20", "10", [10,20] or {start,end}.
 // Returns {from, to}; to is 0 when open-ended.
@@ -830,97 +829,73 @@ json tidy_read_args(const json& j, const util::Bounds& b) {
             if (t.line_to >= t.line_from) out["end_line"] = t.line_to;
         }
     }
+    // One spelling per field: `end_line` is a POSITION (to_line, endLine say
+    // the same); start_line / start / from_line are the offset.
+    for (const char* k : {"to_line", "endLine"})
+        if (auto it = out.find(k); it != out.end() && !out.contains("end_line")) {
+            out["end_line"] = *it;
+            out.erase(it);
+        }
     return out;
 }
 
-std::expected<ReadArgs, ToolError> parse_read_args(const json& raw_j, const util::Bounds& b) {
-    const json j = tidy_read_args(raw_j, b);
-    util::ArgReader ar(j);
-    auto path_opt = ar.require_str("path");
-    if (!path_opt && j.is_object())
-        for (const char* k : {"paths", "files", "file_paths"})
-            if (auto it = j.find(k); it != j.end() && it->is_array() && it->size() > 1)
-                return std::unexpected(ToolError::invalid_args(std::format(
-                    "read takes one `path`; got {} in `{}`. Make one read call per file "
-                    "(they run in parallel).", it->size(), k)));
-    if (!path_opt)
-        // Name the keys we DID receive, the way parse_write_args does.
-        //
-        // A bare "path required" tells the caller nothing about why: a typo in
-        // the key, a path nested one level too deep, a null, or an argument
-        // object that got dropped entirely all produce the identical message.
-        // A model that cannot see the difference retries the same broken call,
-        // which is exactly what happened -- three identical failures in a row
-        // before the loop-breaker stepped in.
-        //
-        // The received-keys list makes the two common cases self-evident:
-        // an empty list means the arguments never arrived, and a list
-        // containing `file`/`filename`/`file_path` means the key was wrong.
-        return std::unexpected(ToolError::invalid_args(
-            std::format("path required (received keys: {})", describe_keys(j))));
-    auto wp = util::make_readable_path_checked(*path_opt, "read", b);
-    if (!wp) return std::unexpected(std::move(wp.error()));
-    int offset = ar.integer("offset", 1);
-    // NEGATIVE offset = tail semantics: offset:-50 means "the last 50
-    // lines" (like `tail -n 50`) — the shape every log/build-output check
-    // wants, without a bash round-trip or knowing the file's length first.
-    // Resolved against the real line count in run_read.
-    if (offset == 0) offset = 1;
-    // Did the caller pin a START but leave the END open? Paging with only an
-    // `offset`/`start_line` and no `limit`/`end_line` is the common case, and
-    // defaulting `limit` to 2000 there dumps the ENTIRE rest of the file into
-    // context — the "why is every read huge" footgun. A start-anchored read
-    // wants a FOCUSED window, so default it to kPageWindow lines. A read with
-    // NO position at all (`read(path)`) keeps the whole-file default (2000,
-    // or the >32 KiB auto-outline) — that's the deliberate "show me the file"
-    // request. An explicit `limit`/`end_line` always wins.
-    constexpr int kPageWindow = 250;
-    // has() is alias-aware (raw() consults the synonym tables), so has("offset")
-    // already covers start_line/start/from_line and has("limit") covers
-    // end_line/num_lines/max_lines/count — no need to spell the aliases out.
-    const bool anchored_start = ar.has("offset");
-    // `end_line` is an END POSITION, not a line count. It's aliased to `limit`
-    // in the arg tables (so has("limit") sees it), but its VALUE must be
-    // converted (end_line − offset + 1), not used raw — otherwise
-    // end_line=180 with offset=120 reads 180 lines (120..299) instead of the
-    // 60-line window 120..180 the outline tells the model to ask for. Detect
-    // a raw, literal `end_line`/`to_line` key and honour it as a position.
-    const bool has_end_line =
-        j.contains("end_line") || j.contains("to_line") || j.contains("endLine");
-    const bool explicit_end = ar.has("limit");
-    const int default_limit = (anchored_start && !explicit_end)
-                                  ? kPageWindow : 2000;
-    int limit = ar.integer("limit", default_limit);
-    // A literal end_line= wins and is interpreted as a position: window is
-    // [offset, end_line] inclusive. (A raw `limit`/`num_lines`/`count` stays a
-    // count and is already in `limit` above — we only remap the true end key.)
-    if (has_end_line) {
-        int end_line = 0;
-        for (const char* k : {"end_line", "to_line", "endLine"}) {
-            auto it = j.find(k);
-            if (it != j.end() && it->is_number()) {
-                end_line = it->get<int>();
-                break;
-            }
-        }
-        if (end_line >= offset) limit = end_line - offset + 1;
+// What the spec can't say: one path, not several; the path is readable; and
+// the line window, which depends on which of offset / limit / end_line came.
+std::expected<ReadArgs, ToolError> check_read_args(ReadArgs a, const util::Bounds& b) {
+    if (a.raw_path.empty()) {
+        if (a.raw.is_object())
+            for (const char* k : {"paths", "files", "file_paths"})
+                if (auto it = a.raw.find(k); it != a.raw.end() && it->is_array() && it->size() > 1)
+                    return std::unexpected(ToolError::invalid_args(std::format(
+                        "read takes one `path`; got {} in `{}`. Make one read call per file "
+                        "(they run in parallel).", it->size(), k)));
+        // Name the keys that DID arrive: a typo in the key and an argument
+        // object that never arrived look the same otherwise.
+        return std::unexpected(ToolError::invalid_args(std::format(
+            "path required (received keys: {})", util::ArgReader(a.raw).received_keys())));
     }
+    auto wp = util::make_readable_path_checked(a.raw_path, "read", b);
+    if (!wp) return std::unexpected(std::move(wp.error()));
+
+    // NEGATIVE offset = tail (offset:-50 is the last 50 lines), resolved
+    // against the real line count in run_read.
+    int offset = a.offset_in.value_or(1);
+    if (offset == 0) offset = 1;
+    // A start with no end wants a focused window, not the rest of the file;
+    // a bare read(path) keeps the whole-file default. An explicit end wins.
+    constexpr int kPageWindow = 250;
+    const bool anchored_start = a.offset_in.has_value();
+    const bool explicit_end   = a.limit_in.has_value() || a.end_line.has_value();
+    const int default_limit = (anchored_start && !explicit_end) ? kPageWindow : 2000;
+    int limit = a.limit_in.value_or(default_limit);
+    // end_line is a POSITION: the window is [offset, end_line].
+    if (a.end_line && *a.end_line >= offset) limit = *a.end_line - offset + 1;
     if (limit <= 0) limit = default_limit;
-    const std::string symbol = ar.str("symbol", "");
-    // symbol= is itself an explicit selection, so it must NOT trigger the
-    // whole-file auto-outline path.
-    bool explicit_range = ar.has("offset") || ar.has("limit")
-                       || ar.has("start_line") || ar.has("end_line")
-                       || !symbol.empty();
-    return ReadArgs{
-        std::move(*wp), offset, limit, symbol,
-        ar.str("display_description", ""),
-        /*no_explicit_range=*/ !explicit_range,
-    };
+
+    a.path   = std::move(*wp);
+    a.offset = offset;
+    a.limit  = limit;
+    // symbol= is an explicit selection too: no whole-file auto-outline.
+    a.no_explicit_range = !anchored_start && !explicit_end && a.symbol.empty();
+    return a;
 }
 
+const util::ArgSpec<ReadArgs> kReadArgs = [] {
+    util::ArgSpec<ReadArgs> s{
+        util::arg(&ReadArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&ReadArgs::raw_path, "path", "Absolute or relative path").advertise_required(),
+        util::arg(&ReadArgs::symbol, "symbol", "Read ONLY this symbol's definition + body (function/class/etc.), resolved to its enclosing block — no line numbers or `sed` needed. e.g. symbol=\"parse_args\"."),
+        util::arg(&ReadArgs::offset_in, "offset", "Start line (1-based). NEGATIVE = tail: offset:-50 returns the LAST 50 lines (like tail -n 50) — ideal for logs and build output, no need to know the file length."),
+        util::arg(&ReadArgs::limit_in, "limit", "Max lines"),
+        util::arg(&ReadArgs::end_line, "end_line", "Inclusive last line (Zed-style)"),
+    };
+    s.tidy(&tidy_read_args).raw(&ReadArgs::raw);
+    return s;
+}();
+
 ExecResult run_read(const Call& call, const ReadArgs& a) {
-    const auto& p = a.path.path();
+    const auto& p = a.path->path();
     std::error_code ec;
     if (!call.fs().stat(p).exists) {
         // Same name somewhere else in the parent, or a different case/extension.
@@ -943,7 +918,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
                 if (shown == 5) break;
             }
         }
-        return std::unexpected(ToolError::not_found("file not found: " + a.path.string()
+        return std::unexpected(ToolError::not_found("file not found: " + a.path->string()
             + (near.empty() ? std::string{". Run `list_dir` on the parent directory or `glob` by name to verify."}
                             : ". Similar names in " + parent.string() + ": " + near + ".")));
     }
@@ -953,7 +928,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
         std::ranges::sort(entries, [](const DirEntry& x, const DirEntry& y) {
             return x.directory != y.directory ? x.directory : x.path.filename() < y.path.filename();
         });
-        std::string out = a.path.string() + " is a directory. Its entries:\n";
+        std::string out = a.path->string() + " is a directory. Its entries:\n";
         std::size_t n = 0;
         for (const auto& e : entries) {
             if (++n > 200) { out += "... (" + std::to_string(entries.size() - 200) + " more)\n"; break; }
@@ -963,7 +938,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
         return ToolOutput{std::move(out), std::nullopt};
     }
     if (!call.fs().stat(p).regular)
-        return std::unexpected(ToolError::not_a_file("not a regular file: " + a.path.string()));
+        return std::unexpected(ToolError::not_a_file("not a regular file: " + a.path->string()));
 
     fs::file_time_type current_mtime{};
     {
@@ -1031,16 +1006,16 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
             if (!ec && sz > kMaxImageBytes)
                 return std::unexpected(ToolError::too_large(std::format(
                     "image is {} KiB (> 8 MiB cap): {}",
-                    sz / 1024, a.path.string())));
-            std::string raw = util::read_file(a.path);
+                    sz / 1024, a.path->string())));
+            std::string raw = util::read_file(*a.path);
             if (raw.empty())
                 return std::unexpected(ToolError::io(
-                    "cannot read image " + a.path.string()));
+                    "cannot read image " + a.path->string()));
             ToolOutput out;
             out.text = std::format(
                 "[image {} \xc2\xb7 {} \xc2\xb7 {} KiB] attached to this "
                 "result; if you can see images it is shown above.",
-                a.path.string(), mime, raw.size() / 1024);
+                a.path->string(), mime, raw.size() / 1024);
             out.images.push_back(util::ToolImage{std::move(mime), std::move(raw)});
             return out;
         }
@@ -1052,15 +1027,15 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
             "Read in chunks via offset/limit (or start_line/end_line) — "
             "e.g. {{\"path\":\"{}\",\"offset\":1,\"limit\":500}}. "
             "For a structural overview, run `grep` for the symbols you need.",
-            sz / 1024, a.path.string())));
+            sz / 1024, a.path->string())));
     }
     if (util::is_binary_file(call.fs(), p)) {
         return std::unexpected(ToolError::binary(std::format(
             "cannot read binary file: {} ({} bytes). "
             "Use the `shell` tool with `file`, `hexdump`, or similar.",
-            a.path.string(), static_cast<uintmax_t>(ec ? 0 : sz))));
+            a.path->string(), static_cast<uintmax_t>(ec ? 0 : sz))));
     }
-    auto content = util::read_file(a.path);
+    auto content = util::read_file(*a.path);
 
     // symbol=: resolve to the defining line + enclosing block, then read just
     // that range — no `sed`, no line arithmetic. Overrides offset/limit.
@@ -1175,7 +1150,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
                     "SUCCESS: `{}` is {} in {}; its definition is in {}:{} "
                     "(lines {}\xe2\x80\x93{}).\n\n{}",
                     a.symbol, rng ? "only declared" : "not defined",
-                    a.path.string(), q.string(), r2->first,
+                    a.path->string(), q.string(), r2->first,
                     r2->first, r2->second, body)), std::nullopt};
             }
             if (!rng)
@@ -1183,13 +1158,13 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
                 "no definition of `{}` found in {} (or its paired header/source "
                 "and sibling files). Use `find_definition` to search the "
                 "whole tree, or drop `symbol` to read the whole file.",
-                a.symbol, a.path.string())));
+                a.symbol, a.path->string())));
         }
         eff_offset = rng->first;
         eff_limit  = rng->second - rng->first + 1;
         symbol_header = std::format(
             "SUCCESS: `{}` defined at {}:{} (lines {}\xe2\x80\x93{}).\n\n",
-            a.symbol, a.path.string(), rng->first, rng->first, rng->second);
+            a.symbol, a.path->string(), rng->first, rng->first, rng->second);
     }
 
     if (a.no_explicit_range && content.size() > kAutoOutlineSize) {
@@ -1211,7 +1186,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
                 "end_line covering the lines around the symbol "
                 "(e.g. for `[L120] fn foo()`, try start_line=120, "
                 "end_line=180).",
-                kib, a.path.string(), outline);
+                kib, a.path->string(), outline);
         } else {
             constexpr std::size_t kPeekBytes = 1024;
             std::size_t cut = std::min(kPeekBytes, content.size());
@@ -1234,7 +1209,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
                 "see more, pass start_line + end_line (or offset + "
                 "limit); the file has {} lines total.\n\n"
                 "# First 1 KiB of {}\n\n{}",
-                kib, total_lines, a.path.string(), peek);
+                kib, total_lines, a.path->string(), peek);
         }
         if (!a.display_description.empty())
             out = a.display_description + "\n" + out;
@@ -1281,7 +1256,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
                 "cannot read binary file: {} ({} bytes). "
                 "Use the bash tool with `file`, `hexdump`, or similar "
                 "if you need to inspect it.",
-                a.path.string(), N)));
+                a.path->string(), N)));
         }
         if (c == '\n') {
             ++total_lines;
@@ -1323,7 +1298,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
                 "cannot read binary file: {} ({} bytes). "
                 "Use the bash tool with `file`, `hexdump`, or similar "
                 "if you need to inspect it.",
-                a.path.string(), N)));
+                a.path->string(), N)));
         }
         const char* s = base + i;
         const char* e = base + N;
@@ -1426,9 +1401,11 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
 // ─────────────────────────────────────────────────────────────────────────
 
 struct WriteArgs {
-    util::WorkspacePath path;
+    std::string raw_path;
     std::string content;
     std::string display_description;
+    json raw;
+    std::optional<util::WorkspacePath> path;
     std::string coercion_note;
 };
 
@@ -1459,49 +1436,50 @@ std::optional<std::string> salvage_largest_string(const json& j, std::string& wh
     return *best_val;
 }
 
-std::string describe_keys(const json& j) {
-    if (!j.is_object() || j.empty()) return "(no object / empty)";
-    std::string out;
-    for (auto it = j.begin(); it != j.end(); ++it) {
-        if (!out.empty()) out += ", ";
-        out += it.key();
-    }
-    return out;
-}
-
-std::expected<WriteArgs, ToolError> parse_write_args(const json& j, const util::Bounds& b) {
-    util::ArgReader ar(j);
-    auto raw = ar.require_str("path");
-    if (!raw)
-        return std::unexpected(ToolError::invalid_args(
-            std::format("path required (received keys: {})", describe_keys(j))));
-    auto wp = util::make_workspace_path_checked(*raw, "write", b);
+// The spec reads path and content. What it can't: resolve the path, and
+// rescue the body when a model put it under an unknown key.
+std::expected<WriteArgs, ToolError> check_write_args(WriteArgs a, const util::Bounds& b) {
+    auto wp = util::make_workspace_path_checked(a.raw_path, "write", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
-    std::string note;
-    std::string content;
-    if (ar.has("content")) {
-        content = ar.str("content", "", &note);
-    } else {
+    if (!util::ArgReader(a.raw).has("content")) {
         std::string picked_key;
-        auto rescued = salvage_largest_string(j, picked_key);
-        if (!rescued) {
+        auto rescued = salvage_largest_string(a.raw, picked_key);
+        if (!rescued)
             return std::unexpected(ToolError::invalid_args(std::format(
                 "content required — no `content` field or known alias "
                 "(file_text, text, body, data, contents, file_content) "
                 "was present. Received keys: {}. "
                 "Re-run with the full file body in the `content` field.",
-                describe_keys(j))));
-        }
-        content = std::move(*rescued);
-        note = std::format(" (content was pulled from non-standard key "
-                           "`{}` — please use `content` next time)", picked_key);
+                util::ArgReader(a.raw).received_keys())));
+        a.content = std::move(*rescued);
+        a.coercion_note = std::format(" (content was pulled from non-standard key "
+                                      "`{}` — please use `content` next time)", picked_key);
+    } else if (const auto* v = util::ArgReader(a.raw).raw("content"); v && !v->is_string()) {
+        // An array or object body was coerced to text; say so.
+        a.coercion_note = v->is_array() ? " (content was an array — joined with newlines)"
+                                        : " (content was not a string — coerced)";
     }
-    return WriteArgs{std::move(*wp), std::move(content),
-                     ar.str("display_description", ""), std::move(note)};
+    a.path = std::move(*wp);
+    return a;
 }
 
+const util::ArgSpec<WriteArgs> kWriteArgs = [] {
+    util::ArgSpec<WriteArgs> s{
+        util::arg(&WriteArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&WriteArgs::raw_path, "file_path",
+                  "The absolute path to the file to write (must be absolute, not relative).")
+            .required("path required (received keys: {keys})"),
+        // check_write_args rescues a body sent under another key.
+        util::arg(&WriteArgs::content, "content", "The content to write to the file.")
+            .advertise_required(),
+    };
+    s.raw(&WriteArgs::raw);
+    return s;
+}();
+
 ExecResult run_write(const Call& call, const WriteArgs& a) {
-    const auto& p = a.path.path();
+    const auto& p = a.path->path();
     constexpr std::size_t kMaxWriteBytes = 5u * 1024u * 1024u;
     if (a.content.size() > kMaxWriteBytes) {
         return std::unexpected(ToolError::too_large(std::format(
@@ -1514,20 +1492,20 @@ ExecResult run_write(const Call& call, const WriteArgs& a) {
     bool exists = call.fs().stat(p).exists;
     if (exists && call.fs().stat(p).directory)
         return std::unexpected(ToolError::not_a_file(
-            "'" + a.path.string() + "' is a directory — write needs a file path."));
+            "'" + a.path->string() + "' is a directory — write needs a file path."));
     auto parent = p.parent_path();
     if (!parent.empty() && call.fs().stat(parent).exists && !call.fs().stat(parent).directory)
         return std::unexpected(ToolError::not_a_directory(
-            "parent of '" + a.path.string() + "' exists but is not a directory."));
+            "parent of '" + a.path->string() + "' exists but is not a directory."));
     uintmax_t original_size = 0;
     if (exists) {
         if (!call.fs().stat(p).regular)
             return std::unexpected(ToolError::not_a_file(
-                "not a regular file: " + a.path.string()));
+                "not a regular file: " + a.path->string()));
         original_size = call.fs().stat(p).size;
         if (ec) original_size = 0;
         if (original_size <= kMaxWriteBytes)
-            original = util::read_file(a.path);
+            original = util::read_file(*a.path);
     }
     std::string staleness_warning;
     if (exists && staleness(call, p) == util::StaleVerdict::Stale) {
@@ -1562,10 +1540,10 @@ ExecResult run_write(const Call& call, const WriteArgs& a) {
                           std::nullopt};
     FileChange change;
     if (!exists || (!original.empty() && original_size <= kMaxWriteBytes))
-        change = make_change(a.path.string(), original, std::string{content});
+        change = make_change(a.path->string(), original, std::string{content});
     else
-        change.path = a.path.string();
-    if (auto err = util::write_file(a.path, content); !err.empty())
+        change.path = a.path->string();
+    if (auto err = util::write_file(*a.path, content); !err.empty())
         return std::unexpected(ToolError::io(err));
     {
         std::error_code mt_ec;
@@ -1581,7 +1559,7 @@ ExecResult run_write(const Call& call, const WriteArgs& a) {
     if (!a.display_description.empty()) prefix += a.display_description + "\n";
     auto msg = std::format("{}{} {} ({}+ {}-){}",
                            prefix, exists ? "Overwrote" : "Created",
-                           a.path.string(), change.added, change.removed,
+                           a.path->string(), change.added, change.removed,
                            a.coercion_note);
     // Teaching nudge (never blocks — the write already succeeded): when a
     // model OVERWRITES a substantial existing file but only changed a small
@@ -1837,37 +1815,6 @@ ExecResult run_remove(const Call& call, const RemoveArgs& a) {
                                   count == 1 ? "y" : "ies"), std::nullopt};
 }
 
-json read_schema() {
-    return json{
-        {"type", "object"},
-        {"required", {"path"}},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"path",       {{"type","string"}, {"description","Absolute or relative path"}}},
-            {"symbol",     {{"type","string"}, {"description","Read ONLY this symbol's definition + body (function/class/etc.), resolved to its enclosing block — no line numbers or `sed` needed. e.g. symbol=\"parse_args\"."}}},
-            {"offset",     {{"type","integer"}, {"description","Start line (1-based). NEGATIVE = tail: offset:-50 returns the LAST 50 lines (like tail -n 50) — ideal for logs and build output, no need to know the file length."}}},
-            {"limit",      {{"type","integer"}, {"description","Max lines"}}},
-            {"start_line", {{"type","integer"}, {"description","Alias for offset (Zed-style)"}}},
-            {"end_line",   {{"type","integer"}, {"description","Inclusive last line (Zed-style)"}}},
-        }},
-    };
-}
-
-json write_schema() {
-    return json{
-        {"type","object"},
-        {"required", {"file_path","content"}},
-        {"properties", {
-            {"file_path", {{"type","string"},
-                {"description","The absolute path to the file to write "
-                               "(must be absolute, not relative)."}}},
-            {"content",   {{"type","string"},
-                {"description","The content to write to the file."}}},
-        }},
-    };
-}
-
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1881,9 +1828,10 @@ json write_schema() {
 // line number you can jump to via read(symbol=) or read(offset=).
 
 struct OutlineArgs {
-    util::WorkspacePath path;
+    std::string raw_path;
     int  max_entries = 400;
     std::string display_description;
+    std::optional<util::WorkspacePath> path;
 };
 
 [[nodiscard]] std::string render_outline_nested(std::string_view content,
@@ -1941,22 +1889,22 @@ struct OutlineArgs {
 }
 
 ExecResult run_outline(const Call& call, const OutlineArgs& a) {
-    const auto& p = a.path.path();
+    const auto& p = a.path->path();
     std::error_code ec;
     if (!call.fs().stat(p).exists)
-        return std::unexpected(ToolError::not_found(a.path.string()));
+        return std::unexpected(ToolError::not_found(a.path->string()));
     if (!call.fs().stat(p).regular)
-        return std::unexpected(ToolError::not_a_file(a.path.string()));
+        return std::unexpected(ToolError::not_a_file(a.path->string()));
     constexpr std::uintmax_t kMaxBytes = 8u * 1024u * 1024u;
     if (auto sz = call.fs().stat(p).size; !ec && sz > kMaxBytes)
         return std::unexpected(ToolError::too_large(std::format(
             "file is {} KiB (> 8 MiB outline cap).", sz / 1024)));
 
     std::string content;
-    try { content = util::read_file(a.path); }
-    catch (...) { return std::unexpected(ToolError::io("cannot read " + a.path.string())); }
+    try { content = util::read_file(*a.path); }
+    catch (...) { return std::unexpected(ToolError::io("cannot read " + a.path->string())); }
     if (content.find('\0') != std::string::npos)
-        return std::unexpected(ToolError::binary(a.path.string()));
+        return std::unexpected(ToolError::binary(a.path->string()));
 
     int total = 0;
     std::string tree = render_outline_nested(
@@ -1966,10 +1914,10 @@ ExecResult run_outline(const Call& call, const OutlineArgs& a) {
     std::ostringstream out;
     if (!a.display_description.empty()) out << a.display_description << "\n";
     if (total == 0)
-        return ToolOutput{a.path.string() + " (" + std::to_string(lines)
+        return ToolOutput{a.path->string() + " (" + std::to_string(lines)
             + " lines): no top-level definitions or headings detected — "
             "read it directly.", std::nullopt};
-    out << a.path.string() << " — " << total << " definition"
+    out << a.path->string() << " — " << total << " definition"
         << (total==1?"":"s") << " across " << lines << " lines:\n\n" << tree;
     if (total > a.max_entries)
         out << "\n[" << (total - a.max_entries)
@@ -1977,28 +1925,23 @@ ExecResult run_outline(const Call& call, const OutlineArgs& a) {
     return ToolOutput{util::to_valid_utf8(out.str()), std::nullopt};
 }
 
-std::expected<OutlineArgs, ToolError> parse_outline_args(const json& j, const util::Bounds& b) {
-    util::ArgReader r(j);
-    if (!r.is_object())
-        return std::unexpected(ToolError::invalid_args("expected a JSON object"));
-    auto path = r.require_str("path");
-    if (!path || path->empty())
-        return std::unexpected(ToolError::invalid_args("`path` is required"));
-    auto wp = util::make_readable_path_checked(*path, "outline", b);
+std::expected<OutlineArgs, ToolError> check_outline_args(OutlineArgs a, const util::Bounds& b) {
+    auto wp = util::make_readable_path_checked(a.raw_path, "outline", b);
     if (!wp) return std::unexpected(std::move(wp.error()));
-    OutlineArgs a{std::move(*wp),
-                  std::clamp(r.integer("max_entries", 400), 1, 2000),
-                  r.str("display_description")};
+    a.path = std::move(*wp);
     return a;
 }
 
-json outline_schema() {
-    return json{{"type","object"},{"required",{"path"}},{"properties",{
-        {"path",{{"type","string"},{"description","File to outline."}}},
-        {"display_description",{{"type","string"},{"description","One-line summary shown in the UI. Optional."}}},
-        {"max_entries",{{"type","integer"},{"description","Max symbols shown (default 400)."}}},
-    }}};
-}
+const util::ArgSpec<OutlineArgs> kOutlineArgs = [] {
+    util::ArgSpec<OutlineArgs> s{
+        util::arg(&OutlineArgs::raw_path, "path", "File to outline.").required("`path` is required"),
+        util::arg(&OutlineArgs::display_description, "display_description",
+                  "One-line summary shown in the UI. Optional."),
+        util::arg(&OutlineArgs::max_entries, "max_entries", "Max symbols shown (default 400).")
+            .range(1, 2000),
+    };
+    return s;
+}();
 
 void register_fs_tools(Shells& sh) {
     sh.add("read",
@@ -2019,8 +1962,8 @@ void register_fs_tools(Shells& sh) {
         "enclosing block) with no line arithmetic — use that instead "
         "of computing ranges or shelling out to sed/head/tail. Include "
         "a brief `display_description` so the user sees why you're reading.",
-        read_schema(), EffectSet{Effect::ReadFs},
-        body<ReadArgs>(run_read, parse_read_args), 80'000);
+        kReadArgs.schema(), EffectSet{Effect::ReadFs},
+        body<ReadArgs>(run_read, kReadArgs, check_read_args), 80'000);
 
     sh.add("write",
         "Writes a file to the local filesystem.\n\n"
@@ -2032,8 +1975,8 @@ void register_fs_tools(Shells& sh) {
         "- Prefer the Edit tool for modifying existing files — it only sends "
         "the diff. Only use this tool to create new files or for complete "
         "rewrites.",
-        write_schema(), EffectSet{Effect::WriteFs},
-        body<WriteArgs>(run_write, parse_write_args), 40'000);
+        kWriteArgs.schema(), EffectSet{Effect::WriteFs},
+        body<WriteArgs>(run_write, kWriteArgs, check_write_args), 40'000);
 
     sh.add("list_dir",
         "List the contents of a directory. Shows file type, size, and name.",
@@ -2048,8 +1991,8 @@ void register_fs_tools(Shells& sh) {
         "then jump to a symbol with read(symbol=) or read(offset=). Unlike "
         "read's size-triggered outline, this works at any size and nests "
         "methods under their class by indent depth.",
-        outline_schema(), EffectSet{Effect::ReadFs},
-        body<OutlineArgs>(run_outline, parse_outline_args), 25'000);
+        kOutlineArgs.schema(), EffectSet{Effect::ReadFs},
+        body<OutlineArgs>(run_outline, kOutlineArgs, check_outline_args), 25'000);
 
     sh.add("move",
         "Move or rename a file or directory within the workspace without invoking a shell. "

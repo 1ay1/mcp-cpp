@@ -373,7 +373,7 @@ struct GrepArgs {
     std::string display_description;
     bool        literal = false;   // the escaped retry of a bad regex
     std::string context_arg;       // raw `context` / `output`; check_grep reads them
-    json        output_arg;
+    std::string output_arg = "content";
 };
 
 // A pattern that failed as a regex, made into one that can't fail: each
@@ -426,8 +426,7 @@ const util::ArgSpec<GrepArgs> kGrepArgs{
     util::arg(&GrepArgs::case_sensitive, "case_sensitive", "Case-sensitive match (default: false)"),
     util::arg(&GrepArgs::word, "word", "Whole-word match: `foo` won't match `foobar` or `do_foo`. Use for finding all USES of an identifier."),
     util::arg(&GrepArgs::context_arg, "context", "`line` (default) = ±2 lines around each hit. `block` = the WHOLE enclosing function/block, so you rarely need a follow-up `read`. A number `0`-`60` = ±N lines (like grep -C N) (use `0` for match lines only — densest content view)."),
-    util::arg(&GrepArgs::output_arg, "output", "`content` (default) = matching lines with context. `files` = one path + match-count per line, no line bodies (the survey view: WHICH files touch X). `count` = per-file match counts only (the cheapest probe: HOW WIDESPREAD is X — run this before a bulk rewrite).")
-        .shape(json{{"type", "string"}, {"enum", {"content", "files", "count"}}}),
+    util::arg(&GrepArgs::output_arg, "output", "`content` (default) = matching lines with context. `files` = one path + match-count per line, no line bodies (the survey view: WHICH files touch X). `count` = per-file match counts only (the cheapest probe: HOW WIDESPREAD is X — run this before a bulk rewrite).").suggest({"content", "files", "count"}),
     util::arg(&GrepArgs::offset, "offset", "Skip this many matches (for pagination)"),
     util::arg(&GrepArgs::per_page, "limit", "Matches per page (default 20, max 200). Use this instead of piping to `head`.").range(1, kMaxPage),
     util::arg(&GrepArgs::exclude, "exclude", "Drop hits whose line matches this regex (ECMAScript). Use this instead of piping to `grep -v`."),
@@ -444,7 +443,7 @@ std::expected<GrepArgs, ToolError> check_grep(GrepArgs g, const util::Bounds&) {
     else if (!g.context_arg.empty()
              && g.context_arg.find_first_not_of("0123456789") == std::string::npos)
         g.context_lines = std::clamp(std::atoi(g.context_arg.c_str()), 0, kMaxContext);
-    const auto o = util::ArgReader(json{{"output", g.output_arg}}).str("output", "");
+    const auto& o = g.output_arg;
     if (o == "files") g.mode = GrepArgs::Mode::FilesOnly;
     else if (o == "count") g.mode = GrepArgs::Mode::Count;
     // A bad exclude regex is a caller error, not a silent no-op.
