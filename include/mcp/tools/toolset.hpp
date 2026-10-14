@@ -30,48 +30,21 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mcp::tools {
 
-// ── Effect tags ────────────────────────────────────────────────────────────
-// Bit-packed observable impact. Mirrors agentty's tools::EffectSet so a host
-// can map 1:1, but defined here so the library stands alone.
-enum class Effect : std::uint8_t {
-    ReadFs  = 1u << 0,
-    WriteFs = 1u << 1,
-    Net     = 1u << 2,
-    Exec    = 1u << 3,
-};
-
-class EffectSet {
-public:
-    constexpr EffectSet() = default;
-    constexpr EffectSet(std::initializer_list<Effect> es) {
-        for (auto e : es) bits_ |= static_cast<std::uint8_t>(e);
-    }
-    constexpr explicit EffectSet(std::uint8_t bits) : bits_(bits) {}
-    [[nodiscard]] constexpr bool has(Effect e) const {
-        return (bits_ & static_cast<std::uint8_t>(e)) != 0;
-    }
-    [[nodiscard]] constexpr std::uint8_t bits() const { return bits_; }
-private:
-    std::uint8_t bits_ = 0;
-};
-
-// ── FileChange carry ───────────────────────────────────────────────────────
-// A library-native description of a file mutation, enough for a host to build
-// a diff-review UI. The host recomputes its own structured diff from
-// before/after if it wants hunks; the line counts are provided for a strip.
-struct FileChange {
-    std::string path;
-    int         added   = 0;
-    int         removed = 0;
-    std::string before;     // original contents ("" for a new file)
-    std::string after;      // new contents
-};
+// The effect, file-change and image types are the capability layer's
+// (mcp/cap/capability.hpp): one definition, read by the permission policy,
+// the scheduler and the host alike.
+using mcp::cap::Effect;
+using mcp::cap::EffectSet;
+using mcp::cap::FileChange;
 
 // ── Per-tool / toolset configuration ───────────────────────────────────────
 struct ToolsetConfig {
@@ -92,16 +65,22 @@ struct ToolsetConfig {
     // still opt out with an `x-no-jina` header.
     bool jina         = true;
 
-    // Per-tool output budget defaults (chars). 0 ⇒ no cap. The shell applies
-    // these the same way agentty's dispatcher did.
+    // Per-tool output budget defaults (chars). 0 ⇒ no cap.
     int  default_output_budget = 60'000;
+
+    // Steering text is a host's call, not the library's: how strongly to
+    // push a model from `shell` toward `read`, which tool to prefer for
+    // what. The built-in descriptions say what a tool does. A host that
+    // wants to say more appends it here, keyed by tool name; the text is
+    // added after the built-in description.
+    std::map<std::string, std::string, std::less<>> description_notes;
 };
 
 // ── The provider factory ───────────────────────────────────────────────────
 // Build a CapabilityProvider exposing every enabled built-in tool plus every
 // host-coupled tool whose backend is present in `svc`. Tools are advertised
-// through CapabilityProvider::list() and run through ::execute(); FileChange +
-// effects ride in the Result's structured payload (see meta.hpp helpers).
+// through CapabilityProvider::list() and run through ::execute(); each
+// Result carries its effects, file changes and images as typed fields.
 //
 // origin defaults to "local" so the Registry namespaces these as the host's
 // own tools, indistinguishable on the wire from any other provider.
@@ -110,12 +89,10 @@ make_provider(HostServices svc,
               ToolsetConfig cfg = {},
               std::string   origin = "local");
 
-// ── Scheduler glue ──────────────────────────────────────────────────────────
-// The effect declaration for a built-in tool, by name. DEFINED in the compiled
-// toolset (effects.cpp); also declared in meta.hpp. Forward-declared here
-// (rather than #include <mcp/tools/meta.hpp>) to avoid a circular include:
-// meta.hpp needs EffectSet/FileChange from THIS header.
-[[nodiscard]] EffectSet effects_for_builtin(const std::string& name);
+// ── Scheduler glue ──────────────────────────────────────────────────────────────────────
+// The effect declaration for a built-in tool, by name (effects.cpp), or
+// nullopt for a name the toolset doesn't have.
+[[nodiscard]] std::optional<EffectSet> effects_for_builtin(std::string_view name);
 
 // A cap::EffectFn keyed off the RICH built-in effect table (effects_for_builtin)
 // + the built-in path-extraction, so the effect-aware parallel scheduler
@@ -130,31 +107,22 @@ make_provider(HostServices svc,
 // registry) get a conservative writer classification so they always serialise
 // — the planner never parallelises a tool it can't reason about.
 [[nodiscard]] inline mcp::cap::EffectFn make_effect_fn() {
-    // The host-coupled shells are pure from the scheduler's standpoint (their
-    // side effects are the host's responsibility) and carry an EffectSet{} in
-    // the table — indistinguishable by bits from an UNKNOWN tool. Enumerate
-    // the known-pure names so we don't mis-serialise them, and treat any other
-    // zero-effect lookup as an unknown third-party tool to serialise.
-    static const std::vector<std::string> kKnownPure = {
-        "remember", "forget", "wipe_memory", "todo", "skill"};
     return [](const mcp::cap::Request& r) -> mcp::cap::CallFacts {
         mcp::cap::CallFacts f;
         // The registry may namespace the bare name ("local__read"); the effect
         // table is keyed on the bare name, so strip any "<origin>__" prefix.
-        std::string name = r.tool;
-        if (auto pos = name.rfind("__"); pos != std::string::npos)
+        std::string_view name = r.tool;
+        if (auto pos = name.rfind("__"); pos != std::string_view::npos)
             name = name.substr(pos + 2);
-        EffectSet fx = effects_for_builtin(name);
-        const bool known_pure =
-            std::find(kKnownPure.begin(), kKnownPure.end(), name) != kKnownPure.end();
-        if (fx.bits() == 0 && !known_pure) {
-            // Unknown tool (not in the built-in table, not a known-pure shell):
-            // conservative writer so the planner always serialises it.
-            f.effects = mcp::cap::Effects{mcp::cap::Eff::WriteFs};
+        const auto fx = effects_for_builtin(name);
+        if (!fx) {
+            // Not a built-in (a third-party server in the same registry):
+            // classify as a writer so the planner always serialises it.
+            f.effects = EffectSet{Effect::WriteFs};
             return f;
         }
-        f.effects = mcp::cap::Effects{fx.bits()};   // bit layout is identical
-        f.paths   = mcp::cap::extract_paths(name, r.args);
+        f.effects = *fx;
+        f.paths   = mcp::cap::extract_paths(std::string{name}, r.args);
         return f;
     };
 }

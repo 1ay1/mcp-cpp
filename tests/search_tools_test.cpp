@@ -8,7 +8,7 @@
 #include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
-#include <mcp/tools/meta.hpp>
+#include <mcp/tools/toolset.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/cap/local.hpp>
 
@@ -81,7 +81,7 @@ TEST_CASE("search_tools") {
         assert(!r.is_error);
         assert(r.text.find("alpha.cpp") != std::string::npos);
         assert(r.text.find("beta.txt") != std::string::npos);
-        assert(read_effects(r).has(Effect::ReadFs));
+        assert(r.effects.has(Effect::ReadFs));
         std::puts("grep: ok (found across files)");
     }
 
@@ -377,7 +377,7 @@ TEST_CASE("search_tools") {
         auto r = call(*provider, "glob", args);
         assert(!r.is_error);
         assert(r.text.find("gamma.py") != std::string::npos);
-        assert(read_effects(r).has(Effect::ReadFs));
+        assert(r.effects.has(Effect::ReadFs));
         std::puts("glob: ok");
     }
 
@@ -426,7 +426,7 @@ TEST_CASE("search_tools") {
         auto r = call(*provider, "shell", args);
         assert(!r.is_error);
         assert(r.text.find("hello_from_bash") != std::string::npos);
-        assert(read_effects(r).has(Effect::Exec));
+        assert(r.effects.has(Effect::Exec));
         std::puts("bash: ok");
     }
 
@@ -466,7 +466,7 @@ TEST_CASE("search_tools") {
         auto r = call(*provider, "diagnostics", args);
         assert(!r.is_error);
         assert(r.text.find("build_ok") != std::string::npos);
-        assert(read_effects(r).has(Effect::Exec));
+        assert(r.effects.has(Effect::Exec));
         std::puts("diagnostics: explicit command ok");
     }
 
@@ -482,7 +482,7 @@ TEST_CASE("search_tools") {
         auto sargs = obj(); sargs["path"] = root.string();
         auto st = call(*provider, "git_status", sargs);
         assert(!st.is_error);
-        assert(read_effects(st).has(Effect::ReadFs));
+        assert(st.effects.has(Effect::ReadFs));
         // Readable short format: a `## ` branch header (v1 --branch), NOT the
         // v2 machine rows (`# branch.head` / `1 .M N... <modes> <sha>`) the
         // tool card body would render as gibberish.
@@ -516,7 +516,7 @@ TEST_CASE("search_tools") {
         cargs["stage_all"] = true;
         auto ci = call(*provider, "git_commit", cargs);
         assert(!ci.is_error);
-        assert(read_effects(ci).has(Effect::WriteFs));
+        assert(ci.effects.has(Effect::WriteFs));
         // Clean synthesized result: "committed <hash> on <branch>" + subject.
         assert(ci.text.find("committed ") != std::string::npos
                && "git_commit must report a clean committed-<hash> summary");
@@ -675,7 +675,7 @@ TEST_CASE("search_tools") {
         auto bc = obj(); bc["action"] = "create"; bc["name"] = "feature-x";
         auto bcr = call(*provider, "git_branch", bc);
         assert(!bcr.is_error);
-        assert(read_effects(bcr).has(Effect::WriteFs));
+        assert(bcr.effects.has(Effect::WriteFs));
         std::puts("git_branch: create ok");
 
         // switch to it, then verify git_status reports the new branch.
@@ -755,7 +755,7 @@ TEST_CASE("search_tools") {
         auto spr = call(*provider, "git_stash", sp);
         assert(!spr.is_error);
         assert(spr.text.find("stashed") != std::string::npos);
-        assert(read_effects(spr).has(Effect::WriteFs));
+        assert(spr.effects.has(Effect::WriteFs));
         std::puts("git_stash: push ok");
 
         // The working tree is clean again (a fresh diff shows nothing new).
@@ -848,7 +848,7 @@ TEST_CASE("search_tools") {
         auto rbr = call(*provider, "git_rebase", rb);
         assert(!rbr.is_error && "clean rebase onto master must succeed");
         assert(rbr.text.find("rebased onto master") != std::string::npos);
-        assert(read_effects(rbr).has(Effect::WriteFs));
+        assert(rbr.effects.has(Effect::WriteFs));
         std::puts("git_rebase: onto ok");
 
         // After the rebase, mainline.txt is reachable from the topic branch.
@@ -881,7 +881,7 @@ TEST_CASE("search_tools") {
         assert(!r.is_error);
         assert(r.text.find("alpha.cpp") != std::string::npos);
         assert(r.text.find("L") != std::string::npos);
-        assert(read_effects(r).has(Effect::ReadFs));
+        assert(r.effects.has(Effect::ReadFs));
         std::puts("repo_map: ok (ranked skeleton with line anchors)");
 
         // focus re-centers: focusing on the python symbol keeps gamma.py.

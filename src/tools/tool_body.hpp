@@ -11,8 +11,8 @@
 #include "call_state.hpp"
 
 #include <mcp/cap/capability.hpp>
-#include <mcp/tools/meta.hpp>
 #include <mcp/tools/state.hpp>
+#include <mcp/tools/util/arg_spec.hpp>
 #include <mcp/tools/util/error.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/utf8.hpp>
@@ -29,10 +29,9 @@ namespace mcp::tools::detail {
 
 using mcp::Json;
 
-// Lower a tool body's ExecResult into a cap::Result. On success copies text
-// and, when the body produced a FileChange, stashes it under the meta key so
-// the provider's attach_meta carries it to the host's diff-review UI. On
-// error returns an is_error Result whose text is the rendered ToolError.
+// Lower a tool body's ExecResult into a cap::Result: text, plus the files
+// it wrote and images, on the Result's typed fields. On error returns an
+// is_error Result whose text is the rendered ToolError.
 inline mcp::cap::Result lower(util::ExecResult r) {
     // The one exit for every tool body. A file, a command's output or an
     // error can carry bytes that aren't UTF-8; they are made valid here, so
@@ -41,40 +40,14 @@ inline mcp::cap::Result lower(util::ExecResult r) {
         return mcp::cap::Result::error(util::to_valid_utf8(r.error().render()));
     }
     mcp::cap::Result out = mcp::cap::Result::ok(util::to_valid_utf8(std::move(r->text)));
-    if (r->change || !r->changes.empty() || !r->images.empty()) {
-        out.structured = Json::object();
-        Json m = Json::object();
-        auto encode = [](const mcp::tools::FileChange& c) {
-            return Json{
-                {"path",    util::to_valid_utf8(c.path)},
-                {"added",   c.added},
-                {"removed", c.removed},
-                {"before",  util::to_valid_utf8(c.before)},
-                {"after",   util::to_valid_utf8(c.after)},
-            };
-        };
-        if (r->change) m["change"] = encode(*r->change);
-        if (!r->changes.empty()) {
-            Json arr = Json::array();
-            for (const auto& c : r->changes) arr.push_back(encode(c));
-            m["changes"] = std::move(arr);
-        }
-        // Images ride the SAME structured-meta channel that carries
-        // FileChanges to the host (attach_meta -> the host bridge). Base64 here
-        // because structured meta is JSON; the host decodes back to raw bytes
-        // and maps onto its ImageContent. Kept out of `text` so a non-vision
-        // model just sees the [image ...] note, never a megabyte of base64.
-        if (!r->images.empty()) {
-            Json arr = Json::array();
-            for (const auto& img : r->images)
-                arr.push_back(Json{
-                    {"media_type", img.media_type},
-                    {"data",       mcp::tools::util::b64_encode(img.bytes)},
-                });
-            m["images"] = std::move(arr);
-        }
-        out.structured[kMetaKey] = std::move(m);
+    out.changes.reserve(r->changes.size());
+    for (auto& c : r->changes) {
+        c.path   = util::to_valid_utf8(std::move(c.path));
+        c.before = util::to_valid_utf8(std::move(c.before));
+        c.after  = util::to_valid_utf8(std::move(c.after));
+        out.changes.push_back(std::move(c));
     }
+    out.images = std::move(r->images);
     return out;
 }
 
@@ -120,6 +93,31 @@ template <class Args, class Run>
 template <class Args, class Run, class P>
 [[nodiscard]] auto body_with(Run run, P parse) {
     return body<Args>(std::move(run), parse);
+}
+
+// A tool whose arguments are declared by an ArgSpec: the schema and the
+// decoder come from the same declaration. `spec` must outlive the provider
+// (declare it as a static const). A `check` that needs the call's Bounds
+// (resolving paths) runs after decoding.
+template <class Args, class Run>
+[[nodiscard]] auto body(Run run, const util::ArgSpec<Args>& spec) {
+    return [run = std::move(run), &spec](const Call& call, const Json& j) mutable -> mcp::cap::Result {
+        auto parsed = spec.decode(j);
+        if (!parsed) return mcp::cap::Result::error(parsed.error().render());
+        return lower(run_on<Args>(run, call, *parsed));
+    };
+}
+template <class Args>
+using CheckIn = std::expected<Args, util::ToolError> (*)(Args, const util::Bounds&);
+template <class Args, class Run>
+[[nodiscard]] auto body(Run run, const util::ArgSpec<Args>& spec, CheckIn<Args> check) {
+    return [run = std::move(run), &spec, check](const Call& call, const Json& j) mutable
+               -> mcp::cap::Result {
+        auto parsed = spec.decode(j);
+        if (parsed) parsed = check(std::move(*parsed), detail::bounds(call));
+        if (!parsed) return mcp::cap::Result::error(parsed.error().render());
+        return lower(run_on<Args>(run, call, *parsed));
+    };
 }
 
 // ── Line-count diff (added/removed) ─────────────────────────────────────────

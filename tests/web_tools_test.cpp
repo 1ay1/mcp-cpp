@@ -8,7 +8,7 @@
 #include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
-#include <mcp/tools/meta.hpp>
+#include <mcp/tools/toolset.hpp>
 #include <mcp/cap/local.hpp>
 
 #include "agtest.hpp"
@@ -82,7 +82,7 @@ TEST_CASE("web_tools") {
         assert(r.text.find("[link text](https://dest.test/x)") != std::string::npos);
         // nav chrome should be stripped
         assert(r.text.find("Home About") == std::string::npos);
-        assert(read_effects(r).has(Effect::Net));
+        assert(r.effects.has(Effect::Net));
         std::puts("web_fetch: HTML→text + link preserved + nav stripped");
     }
 
@@ -152,7 +152,7 @@ TEST_CASE("web_tools") {
         assert(r.text.find("[via Brave Free]") != std::string::npos);
         assert(r.text.find("Result Title") != std::string::npos);
         assert(r.text.find("https://result.test/page") != std::string::npos);
-        assert(read_effects(r).has(Effect::Net));
+        assert(r.effects.has(Effect::Net));
         std::puts("web_search: Brave parse ok");
     }
 

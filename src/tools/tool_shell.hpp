@@ -88,6 +88,8 @@ public:
              EffectSet effects, F handler, int output_budget = 0) {
         Shell s;
         s.tool.name = name;
+        if (auto n = cfg_.description_notes.find(name); n != cfg_.description_notes.end())
+            description = description.empty() ? n->second : description + " " + n->second;
         if (!description.empty()) s.tool.description = description;
         try { s.tool.inputSchema = mcp::from_json<mcp::JsonSchema>(schema); }
         catch (...) {}
@@ -140,5 +142,12 @@ void register_test_tool(Shells&, const std::shared_ptr<Exec>&);
 void register_git_tools(Shells&, const std::shared_ptr<Exec>&);
 void register_web_tools(Shells&, const std::shared_ptr<HttpClient>&, bool jina,
                         const std::shared_ptr<WebSearchPlanSource>&);
+
+// Every family at once (provider.cpp). make_provider and the effect table
+// both walk this, so they can't disagree about what a tool declares.
+void register_all(Shells&, const HostServices&, ToolsetConfig);
+// Non-null backends that are never called, so every family registers when
+// only the declarations are wanted (effects.cpp).
+[[nodiscard]] HostServices declare_only_services();
 
 } // namespace mcp::tools::detail

@@ -1614,22 +1614,19 @@ ExecResult run_write(const Call& call, const WriteArgs& a) {
 // ─────────────────────────────────────────────────────────────────────────
 
 struct ListDirArgs {
-    std::string root;
-    bool recursive;
-    int max_depth;
+    std::string root = ".";
+    bool recursive = false;
+    int max_depth = 3;
     std::string display_description;
 };
 
-std::expected<ListDirArgs, ToolError> parse_list_dir_args(const json& j) {
-    util::ArgReader ar(j);
-    int max_depth = std::clamp(ar.integer("max_depth", 3), 1, 16);
-    return ListDirArgs{
-        ar.str("path", "."),
-        ar.boolean("recursive", false),
-        max_depth,
-        ar.str("display_description", ""),
-    };
-}
+const util::ArgSpec<ListDirArgs> kListDirArgs{
+    util::arg(&ListDirArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&ListDirArgs::root, "path", "Directory to list (default: cwd)"),
+    util::arg(&ListDirArgs::recursive, "recursive", "List recursively"),
+    util::arg(&ListDirArgs::max_depth, "max_depth", "Max depth for recursive listing").range(1, 16),
+};
 
 ExecResult run_list_dir(const Call& call, const ListDirArgs& a) {
     auto wp = util::make_workspace_path_checked(a.root, "list_dir", bounds(call));
@@ -1710,21 +1707,24 @@ ExecResult run_list_dir(const Call& call, const ListDirArgs& a) {
 //  safe move / remove
 // ─────────────────────────────────────────────────────────────────────────
 
-struct MoveArgs { fs::path source; fs::path destination; bool overwrite = false; };
+struct MoveArgs { std::string raw_source; std::string raw_destination; bool overwrite = false;
+                  fs::path source; fs::path destination; };
 
-std::expected<MoveArgs, ToolError> parse_move_args(const json& j, const util::Bounds& b) {
-    util::ArgReader r{j};
-    auto source = r.require_str("source");
-    if (!source || source->empty())
-        return std::unexpected(ToolError::invalid_args("source is required"));
-    auto destination = r.require_str("destination");
-    if (!destination || destination->empty())
-        return std::unexpected(ToolError::invalid_args("destination is required"));
-    auto src = util::make_workspace_path_checked(*source, "move", b);
+const util::ArgSpec<MoveArgs> kMoveArgs{
+    util::arg(&MoveArgs::raw_source, "source", "Workspace-relative or absolute source path.").required(),
+    util::arg(&MoveArgs::raw_destination, "destination",
+              "Workspace-relative or absolute destination path.").required(),
+    util::arg(&MoveArgs::overwrite, "overwrite", "Replace an existing destination."),
+};
+
+std::expected<MoveArgs, ToolError> check_move_args(MoveArgs a, const util::Bounds& b) {
+    auto src = util::make_workspace_path_checked(a.raw_source, "move", b);
     if (!src) return std::unexpected(src.error());
-    auto dst = util::make_workspace_path_checked(*destination, "move", b);
+    auto dst = util::make_workspace_path_checked(a.raw_destination, "move", b);
     if (!dst) return std::unexpected(dst.error());
-    return MoveArgs{src->path(), dst->path(), r.boolean("overwrite", false)};
+    a.source      = src->path();
+    a.destination = dst->path();
+    return a;
 }
 
 ExecResult run_move(const Call& call, const MoveArgs& a) {
@@ -1788,14 +1788,15 @@ ExecResult run_move(const Call& call, const MoveArgs& a) {
     return ToolOutput{std::format("Moved {} -> {}", a.source.string(), a.destination.string()), std::nullopt};
 }
 
-struct RemoveArgs { fs::path path; bool recursive = false; };
+struct RemoveArgs { std::string raw; bool recursive = false; fs::path path; };
 
-std::expected<RemoveArgs, ToolError> parse_remove_args(const json& j, const util::Bounds& b) {
-    util::ArgReader r{j};
-    auto path = r.require_str("path");
-    if (!path || path->empty())
-        return std::unexpected(ToolError::invalid_args("path is required"));
-    auto checked = util::make_workspace_path_checked(*path, "remove", b);
+const util::ArgSpec<RemoveArgs> kRemoveArgs{
+    util::arg(&RemoveArgs::raw, "path", "Workspace path to remove.").required(),
+    util::arg(&RemoveArgs::recursive, "recursive", "Required for non-empty directories."),
+};
+
+std::expected<RemoveArgs, ToolError> check_remove_args(RemoveArgs a, const util::Bounds& b) {
+    auto checked = util::make_workspace_path_checked(a.raw, "remove", b);
     if (!checked) return std::unexpected(checked.error());
     // Compare resolved paths: ".", "./", "d/.." and "<root>/" all name the
     // workspace root, and a raw == let them through to remove_all.
@@ -1809,7 +1810,8 @@ std::expected<RemoveArgs, ToolError> parse_remove_args(const json& j, const util
     const auto target = resolve(checked->path());
     if (target == resolve(b.workspace) || (!b.project.empty() && target == resolve(b.project)))
         return std::unexpected(ToolError::invalid_args("refusing to remove the workspace root"));
-    return RemoveArgs{checked->path(), r.boolean("recursive", false)};
+    a.path = checked->path();
+    return a;
 }
 
 ExecResult run_remove(const Call& call, const RemoveArgs& a) {
@@ -1833,24 +1835,6 @@ ExecResult run_remove(const Call& call, const RemoveArgs& a) {
     if (ec) return std::unexpected(ToolError::io("remove failed: " + ec.message()));
     return ToolOutput{std::format("Removed {} ({} filesystem entr{})", a.path.string(), count,
                                   count == 1 ? "y" : "ies"), std::nullopt};
-}
-
-json move_schema() {
-    return json{{"type","object"}, {"required", {"source","destination"}},
-        {"properties", {
-            {"source", {{"type","string"}, {"description","Workspace-relative or absolute source path."}}},
-            {"destination", {{"type","string"}, {"description","Workspace-relative or absolute destination path."}}},
-            {"overwrite", {{"type","boolean"}, {"default",false}}}
-        }}};
-}
-
-json remove_schema() {
-    return json{{"type","object"}, {"required", {"path"}},
-        {"properties", {
-            {"path", {{"type","string"}, {"description","Workspace path to remove."}}},
-            {"recursive", {{"type","boolean"}, {"default",false},
-                {"description","Required for non-empty directories."}}}
-        }}};
 }
 
 json read_schema() {
@@ -1880,19 +1864,6 @@ json write_schema() {
                                "(must be absolute, not relative)."}}},
             {"content",   {{"type","string"},
                 {"description","The content to write to the file."}}},
-        }},
-    };
-}
-
-json list_dir_schema() {
-    return json{
-        {"type","object"},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"path",      {{"type","string"}, {"description","Directory to list (default: cwd)"}}},
-            {"recursive", {{"type","boolean"}, {"description","List recursively (default: false)"}}},
-            {"max_depth", {{"type","integer"}, {"description","Max depth for recursive listing (default: 3)"}}},
         }},
     };
 }
@@ -2065,10 +2036,9 @@ void register_fs_tools(Shells& sh) {
         body<WriteArgs>(run_write, parse_write_args), 40'000);
 
     sh.add("list_dir",
-        "List the contents of a directory. Shows file type, size, and name. "
-        "Use this to explore project structure before reading files.",
-        list_dir_schema(), EffectSet{Effect::ReadFs},
-        body<ListDirArgs>(run_list_dir, parse_list_dir_args), 25'000);
+        "List the contents of a directory. Shows file type, size, and name.",
+        kListDirArgs.schema(), EffectSet{Effect::ReadFs},
+        body<ListDirArgs>(run_list_dir, kListDirArgs), 25'000);
 
     sh.add("outline",
         "Show a file's SHAPE \xe2\x80\x94 a nested tree of its definitions "
@@ -2084,14 +2054,14 @@ void register_fs_tools(Shells& sh) {
     sh.add("move",
         "Move or rename a file or directory within the workspace without invoking a shell. "
         "The destination is never overwritten unless overwrite:true is explicit.",
-        move_schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
-        body<MoveArgs>(run_move, parse_move_args), 4'000);
+        kMoveArgs.schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
+        body<MoveArgs>(run_move, kMoveArgs, check_move_args), 4'000);
 
     sh.add("remove",
         "Remove a file or directory within the workspace without invoking a shell. "
         "Non-empty directories require recursive:true; the workspace root is always refused.",
-        remove_schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
-        body<RemoveArgs>(run_remove, parse_remove_args), 4'000);
+        kRemoveArgs.schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
+        body<RemoveArgs>(run_remove, kRemoveArgs, check_remove_args), 4'000);
 
     // edit (own TU — fuzzy splice logic is large)
     register_edit_tool(sh);

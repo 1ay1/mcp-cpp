@@ -7,7 +7,7 @@
 #include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
-#include <mcp/tools/meta.hpp>
+#include <mcp/tools/toolset.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include "../src/tools/diff.hpp"
 #include <mcp/cap/local.hpp>
@@ -73,7 +73,7 @@ TEST_CASE("edit diff stays minimal on large + CRLF files") {
         args["edits"] = mcp::Json::array({e});
         auto r = call(*provider, "edit", args);
         assert(!r.is_error);
-        auto ch = read_change(r);
+        auto ch = only_change(r);
         assert(ch.has_value());
         auto d = diff::compute(p, ch->before, ch->after);
         added = d.added; removed = d.removed;
@@ -237,12 +237,12 @@ TEST_CASE("fs_tools") {
         args["content"]   = "line1\nline2\nline3\n";
         auto wr = call(*provider, "write", args);
         assert(!wr.is_error);
-        auto change = read_change(wr);
+        auto change = only_change(wr);
         assert(change.has_value());
         assert(change->path == wpath);
         assert(change->added == 3);
         assert(change->after == "line1\nline2\nline3\n");
-        assert(read_effects(wr).has(Effect::WriteFs));
+        assert(wr.effects.has(Effect::WriteFs));
         std::puts("write: ok (FileChange carried, 3 added)");
     }
 
@@ -253,7 +253,7 @@ TEST_CASE("fs_tools") {
         assert(!rd.is_error);
         assert(rd.text.find("line1") != std::string::npos);
         assert(rd.text.find("line3") != std::string::npos);
-        assert(read_effects(rd).has(Effect::ReadFs));
+        assert(rd.effects.has(Effect::ReadFs));
         std::puts("read: ok");
     }
 
@@ -681,7 +681,7 @@ TEST_CASE("fs_tools") {
         auto ed = call(*provider, "edit", args);
         assert(!ed.is_error);
         assert(ed.text.find("Edited") != std::string::npos);
-        auto echange = read_change(ed);
+        auto echange = only_change(ed);
         assert(echange.has_value());
         assert(echange->after.find("LINE-TWO") != std::string::npos);
         assert(echange->before.find("line2") != std::string::npos);
@@ -794,7 +794,7 @@ TEST_CASE("fs_tools") {
         assert(r.text.find("[image") != std::string::npos);
         assert(r.text.find("image/png") != std::string::npos);
 
-        auto imgs = read_images(r);
+        auto imgs = r.images;
         assert(imgs.size() == 1);
         assert(imgs[0].media_type == "image/png");
         assert(imgs[0].bytes == png);                 // exact bytes round-trip
@@ -811,7 +811,7 @@ TEST_CASE("fs_tools") {
         auto r = call(*provider, "read", args);
         assert(r.is_error);
         assert(r.text.find("binary") != std::string::npos);
-        assert(read_images(r).empty());
+        assert(r.images.empty());
         std::puts("read: non-image binary still refused");
     }
 

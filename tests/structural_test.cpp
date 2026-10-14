@@ -9,7 +9,7 @@
 #include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
-#include <mcp/tools/meta.hpp>
+#include <mcp/tools/toolset.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/cap/local.hpp>
 
@@ -90,7 +90,7 @@ TEST_CASE("search_structural") {
         // The comment (L4) and the string (L5) must never be MATCHED.
         assert(r.text.find("> L4") == std::string::npos);
         assert(r.text.find("> L5") == std::string::npos);
-        assert(read_effects(r).has(Effect::ReadFs));
+        assert(r.effects.has(Effect::ReadFs));
         std::puts("structural: malloc($SIZE) binds one node, skips comments/strings ok");
     }
 

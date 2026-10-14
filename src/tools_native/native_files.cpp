@@ -173,7 +173,7 @@ std::string native_write(const fs::path& p, std::string_view content) {
     fs::path tmp;
     auto tmp_name = [&](int attempt) {
         fs::path t = real;
-        t += fs::path(".agentty-tmp-" + std::to_string(pid) + "-"
+        t += fs::path(".mcp-tmp-" + std::to_string(pid) + "-"
                       + std::to_string((salt >> 4) ^ (static_cast<std::uint64_t>(attempt) * 0x9e3779b97f4a7c15ULL)));
         return t;
     };

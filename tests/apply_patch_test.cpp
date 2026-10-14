@@ -9,7 +9,7 @@
 #include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
-#include <mcp/tools/meta.hpp>
+#include <mcp/tools/toolset.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/cap/local.hpp>
 
@@ -84,8 +84,8 @@ TEST_CASE("apply_patch") {
         check(has(rd(root / "a.txt"), "line TWO changed"), "removed→added line landed");
         check(has(rd(root / "a.txt"), "line one") &&
               has(rd(root / "a.txt"), "line five"), "context untouched");
-        check(read_effects(r).has(Effect::WriteFs), "apply_patch is WriteFs");
-        auto ch = read_change(r);
+        check(r.effects.has(Effect::WriteFs), "apply_patch is WriteFs");
+        auto ch = only_change(r);
         check(ch.has_value(), "carries a FileChange for the diff-review UI");
         check(ch && ch->added >= 1 && ch->removed >= 1, "FileChange has add/remove counts");
     }

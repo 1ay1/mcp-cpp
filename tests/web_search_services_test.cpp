@@ -12,7 +12,7 @@
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/web_search.hpp>
-#include <mcp/tools/meta.hpp>
+#include <mcp/tools/toolset.hpp>
 #include <mcp/cap/local.hpp>
 
 #include "../src/tools/web_search_services.hpp"

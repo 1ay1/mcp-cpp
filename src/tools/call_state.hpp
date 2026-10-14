@@ -16,11 +16,13 @@ namespace mcp::tools::detail {
     auto b = c.with([](ToolState& s) {
         util::Bounds out;
         out.workspace = s.workspace_root; out.read_roots = s.read_roots; out.home = s.home;
+        out.widen_hint = s.widen_hint;
         return out;
     });
     if (!c.scope_workspace.empty()) b.workspace = c.scope_workspace;
     // Canonicalising touches the disk: done outside the state lock.
     auto out = util::bounds_from(c.fs(), b.workspace, std::move(b.read_roots), std::move(b.home));
+    out.widen_hint = std::move(b.widen_hint);
     for (const auto& r : c.scope_extra_roots)
         if (!r.empty()) out.extra_roots.push_back(util::canonical_root(c.fs(), r));
     if (!c.scope_project.empty()) out.project = util::canonical_root(c.fs(), c.scope_project);

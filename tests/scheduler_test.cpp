@@ -28,7 +28,7 @@ using namespace mcp::cap;
 
 namespace {
 
-CallFacts cf(Effects e, std::vector<std::string> paths = {}) {
+CallFacts cf(EffectSet e, std::vector<std::string> paths = {}) {
     return CallFacts{e, std::move(paths)};
 }
 
@@ -45,10 +45,10 @@ int wave_of(const Plan& p, std::size_t i) {
 
 TEST_CASE("all reads one wave") {
     std::vector<CallFacts> f = {
-        cf(Effects{Eff::ReadFs}, {"a.c"}),
-        cf(Effects{Eff::ReadFs}, {"b.c"}),
-        cf(Effects{Eff::Net}),                 // web_fetch-like
-        cf(Effects{Eff::ReadFs}, {"a.c"}),     // same path as #0 — reads don't conflict
+        cf(EffectSet{Effect::ReadFs}, {"a.c"}),
+        cf(EffectSet{Effect::ReadFs}, {"b.c"}),
+        cf(EffectSet{Effect::Net}),                 // web_fetch-like
+        cf(EffectSet{Effect::ReadFs}, {"a.c"}),     // same path as #0 — reads don't conflict
     };
     auto p = plan_waves(f);
     CHECK(p.wave_count() == 1);
@@ -60,9 +60,9 @@ TEST_CASE("all reads one wave") {
 //        parallelise alongside. ─────────────────────────────────────────────
 TEST_CASE("write overlap serialises") {
     std::vector<CallFacts> f = {
-        cf(Effects{Eff::ReadFs},  {"src/a.c"}),   // 0
-        cf(Effects{Eff::ReadFs},  {"src/b.c"}),   // 1
-        cf(Effects{Eff::WriteFs}, {"src/a.c"}),   // 2 — conflicts with 0
+        cf(EffectSet{Effect::ReadFs},  {"src/a.c"}),   // 0
+        cf(EffectSet{Effect::ReadFs},  {"src/b.c"}),   // 1
+        cf(EffectSet{Effect::WriteFs}, {"src/a.c"}),   // 2 — conflicts with 0
     };
     auto p = plan_waves(f);
     // 0 and 1 share wave 0; 2 is forced into a later wave (conflicts with 0).
@@ -74,8 +74,8 @@ TEST_CASE("write overlap serialises") {
 // ── (c) Disjoint writes parallelise. ───────────────────────────────────────
 TEST_CASE("disjoint writes parallel") {
     std::vector<CallFacts> f = {
-        cf(Effects{Eff::WriteFs}, {"a.c"}),
-        cf(Effects{Eff::WriteFs}, {"b.c"}),
+        cf(EffectSet{Effect::WriteFs}, {"a.c"}),
+        cf(EffectSet{Effect::WriteFs}, {"b.c"}),
     };
     auto p = plan_waves(f);
     CHECK(p.wave_count() == 1);   // no overlap → same wave
@@ -85,9 +85,9 @@ TEST_CASE("disjoint writes parallel") {
 //        "src/deep/x.c". ──────────────────────────────────────────────────
 TEST_CASE("dir prefix overlap") {
     std::vector<CallFacts> f = {
-        cf(Effects{Eff::WriteFs}, {"src"}),          // 0
-        cf(Effects{Eff::ReadFs},  {"src/deep/x.c"}), // 1 — under src/
-        cf(Effects{Eff::ReadFs},  {"other/y.c"}),    // 2 — disjoint
+        cf(EffectSet{Effect::WriteFs}, {"src"}),          // 0
+        cf(EffectSet{Effect::ReadFs},  {"src/deep/x.c"}), // 1 — under src/
+        cf(EffectSet{Effect::ReadFs},  {"other/y.c"}),    // 2 — disjoint
     };
     auto p = plan_waves(f);
     CHECK(wave_of(p, 0) != wave_of(p, 1));   // 0 vs 1 conflict
@@ -97,8 +97,8 @@ TEST_CASE("dir prefix overlap") {
 
 TEST_CASE("no spurious prefix") {
     std::vector<CallFacts> f = {
-        cf(Effects{Eff::WriteFs}, {"src"}),       // 0
-        cf(Effects{Eff::WriteFs}, {"srcfoo"}),    // 1 — NOT under "src"
+        cf(EffectSet{Effect::WriteFs}, {"src"}),       // 0
+        cf(EffectSet{Effect::WriteFs}, {"srcfoo"}),    // 1 — NOT under "src"
     };
     auto p = plan_waves(f);
     CHECK(p.wave_count() == 1);   // no real overlap → parallel
@@ -107,9 +107,9 @@ TEST_CASE("no spurious prefix") {
 // ── (e) Exec serialises against EVERYTHING. ────────────────────────────────
 TEST_CASE("exec serialises all") {
     std::vector<CallFacts> f = {
-        cf(Effects{Eff::ReadFs}, {"a.c"}),                       // 0
-        cf(Effects{Eff::Exec, Eff::ReadFs, Eff::WriteFs}, {}),   // 1 — bash
-        cf(Effects{Eff::ReadFs}, {"b.c"}),                       // 2
+        cf(EffectSet{Effect::ReadFs}, {"a.c"}),                       // 0
+        cf(EffectSet{Effect::Exec, Effect::ReadFs, Effect::WriteFs}, {}),   // 1 — bash
+        cf(EffectSet{Effect::ReadFs}, {"b.c"}),                       // 2
     };
     auto p = plan_waves(f);
     // 1 conflicts with everything, so it gets its own wave; 0 and 2 are reads
@@ -124,9 +124,9 @@ TEST_CASE("exec serialises all") {
 //        fs-touching peers, but a pure-Net peer still parallelises. ──────────
 TEST_CASE("blind writer") {
     std::vector<CallFacts> f = {
-        cf(Effects{Eff::ReadFs},  {"a.c"}),   // 0 fs
-        cf(Effects{Eff::WriteFs}, {}),        // 1 blind writer
-        cf(Effects{Eff::Net}),                // 2 pure net — no fs
+        cf(EffectSet{Effect::ReadFs},  {"a.c"}),   // 0 fs
+        cf(EffectSet{Effect::WriteFs}, {}),        // 1 blind writer
+        cf(EffectSet{Effect::Net}),                // 2 pure net — no fs
     };
     auto p = plan_waves(f);
     CHECK(wave_of(p, 0) != wave_of(p, 1));    // blind writer vs fs read
@@ -137,8 +137,8 @@ TEST_CASE("blind writer") {
 //        an earlier wave than the call it conflicts with. ──────────────────
 TEST_CASE("order preserved") {
     std::vector<CallFacts> f = {
-        cf(Effects{Eff::WriteFs}, {"x"}),   // 0
-        cf(Effects{Eff::ReadFs},  {"x"}),   // 1 — must come AFTER 0
+        cf(EffectSet{Effect::WriteFs}, {"x"}),   // 0
+        cf(EffectSet{Effect::ReadFs},  {"x"}),   // 1 — must come AFTER 0
     };
     auto p = plan_waves(f);
     CHECK(wave_of(p, 0) < wave_of(p, 1));
@@ -179,7 +179,7 @@ TEST_CASE("concurrent execution") {
     };
     // EffectFn: everything is a pure read with the named path.
     EffectFn fn = [](const Request& r) {
-        return CallFacts{Effects{Eff::ReadFs}, extract_paths("read", r.args)};
+        return CallFacts{EffectSet{Effect::ReadFs}, extract_paths("read", r.args)};
     };
 
     // The host decides parallelism; here, one thread per call in a wave.
@@ -229,7 +229,7 @@ TEST_CASE("serial path correct") {
         Request{"edit", Json{{"path","same.c"},{"tag","Z"}}},
     };
     EffectFn fn = [](const Request& r) {
-        return CallFacts{Effects{Eff::WriteFs}, extract_paths("edit", r.args)};
+        return CallFacts{EffectSet{Effect::WriteFs}, extract_paths("edit", r.args)};
     };
     auto plan = plan_waves(batch, fn);
     CHECK(plan.is_fully_serial());

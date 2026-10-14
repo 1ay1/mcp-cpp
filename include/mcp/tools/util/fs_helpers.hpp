@@ -35,6 +35,8 @@ struct Bounds {
     // Where relative paths resolve, when the host knows better than the
     // process cwd (one agent serving sessions in different folders).
     fs::path              project;
+    // The host's "how to widen the boundary" advice (ToolState::widen_hint).
+    std::string           widen_hint;
 };
 
 // A Bounds from the state's fields. An empty workspace means the cwd.
@@ -109,17 +111,15 @@ struct NormalizedPath {
 // fast path of "model casually `read`s ~/.ssh/id_rsa or `write`s to
 // /etc/hosts". Pair it with an OS sandbox for defense in depth.
 
-// The ACTIVE PROJECT directory: the process cwd (the directory the user
-// launched agentty in), clamped to stay inside the access boundary. This
+// The ACTIVE PROJECT directory: the process cwd (where the host was
+// launched), clamped to stay inside the access boundary. This
 // is distinct from the workspace boundary, which is the widenable ACCESS
-// BOUNDARY (`--workspace /` opens the whole disk). Relative tool paths and
+// BOUNDARY (a host may open the whole disk). Relative tool paths and
 // repo-scoped defaults resolve from HERE, not the boundary, so that
-// `read src/foo.cpp` under `--workspace /` still lands in the project the
+// `read src/foo.cpp` with a boundary of `/` still lands in the project the
 // user launched in rather than at `/src/foo.cpp`. Falls back to the
-// boundary only when the cwd is unusable or escapes it (an unusual launch
-// from outside a wider `-w` scope). Computed fresh each call (cheap: one
-// current_path() + canonicalise) since agentty never chdir's but tool
-// worker threads or embedders theoretically could.
+// boundary only when the cwd is unusable or escapes it. Computed fresh
+// each call (cheap: one current_path() + canonicalise).
 [[nodiscard]] fs::path project_root(const Bounds& b);
 
 // True if `target` is at-or-under the workspace root after canonicalising

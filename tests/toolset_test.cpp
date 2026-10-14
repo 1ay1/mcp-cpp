@@ -5,21 +5,24 @@
 // end to end through the CapabilityProvider interface. Validates that:
 //   • a tool is registered only when its backend is present;
 //   • arg parsing + scope validation + dedup messaging live in the shell;
-//   • effects ride back in the Result meta;
+//   • effects ride back on the Result as a typed field;
 //   • the host backend receives exactly the parsed request.
 
 #include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
-#include <mcp/tools/meta.hpp>
 #include <mcp/cap/local.hpp>
 
 #include <algorithm>
 #include "agtest.hpp"
+#include "test_exec.hpp"
+#include "test_state.hpp"
 #include <cstdio>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 using namespace mcp::tools;
 
@@ -126,6 +129,45 @@ mcp::cap::Result call(mcp::cap::CapabilityProvider& p, const std::string& tool, 
 
 } // namespace
 
+TEST_CASE("toolset: effect table is read off the registrations") {
+    // Every advertised tool has a declared effect, and it is the one the
+    // provider stamps on its results: there is no second table to drift.
+    auto exec = std::make_shared<mcp::test::PopenExec>();
+    HostServices svc;
+    svc.exec  = exec;
+    svc.files = std::make_shared<NativeFileSystem>();
+    auto p = make_provider(std::move(svc), ToolsetConfig{});
+    for (const auto& t : p->list()) {
+        const auto fx = effects_for_builtin(t.name);
+        CHECK_MESSAGE(fx.has_value(), t.name << " has no declared effects");
+    }
+    CHECK(effects_for_builtin("read") == EffectSet{Effect::ReadFs});
+    CHECK(effects_for_builtin("write")->writes());
+    CHECK(effects_for_builtin("shell")->execs());
+    CHECK(effects_for_builtin("remember").has_value());   // host-coupled tools too
+    CHECK(!effects_for_builtin("not_a_tool").has_value());
+}
+
+TEST_CASE("toolset: a result carries effects and changes as typed fields") {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / ("mcp_meta_" + std::to_string(::getpid()));
+    fs::create_directories(root);
+    HostServices svc;
+    svc.files = std::make_shared<NativeFileSystem>();
+    svc.state = mcp::test::state_at(root);
+    auto p = make_provider(std::move(svc), ToolsetConfig{});
+    mcp::cap::Request w{"write", mcp::Json{{"path", (root / "x.txt").string()}, {"content", "a\nb\n"}}};
+    auto r = p->execute(w);
+    REQUIRE(!r.is_error);
+    CHECK(r.effects.writes());
+    REQUIRE(r.changes.size() == 1);
+    CHECK(r.changes[0].added == 2);
+    CHECK(r.changes[0].after == "a\nb\n");
+    // Nothing smuggled through the structured JSON any more.
+    CHECK(!r.structured.contains("_mcp_tools"));
+    fs::remove_all(root);
+}
+
 TEST_CASE("toolset") {
     // ── backend absent → no memory tools registered ──────────────────────
     {
@@ -154,7 +196,7 @@ TEST_CASE("toolset") {
     check(!r1.is_error, "remember ok");
     check(store->records.size() == 1, "one record stored");
     check(store->records[0].scope == "user", "scope passed through");
-    check(read_effects(r1).bits() == 0, "remember effects empty in meta");
+    check(r1.effects.bits() == 0, "remember effects empty in meta");
 
     // dedup path
     auto r2 = call(*p, "remember", {{"text", "prefer fish shell"}, {"scope", "user"}});
@@ -279,7 +321,7 @@ TEST_CASE("toolset") {
 
         auto rsd = call(*p2, "search_docs", {{"query","hello"}, {"k", 3}});
         check(!rsd.is_error && rsd.text.find("matched passage") != std::string::npos, "docs retrieved");
-        check(read_effects(rsd).has(Effect::Net), "search_docs carries Net effect");
+        check(rsd.effects.has(Effect::Net), "search_docs carries Net effect");
 
         auto rtask = call(*p2, "task", {{"prompt","investigate"}});
         check(!rtask.is_error && rtask.text.find("report for: investigate") != std::string::npos, "task ran");

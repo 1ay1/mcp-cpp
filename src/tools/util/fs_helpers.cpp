@@ -55,16 +55,16 @@ fs::path normalize_path(std::string_view s, const Bounds& b) {
         // Resolve relative to the ACTIVE PROJECT (the process cwd clamped
         // inside the access boundary), NOT the raw access boundary and NOT
         // the tool thread's cwd. Three roots are in play:
-        //   * workspace_root() — the widenable ACCESS BOUNDARY (`-w /`).
+        //   * the access boundary (b.workspace), widenable by the host.
         //   * project_root()   — the cwd the user launched in (the project).
         //   * a worker thread's cwd — may differ (process_start cwd=".").
         // The tool schemas promise "relative to the workspace root", and by
-        // default project_root() == workspace_root() so nothing changes. But
-        // when the user widens the boundary (`--workspace /`), anchoring to
-        // the boundary would turn `read src/foo.cpp` into `/src/foo.cpp`;
-        // anchoring to project_root() keeps it in the launched project. The
-        // result is still containment-checked against the boundary by the
-        // caller, so this only ever narrows where a relative path lands.
+        // default project_root() == the boundary so nothing changes. But
+        // when the host widens the boundary (to `/`, say), anchoring to it
+        // would turn `read src/foo.cpp` into `/src/foo.cpp`; anchoring to
+        // project_root() keeps it in the launched project. The result is
+        // still containment-checked against the boundary by the caller, so
+        // this only ever narrows where a relative path lands.
         p = project_root(b) / p;
     }
     return p.lexically_normal();
@@ -235,16 +235,13 @@ std::expected<NormalizedPath, ToolError>
 make_workspace_path(std::string_view raw, std::string_view tool_name, const Bounds& b) {
     NormalizedPath p{raw, b};
     if (!is_within_workspace(p.path(), b)) {
-        // Helpful, actionable message: name the offending path, the
-        // active root, and the two ways out (restart in a wider dir or
-        // pass --workspace). The model can read this and either ask the
-        // user to widen the scope or pick a different path.
-        return std::unexpected(ToolError::out_of_workspace(
-            "tool '" + std::string{tool_name} + "' refused: '"
+        // Name the offending path and the active root, plus the host's own
+        // way to widen the boundary if it gave one.
+        std::string msg = "tool '" + std::string{tool_name} + "' refused: '"
             + p.string() + "' is outside the workspace root '"
-            + b.workspace.string() + "'. "
-            "Restart agentty in a parent directory or pass "
-            "--workspace <dir> to widen the scope."));
+            + b.workspace.string() + "'.";
+        if (!b.widen_hint.empty()) msg += " " + b.widen_hint;
+        return std::unexpected(ToolError::out_of_workspace(std::move(msg)));
     }
     return p;
 }
@@ -295,9 +292,8 @@ make_readable_path_checked(std::string_view raw, std::string_view tool_name, con
             msg += " Use the exact directory listed (skills resolve "
                    "against several roots — do not guess a sibling "
                    "root).";
-        } else {
-            msg += " Restart agentty in a parent directory or pass "
-                   "--workspace <dir> to widen the scope.";
+        } else if (!b.widen_hint.empty()) {
+            msg += " " + b.widen_hint;
         }
     }
     return std::unexpected(ToolError::out_of_workspace(std::move(msg)));

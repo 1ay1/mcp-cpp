@@ -25,7 +25,9 @@
 #include <mcp/methods.hpp>   // CallToolResult, GetPromptResult
 #include <mcp/codec.hpp>     // to_json
 
+#include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -33,6 +35,58 @@
 #include <vector>
 
 namespace mcp::cap {
+
+// ── What a capability does to the world ──────────────────────────────────────
+// The one effect type in mcp-cpp. Permission policy and the parallel
+// scheduler both read it; tools declare it.
+enum class Effect : std::uint8_t {
+    ReadFs  = 1u << 0,
+    WriteFs = 1u << 1,
+    Net     = 1u << 2,
+    Exec    = 1u << 3,
+};
+
+class EffectSet {
+public:
+    constexpr EffectSet() = default;
+    constexpr EffectSet(std::initializer_list<Effect> es) {
+        for (auto e : es) bits_ |= static_cast<std::uint8_t>(e);
+    }
+    constexpr explicit EffectSet(std::uint8_t bits) : bits_(bits & 0x0Fu) {}
+    [[nodiscard]] constexpr bool has(Effect e) const {
+        return (bits_ & static_cast<std::uint8_t>(e)) != 0;
+    }
+    [[nodiscard]] constexpr std::uint8_t bits() const { return bits_; }
+    [[nodiscard]] constexpr bool empty() const { return bits_ == 0; }
+    [[nodiscard]] constexpr bool writes() const { return has(Effect::WriteFs); }
+    [[nodiscard]] constexpr bool execs()  const { return has(Effect::Exec); }
+    /// Touches the filesystem in any way.
+    [[nodiscard]] constexpr bool touches_fs() const {
+        return has(Effect::ReadFs) || has(Effect::WriteFs);
+    }
+    /// Reads and/or talks to the network, never writes or runs anything.
+    /// Two pure-read calls are always safe to run at once.
+    [[nodiscard]] constexpr bool pure_read() const { return !writes() && !execs(); }
+    constexpr EffectSet operator|(EffectSet o) const { return EffectSet(std::uint8_t(bits_ | o.bits_)); }
+    friend constexpr bool operator==(EffectSet, EffectSet) = default;
+private:
+    std::uint8_t bits_ = 0;
+};
+
+// A file a capability wrote: enough for a host's diff-review UI.
+struct FileChange {
+    std::string path;
+    int         added   = 0;
+    int         removed = 0;
+    std::string before;     // "" for a new file
+    std::string after;
+};
+
+// An image a capability wants a vision model to see.
+struct Image {
+    std::string media_type;   // "image/png", "image/jpeg", ...
+    std::string bytes;        // raw, not base64
+};
 
 // A request to perform one capability. `tool` is the UNQUALIFIED tool name as
 // the provider advertised it (the Registry strips any namespace prefix before
@@ -67,11 +121,20 @@ struct Request {
 // rendering (already flattened from MCP content blocks); `structured` carries
 // typed output when the provider produced it (MCP structuredContent); raw
 // holds the original content-block list for callers that want full fidelity.
+//
+// effects / changes / images are what a rich host needs beside the text and
+// the bare MCP wire has no field for. They are plain typed fields: a host
+// reads them directly, and lowering to the wire (call_result_from) drops
+// them, so a plain MCP client never sees them.
 struct Result {
     std::string text;
     Json        structured = Json::object();   // empty object == none
     Json        raw        = Json::array();    // original content blocks
     bool        is_error   = false;
+
+    EffectSet               effects;   // what the call did (declared by the tool)
+    std::vector<FileChange> changes;   // files it wrote, one per path
+    std::vector<Image>      images;    // pictures for a vision model
 
     [[nodiscard]] static Result ok(std::string t) {
         Result r; r.text = std::move(t); return r;

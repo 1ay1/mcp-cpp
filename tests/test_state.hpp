@@ -2,11 +2,13 @@
 // the workspace root set (canonicalised the way a host would).
 #pragma once
 
+#include <mcp/cap/capability.hpp>
 #include <mcp/tools/state.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 #include <mcp/tools/native_files.hpp>
 
@@ -19,3 +21,9 @@ inline std::shared_ptr<tools::SoleStateAccess> state_at(const std::filesystem::p
 }
 
 }  // namespace mcp::test
+
+// The one file a single-file tool (write, edit, apply_patch) wrote, or nullopt.
+inline std::optional<mcp::cap::FileChange> only_change(const mcp::cap::Result& r) {
+    if (r.changes.size() != 1) return std::nullopt;
+    return r.changes.front();
+}

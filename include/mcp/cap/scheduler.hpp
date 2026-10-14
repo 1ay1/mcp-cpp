@@ -61,37 +61,7 @@
 
 namespace mcp::cap {
 
-// ── Effect model (mirrors mcp::tools::Effect, but lives in the core cap layer
-//    so the scheduler doesn't depend on the compiled toolset). ──────────────
-enum class Eff : std::uint8_t {
-    ReadFs  = 1u << 0,
-    WriteFs = 1u << 1,
-    Net     = 1u << 2,
-    Exec    = 1u << 3,
-};
-
-struct Effects {
-    std::uint8_t bits = 0;
-    constexpr Effects() = default;
-    constexpr explicit Effects(std::uint8_t b) : bits(b) {}
-    constexpr Effects(std::initializer_list<Eff> es) {
-        for (auto e : es) bits |= static_cast<std::uint8_t>(e);
-    }
-    [[nodiscard]] constexpr bool has(Eff e) const {
-        return (bits & static_cast<std::uint8_t>(e)) != 0;
-    }
-    [[nodiscard]] constexpr bool writes() const { return has(Eff::WriteFs); }
-    [[nodiscard]] constexpr bool execs()  const { return has(Eff::Exec); }
-    // Touches the filesystem in any way (read or write).
-    [[nodiscard]] constexpr bool touches_fs() const {
-        return has(Eff::ReadFs) || has(Eff::WriteFs);
-    }
-    // Pure-read: reads and/or talks to the network, but never writes or execs.
-    // Two pure-read calls are unconditionally parallel-safe.
-    [[nodiscard]] constexpr bool pure_read() const {
-        return !writes() && !execs();
-    }
-};
+// The scheduler reads the one effect type, cap::EffectSet (capability.hpp).
 
 // How the scheduler learns a call's effects + touched paths. Given the
 // (exposed) tool name and its args, return the effect set and the list of
@@ -100,7 +70,7 @@ struct Effects {
 // works). An empty path list for an fs-touching write means "unknown blast
 // radius" (rule 4).
 struct CallFacts {
-    Effects                  effects;
+    EffectSet                effects;
     std::vector<std::string> paths;   // touched fs resources; empty ⇒ unknown
 };
 using EffectFn = std::function<CallFacts(const Request&)>;
@@ -154,10 +124,9 @@ extract_paths(const std::string& tool, const Json& args) {
         const bool open_world =
             it != ann->end() && it->second.openWorldHint.has_value()
             && *it->second.openWorldHint;
-        if (read_only) f.effects = Effects{Eff::ReadFs};
-        else           f.effects = Effects{Eff::WriteFs};   // conservative
-        if (open_world) f.effects = Effects{static_cast<std::uint8_t>(
-            f.effects.bits | static_cast<std::uint8_t>(Eff::Net))};
+        if (read_only) f.effects = EffectSet{Effect::ReadFs};
+        else           f.effects = EffectSet{Effect::WriteFs};   // conservative
+        if (open_world) f.effects = f.effects | EffectSet{Effect::Net};
         f.paths = extract_paths(r.tool, r.args);
         return f;
     };

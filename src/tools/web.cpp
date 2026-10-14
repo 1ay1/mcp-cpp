@@ -113,7 +113,7 @@ std::expected<WebFetchArgs, ToolError> parse_web_fetch_args(const json& j) {
             std::string lower; lower.reserve(k.size());
             for (char c : k) lower.push_back(static_cast<char>(std::tolower((unsigned char)c)));
             std::string val = v.is_string() ? v.get<std::string>() : v.dump();
-            if (lower == "x-no-jina" || lower == "x-agentty-no-jina") {
+            if (lower == "x-no-jina") {
                 allow_jina = !(val == "1" || val == "true" || val == "yes");
                 continue;
             }

@@ -128,25 +128,24 @@ struct ToolError {
 };
 
 // An image a tool surfaces to a vision-capable model (e.g. `read` on a PNG).
-// mcp-cpp has no dependency on the host's Message model, so this is a minimal
-// self-contained carrier the host maps onto its own ImageContent. Bytes are
-// RAW (not base64); the host/wire encodes at the JSON boundary.
-struct ToolImage {
-    std::string media_type;   // "image/png", "image/jpeg", "image/webp", "image/gif"
-    std::string bytes;        // raw image bytes
-};
+using ToolImage = mcp::cap::Image;
 
-// The output a tool body produces: text plus an optional file mutation a
-// write/edit emitted (carried back to the host's diff-review UI via meta).
+// The output a tool body produces: text, the files it wrote, and images for
+// a vision model. lower() moves them onto cap::Result's typed fields.
 struct ToolOutput {
     std::string                            text;
-    std::optional<mcp::tools::FileChange>  change;
-    // Multi-file tools (replace) emit ONE FileChange per written file here;
-    // single-file tools use `change` above. Both flow to the host diff-review.
-    std::vector<mcp::tools::FileChange>    changes;
-    // Images a tool wants a vision model to actually SEE (read on an image
-    // file). The host maps these onto the turn's tool_result image blocks.
+    std::vector<mcp::tools::FileChange>    changes;   // one per written file
     std::vector<ToolImage>                 images;
+
+    ToolOutput() = default;
+    ToolOutput(std::string t) : text(std::move(t)) {}   // NOLINT: text-only results
+    ToolOutput(std::string t, std::nullopt_t) : text(std::move(t)) {}
+    ToolOutput(std::string t, std::optional<mcp::tools::FileChange> c) : text(std::move(t)) {
+        if (c) changes.push_back(std::move(*c));
+    }
+    ToolOutput(std::string t, mcp::tools::FileChange c) : text(std::move(t)) {
+        changes.push_back(std::move(c));
+    }
 };
 
 using ExecResult = std::expected<ToolOutput, ToolError>;

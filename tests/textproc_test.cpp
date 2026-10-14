@@ -8,7 +8,7 @@
 #include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
-#include <mcp/tools/meta.hpp>
+#include <mcp/tools/toolset.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/cap/local.hpp>
 
@@ -85,7 +85,7 @@ TEST_CASE("textproc") {
         check(has(r.text, "Foo") && has(r.text, "Bar") &&
               has(r.text, "Baz") && has(r.text, "Baz"),
               "extract pulls each capture-group value");
-        check(read_effects(r).has(Effect::ReadFs), "extract is ReadFs");
+        check(r.effects.has(Effect::ReadFs), "extract is ReadFs");
     }
 
     // ── extract count: Foo appears twice, sorted desc ────────────────────
@@ -195,7 +195,7 @@ TEST_CASE("textproc") {
         a["apply"] = true;
         auto r = call(*provider, "replace", a);
         check(!r.is_error, "replace apply runs");
-        check(read_effects(r).has(Effect::WriteFs), "apply is WriteFs");
+        check(r.effects.has(Effect::WriteFs), "apply is WriteFs");
         check(has(rd(root / "src" / "a.ts"), "Qux") &&
               !has(rd(root / "src" / "a.ts"), "Foo"),
               "apply rewrites Foo→Qux on disk");
@@ -203,7 +203,7 @@ TEST_CASE("textproc") {
               "apply hits every matching file");
         // Multi-file diff-review feed: one FileChange per written file, each
         // with before/after (so the host can rebuild hunks + queue for review).
-        auto changes = mcp::tools::read_changes(r);
+        auto changes = r.changes;
         check(changes.size() == 2, "apply emits one change per written file");
         bool ca=false, cb=false;
         for (auto& ch : changes) {

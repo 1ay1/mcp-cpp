@@ -204,12 +204,12 @@ ExecResult run_start(const Call& call, const StartArgs& args, CallExec& exec) {
             text += "\n\nThe command finished cleanly (exit 0) before the "
                     "background settle window — its full output is above and no "
                     "session was kept. For commands that finish on their own, "
-                    "call `bash` instead of process_start; it's built for "
+                    "call `shell` instead of process_start; it's built for "
                     "one-shot runs and returns the output directly.";
         else
             text += "\n\nThe process is no longer running — no session was kept. "
                     "Fix the command and call process_start again, or run a "
-                    "one-shot command with bash instead.";
+                    "one-shot command with shell instead.";
         return ToolOutput{std::move(text), std::nullopt};
     }
 
@@ -233,7 +233,7 @@ std::expected<PollArgs, ToolError> parse_poll(const json& args) {
     util::ArgReader reader(args);
     auto id = reader.require_str("id");
     if (!id || id->empty()) return std::unexpected(ToolError::invalid_args("id is required"));
-    // wait_ms up to 300 s (matches the bash tool's max). A long block is safe:
+    // wait_ms up to 300 s (matches the shell tool's max). A long block is safe:
     // the host returns the instant output arrives OR the child exits, and
     // the wait is sliced so a cancel is noticed.
     return PollArgs{*id, std::clamp(reader.integer("max_chars", 30000), 1000, 100000),
@@ -310,7 +310,7 @@ json start_schema() {
         {"command", {{"type","string"}, {"description",
             "Shell command to run as a persistent background process (dev "
             "server, file watcher, log tail). For a command that finishes on "
-            "its own, use bash instead."}}},
+            "its own, use shell instead."}}},
         {"cwd", {{"type","string"}, {"description",
             "Working directory, relative to the workspace root (default: "
             "workspace root)."}}}

@@ -5,7 +5,7 @@
 #include <mcp/tools/native_files.hpp>
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
-#include <mcp/tools/meta.hpp>
+#include <mcp/tools/toolset.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/cap/local.hpp>
 
@@ -78,7 +78,7 @@ TEST_CASE("json_query") {
         auto r = q(".version");
         check(!r.is_error, ".version runs");
         check(has(r.text, "1.2.3"), ".version returns the value");
-        check(read_effects(r).has(Effect::ReadFs), "json_query is ReadFs");
+        check(r.effects.has(Effect::ReadFs), "json_query is ReadFs");
     }
     // raw string
     {

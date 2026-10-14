@@ -111,33 +111,10 @@ const std::vector<std::regex>& def_patterns() {
     return false;
 }
 
-struct Def {
-    std::string name;
-    int         line = 0;
-    std::string signature;   // the trimmed definition line
-    // Inbound references from OTHER files (filled in the linking pass) — how
-    // many distinct files mention this symbol. Drives both edge weight and
-    // the symbol-level rank used to pack the budget aider-style: a widely-
-    // referenced def in a mid-ranked file beats 20 trivial defs in a
-    // god-file.
-    int         inbound = 0;
-    double      rank = 0.0;  // this symbol's share of its file's PageRank
-};
-
-struct FileNode {
-    std::string      rel;      // workspace-relative path
-    std::vector<Def> defs;
-    // Names referenced in this file that are DEFINED in another file — the
-    // outbound edges, weighted by sqrt(#refs)/#definers. Filled in the
-    // linking pass.
-    std::unordered_map<std::uint32_t, double> out_edges;   // file idx → weight
-    double rank = 0.0;
-};
-
-struct RepoGraph {
-    std::vector<FileNode> files;
-    std::uint64_t         signature = 0;   // Σ(size+mtime) stat fingerprint
-};
+// The graph types are the tool state's (state.hpp): the cache lives there.
+using Def       = state::RepoDef;
+using FileNode  = state::RepoFile;
+using RepoGraph = state::RepoGraph;
 
 std::string trim(std::string_view s) {
     std::size_t b = 0, e = s.size();
@@ -215,25 +192,16 @@ bool is_nested_project_root(const FileSystem& files, const fs::path& dir) {
     return false;
 }
 
-// Build (or reuse) the def/ref graph for `root`. Guarded by the caller's
-// mutex. The cache holds up to kCacheSlots graphs keyed by root path, so
-// alternating between the workspace root and a `path=` subdir (or between
-// two projects in one session) doesn't force a full re-parse each call —
-// the single-slot cache it replaced thrashed to zero hit-rate the moment a
-// second root appeared. LRU eviction keeps the memory bounded.
-// Built graphs, kept in the tool state (ToolState::repo_graphs) so a repeat
-// call on an unchanged tree skips the parse. A few roots, least recently
-// used evicted.
-struct GraphCache {
-    struct Slot { std::string root; std::shared_ptr<const RepoGraph> graph; std::uint64_t seq = 0; };
-    std::vector<Slot> slots;
-    std::uint64_t     seq = 0;
-};
+// Build (or reuse) the def/ref graph for `root`. The cache holds up to
+// kCacheSlots graphs keyed by root path, so alternating between the
+// workspace root and a `path=` subdir (or two projects in one session)
+// doesn't force a full re-parse each call.
 constexpr std::size_t kCacheSlots = 4;
+using GraphCache = state::RepoGraphCache;
 
 GraphCache& graph_cache(ToolState& s) {
     if (!s.repo_graphs) s.repo_graphs = std::make_shared<GraphCache>();
-    return *static_cast<GraphCache*>(s.repo_graphs.get());
+    return *s.repo_graphs;
 }
 
 std::shared_ptr<const RepoGraph> build_graph(const Call& call, const fs::path& root,

@@ -9,7 +9,7 @@
 #include "tool_shell.hpp"
 
 #include <mcp/tools/host.hpp>
-#include <mcp/tools/meta.hpp>
+
 
 #include <algorithm>
 #include <string>

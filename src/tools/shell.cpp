@@ -478,7 +478,7 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
         try {
             auto scratch = exec.call().fs().scratch_dir();
             if (!scratch.empty()) {
-                auto dir = scratch / "agentty-bash";
+                auto dir = scratch / "shell-output";
                 std::error_code ec;
                 exec.call().fs().create_directories(dir, ec);
                 // Named by content: the same output lands in the same file,
@@ -675,19 +675,16 @@ void register_shell_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
     sh.add("shell",
 #ifdef _WIN32
         "Executes a shell command and returns its combined output. "
-        "Output is truncated at 30k chars. Use for builds, tests, git, etc. "
+        "Output is truncated at 30k chars. "
         "This runs under cmd.exe on Windows — use native equivalents like "
         "`dir`, `where`, `systeminfo`, `type`, `findstr`, or `powershell -c`. "
-        "Do NOT use POSIX-only commands (`uname`, `cat /etc/os-release`, "
-        "`sw_vers`, `ls`, `grep`, `sed`, `awk`, heredocs) — they will fail. "
-        "Do NOT use for file IO — use the write/edit/read tools instead.",
+        "POSIX-only commands (`uname`, `cat /etc/os-release`, `sw_vers`, `ls`, "
+        "`grep`, `sed`, `awk`, heredocs) will fail.",
 #else
         "Executes a shell command and returns its combined output. The "
         "command runs under the operating-system shell (POSIX /bin/sh on "
-        "Linux and macOS), NOT bash — keep commands portable and avoid "
-        "bashisms. Output is truncated at 30k chars. Use for builds, tests, "
-        "git, etc. Do NOT use for file IO — use the write/edit/read tools "
-        "instead (no cat/echo/sed/heredoc to create or modify files).",
+        "Linux and macOS), not bash — keep commands portable and avoid "
+        "bashisms. Output is truncated at 30k chars.",
 #endif
         bash_schema(), EffectSet{Effect::Exec},
         body_with<BashArgs>([exec](const Call& c, const BashArgs& a) {

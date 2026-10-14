@@ -23,6 +23,8 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -60,10 +62,23 @@ static std::string extract_id(const std::string& text) {
     return text.substr(pos, end - pos);
 }
 
+// The state, under a lock, the way a host that runs calls concurrently
+// (agentty: a maya::guarded) must provide it. SoleStateAccess does no
+// exclusion, so it is only for one call at a time.
+struct LockedStateAccess final : StateAccess {
+    ToolState  state;
+    std::mutex m;
+    void with(const std::function<void(ToolState&)>& f) override {
+        std::lock_guard lk(m);
+        f(state);
+    }
+};
+
 int main() {
     auto root = fs::temp_directory_path() / ("mcp_proc_test_" + std::to_string(::getpid()));
     fs::create_directories(root);
-    auto ws_state = mcp::test::state_at(root);
+    auto ws_state = std::make_shared<LockedStateAccess>();
+    ws_state->state.workspace_root = util::canonical_root(NativeFileSystem{}, root);
 
     HostServices svc;
 

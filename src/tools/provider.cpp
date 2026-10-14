@@ -11,11 +11,14 @@
 
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
-#include <mcp/tools/meta.hpp>
+
 #include <mcp/cap/local.hpp>
 
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace mcp::tools {
@@ -28,6 +31,44 @@ void register_skill_tool(Shells&, const std::shared_ptr<SkillResolver>&);
 void register_search_docs_tool(Shells&, const std::shared_ptr<DocRetriever>&);
 void register_search_code_tool(Shells&, const std::shared_ptr<DocRetriever>&);
 void register_task_tool(Shells&, const std::shared_ptr<SubagentRunner>&);
+
+// Every tool family, registered in one place. make_provider passes the
+// host's services; effects_for_builtin passes declare-only ones. A family
+// whose backend is null isn't registered: a tool the host can't serve is
+// absent, not present-and-failing.
+void register_all(Shells& shells, const HostServices& svc, ToolsetConfig cfg) {
+    register_memory_tools(shells, svc.memory);
+    register_todo_tool(shells, svc.todo);
+    register_skill_tool(shells, svc.skills);
+    register_search_docs_tool(shells, svc.retriever);
+    register_search_code_tool(shells, svc.code_retriever);
+    register_task_tool(shells, svc.subagent);
+
+    // Everything below reads or writes files, which only the host's
+    // FileSystem may do.
+    if (!svc.files) cfg.filesystem = cfg.shell = cfg.search = cfg.diagnostics = cfg.git = false;
+
+    if (cfg.filesystem) register_fs_tools(shells);
+    if (cfg.shell) {
+        register_shell_tools(shells, svc.exec);
+        register_process_tools(shells, svc.exec);
+    }
+    if (cfg.search) {
+        register_search_tools(shells, svc.exec);
+        register_structural_tools(shells, svc.code_retriever);
+        register_repo_map_tool(shells);
+    }
+    // Transforms have their own toggle so a minimal profile can drop them
+    // without losing grep/read; each still needs its base capability.
+    if (cfg.search && cfg.transforms)     register_textproc_tools(shells);
+    if (cfg.filesystem && cfg.transforms) register_data_tools(shells);
+    if (cfg.diagnostics) {
+        register_diagnostics_tool(shells, svc.exec);
+        register_test_tool(shells, svc.exec);
+    }
+    if (cfg.git) register_git_tools(shells, svc.exec);
+    if (cfg.web) register_web_tools(shells, svc.http, cfg.jina, svc.web_search_plan);
+}
 } // namespace detail
 
 namespace {
@@ -60,43 +101,7 @@ std::size_t Call::width() const noexcept {
 std::shared_ptr<mcp::cap::CapabilityProvider>
 make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
     detail::Shells shells(cfg);
-
-    // Host-coupled tools — registered only when their backend is present.
-    detail::register_memory_tools(shells, svc.memory);
-    detail::register_todo_tool(shells, svc.todo);
-    detail::register_skill_tool(shells, svc.skills);
-    detail::register_search_docs_tool(shells, svc.retriever);
-    detail::register_search_code_tool(shells, svc.code_retriever);
-    detail::register_task_tool(shells, svc.subagent);
-
-    // Everything below reads or writes files, which only the host's
-    // FileSystem may do. Without one, none of it is advertised: a tool the
-    // host can't serve is absent, not present-and-failing.
-    const bool disk = svc.files != nullptr;
-    if (!disk) { cfg.filesystem = cfg.shell = cfg.search = cfg.diagnostics = cfg.git = false; }
-
-    if (cfg.filesystem)  detail::register_fs_tools(shells);
-    // Exec-dependent families. Null exec ⇒ not advertised at all, the same
-    // rule register_web_tools follows for a null HttpClient: a tool the host
-    // cannot serve should be absent, not present-and-failing.
-    if (cfg.shell) {
-        detail::register_shell_tools(shells, svc.exec);
-        detail::register_process_tools(shells, svc.exec);
-    }
-    if (cfg.search)      detail::register_search_tools(shells, svc.exec);
-    if (cfg.search)      detail::register_structural_tools(shells, svc.code_retriever);
-    if (cfg.search)      detail::register_repo_map_tool(shells);
-    // Transform / aggregate / structured-data family — its own toggle so a
-    // minimal profile can drop it without losing grep/read (see
-    // ToolsetConfig::transforms). Each still needs its base capability.
-    if (cfg.search && cfg.transforms)      detail::register_textproc_tools(shells);
-    if (cfg.filesystem && cfg.transforms)  detail::register_data_tools(shells);
-    if (cfg.diagnostics) {
-        detail::register_diagnostics_tool(shells, svc.exec);
-        detail::register_test_tool(shells, svc.exec);
-    }
-    if (cfg.git)         detail::register_git_tools(shells, svc.exec);
-    if (cfg.web)         detail::register_web_tools(shells, svc.http, cfg.jina, svc.web_search_plan);
+    detail::register_all(shells, svc, cfg);
 
     auto provider = std::make_shared<mcp::cap::LocalProvider>(std::move(origin));
     const int default_budget = cfg.default_output_budget;
@@ -131,21 +136,29 @@ make_provider(HostServices svc, ToolsetConfig cfg, std::string origin) {
                     call.cancelled = [st = req.stop] { return st.stop_requested(); };
                 mcp::cap::Result r = handler(call, req.args);
                 if (!r.is_error) r.text = apply_budget(std::move(r.text), budget);
-                // The tool body (via lower()) may have put file change(s) in
-                // structured already; re-stamp effects WITHOUT dropping them.
-                // read_changes() returns the single `change` (edit/write/
-                // apply_patch) AND the `changes` array (multi-file replace);
-                // preserve both.
-                auto all = read_changes(r);
-                std::optional<FileChange> single;
-                std::vector<FileChange>   multi;
-                if (all.size() == 1) single = std::move(all.front());
-                else if (all.size() > 1) multi = std::move(all);
-                attach_meta(r, fx, single, multi);
+                // The tool's declaration, stamped by the one place that knows
+                // it. A body sets changes and images; it never sets effects.
+                r.effects = fx;
                 return r;
             });
     }
     return provider;
+}
+
+std::optional<EffectSet> effects_for_builtin(std::string_view name) {
+    // Read off the same registrations make_provider uses, so the policy, the
+    // scheduler and the tools can't disagree. The declare-only services are
+    // never called; they only make every family register.
+    static const auto table = [] {
+        ToolsetConfig all;
+        detail::Shells shells(all);
+        detail::register_all(shells, detail::declare_only_services(), all);
+        std::map<std::string, EffectSet, std::less<>> out;
+        for (const auto& s : shells.items()) out.emplace(s.tool.name, s.effects);
+        return out;
+    }();
+    if (auto it = table.find(name); it != table.end()) return it->second;
+    return std::nullopt;
 }
 
 } // namespace mcp::tools

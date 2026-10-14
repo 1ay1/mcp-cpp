@@ -42,6 +42,40 @@ struct Splitter;   // host.hpp
 
 namespace state {
 
+// repo_map's def/ref graph and its cache, kept in the tool state so a
+// repeat call on an unchanged tree skips the parse. Plain data: everything
+// the state reaches is visible here, so a host that guards the state can
+// check destroying it never waits on a thread.
+struct RepoDef {
+    std::string name;
+    int         line = 0;
+    std::string signature;   // the trimmed defining line (≤ ~120 chars)
+    int         inbound = 0; // distinct OTHER files referencing this name
+    double      rank = 0.0;  // this symbol's share of its file's PageRank
+};
+struct RepoFile {
+    std::string          rel;   // workspace-relative path
+    std::vector<RepoDef> defs;
+    // Names referenced here that are DEFINED in another file: outbound
+    // edges, weighted by sqrt(#refs)/#definers.
+    std::unordered_map<std::uint32_t, double> out_edges;   // file idx → weight
+    double rank = 0.0;
+};
+struct RepoGraph {
+    std::vector<RepoFile> files;
+    std::uint64_t         signature = 0;   // Σ(size+mtime) stat fingerprint
+};
+// A few built graphs keyed by root, least recently used evicted.
+struct RepoGraphCache {
+    struct Slot {
+        std::string                      root;
+        std::shared_ptr<const RepoGraph> graph;
+        std::uint64_t                    seq = 0;
+    };
+    std::vector<Slot> slots;
+    std::uint64_t     seq = 0;
+};
+
 // A file as a tool last saw it.
 struct FileSnapshot {
     std::filesystem::file_time_type mtime{};
@@ -78,6 +112,10 @@ struct ToolState {
     // What `~` in a path argument expands to. The host fills it ($HOME, or
     // %USERPROFILE% on Windows); empty leaves `~` literal.
     std::filesystem::path home;
+    // Appended to an out-of-workspace refusal: how THIS host lets a user
+    // widen the boundary ("pass --workspace <dir>"). Empty says nothing,
+    // since only the host knows its own flags.
+    std::string widen_hint;
 
     // `read`'s memory, keyed (reader, canonical path).
     std::map<std::pair<std::string, std::string>, state::ReadSeen> reads;
@@ -92,8 +130,8 @@ struct ToolState {
                   "to the host's Session");
     unsigned long long next_proc = 1;
 
-    // repo_map's built graphs, opaque to everyone else.
-    std::shared_ptr<void> repo_graphs;
+    // repo_map's built graphs (see state::RepoGraphCache).
+    std::shared_ptr<state::RepoGraphCache> repo_graphs;
 
     // Is ripgrep on the host's PATH? Probed once, on first need.
     std::optional<bool> have_rg;
