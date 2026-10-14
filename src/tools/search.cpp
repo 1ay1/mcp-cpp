@@ -930,7 +930,97 @@ std::string grep_no_match_hint(const GrepArgs& a) {
     return h;
 }
 
+ExecResult run_ripgrep(const GrepArgs& a, CallExec& exec);
+
+// files / count modes on rg: `--count-matches` prints `path:N` per file with
+// no line bodies, so every file is counted, not the first 500 matches.
+ExecResult run_ripgrep_counts(const GrepArgs& a, CallExec& exec) {
+    std::vector<std::string> argv = {"rg", "--count-matches", "--no-config",
+                                     "--with-filename", "--null"};
+    if (!a.case_sensitive) argv.push_back("-i");
+    if (a.word) argv.push_back("-w");
+    if (!a.literal && is_literal_pattern(a.pattern)) argv.push_back("-F");
+    if (a.pattern.find('\n') != std::string::npos || a.pattern.find("\\n") != std::string::npos)
+        argv.push_back("-U");
+    for (const auto& g : util::skip_dir_rg_globs()) argv.push_back(g);
+    if (!a.file_glob.empty()) { argv.push_back("-g"); argv.push_back(a.file_glob); }
+    argv.push_back("--");
+    argv.push_back(a.pattern);
+    argv.push_back(a.root.empty() ? std::string{"."} : a.root);
+
+    auto r = run_prog(exec, std::move(argv), std::chrono::seconds(60), 4 * 1024 * 1024);
+    if (!r.started)
+        return std::unexpected(ToolError::spawn("rg failed to start: " + r.start_error));
+    if (r.exit_code == 1) return ToolOutput{grep_no_match_hint(a), std::nullopt};
+    // Same plain-text retry as the content path.
+    if (r.exit_code == 2 && !a.literal
+        && (r.output.find("regex parse error") != std::string::npos
+            || r.output.find("is not allowed in a regex") != std::string::npos)) {
+        GrepArgs lit = a;
+        lit.pattern = literal_alternation(a.pattern);
+        lit.literal = true;
+        auto again = run_ripgrep_counts(lit, exec);
+        if (again) again->text = "[note: pattern isn't a valid regex, searched it as plain text]\n"
+                                 + std::move(again->text);
+        return again;
+    }
+
+    // `--null` puts a NUL after the path, so a ':' in a file name can't
+    // confuse the split: "path\0count\n".
+    struct Row { std::string path; long long n; };
+    std::vector<Row> rows;
+    long long total = 0;
+    std::string_view out = r.output;
+    while (!out.empty()) {
+        const auto nl = out.find('\n');
+        std::string_view line = out.substr(0, nl);
+        out = nl == std::string_view::npos ? std::string_view{} : out.substr(nl + 1);
+        const auto z = line.find('\0');
+        if (z == std::string_view::npos) continue;      // rg's own warnings
+        const long long n = std::strtoll(std::string{line.substr(z + 1)}.c_str(), nullptr, 10);
+        if (n <= 0) continue;
+        rows.push_back({std::string{line.substr(0, z)}, n});
+        total += n;
+    }
+    if (rows.empty()) {
+        if (r.exit_code != 0)
+            return std::unexpected(ToolError::subprocess(
+                "rg exited " + std::to_string(r.exit_code) + ":\n" + r.output.substr(0, 1024)));
+        return ToolOutput{grep_no_match_hint(a), std::nullopt};
+    }
+    std::ranges::sort(rows, [](const Row& x, const Row& y) {
+        return x.n != y.n ? x.n > y.n : x.path < y.path;
+    });
+
+    std::ostringstream o;
+    o << "Found " << total << " match" << (total == 1 ? "" : "es") << " across "
+      << rows.size() << " file" << (rows.size() == 1 ? "" : "s")
+      << (r.truncated ? " (output capped; there may be more)" : "") << ".\n\n";
+    constexpr std::size_t kMaxRows = 200;
+    std::size_t listed = 0;
+    for (const auto& f : rows) {
+        if (listed++ >= kMaxRows) {
+            o << "[" << (rows.size() - kMaxRows) << " more files — narrow with `glob` or `path`]\n";
+            break;
+        }
+        if (a.mode == GrepArgs::Mode::FilesOnly)
+            o << f.path << "  (" << f.n << (f.n == 1 ? " match)" : " matches)") << "\n";
+        else
+            o << f.n << "\t" << f.path << "\n";
+    }
+    std::string body = o.str();
+    if (!a.display_description.empty()) body = a.display_description + "\n" + body;
+    return ToolOutput{std::move(body), std::nullopt};
+}
+
 ExecResult run_ripgrep(const GrepArgs& a, CallExec& exec) {
+    // files / count: the question is "how widespread is X", so the answer
+    // must cover every file. The match stream below stops at kMaxScanned
+    // (500), which made 100 files x 200 hits read as "500+ across 3 files".
+    // rg counts per file itself, with no line bodies to carry. (`exclude`
+    // filters lines, which counting can't, so it keeps the stream.)
+    if (a.mode != GrepArgs::Mode::Content && a.exclude.empty())
+        return run_ripgrep_counts(a, exec);
     std::vector<std::string> argv = {"rg", "--json", "--no-config"};
     if (!a.case_sensitive) argv.push_back("-i");
     if (a.word) argv.push_back("-w");           // whole-word match

@@ -247,6 +247,10 @@ std::expected<ReadArgs, ToolError> check_read_args(ReadArgs a, const util::Bound
     const int default_limit = (anchored_start && !explicit_end) ? kPageWindow : 2000;
     int limit = a.limit_in.value_or(default_limit);
     // end_line is a POSITION: the window is [offset, end_line].
+    if (a.end_line && *a.end_line > 0 && offset > 0 && *a.end_line < offset)
+        return std::unexpected(ToolError::invalid_args(std::format(
+            "end_line {} is before start_line {}; give the lower line first "
+            "(start_line: {}, end_line: {})", *a.end_line, offset, *a.end_line, offset)));
     if (a.end_line && *a.end_line >= offset) limit = *a.end_line - offset + 1;
     if (limit <= 0) limit = default_limit;
 
