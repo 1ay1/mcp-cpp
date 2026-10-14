@@ -11,6 +11,7 @@
 
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/bash_validate.hpp>
+#include <mcp/tools/util/shell_detour.hpp>
 #include <mcp/tools/util/shellx.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/tools/util/error.hpp>

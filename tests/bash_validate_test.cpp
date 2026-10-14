@@ -17,6 +17,7 @@
 static int g_failures = 0;
 
 #include <mcp/tools/util/bash_validate.hpp>
+#include <mcp/tools/util/shell_detour.hpp>
 
 #include <cstdio>
 #include <string>
