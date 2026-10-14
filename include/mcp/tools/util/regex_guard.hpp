@@ -22,6 +22,9 @@
 #define MCP_TOOLS_UTIL_REGEX_GUARD_HPP
 
 #include <cstddef>
+#include <expected>
+#include <regex>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -56,6 +59,32 @@ namespace mcp::tools::util {
         }
     }
     return false;
+}
+
+// libstdc++ compiles and matches a regex by recursion, about one stack frame
+// per pattern element, so a long enough pattern overflows the stack and
+// kills the process (a 200 KB literal does, on an 8 MB stack). No real
+// search needs more than this.
+inline constexpr std::size_t kMaxRegexBytes = 4096;
+
+// Compile a regex the model wrote: length-capped, ReDoS-guarded, and with
+// std::regex_error turned into a sentence. `what` names the argument.
+[[nodiscard]] inline std::expected<std::regex, std::string>
+compile_model_regex(std::string_view pattern, std::regex::flag_type flags,
+                    std::string_view what = "pattern") {
+    if (pattern.size() > kMaxRegexBytes)
+        return std::unexpected(std::string{what} + " is too long for a regex (" +
+                               std::to_string(pattern.size()) + " bytes, max " +
+                               std::to_string(kMaxRegexBytes) + ")");
+    if (has_nested_quantifier(pattern))
+        return std::unexpected(std::string{what} + " has a nested unbounded quantifier "
+                               "like (a+)+, which can take forever to match; "
+                               "flatten it (a+)");
+    try {
+        return std::regex(std::string{pattern}, flags);
+    } catch (const std::regex_error& e) {
+        return std::unexpected(std::string{what} + " is not a valid regex (" + e.what() + ")");
+    }
 }
 
 } // namespace mcp::tools::util

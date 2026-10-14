@@ -105,6 +105,13 @@ hardened_git_argv(const std::vector<std::string>& argv) {
     ExecRequest req;
     if (!argv.empty())
         req.program = {argv.front(), {argv.begin() + 1, argv.end()}};
+    // Non-interactive, whatever the user's shell exports. GIT_EDITOR and
+    // GIT_SEQUENCE_EDITOR beat `-c core.editor`, so a user with
+    // GIT_EDITOR=vim had rebase --continue open vim with no tty and hang
+    // until the idle timeout. `true` accepts the prepared message.
+    req.env = {{"GIT_EDITOR", "true"}, {"GIT_SEQUENCE_EDITOR", "true"},
+               {"GIT_PAGER", "cat"}, {"PAGER", "cat"},
+               {"GIT_TERMINAL_PROMPT", "0"}, {"GIT_MERGE_AUTOEDIT", "no"}};
     req.budgets.idle     = timeout;
     req.max_output_bytes = max_bytes;
     const auto res = exec.run(req);
@@ -986,6 +993,15 @@ std::expected<GitBranchArgs, ToolError> check_git_branch(GitBranchArgs a, const 
         if (name.find_first_of(" \t\n") != std::string::npos)
             return std::unexpected(ToolError::invalid_args(
                 "branch name may not contain whitespace: '" + name + "'"));
+    }
+    // start_point goes into argv after the name; a leading '-' would be read
+    // as an option (`--upload-pack=...` reached git before this).
+    if (!a.start_point.empty()) {
+        if (auto v = validate_ref(a.start_point); !v)
+            return std::unexpected(std::move(v.error()));
+        if (a.start_point.find_first_of(" \t\n") != std::string::npos)
+            return std::unexpected(ToolError::invalid_args(
+                "start_point may not contain whitespace: '" + a.start_point + "'"));
     }
     return a;
 }

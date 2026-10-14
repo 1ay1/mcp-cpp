@@ -97,4 +97,11 @@ if(PYTHON3_EXECUTABLE)
                 ${CMAKE_CURRENT_SOURCE_DIR}/../evals/run.py)
     set_tests_properties(tool_evals PROPERTIES
         ENVIRONMENT "AGENTTY_EVAL_SERVER=$<TARGET_FILE:mcp_eval_server>")
+    # The bytes on disk after edit / apply_patch / write / replace: line
+    # endings, BOM, batch semantics, ReDoS guards. Seconds to run.
+    add_test(NAME edit_cases
+        COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/edit_cases.py
+                $<TARGET_FILE:mcp_eval_server>)
+    # tool_probe.py (hostile arguments at every tool) takes ~10 minutes and
+    # is run by hand: python3 tests/tool_probe.py <mcp_eval_server> [tool]
 endif()

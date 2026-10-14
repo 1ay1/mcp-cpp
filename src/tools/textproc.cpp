@@ -163,6 +163,11 @@ using util::has_nested_quantifier;
 compile_pattern(const std::string& pattern, bool case_sensitive, bool word) {
     const bool literal = !word && is_literal_pattern(pattern);
     if (literal) return std::optional<std::regex>{std::nullopt};
+    if (pattern.size() > util::kMaxRegexBytes)
+        return std::unexpected(ToolError::invalid_regex(std::format(
+            "regex is too long ({} bytes, max {}): libstdc++ compiles it by "
+            "recursion and a long one overflows the stack. Search for a shorter "
+            "distinctive piece.", pattern.size(), util::kMaxRegexBytes)));
     if (has_nested_quantifier(pattern))
         return std::unexpected(ToolError::invalid_regex(
             "regex '" + pattern + "' has a nested unbounded quantifier (e.g. "
@@ -736,11 +741,9 @@ ExecResult run_replace(const Call& call, const ReplaceArgs& a) {
     if (a.regex) {
         auto flags = std::regex::ECMAScript | std::regex::optimize;
         if (!a.case_sensitive) flags |= std::regex::icase;
-        try { re.emplace(a.find, flags); }
-        catch (const std::regex_error& e) {
-            return std::unexpected(ToolError::invalid_regex(
-                "invalid regex '" + a.find + "': " + e.what()));
-        }
+        auto compiled = util::compile_model_regex(a.find, flags, "find");
+        if (!compiled) return std::unexpected(ToolError::invalid_regex(std::move(compiled.error())));
+        re.emplace(std::move(*compiled));
     }
 
     auto files = collect_files(call.fs(), root, a.file_glob);

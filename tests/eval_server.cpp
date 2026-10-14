@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
                 json tj = json::object();
                 tj["name"] = t.name;
                 tj["description"] = t.description.value_or("");
+                tj["inputSchema"] = mcp::to_json(t.inputSchema);
                 arr.push_back(std::move(tj));
             }
             reply(id, json{{"tools", std::move(arr)}});

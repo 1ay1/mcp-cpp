@@ -266,8 +266,12 @@ ExecResult run_json_query(const Call& call, const QueryArgs& a) {
     json doc;
     try { doc = json::parse(text); }
     catch (const json::parse_error& e) {
-        return std::unexpected(ToolError::invalid_args(
-            std::string("not valid JSON: ") + e.what()));
+        // nlohmann's what() is "[json.exception.parse_error.101] parse error at
+        // line 1, column 4: syntax error ..."; keep the useful middle.
+        std::string why = e.what();
+        if (auto p = why.find("] "); p != std::string::npos) why.erase(0, p + 2);
+        if (text.starts_with("\xEF\xBB\xBF")) why += " (the file starts with a UTF-8 BOM)";
+        return std::unexpected(ToolError::invalid_args("not valid JSON: " + why));
     }
 
     std::string perr;

@@ -184,6 +184,26 @@ const util::ArgSpec<FindDefinitionArgs> kFindDefinitionArgs{
     util::arg(&FindDefinitionArgs::root, "path", "Directory to search (default: cwd)"),
 };
 
+// A symbol is a name, maybe qualified (ns::name, obj.name). Checked here so
+// it can't reach the regexes below as something else: a 200 KB "symbol"
+// overflowed std::regex's recursive compiler and killed the process.
+std::expected<FindDefinitionArgs, ToolError>
+check_find_definition_args(FindDefinitionArgs a, const util::Bounds&) {
+    auto& s = a.symbol;
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+    if (s.empty())
+        return std::unexpected(ToolError::invalid_args("`symbol` is required (a name like parse_args)"));
+    if (s.size() > 256)
+        return std::unexpected(ToolError::invalid_args(
+            "`symbol` is too long for a name (" + std::to_string(s.size()) + " bytes, max 256)"));
+    for (unsigned char c : s)
+        if (c < 0x20 || c == 0x7f)
+            return std::unexpected(ToolError::invalid_args(
+                "`symbol` must be a single name, without newlines or control characters"));
+    return a;
+}
+
 // Run a program through the host. Shaped like SubprocessResult so the
 // parsing below is untouched; `stop_when` is forwarded because only this
 // file knows when it has seen enough matches.
@@ -447,16 +467,15 @@ std::expected<GrepArgs, ToolError> check_grep(GrepArgs g, const util::Bounds&) {
     else if (o == "count") g.mode = GrepArgs::Mode::Count;
     // A bad exclude regex is a caller error, not a silent no-op.
     if (!g.exclude.empty()) {
-        if (util::has_nested_quantifier(g.exclude))
-            return std::unexpected(ToolError::invalid_args(
-                "exclude has a nested unbounded quantifier (e.g. (a+)+) that "
-                "can cause catastrophic backtracking; rewrite it."));
-        try { std::regex probe{g.exclude}; (void)probe; }
-        catch (const std::regex_error&) {
-            return std::unexpected(ToolError::invalid_args(
-                "exclude is not a valid regex (ECMAScript): " + g.exclude));
-        }
+        if (auto ok = util::compile_model_regex(g.exclude, std::regex::ECMAScript, "exclude"); !ok)
+            return std::unexpected(ToolError::invalid_args(std::move(ok.error())));
     }
+    // The builtin scanner compiles the pattern with std::regex, whose
+    // compiler recurses per element: same cap as every other model regex.
+    if (g.pattern.size() > util::kMaxRegexBytes)
+        return std::unexpected(ToolError::invalid_args(std::format(
+            "pattern is too long ({} bytes, max {}). Search for a shorter, "
+            "distinctive piece of it.", g.pattern.size(), util::kMaxRegexBytes)));
     return g;
 }
 
@@ -1513,7 +1532,7 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "To find USES of a symbol, use `grep` with word=true; for calls with a "
         "specific shape use `search_structural`.",
         kFindDefinitionArgs.schema(), EffectSet{Effect::ReadFs},
-        body<FindDefinitionArgs>([exec](const Call& c, const FindDefinitionArgs& a) { CallExec ce{*exec, c}; return run_find_definition(c, a, ce); }, kFindDefinitionArgs), 25'000);
+        body<FindDefinitionArgs>([exec](const Call& c, const FindDefinitionArgs& a) { CallExec ce{*exec, c}; return run_find_definition(c, a, ce); }, kFindDefinitionArgs, check_find_definition_args), 25'000);
 }
 
 } // namespace mcp::tools::detail

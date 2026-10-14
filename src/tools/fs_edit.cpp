@@ -8,6 +8,7 @@
 #include "tool_shell.hpp"
 #include "call_state.hpp"
 #include "tool_body.hpp"
+#include <mcp/tools/util/regex_guard.hpp>
 #include "diff.hpp"
 
 #include <mcp/tools/util/arg_reader.hpp>
@@ -391,14 +392,12 @@ int apply_one(std::string& buf, const OneEdit& e,
     // replace_all is an error, not a silent first-hit edit).
     // expected_replacements still enforces an exact count.
     if (e.regex) {
-        std::regex re;
-        try {
-            re.assign(e.old_text,
-                      std::regex::ECMAScript | std::regex::multiline);
-        } catch (const std::regex_error& ex) {
-            err = std::format("invalid regex in old_text: {}", ex.what());
-            return 0;
-        }
+        // Guarded: length cap (the compiler recurses) and no nested unbounded
+        // quantifier like (a+)+, which std::regex can take forever on.
+        auto compiled = util::compile_model_regex(
+            e.old_text, std::regex::ECMAScript | std::regex::multiline, "old_text");
+        if (!compiled) { err = std::move(compiled.error()); return 0; }
+        std::regex re = std::move(*compiled);
         // Count matches first (also powers the uniqueness + expected gates).
         // The whole match+replace runs inside a try: std::regex can throw
         // error_complexity/error_stack AT MATCH TIME on catastrophic
@@ -849,6 +848,9 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
         const auto& ed = edit_at(i);
         if (ed.old_text == ed.new_text) { ++skipped_noop; continue; }
         std::string err;
+        // apply_one rewrites `updated` in place; keep the bytes from before
+        // so an edit that fails its count can be undone exactly.
+        std::string before_this = updated;
         int n = apply_one(updated, ed, a.path->string(), err);
         if (n == kIdempotentNoOp) {
             ++idempotent;
@@ -858,14 +860,14 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
         bool count_mismatch =
             (n > 0 && ed.expected_replacements > 0 && n != ed.expected_replacements);
         if (count_mismatch) {
-            updated = original;
-            for (const auto& prior : outcomes) {
-                if (prior.applied <= 0) continue;
-                std::string tmp_err;
-                (void)apply_one(updated, edit_at(prior.index), a.path->string(), tmp_err);
-            }
-            outcomes.push_back({i, n, true, std::format(
-                "expected_replacements={} but matched {} occurrence(s)",
+            // Undo exactly this edit. Recorded as FAILED (applied 0) so it
+            // is counted and reported; it used to keep its match count, which
+            // hid it from both the failure count and the message. (The undo
+            // used to re-run the earlier edits' matchers on the original,
+            // which could land them somewhere else.)
+            updated = std::move(before_this);
+            outcomes.push_back({i, 0, true, std::format(
+                "expected_replacements={} but matched {} occurrence(s); not applied",
                 ed.expected_replacements, n)});
             continue;
         }
@@ -1258,6 +1260,25 @@ ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
     struct Span { std::size_t pos, len; std::string replacement; int hunk; };
     std::vector<Span> spans;
     spans.reserve(hunks.size());
+    // A CRLF file keeps CRLF: the patch's lines are \n-terminated, so give the
+    // hunks the file's endings before matching. Otherwise the fuzzy match
+    // still lands but splices bare \n lines into a \r\n file.
+    const bool file_crlf = [&] {
+        const auto nl = original.find('\n');
+        return nl != std::string::npos && nl > 0 && original[nl - 1] == '\r';
+    }();
+    if (file_crlf) {
+        const auto to_crlf = [](const std::string& s) {
+            std::string out;
+            out.reserve(s.size() + s.size() / 40);
+            for (std::size_t k = 0; k < s.size(); ++k) {
+                if (s[k] == '\n' && (k == 0 || s[k - 1] != '\r')) out.push_back('\r');
+                out.push_back(s[k]);
+            }
+            return out;
+        };
+        for (auto& h : hunks) { h.before = to_crlf(h.before); h.after = to_crlf(h.after); }
+    }
     for (const auto& h : hunks) {
         // A pure-insertion hunk (no `before`) has nothing to fuzzy-match;
         // reject rather than guess a location.
