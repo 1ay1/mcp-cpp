@@ -105,6 +105,25 @@ template <class Args, class Run, class P>
     return call.files ? detail::bounds(call) : util::Bounds{};
 }
 
+// A tool whose runner builds its own cap::Result (the host-coupled tools:
+// todo, skill, task...). The spec is shared, so it can be built at
+// registration time (a memory store's scopes, a runner's agent types).
+template <class A>
+[[nodiscard]] std::shared_ptr<const util::ArgSpec<A>> share(util::ArgSpec<A> s) {
+    return std::make_shared<const util::ArgSpec<A>>(std::move(s));
+}
+template <class Args, class Run>
+[[nodiscard]] auto spec_body(std::shared_ptr<const util::ArgSpec<Args>> spec, Run run) {
+    return [spec = std::move(spec), run = std::move(run)](const Call& call, const Json& j) mutable
+               -> mcp::cap::Result {
+        auto parsed = spec->decode(j);
+        // Host tools word their errors as plain text ("skill: `name` is required.").
+        if (!parsed) return mcp::cap::Result::error(parsed.error().detail);
+        if constexpr (std::invocable<Run&, const Call&, const Args&>) return run(call, *parsed);
+        else return run(*parsed);
+    };
+}
+
 template <class Args, class Run>
 [[nodiscard]] auto body(Run run, const util::ArgSpec<Args>& spec) {
     return [run = std::move(run), &spec](const Call& call, const Json& j) mutable -> mcp::cap::Result {
