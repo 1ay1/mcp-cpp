@@ -55,7 +55,7 @@ struct NoHttp final : HttpClient {
 };
 struct NoExec final : Exec {
     ExecResult run(const Call&, const ExecRequest&) override { never("Exec"); }
-    std::expected<std::shared_ptr<Session>, std::string> start(const ExecRequest&) override {
+    std::expected<std::shared_ptr<Session>, std::string> start(const Call&, const ExecRequest&) override {
         never("Exec");
     }
     bool stops_whole_tree() const noexcept override { return false; }

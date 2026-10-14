@@ -137,7 +137,7 @@ struct PopenExec final : tools::Exec {
         }
         return out;
     }
-    std::expected<std::shared_ptr<tools::Session>, std::string> start(const tools::ExecRequest& r) override {
+    std::expected<std::shared_ptr<tools::Session>, std::string> start(const tools::Call&, const tools::ExecRequest& r) override {
         int fds[2];
         if (::pipe(fds) != 0) return std::unexpected(std::string{"pipe failed"});
         const pid_t pid = ::fork();

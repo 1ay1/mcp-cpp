@@ -459,9 +459,10 @@ struct Exec {
     /// Start one and come back for it later. Same request type, because it
     /// is the same question asked with a different lifetime -- budgets still
     /// apply, and a session that goes silent past its idle budget is as dead
-    /// as a command that does.
+    /// as a command that does. `call` is the one that started it: its scope
+    /// (extra roots) bounds the program as it does for run().
     [[nodiscard]] virtual std::expected<std::shared_ptr<Session>, std::string>
-    start(const ExecRequest&) = 0;
+    start(const Call& call, const ExecRequest&) = 0;
 
     /// Can the host stop a whole process tree, or only the leader? A tool
     /// that reports what confinement is in force needs to ask rather than
@@ -478,7 +479,7 @@ public:
     CallExec(Exec& exec, const Call& call) noexcept : exec_(&exec), call_(&call) {}
     [[nodiscard]] ExecResult run(const ExecRequest& r) { return exec_->run(*call_, r); }
     [[nodiscard]] std::expected<std::shared_ptr<Session>, std::string>
-    start(const ExecRequest& r) { return exec_->start(r); }
+    start(const ExecRequest& r) { return exec_->start(*call_, r); }
     [[nodiscard]] bool stops_whole_tree() const noexcept { return exec_->stops_whole_tree(); }
     [[nodiscard]] const Call& call() const noexcept { return *call_; }
 private:
