@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <vector>
 #include <unistd.h>
 
 using namespace mcp::tools;
@@ -268,6 +269,112 @@ int main() {
         CHECK(contains(pr.text, "delayed-line"));   // got the output
         CHECK(elapsed < 5000);                        // returned when it arrived, not at the deadline
         std::puts("large wait_ms early-return: ok");
+    }
+
+    // ── 8. two polls on one id at once get disjoint output ──────────────────────
+    //    The old design had a shared rolling buffer and a cursor that two
+    //    calls could both read before either advanced it. Each line must be
+    //    returned exactly once across the two pollers.
+    {
+        mcp::Json a = mcp::Json::object();
+        a["command"] = "i=0; while [ $i -lt 400 ]; do echo L$i; i=$((i+1)); sleep 0.002; done";
+        auto r = call(*provider, "process_start", a);
+        CHECK(!r.is_error);
+        auto id = extract_id(r.text);
+        CHECK(!id.empty());
+        std::string seen_a, seen_b;
+        auto poller = [&](std::string& out) {
+            for (int k = 0; k < 2000; ++k) {
+                mcp::Json p = mcp::Json::object();
+                p["id"] = id; p["wait_ms"] = 50;
+                auto pr = call(*provider, "process_poll", p);
+                if (pr.is_error) break;
+                out += pr.text + "\n";
+                if (contains(pr.text, "exited")) break;
+            }
+        };
+        std::thread t1(poller, std::ref(seen_a)), t2(poller, std::ref(seen_b));
+        t1.join(); t2.join();
+        int dup = 0, missing = 0;
+        for (int i = 0; i < 400; ++i) {
+            const std::string line = "\nL" + std::to_string(i) + "\n";
+            const bool in_a = ("\n" + seen_a).find(line) != std::string::npos;
+            const bool in_b = ("\n" + seen_b).find(line) != std::string::npos;
+            if (in_a && in_b) ++dup;
+            if (!in_a && !in_b) ++missing;
+        }
+        // Only the first lines may be missing: process_start's settle window
+        // takes them. Every other line is returned exactly once.
+        CHECK(dup == 0);
+        CHECK(missing < 100);
+        if (missing >= 100 || dup)
+            std::fprintf(stderr, "dup=%d missing=%d\n", dup, missing);
+        mcp::Json s = mcp::Json::object(); s["id"] = id;
+        (void)call(*provider, "process_stop", s);
+        std::puts("concurrent polls disjoint: ok");
+    }
+
+    // ── 9. poll and stop racing on one id ──────────────────────────────────────
+    //    Either order is fine; neither may crash, hang, or leave the id half
+    //    alive. After both, the id is gone.
+    for (int round = 0; round < 8; ++round) {
+        mcp::Json a = mcp::Json::object();
+        a["command"] = "while :; do echo tick; sleep 0.01; done";
+        auto r = call(*provider, "process_start", a);
+        CHECK(!r.is_error);
+        auto id = extract_id(r.text);
+        std::thread poll_t([&] {
+            mcp::Json p = mcp::Json::object();
+            p["id"] = id; p["wait_ms"] = 200;
+            (void)call(*provider, "process_poll", p);
+        });
+        std::thread stop_t([&] {
+            mcp::Json s = mcp::Json::object(); s["id"] = id;
+            (void)call(*provider, "process_stop", s);
+        });
+        poll_t.join(); stop_t.join();
+        mcp::Json p = mcp::Json::object(); p["id"] = id;
+        CHECK(call(*provider, "process_poll", p).is_error);   // gone
+    }
+    std::puts("poll/stop race: ok");
+
+    // ── 10. stop is quick, even for a program that ignores SIGTERM ────────────
+    {
+        mcp::Json a = mcp::Json::object();
+        a["command"] = "trap '' TERM; while :; do sleep 0.05; done";
+        auto r = call(*provider, "process_start", a);
+        CHECK(!r.is_error);
+        auto id = extract_id(r.text);
+        const auto t0 = std::chrono::steady_clock::now();
+        mcp::Json s = mcp::Json::object(); s["id"] = id;
+        auto sr = call(*provider, "process_stop", s);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        CHECK(!sr.is_error);
+        CHECK(ms < 5000);   // bounded by the TERM->KILL grace, never a hang
+        std::puts("stop bounded: ok");
+    }
+
+    // ── 11. many sessions started and dropped while others poll ──────────────
+    {
+        std::vector<std::thread> ts;
+        for (int t = 0; t < 4; ++t)
+            ts.emplace_back([&] {
+                for (int k = 0; k < 6; ++k) {
+                    mcp::Json a = mcp::Json::object();
+                    a["command"] = "echo x; sleep 0.5";
+                    auto r = call(*provider, "process_start", a);
+                    auto id = extract_id(r.text);
+                    if (id.empty()) continue;
+                    mcp::Json p = mcp::Json::object();
+                    p["id"] = id; p["wait_ms"] = 20;
+                    (void)call(*provider, "process_poll", p);
+                    mcp::Json s = mcp::Json::object(); s["id"] = id;
+                    (void)call(*provider, "process_stop", s);
+                }
+            });
+        for (auto& t : ts) t.join();
+        std::puts("many sessions: ok");
     }
 
     fs::remove_all(root);

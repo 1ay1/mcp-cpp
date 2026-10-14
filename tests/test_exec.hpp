@@ -9,6 +9,7 @@
 
 #include <mcp/tools/host.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -23,8 +24,11 @@
 
 namespace mcp::test {
 
-// A background child: a thread reads its merged output until EOF; poll()
-// hands out what arrived and waits up to `wait` for more.
+// A background child for tests. A reader thread drains the pipe into one
+// rolling buffer; read() hands out what's new past the caller-visible
+// cursor. stop() only signals; the reader and a reaper finish on their own,
+// and the destructor joins them (tests own their threads; it's bounded by
+// the SIGKILL).
 class BgSession final : public tools::Session {
 public:
     BgSession(pid_t pid, int fd) : pid_(pid), fd_(fd), started_(std::chrono::steady_clock::now()) {
@@ -34,70 +38,68 @@ public:
                 const auto n = ::read(fd_, buf, sizeof buf);
                 std::lock_guard lk(mu_);
                 if (n <= 0) { eof_ = true; cv_.notify_all(); return; }
-                pending_.append(buf, static_cast<std::size_t>(n));
+                buf_.append(buf, static_cast<std::size_t>(n));
+                if (buf_.size() > kWindow) {
+                    const auto cut = buf_.size() - kWindow;
+                    buf_.erase(0, cut);
+                    base_ += cut;
+                }
                 cv_.notify_all();
             }
+        });
+        reaper_ = std::thread([this] {
+            int st = 0;
+            ::waitpid(pid_, &st, 0);
+            std::lock_guard lk(mu_);
+            exited_ = true;
+            if (WIFEXITED(st)) outcome_ = tools::Exited{WEXITSTATUS(st)};
+            else               outcome_ = tools::Signalled{WIFSIGNALED(st) ? WTERMSIG(st) : 0};
+            cv_.notify_all();
         });
     }
     ~BgSession() override {
         stop();
+        if (reaper_.joinable()) reaper_.join();
         if (reader_.joinable()) reader_.join();
         ::close(fd_);
     }
-    Update poll(std::chrono::milliseconds wait) override {
-        // Keep gathering until the child exits or the window ends. Returning
-        // on the first output raced the exit: `echo x; exit 7` prints, then
-        // dies a moment later, and the caller saw it still running. Not
-        // waiting for EOF: a backgrounded grandchild can hold the pipe open.
+    Read read(std::chrono::milliseconds wait, std::size_t max) override {
         std::unique_lock lk(mu_);
-        const auto until = std::chrono::steady_clock::now() + wait;
-        for (;;) {
-            reap_locked();
-            if (exited_) {
-                // Let the reader drain what the child wrote before it died.
-                cv_.wait_for(lk, std::chrono::milliseconds{20}, [&] { return eof_; });
-                break;
-            }
-            if (cv_.wait_until(lk, until) == std::cv_status::timeout) { reap_locked(); break; }
-        }
-        Update u;
-        u.output = std::exchange(pending_, {});
-        u.running = !exited_;
-        if (exited_ && eof_ && !reported_) { u.outcome = outcome_; reported_ = true; }
-        u.uptime = std::chrono::duration_cast<std::chrono::seconds>(
+        const auto fresh = [&] { return base_ + buf_.size() > seen_; };
+        cv_.wait_for(lk, wait, [&] { return fresh() || exited_; });
+        // After the exit, give the reader a beat to drain what was written
+        // just before it (the dying-breath tail).
+        if (exited_ && !eof_) cv_.wait_for(lk, std::chrono::milliseconds{20}, [&] { return eof_; });
+        Read r;
+        const auto end = base_ + buf_.size();
+        auto from = std::max(seen_, base_);
+        r.dropped = from - seen_;
+        if (end - from > max) { r.dropped += (end - from) - max; from = end - max; }
+        r.output  = buf_.substr(from - base_, end - from);
+        seen_     = end;
+        r.running = !exited_;
+        r.eof     = eof_;
+        if (exited_) r.outcome = outcome_;
+        r.uptime  = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - started_);
-        return u;
+        return r;
     }
-    void stop() override {
+    void stop() noexcept override {
         std::lock_guard lk(mu_);
-        reap_locked();
-        if (!exited_) {
-            ::kill(-pid_, SIGKILL);
-            int st = 0;
-            ::waitpid(pid_, &st, 0);
-            exited_ = true;
-            outcome_ = tools::Signalled{SIGKILL};
-        }
+        if (!exited_) ::kill(-pid_, SIGKILL);
     }
 private:
-    void reap_locked() {
-        if (exited_) return;
-        int st = 0;
-        if (::waitpid(pid_, &st, WNOHANG) == pid_) {
-            exited_ = true;
-            if (WIFEXITED(st)) outcome_ = tools::Exited{WEXITSTATUS(st)};
-            else               outcome_ = tools::Signalled{WIFSIGNALED(st) ? WTERMSIG(st) : 0};
-        }
-    }
+    static constexpr std::size_t kWindow = 128 * 1024;
     pid_t pid_;
     int   fd_;
     std::chrono::steady_clock::time_point started_;
     std::mutex              mu_;
     std::condition_variable cv_;
-    std::string             pending_;
-    bool eof_ = false, exited_ = false, reported_ = false;
+    std::string             buf_;
+    std::size_t base_ = 0, seen_ = 0;
+    bool eof_ = false, exited_ = false;
     tools::ExecOutcome outcome_ = tools::Exited{0};
-    std::thread reader_;
+    std::thread reader_, reaper_;
 };
 
 struct PopenExec final : tools::Exec {

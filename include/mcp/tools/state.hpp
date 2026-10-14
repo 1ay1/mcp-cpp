@@ -58,20 +58,14 @@ struct ReadSeen {
     std::string content;      // the bytes served
 };
 
-// A background process started by process_start.
+// A background process started by process_start. Immutable once it is in
+// the map: everything that changes (output, cursor, exit) lives in the
+// host's Session, which is thread-safe by contract. So a tool can take the
+// entry out of the map and use it without holding the state.
 struct Proc {
-    std::string id;
-    std::string command;
-    std::shared_ptr<tools::Session>       proc;
-    std::string                           output;          // rolling window
-    std::size_t                           output_base = 0; // offset of output[0]
-    std::size_t                           delivered = 0;   // read up to here
-    std::size_t                           dropped_unseen = 0;
-    std::optional<int>                    exit_code;
-    std::chrono::seconds                  uptime{0};   // as the host last reported
-    bool                                  running = true;
-    bool                                  stopped = false;
-    bool                                  eof = false;      // no more output will come
+    std::string                           id;
+    std::string                           command;
+    std::shared_ptr<tools::Session>       session;
 };
 
 }  // namespace state
@@ -90,8 +84,12 @@ struct ToolState {
     // The last snapshot of every file read or written, keyed by canonical path.
     std::unordered_map<std::string, state::FileSnapshot> files;
 
-    // process_start's sessions.
-    std::unordered_map<std::string, std::shared_ptr<state::Proc>> procs;
+    // process_start's sessions. Entries are const: a tool takes one out and
+    // drops the state before talking to its Session.
+    std::unordered_map<std::string, std::shared_ptr<const state::Proc>> procs;
+    static_assert(std::is_const_v<decltype(procs)::mapped_type::element_type>,
+                  "a Proc in the map is immutable; mutable process state belongs "
+                  "to the host's Session");
     unsigned long long next_proc = 1;
 
     // repo_map's built graphs, opaque to everyone else.

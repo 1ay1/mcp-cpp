@@ -389,31 +389,47 @@ struct ExecResult {
 /// A program that outlives the call which started it: a dev server, a file
 /// watcher, a log tail.
 ///
-/// The tool layer used to own these -- a thread per session draining a pipe
-/// into a buffer, two mutexes guarding it, and a global map of them. That is
-/// concurrency, which is the host's, and it was the last of it in here.
+/// The host's Session is the ONLY owner of everything about the program: the
+/// process, the pipe, the output buffer and the read cursor. The tool layer
+/// keeps nothing but the handle, so there is one copy of the output and one
+/// place that decides what has been seen.
+///
+/// Contract (every host must meet it; process_tools_test checks it):
+///   * read() and stop() are safe from any thread, at the same time.
+///   * Two concurrent read()s get disjoint output: each byte is returned at
+///     most once.
+///   * read() blocks at most `wait`. stop() and the destructor never block.
+///     Dropping the last handle stops the program; the host reaps it in the
+///     background.
 struct Session {
     virtual ~Session() = default;
 
-    struct Update {
-        /// Produced since the previous poll. Empty is normal and means
-        /// "nothing new", not "finished" -- check `running` for that.
+    struct Read {
+        /// New since the previous read, at most `max` bytes (the newest).
+        /// Empty is normal and means "nothing new", not "finished".
         std::string output;
-        bool        running   = true;
-        bool        truncated = false;
-        /// Set exactly once, on the poll that observes the end.
+        /// Bytes no read will ever return: they scrolled out of the host's
+        /// window, or were older than the `max` this read asked for.
+        std::size_t dropped = 0;
+        bool        running = true;
+        /// No more output can come: the pipe closed. A program can exit with
+        /// the pipe still open, when a background child it started inherited
+        /// the write end, so this is not the same as !running.
+        bool        eof = false;
+        /// Set once the program has been reaped. Every read after that
+        /// reports it again (it doesn't move).
         std::optional<ExecOutcome> outcome;
-        /// How long it has been running, by the host's clock.
+        /// How long it has been (or was) running, by the host's clock.
         std::chrono::seconds uptime{0};
     };
 
-    /// Wait up to `wait` for new output, then return whatever there is.
+    /// Wait up to `wait` for new output or the end, then take what is new.
     /// Blocking only for that long: a tool call must not hang on a server
     /// that has gone quiet, because quiet is the normal state of a server.
-    [[nodiscard]] virtual Update poll(std::chrono::milliseconds wait) = 0;
+    [[nodiscard]] virtual Read read(std::chrono::milliseconds wait, std::size_t max) = 0;
 
-    /// Ask it to stop, then insist. Idempotent.
-    virtual void stop() = 0;
+    /// Ask it to stop, then insist. Returns at once. Idempotent.
+    virtual void stop() noexcept = 0;
 };
 
 /// How a scan splits its work. mcp-cpp owns no threads: the scan tools
