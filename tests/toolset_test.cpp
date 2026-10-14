@@ -8,7 +8,7 @@
 //   • effects ride back on the Result as a typed field;
 //   • the host backend receives exactly the parsed request.
 
-#include <mcp/tools/native_files.hpp>
+#include "support/disk_files.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/cap/local.hpp>
@@ -135,7 +135,7 @@ TEST_CASE("toolset: effect table is read off the registrations") {
     auto exec = std::make_shared<mcp::test::PopenExec>();
     HostServices svc;
     svc.exec  = exec;
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     auto p = make_provider(std::move(svc), ToolsetConfig{});
     for (const auto& t : p->list()) {
         const auto fx = effects_for_builtin(t.name);
@@ -153,7 +153,7 @@ TEST_CASE("toolset: a result carries effects and changes as typed fields") {
     const fs::path root = fs::temp_directory_path() / ("mcp_meta_" + std::to_string(::getpid()));
     fs::create_directories(root);
     HostServices svc;
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     svc.state = mcp::test::state_at(root);
     auto p = make_provider(std::move(svc), ToolsetConfig{});
     mcp::cap::Request w{"write", mcp::Json{{"path", (root / "x.txt").string()}, {"content", "a\nb\n"}}};
@@ -181,7 +181,7 @@ TEST_CASE("toolset") {
     // ── backend present → tools registered + driven end to end ───────────
     auto store = std::make_shared<FakeStore>();
     HostServices svc; svc.memory = store;
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     auto p = make_provider(svc);
 
     // remember + forget + wipe_memory all advertised

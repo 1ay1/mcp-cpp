@@ -191,10 +191,9 @@ want a production agent toolset out of the box:
 
 ```cpp
 #include <mcp/tools/toolset.hpp>
-#include <mcp/tools/native_files.hpp>   // link mcp::tools_native_files
 
 mcp::tools::HostServices svc;
-svc.files     = std::make_shared<mcp::tools::NativeFileSystem>();  // enables read/edit/grep/... (any FileSystem)
+svc.files     = std::make_shared<MyFileSystem>();     // enables read/edit/grep/... (see files.hpp)
 svc.memory    = std::make_shared<MyMemoryStore>();   // enables remember/forget/wipe
 svc.retriever = std::make_shared<MyDocRetriever>();  // enables search_docs
 svc.http      = std::make_shared<MyHttpClient>();    // enables web_fetch/web_search
@@ -213,8 +212,9 @@ request: `Request::reader` (whose context a `read` serves) and
 `Request::cancelled`. Running programs is always the host's (`svc.exec`),
 and so is its sandbox. So is the disk: every file a tool reads, writes, lists
 or stats goes through `svc.files` (`files.hpp`), and the tool library itself
-does no IO. `NativeFileSystem`, in its own target, is the plain
-std::filesystem one; a host can route files anywhere else instead.
+does no IO. The library ships no disk implementation; the tests have one in
+`tests/support/disk_files.cpp` that shows the expected behaviour (atomic
+writes, symlinks followed, no walking through linked dirs).
 
 Two pieces of metadata the bare wire has no field for ride in the result's
 structured payload under a reserved key (`meta.hpp`): an **`EffectSet`**

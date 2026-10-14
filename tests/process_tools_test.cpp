@@ -12,7 +12,7 @@
 
 #include "test_state.hpp"
 #include "test_exec.hpp"
-#include <mcp/tools/native_files.hpp>
+#include "support/disk_files.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
@@ -78,11 +78,11 @@ int main() {
     auto root = fs::temp_directory_path() / ("mcp_proc_test_" + std::to_string(::getpid()));
     fs::create_directories(root);
     auto ws_state = std::make_shared<LockedStateAccess>();
-    ws_state->state.workspace_root = util::canonical_root(NativeFileSystem{}, root);
+    ws_state->state.workspace_root = util::canonical_root(mcp::test::DiskFiles{}, root);
 
     HostServices svc;
 
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
 
     svc.state = ws_state;
 

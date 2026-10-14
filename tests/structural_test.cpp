@@ -6,7 +6,7 @@
 // $$$, balanced-group capture, and — the load-bearing property — NEVER
 // matching inside comments or string literals.
 
-#include <mcp/tools/native_files.hpp>
+#include "support/disk_files.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/toolset.hpp>
@@ -69,7 +69,7 @@ TEST_CASE("search_structural") {
 
     HostServices svc;
 
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
@@ -451,7 +451,7 @@ TEST_CASE("search_structural semantic bridge") {
 
     auto fake = std::make_shared<FakeRetriever>();
     HostServices svc;
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     svc.state = ws_state;
     svc.code_retriever = fake;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
@@ -561,7 +561,7 @@ TEST_CASE("rewrite_structural") {
 
     HostServices svc;
 
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 

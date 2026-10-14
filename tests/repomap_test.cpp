@@ -11,7 +11,7 @@
 #include "agtest.hpp"
 #include "test_state.hpp"
 
-#include <mcp/tools/native_files.hpp>
+#include "support/disk_files.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
 #include <mcp/cap/capability.hpp>
@@ -53,7 +53,7 @@ TEST_CASE("repomap") {
 
     auto ws_state = mcp::test::state_at(root.string());
     mt::HostServices svc;
-    svc.files = std::make_shared<mt::NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     svc.state = ws_state;
     auto provider = mt::make_provider(svc, mt::ToolsetConfig{}, "local");
 

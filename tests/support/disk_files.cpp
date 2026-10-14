@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// mcp::tools::NativeFileSystem — the FileSystem a host gets for free: the
-// process's own disk through std::filesystem and the OS. It lives in its own
-// target (mcp::tools_native_files) so the tool library proper links no IO.
-#include <mcp/tools/native_files.hpp>
+// mcp::test::DiskFiles — the real disk, for the tests and the eval server.
+#include "disk_files.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -34,7 +32,7 @@
 #  include <sys/stat.h>
 #endif
 
-namespace mcp::tools {
+namespace mcp::test {
 
 namespace {
 // Translate the most common filesystem errno values to a sentence the
@@ -322,7 +320,7 @@ FileStat stat_of(const fs::directory_entry& e, int depth, DirEntry* out) {
 
 }  // namespace
 
-FileStat NativeFileSystem::stat(const fs::path& p) const {
+FileStat DiskFiles::stat(const fs::path& p) const {
     FileStat s;
     std::error_code ec;
     const auto st = fs::status(p, ec);
@@ -342,27 +340,27 @@ FileStat NativeFileSystem::stat(const fs::path& p) const {
     return s;
 }
 
-fs::path NativeFileSystem::canonical(const fs::path& p, std::error_code& ec) const {
+fs::path DiskFiles::canonical(const fs::path& p, std::error_code& ec) const {
     return fs::weakly_canonical(p, ec);
 }
 
-fs::path NativeFileSystem::read_symlink(const fs::path& p, std::error_code& ec) const {
+fs::path DiskFiles::read_symlink(const fs::path& p, std::error_code& ec) const {
     return fs::read_symlink(p, ec);
 }
 
-fs::path NativeFileSystem::cwd() const {
+fs::path DiskFiles::cwd() const {
     std::error_code ec;
     auto c = fs::current_path(ec);
     return ec ? fs::path{} : c;
 }
 
-fs::path NativeFileSystem::scratch_dir() const {
+fs::path DiskFiles::scratch_dir() const {
     std::error_code ec;
     auto t = fs::temp_directory_path(ec);
     return ec ? fs::path{} : t;
 }
 
-std::optional<std::string> NativeFileSystem::read(const fs::path& p) const {
+std::optional<std::string> DiskFiles::read(const fs::path& p) const {
     std::error_code ec;
     if (!fs::exists(p, ec) || ec) return std::nullopt;
     {
@@ -372,7 +370,7 @@ std::optional<std::string> NativeFileSystem::read(const fs::path& p) const {
     return native_read(p);
 }
 
-std::optional<std::string> NativeFileSystem::read_prefix(const fs::path& p, std::size_t n) const {
+std::optional<std::string> DiskFiles::read_prefix(const fs::path& p, std::size_t n) const {
     std::ifstream ifs(p, std::ios::binary);
     if (!ifs) return std::nullopt;
     std::string out(n, '\0');
@@ -381,11 +379,11 @@ std::optional<std::string> NativeFileSystem::read_prefix(const fs::path& p, std:
     return out;
 }
 
-std::string NativeFileSystem::write_atomic(const fs::path& p, std::string_view content) {
+std::string DiskFiles::write_atomic(const fs::path& p, std::string_view content) {
     return native_write(p, content);
 }
 
-std::vector<DirEntry> NativeFileSystem::list(const fs::path& dir, std::error_code& ec) const {
+std::vector<DirEntry> DiskFiles::list(const fs::path& dir, std::error_code& ec) const {
     std::vector<DirEntry> out;
     fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
     if (ec) return out;
@@ -398,7 +396,7 @@ std::vector<DirEntry> NativeFileSystem::list(const fs::path& dir, std::error_cod
     return out;
 }
 
-bool NativeFileSystem::walk(const fs::path& root,
+bool DiskFiles::walk(const fs::path& root,
                             const std::function<WalkStep(const DirEntry&)>& visit) const {
     std::error_code ec;
     // A file root is a walk of one. recursive_directory_iterator on a
@@ -430,25 +428,25 @@ bool NativeFileSystem::walk(const fs::path& root,
     return true;
 }
 
-bool NativeFileSystem::create_directories(const fs::path& p, std::error_code& ec) {
+bool DiskFiles::create_directories(const fs::path& p, std::error_code& ec) {
     return fs::create_directories(p, ec);
 }
 
-bool NativeFileSystem::remove(const fs::path& p, std::error_code& ec) {
+bool DiskFiles::remove(const fs::path& p, std::error_code& ec) {
     return fs::remove(p, ec);
 }
 
-std::uintmax_t NativeFileSystem::remove_all(const fs::path& p, std::error_code& ec) {
+std::uintmax_t DiskFiles::remove_all(const fs::path& p, std::error_code& ec) {
     return fs::remove_all(p, ec);
 }
 
-void NativeFileSystem::rename(const fs::path& from, const fs::path& to, std::error_code& ec) {
+void DiskFiles::rename(const fs::path& from, const fs::path& to, std::error_code& ec) {
     fs::rename(from, to, ec);
 }
 
-void NativeFileSystem::copy(const fs::path& from, const fs::path& to, std::error_code& ec) {
+void DiskFiles::copy(const fs::path& from, const fs::path& to, std::error_code& ec) {
     // Links are copied as links, never followed into what they point at.
     fs::copy(from, to, fs::copy_options::recursive | fs::copy_options::copy_symlinks, ec);
 }
 
-}  // namespace mcp::tools
+}  // namespace mcp::test

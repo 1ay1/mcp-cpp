@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// mcp/tools/native_files.hpp — a FileSystem over the process's own disk.
-//
-//   Link mcp::tools_native_files and hand one to HostServices::files when the
-//   host has no reason to route file access anywhere special:
-//
-//     svc.files = std::make_shared<mcp::tools::NativeFileSystem>();
-//
-//   Writes are atomic (temp file in the same directory, fsync, rename, then
-//   fsync the directory), keep the target's mode, and follow a symlink to
-//   the real file instead of replacing the link.
+// disk_files.hpp — the FileSystem the tests hand the tools: the real disk.
+// The library does no IO; a host supplies its own FileSystem.
 #pragma once
 
 #include <mcp/tools/files.hpp>
 
-namespace mcp::tools {
+namespace mcp::test {
 
-class NativeFileSystem final : public FileSystem {
+namespace fs = std::filesystem;
+using mcp::tools::DirEntry;
+using mcp::tools::FileStat;
+using mcp::tools::WalkStep;
+
+class DiskFiles final : public mcp::tools::FileSystem {
 public:
     [[nodiscard]] FileStat stat(const fs::path& p) const override;
     [[nodiscard]] fs::path canonical(const fs::path& p, std::error_code& ec) const override;
@@ -38,4 +35,4 @@ public:
     void copy(const fs::path& from, const fs::path& to, std::error_code& ec) override;
 };
 
-}  // namespace mcp::tools
+}  // namespace mcp::test

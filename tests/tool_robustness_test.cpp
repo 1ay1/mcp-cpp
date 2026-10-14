@@ -3,7 +3,7 @@
 // tool_robustness_test.cpp — the argument shapes weaker models send to read,
 // grep and shell. Each case is one that used to fail in real transcripts.
 
-#include <mcp/tools/native_files.hpp>
+#include "support/disk_files.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/cap/local.hpp>
@@ -51,7 +51,7 @@ TEST_CASE("tools tolerate the argument shapes weak models send") {
     write_file(root / "src" / "main.cpp", "int run_turn(int x) {\n    return x;\n}\n// CSI [>1u here\n");
 
     HostServices svc;
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     svc.state = mcp::test::state_at(root);
 #if !defined(_WIN32)
     svc.exec = std::make_shared<mcp::test::PopenExec>();

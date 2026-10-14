@@ -513,7 +513,7 @@ struct HostServices {
     std::shared_ptr<StateAccess>    state;
     // Every file the tools read, write, list or stat goes through this; the
     // library itself does no IO. Null ⇒ no filesystem, search or edit tools
-    // (they can't run). mcp/tools/native_files.hpp has a ready-made one.
+    // (they can't run). The library has no disk implementation of its own.
     std::shared_ptr<FileSystem>     files;
 };
 

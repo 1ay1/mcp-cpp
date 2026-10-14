@@ -10,8 +10,8 @@
 //   replay, or faked in a test — and keeps the "passive library" rule
 //   checkable by a lint instead of by trust.
 //
-//   mcp/tools/native_files.hpp is a ready-made std::filesystem one, in its
-//   own target (mcp::tools_native_files), for hosts that want the obvious.
+//   The library ships no disk implementation: that is the host's IO. The
+//   tests' one (tests/support/disk_files.cpp) shows the expected behaviour.
 //
 //   Errors: nothing here throws. A failed query returns an empty optional
 //   or sets the error code, exactly as the std::filesystem error_code

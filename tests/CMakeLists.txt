@@ -17,6 +17,10 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE INTERNAL "")
 FetchContent_MakeAvailable(doctest)
 unset(CMAKE_POLICY_VERSION_MINIMUM CACHE)
 
+# The real disk as a FileSystem, for the tests. The library has none.
+add_library(mcp_test_disk STATIC support/disk_files.cpp)
+target_link_libraries(mcp_test_disk PUBLIC mcp::tools)
+
 add_executable(mcp_tests
     test_main.cpp
     codec_test.cpp
@@ -46,7 +50,7 @@ add_executable(mcp_tests
     shellx_test.cpp
     tool_robustness_test.cpp
 )
-target_link_libraries(mcp_tests PRIVATE mcp::mcp mcp::tools mcp::tools_native_files doctest::doctest Threads::Threads)
+target_link_libraries(mcp_tests PRIVATE mcp::mcp mcp::tools mcp_test_disk doctest::doctest Threads::Threads)
 include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
 doctest_discover_tests(mcp_tests)
 
@@ -55,11 +59,11 @@ doctest_discover_tests(mcp_tests)
 # must not share a binary with the in-process unit tests.
 if(NOT WIN32)
     add_executable(mcp_process_tools_test process_tools_test.cpp)
-    target_link_libraries(mcp_process_tools_test PRIVATE mcp::tools mcp::tools_native_files Threads::Threads)
+    target_link_libraries(mcp_process_tools_test PRIVATE mcp::tools mcp_test_disk Threads::Threads)
     add_test(NAME mcp_process_tools_test COMMAND mcp_process_tools_test)
 
     add_executable(mcp_shell_bound_test shell_bound_test.cpp)
-    target_link_libraries(mcp_shell_bound_test PRIVATE mcp::tools mcp::tools_native_files Threads::Threads)
+    target_link_libraries(mcp_shell_bound_test PRIVATE mcp::tools mcp_test_disk Threads::Threads)
     add_test(NAME mcp_shell_bound_test COMMAND mcp_shell_bound_test)
 endif()
 
@@ -69,7 +73,7 @@ endif()
 # as a CTest only when python3 is present (build-time dep is fine); skipped,
 # not failed, otherwise.
 add_executable(mcp_eval_server eval_server.cpp)
-target_link_libraries(mcp_eval_server PRIVATE mcp::tools mcp::tools_native_files Threads::Threads)
+target_link_libraries(mcp_eval_server PRIVATE mcp::tools mcp_test_disk Threads::Threads)
 
 # ── tool_bench ────────────────────────────────────────────────────
 # Times the real tool bodies against a real tree. Deliberately NOT a ctest:
@@ -84,7 +88,7 @@ target_link_libraries(mcp_eval_server PRIVATE mcp::tools mcp::tools_native_files
 # for a windowed read, file-sized reserve, a content hash nothing reads) was
 # invisible to code review and obvious the moment a number was measured.
 add_executable(mcp_tool_bench tool_bench.cpp)
-target_link_libraries(mcp_tool_bench PRIVATE mcp::tools mcp::tools_native_files Threads::Threads)
+target_link_libraries(mcp_tool_bench PRIVATE mcp::tools mcp_test_disk Threads::Threads)
 
 find_program(PYTHON3_EXECUTABLE NAMES python3 python)
 if(PYTHON3_EXECUTABLE)

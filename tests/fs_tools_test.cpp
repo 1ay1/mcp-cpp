@@ -4,7 +4,7 @@
 // edit / list_dir) end-to-end through make_provider(), proving the ported
 // bodies behave and that write/edit carry a FileChange back via the meta.
 
-#include <mcp/tools/native_files.hpp>
+#include "support/disk_files.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/toolset.hpp>
@@ -46,8 +46,8 @@ static mcp::Json obj() { return mcp::Json::object(); }
 // even on a large file or a CRLF file. Reproduces the reported "edit shows all
 // - lines" symptom. FileChange.before/after are diffed through the same engine
 // the card uses.// Tests stand in for the host; they write fixtures through the same disk.
-inline mcp::tools::NativeFileSystem& test_fs() {
-    static mcp::tools::NativeFileSystem f;
+inline mcp::test::DiskFiles& test_fs() {
+    static mcp::test::DiskFiles f;
     return f;
 }
 
@@ -59,7 +59,7 @@ TEST_CASE("edit diff stays minimal on large + CRLF files") {
     fs::create_directories(root);
     auto ws_state = mcp::test::state_at(root);
     HostServices svc;
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 
@@ -141,7 +141,7 @@ TEST_CASE("fs tools keep data safe on edge-case paths and encodings") {
     fs::create_directories(root / "d" / "sub");
     auto ws_state = mcp::test::state_at(root);
     HostServices svc;
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
     auto slurp = [](const fs::path& p) { return util::read_file(test_fs(), p); };
@@ -222,7 +222,7 @@ TEST_CASE("read: every window spelling lands on the same lines") {
     auto root = fs::temp_directory_path() / ("mcp_read_win_" + std::to_string(mcp_getpid()));
     fs::create_directories(root);
     HostServices svc;
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     svc.state = mcp::test::state_at(root);
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
     std::string body;
@@ -295,7 +295,7 @@ TEST_CASE("fs_tools") {
 
     HostServices svc;  // no host backends needed — Tier-1 is self-contained
 
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 

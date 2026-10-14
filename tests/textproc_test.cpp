@@ -5,7 +5,7 @@
 // each tool's core contract and that the workspace boundary + effects flow.
 
 #include <chrono>
-#include <mcp/tools/native_files.hpp>
+#include "support/disk_files.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/toolset.hpp>
@@ -69,7 +69,7 @@ TEST_CASE("textproc") {
 
     HostServices svc;
 
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     svc.state = ws_state;
     auto provider = make_provider(svc, ToolsetConfig{}, "local");
 

@@ -10,13 +10,13 @@
 #include <memory>
 #include <optional>
 
-#include <mcp/tools/native_files.hpp>
+#include "support/disk_files.hpp"
 
 namespace mcp::test {
 
 inline std::shared_ptr<tools::SoleStateAccess> state_at(const std::filesystem::path& root) {
     auto s = std::make_shared<tools::SoleStateAccess>();
-    s->state.workspace_root = tools::util::canonical_root(tools::NativeFileSystem{}, root);
+    s->state.workspace_root = tools::util::canonical_root(::mcp::test::DiskFiles{}, root);
     return s;
 }
 

@@ -12,7 +12,7 @@
 
 #include "test_state.hpp"
 #include "test_exec.hpp"
-#include <mcp/tools/native_files.hpp>
+#include "support/disk_files.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/util/fs_helpers.hpp>
@@ -46,7 +46,7 @@ int main() {
 
     HostServices svc;
 
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
 
     svc.state = ws_state;
 

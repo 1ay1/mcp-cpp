@@ -5,7 +5,7 @@
 // make_provider(), proving the ported bodies behave + the workspace
 // boundary + effects flow through.
 
-#include <mcp/tools/native_files.hpp>
+#include "support/disk_files.hpp"
 #include <mcp/tools/toolset.hpp>
 #include <mcp/tools/host.hpp>
 #include <mcp/tools/toolset.hpp>
@@ -67,7 +67,7 @@ TEST_CASE("search_tools") {
 
     HostServices svc;
 
-    svc.files = std::make_shared<NativeFileSystem>();
+    svc.files = std::make_shared<mcp::test::DiskFiles>();
     svc.state = ws_state;
 #if !defined(_WIN32)
     svc.exec = std::make_shared<mcp::test::PopenExec>();   // shell, git_*, find_definition run programs
@@ -90,7 +90,7 @@ TEST_CASE("search_tools") {
     // the builtin grep (the only one on a host without ripgrep) answer
     // "No matches" for grep path=some/file. Pin both layers.
     {
-        NativeFileSystem nfs;
+        mcp::test::DiskFiles nfs;
         int seen = 0;
         bool self = false;
         (void)nfs.walk(root / "beta.txt", [&](const DirEntry& e) {
@@ -101,7 +101,7 @@ TEST_CASE("search_tools") {
         assert(seen == 1 && self);
 
         HostServices nsvc;   // no exec: forces the builtin scanner
-        nsvc.files = std::make_shared<NativeFileSystem>();
+        nsvc.files = std::make_shared<mcp::test::DiskFiles>();
         nsvc.state = ws_state;
         auto bp = make_provider(nsvc, ToolsetConfig{}, "local");
         auto args = obj(); args["pattern"] = "NEEDLE_marker";
@@ -500,7 +500,7 @@ TEST_CASE("search_tools") {
         // cwd stays == root, then call git_status with NO path.
         {
             auto saved_ws = ws_state->state.workspace_root;
-            ws_state->state.workspace_root = util::canonical_root(NativeFileSystem{}, root.parent_path());
+            ws_state->state.workspace_root = util::canonical_root(mcp::test::DiskFiles{}, root.parent_path());
             auto wide = call(*provider, "git_status", obj());  // no `path`
             assert(!wide.is_error
                    && "no-path git_status must resolve the cwd project under a "
