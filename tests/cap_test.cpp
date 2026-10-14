@@ -116,6 +116,32 @@ TEST_CASE("registry always namespace") {
     CHECK(reg.dispatch("calc__add", Json{{"a",4},{"b",4}}).text == "sum=8");
 }
 
+// (d2) A namespaced dispatch routes by origin and never lists: listing a
+//      remote server can block, and must not stall a call to another one.
+namespace {
+struct CountingProvider final : CapabilityProvider {
+    explicit CountingProvider(std::string o) : origin_(std::move(o)) {}
+    std::string_view origin() const noexcept override { return origin_; }
+    std::vector<Tool> list() const override { ++lists; return {}; }
+    Result execute(const Request& r) override { return Result::ok(origin_ + ":" + r.tool); }
+    std::string origin_;
+    mutable int lists = 0;
+};
+}  // namespace
+
+TEST_CASE("registry namespaced dispatch does not list") {
+    auto a  = std::make_shared<CountingProvider>("mcp:a");
+    auto ab = std::make_shared<CountingProvider>("mcp:a__b");
+    Registry reg(/*always_namespace=*/true);
+    reg.add(a);
+    reg.add(ab);
+    CHECK(reg.dispatch("mcp:a__x").text == "mcp:a:x");
+    CHECK(reg.dispatch("mcp:a__b__y").text == "mcp:a__b:y");   // longest origin wins
+    CHECK(a->lists == 0);
+    CHECK(ab->lists == 0);
+    CHECK(reg.dispatch("nobody__x").is_error);
+}
+
 // (e) content <-> Result helpers round-trip text + error + structured.
 TEST_CASE("content helpers") {
     Result r = Result::ok("hello world");

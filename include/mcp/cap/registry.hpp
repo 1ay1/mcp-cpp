@@ -16,13 +16,16 @@
 //
 //   A Registry is a value with one owner. Build it (add providers), then read
 //   it; if several threads read it while another adds, the host wraps it.
-//   Routes are computed from the providers' current lists on each lookup, so
-//   a provider whose list changed is seen without being told.
+//   tools()/prompts() ask the providers each time, so a changed list is seen
+//   without being told. With always_namespace, dispatch() routes by the
+//   origin prefix and never lists.
 #pragma once
 
 #include <mcp/cap/capability.hpp>
 
 #include <memory>
+#include <optional>
+#include <tuple>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -61,15 +64,23 @@ public:
     // Route a request by its EXPOSED tool name (bare or "<origin>__<name>").
     // Never throws — an unknown tool yields Result::error.
     [[nodiscard]] Result dispatch(const Request& req) const {
-        auto routes = tool_routes();
-        auto it = routes.find(req.tool);
-        if (it == routes.end())
-            return Result::error("capability not found: '" + req.tool + "'");
+        std::shared_ptr<CapabilityProvider> provider;
+        std::string bare;
+        if (auto direct = by_origin(req.tool)) {
+            std::tie(provider, bare) = std::move(*direct);
+        } else {
+            auto routes = tool_routes();
+            auto it = routes.find(req.tool);
+            if (it == routes.end())
+                return Result::error("capability not found: '" + req.tool + "'");
+            provider = it->second.provider;
+            bare     = std::move(it->second.bare_name);
+        }
         // Copy, then rename: every field (scope, elicit, any added later)
         // reaches the provider, not just the ones listed here.
         Request fwd = req;
-        fwd.tool = it->second.bare_name;
-        return it->second.provider->execute(fwd);
+        fwd.tool = std::move(bare);
+        return provider->execute(fwd);
     }
 
     [[nodiscard]] Result dispatch(const std::string& tool, Json args = Json::object()) const {
@@ -121,6 +132,8 @@ public:
                                   const std::vector<std::pair<std::string, std::string>>& args,
                                   GetPromptResult& out,
                                   std::string& err) const {
+        if (auto direct = by_origin(name))
+            return direct->first->get_prompt(direct->second, args, out, err);
         auto routes = prompt_routes();
         auto it = routes.find(name);
         if (it == routes.end()) {
@@ -131,6 +144,26 @@ public:
     }
 
 private:
+    // With always_namespace every exposed name is "<origin>__<name>", so the
+    // origin alone picks the provider. No list() calls: for a remote server
+    // that can be a blocking RPC, and one slow server must not hold up a
+    // call to another. The provider rejects a name it doesn't have.
+    [[nodiscard]] std::optional<std::pair<std::shared_ptr<CapabilityProvider>, std::string>>
+    by_origin(std::string_view exposed) const {
+        if (!always_namespace_) return std::nullopt;
+        std::shared_ptr<CapabilityProvider> hit;
+        std::size_t len = 0;
+        for (const auto& p : providers_) {
+            const std::string_view o = p->origin();
+            // Longest origin wins if one is a prefix of another.
+            if (exposed.size() > o.size() + 2 && exposed.starts_with(o)
+                && exposed.substr(o.size(), 2) == "__" && (!hit || o.size() > len)) {
+                hit = p; len = o.size();
+            }
+        }
+        if (!hit) return std::nullopt;
+        return std::pair{std::move(hit), std::string{exposed.substr(len + 2)}};
+    }
     struct Route {
         std::shared_ptr<CapabilityProvider> provider;
         std::string bare_name;   // the provider's own tool name
