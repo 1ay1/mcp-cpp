@@ -31,6 +31,7 @@
 
 #include "tool_shell.hpp"
 #include "call_state.hpp"
+#include "tool_body.hpp"
 
 #include <mcp/tools/util/fs_helpers.hpp>
 
@@ -54,6 +55,9 @@ namespace mcp::tools::detail {
 namespace {
 
 namespace fs = std::filesystem;
+using util::ExecResult;
+using util::ToolError;
+using util::ToolOutput;
 
 // ── Source-file filter (mirrors find_definition's language set, plus a few
 //    config/DSL-ish extensions that carry identifiers worth graphing). ──
@@ -517,18 +521,19 @@ struct RepoMapArgs {
     std::string focus;
     std::string root;
     int         budget = 8000;   // bytes (~2000 tokens)
+    std::string display_description;
 };
 
-mcp::cap::Result run_repo_map(const Call& call, const Json& args) {
-    RepoMapArgs a;
-    if (args.is_object()) {
-        a.focus  = args.value("focus", std::string{});
-        a.root   = args.value("path", std::string{});
-        a.budget = args.value("budget", 8000);
-    }
-    if (a.budget < 1000)  a.budget = 1000;
-    if (a.budget > 60000) a.budget = 60000;
+const util::ArgSpec<RepoMapArgs> kRepoMapArgs{
+    util::arg(&RepoMapArgs::focus, "focus", "Keywords / symbol names to personalize the ranking around (like aider's chat-file boost). Optional."),
+    util::arg(&RepoMapArgs::root, "path", "Root directory (default: workspace root)"),
+    util::arg(&RepoMapArgs::budget, "budget", "Output byte budget, 1000-60000 (default 8000 ≈ 2k tokens)")
+        .range(1000, 60000),
+    util::arg(&RepoMapArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+};
 
+ExecResult run_repo_map(const Call& call, RepoMapArgs a) {
     // Default to the WORKSPACE ROOT, not cwd. The tool documents "default:
     // workspace root", and the model calls repo_map to survey the whole
     // project — resolving an omitted path against cwd made the tool fail with
@@ -541,14 +546,14 @@ mcp::cap::Result run_repo_map(const Call& call, const Json& args) {
         a.root = util::project_root(b).string();
 
     auto wp = util::make_workspace_path_checked(a.root, "repo_map", b);
-    if (!wp) return mcp::cap::Result::error(wp.error().detail);
+    if (!wp) return std::unexpected(std::move(wp.error()));
 
     // The cached graph is shared and const; pagerank writes ranks, so work
     // on a copy and personalisation doesn't leak across calls.
     RepoGraph g = *build_graph(call, wp->path(), b);
     if (g.files.empty())
-        return mcp::cap::Result::error(
-            "repo_map: no source files found under " + wp->path().string());
+        return std::unexpected(ToolError::not_found(
+            "repo_map: no source files found under " + wp->path().string()));
 
     // Personalization: lowercase focus terms matched against path + symbol
     // names. A hit boosts the file's restart probability 20x.
@@ -669,7 +674,7 @@ mcp::cap::Result run_repo_map(const Call& call, const Json& args) {
     out << "\n(" << emitted_files << " of " << g.files.size()
         << " files shown, budget " << a.budget << " bytes. Re-run with "
         << "`focus` to re-center the map, `budget` to widen it.)";
-    return mcp::cap::Result::ok(out.str());
+    return ToolOutput{out.str()};
 }
 
 } // namespace
@@ -682,18 +687,9 @@ void register_repo_map_tool(Shells& sh) {
         "FIRST in a large or unfamiliar repository — one call replaces a "
         "dozen exploratory read/grep rounds. Pass `focus` (task keywords or "
         "symbol names) to re-center the ranking on your task.",
-        Json{
-            {"type", "object"},
-            {"properties", {
-                {"focus",  {{"type","string"},  {"description","Keywords / symbol names to personalize the ranking around (like aider's chat-file boost). Optional."}}},
-                {"path",   {{"type","string"},  {"description","Root directory (default: workspace root)"}}},
-                {"budget", {{"type","integer"}, {"description","Output byte budget, 1000-60000 (default 8000 ≈ 2k tokens)"}}},
-                {"display_description", {{"type","string"},
-                    {"description","One-line summary shown in the UI. Optional."}}},
-            }},
-        },
+        kRepoMapArgs.schema(),
         EffectSet{Effect::ReadFs},
-        run_repo_map, 60'000);
+        body<RepoMapArgs>(run_repo_map, kRepoMapArgs), 60'000);
 }
 
 } // namespace mcp::tools::detail

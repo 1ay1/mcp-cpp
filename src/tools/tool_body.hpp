@@ -102,7 +102,8 @@ template <class Args, class Run, class P>
 template <class Args, class Run>
 [[nodiscard]] auto body(Run run, const util::ArgSpec<Args>& spec) {
     return [run = std::move(run), &spec](const Call& call, const Json& j) mutable -> mcp::cap::Result {
-        auto parsed = spec.decode(j);
+        const auto b = detail::bounds(call);
+        auto parsed = spec.decode(j, &b);
         if (!parsed) return mcp::cap::Result::error(parsed.error().render());
         return lower(run_on<Args>(run, call, *parsed));
     };
@@ -113,8 +114,9 @@ template <class Args, class Run>
 [[nodiscard]] auto body(Run run, const util::ArgSpec<Args>& spec, CheckIn<Args> check) {
     return [run = std::move(run), &spec, check](const Call& call, const Json& j) mutable
                -> mcp::cap::Result {
-        auto parsed = spec.decode(j);
-        if (parsed) parsed = check(std::move(*parsed), detail::bounds(call));
+        const auto b = detail::bounds(call);
+        auto parsed = spec.decode(j, &b);
+        if (parsed) parsed = check(std::move(*parsed), b);
         if (!parsed) return mcp::cap::Result::error(parsed.error().render());
         return lower(run_on<Args>(run, call, *parsed));
     };

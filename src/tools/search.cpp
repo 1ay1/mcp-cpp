@@ -54,24 +54,26 @@ namespace {
 
 struct GlobArgs {
     std::string pattern;   // non-blank by construction (parser enforces)
-    std::string root;
+    std::string root = ".";
     std::string display_description;
 };
 
-std::expected<GlobArgs, ToolError> parse_glob_args(const json& j) {
-    util::ArgReader ar(j);
-    auto pat_opt = ar.require_str("pattern");
-    if (!pat_opt)
-        return std::unexpected(ToolError::invalid_args("pattern required"));
-    std::string pat = *std::move(pat_opt);
-    if (pat.find_first_not_of(" \t\r\n") == std::string::npos)
+const util::ArgSpec<GlobArgs> kGlobArgs{
+    util::arg(&GlobArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&GlobArgs::pattern, "pattern", "Glob pattern, e.g. *.cpp").required(),
+    util::arg(&GlobArgs::root, "path", "Root directory (default: cwd)"),
+};
+
+[[nodiscard]] bool is_blank(std::string_view s) noexcept {
+    return s.find_first_not_of(" \t\r\n") == std::string_view::npos;
+}
+
+std::expected<GlobArgs, ToolError> check_glob(GlobArgs a, const util::Bounds&) {
+    if (is_blank(a.pattern))
         return std::unexpected(ToolError::invalid_args(
             "pattern must not be blank (received only whitespace)"));
-    return GlobArgs{
-        std::move(pat),
-        ar.str("path", "."),
-        ar.str("display_description", ""),
-    };
+    return a;
 }
 
 ExecResult run_glob(const Call& call, const GlobArgs& a) {
@@ -172,21 +174,16 @@ ExecResult run_glob(const Call& call, const GlobArgs& a) {
 
 struct FindDefinitionArgs {
     std::string symbol;
-    std::string root;
+    std::string root = ".";
     std::string display_description;
 };
 
-std::expected<FindDefinitionArgs, ToolError> parse_find_definition_args(const json& j) {
-    util::ArgReader ar(j);
-    auto sym_opt = ar.require_str("symbol");
-    if (!sym_opt)
-        return std::unexpected(ToolError::invalid_args("symbol required"));
-    return FindDefinitionArgs{
-        *std::move(sym_opt),
-        ar.str("path", "."),
-        ar.str("display_description", ""),
-    };
-}
+const util::ArgSpec<FindDefinitionArgs> kFindDefinitionArgs{
+    util::arg(&FindDefinitionArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&FindDefinitionArgs::symbol, "symbol", "The symbol name to find").required(),
+    util::arg(&FindDefinitionArgs::root, "path", "Directory to search (default: cwd)"),
+};
 
 // Run a program through the host. Shaped like SubprocessResult so the
 // parsing below is untouched; `stop_when` is forwarded because only this
@@ -354,11 +351,11 @@ struct GrepArgs {
     std::string pattern;   // non-blank by construction
     std::string root;
     std::string file_glob;
-    bool        case_sensitive;
-    bool        word;      // whole-word match (absorbs find_references)
-    bool        block;     // return the whole enclosing function/block per hit
+    bool        case_sensitive = false;
+    bool        word = false;      // whole-word match (absorbs find_references)
+    bool        block = false;     // return the whole enclosing function/block per hit
     int         context_lines = kContext;  // ±N lines (context:"N")
-    int         offset;    // ≥ 0
+    int         offset = 0;    // ≥ 0
     // Matches per page. `limit` lets a caller ask for fewer (or more, up to
     // kMaxPage) instead of piping to `| head -N`, which is what the prompt
     // and the shell tip tell the model to do.
@@ -375,6 +372,8 @@ struct GrepArgs {
     Mode        mode = Mode::Content;
     std::string display_description;
     bool        literal = false;   // the escaped retry of a bad regex
+    std::string context_arg;       // raw `context` / `output`; check_grep reads them
+    json        output_arg;
 };
 
 // A pattern that failed as a regex, made into one that can't fail: each
@@ -418,67 +417,48 @@ std::string literal_alternation(std::string_view p) {
     return out;
 }
 
-std::expected<GrepArgs, ToolError> parse_grep_args(const json& j) {
-    util::ArgReader ar(j);
-    auto pat_opt = ar.require_str("pattern");
-    if (!pat_opt)
-        return std::unexpected(ToolError::invalid_args("pattern required"));
-    std::string pat = *std::move(pat_opt);
-    if (pat.find_first_not_of(" \t\r\n") == std::string::npos)
+const util::ArgSpec<GrepArgs> kGrepArgs{
+    util::arg(&GrepArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&GrepArgs::pattern, "pattern", "Regex pattern to search for").required(),
+    util::arg(&GrepArgs::root, "path", "Directory to search (default: cwd)"),
+    util::arg(&GrepArgs::file_glob, "glob", "Filter files by glob. A bare pattern like `*.cpp` matches the filename anywhere; a slash pattern like `src/*.ts` or `**/test/*.py` matches the workspace-relative path."),
+    util::arg(&GrepArgs::case_sensitive, "case_sensitive", "Case-sensitive match (default: false)"),
+    util::arg(&GrepArgs::word, "word", "Whole-word match: `foo` won't match `foobar` or `do_foo`. Use for finding all USES of an identifier."),
+    util::arg(&GrepArgs::context_arg, "context", "`line` (default) = ±2 lines around each hit. `block` = the WHOLE enclosing function/block, so you rarely need a follow-up `read`. A number `0`-`60` = ±N lines (like grep -C N) (use `0` for match lines only — densest content view)."),
+    util::arg(&GrepArgs::output_arg, "output", "`content` (default) = matching lines with context. `files` = one path + match-count per line, no line bodies (the survey view: WHICH files touch X). `count` = per-file match counts only (the cheapest probe: HOW WIDESPREAD is X — run this before a bulk rewrite).")
+        .shape(json{{"type", "string"}, {"enum", {"content", "files", "count"}}}),
+    util::arg(&GrepArgs::offset, "offset", "Skip this many matches (for pagination)"),
+    util::arg(&GrepArgs::per_page, "limit", "Matches per page (default 20, max 200). Use this instead of piping to `head`.").range(1, kMaxPage),
+    util::arg(&GrepArgs::exclude, "exclude", "Drop hits whose line matches this regex (ECMAScript). Use this instead of piping to `grep -v`."),
+};
+
+// `context` is "block", a number ("5" or a bare 5, which decodes as "5") or
+// the default; an unknown `output` falls back to content, as before.
+std::expected<GrepArgs, ToolError> check_grep(GrepArgs g, const util::Bounds&) {
+    if (is_blank(g.pattern))
         return std::unexpected(ToolError::invalid_args(
             "pattern must not be blank (received only whitespace)"));
-    int offset = ar.integer("offset", 0);
-    if (offset < 0) offset = 0;
-    const int per_page = std::clamp(ar.integer("limit", kPerPage), 1, kMaxPage);
-    // `context`: "block" returns the enclosing scope; a NUMBER ("0".."60",
-    // or a bare integer) sets the ±N window; anything else is the default ±2.
-    bool block = false;
-    int  ctx_lines = kContext;
-    {
-        std::string ctx = ar.str("context", "");
-        if (ctx.empty() && ar.has("context")) {
-            // Model sent a bare integer (context: 5) — ArgReader.str returns
-            // "" for non-strings; read it as an integer instead.
-            ctx_lines = std::clamp(ar.integer("context", kContext), 0, kMaxContext);
-        } else if (ctx == "block") {
-            block = true;
-        } else if (!ctx.empty()
-                   && ctx.find_first_not_of("0123456789") == std::string::npos) {
-            ctx_lines = std::clamp(std::atoi(ctx.c_str()), 0, kMaxContext);
-        }
-    }
-    GrepArgs::Mode mode = GrepArgs::Mode::Content;
-    {
-        std::string o = ar.str("output", "");
-        if (o == "files") mode = GrepArgs::Mode::FilesOnly;
-        else if (o == "count") mode = GrepArgs::Mode::Count;
-    }
+    if (g.offset < 0) g.offset = 0;
+    if (g.context_arg == "block") g.block = true;
+    else if (!g.context_arg.empty()
+             && g.context_arg.find_first_not_of("0123456789") == std::string::npos)
+        g.context_lines = std::clamp(std::atoi(g.context_arg.c_str()), 0, kMaxContext);
+    const auto o = util::ArgReader(json{{"output", g.output_arg}}).str("output", "");
+    if (o == "files") g.mode = GrepArgs::Mode::FilesOnly;
+    else if (o == "count") g.mode = GrepArgs::Mode::Count;
     // A bad exclude regex is a caller error, not a silent no-op.
-    if (auto ex = ar.str("exclude", ""); !ex.empty()) {
-        if (util::has_nested_quantifier(ex))
+    if (!g.exclude.empty()) {
+        if (util::has_nested_quantifier(g.exclude))
             return std::unexpected(ToolError::invalid_args(
                 "exclude has a nested unbounded quantifier (e.g. (a+)+) that "
                 "can cause catastrophic backtracking; rewrite it."));
-        try { std::regex probe{ex}; (void)probe; }
+        try { std::regex probe{g.exclude}; (void)probe; }
         catch (const std::regex_error&) {
             return std::unexpected(ToolError::invalid_args(
-                "exclude is not a valid regex (ECMAScript): " + ex));
+                "exclude is not a valid regex (ECMAScript): " + g.exclude));
         }
     }
-    GrepArgs g{
-        std::move(pat),
-        ar.str("path", "."),
-        ar.str("glob", ""),
-        ar.boolean("case_sensitive", false),
-        ar.boolean("word", false),
-        block,
-        ctx_lines,
-        offset,
-        per_page,
-        ar.str("exclude", ""),
-        mode,
-        ar.str("display_description", ""),
-    };
     return g;
 }
 
@@ -1505,55 +1485,6 @@ ExecResult run_grep(const Call& call, const GrepArgs& a, Exec* exec) {
     return r;
 }
 
-// ── Schemas ──────────────────────────────────────────────────────────────
-
-json glob_schema() {
-    return json{
-        {"type","object"},
-        {"required", {"pattern"}},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"pattern", {{"type","string"}, {"description","Glob pattern, e.g. *.cpp"}}},
-            {"path",    {{"type","string"}, {"description","Root directory (default: cwd)"}}},
-        }},
-    };
-}
-
-json find_definition_schema() {
-    return json{
-        {"type","object"},
-        {"required", {"symbol"}},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"symbol", {{"type","string"}, {"description","The symbol name to find"}}},
-            {"path",   {{"type","string"}, {"description","Directory to search (default: cwd)"}}},
-        }},
-    };
-}
-
-json grep_schema() {
-    return json{
-        {"type","object"},
-        {"required", {"pattern"}},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"pattern",        {{"type","string"}, {"description","Regex pattern to search for"}}},
-            {"path",           {{"type","string"}, {"description","Directory to search (default: cwd)"}}},
-            {"glob",           {{"type","string"}, {"description","Filter files by glob. A bare pattern like `*.cpp` matches the filename anywhere; a slash pattern like `src/*.ts` or `**/test/*.py` matches the workspace-relative path."}}},
-            {"case_sensitive", {{"type","boolean"}, {"description","Case-sensitive match (default: false)"}}},
-            {"word",           {{"type","boolean"}, {"description","Whole-word match: `foo` won't match `foobar` or `do_foo`. Use for finding all USES of an identifier."}}},
-            {"context",        {{"type","string"}, {"description","`line` (default) = ±2 lines around each hit. `block` = the WHOLE enclosing function/block, so you rarely need a follow-up `read`. A number `0`-`60` = ±N lines (like grep -C N) (use `0` for match lines only — densest content view)."}}},
-            {"output",         {{"type","string"}, {"enum", {"content","files","count"}}, {"description","`content` (default) = matching lines with context. `files` = one path + match-count per line, no line bodies (the survey view: WHICH files touch X). `count` = per-file match counts only (the cheapest probe: HOW WIDESPREAD is X — run this before a bulk rewrite)."}}},
-            {"offset",         {{"type","integer"}, {"description","Skip this many matches (for pagination)"}}},
-            {"limit",          {{"type","integer"}, {"description","Matches per page (default 20, max 200). Use this instead of piping to `head`."}}},
-            {"exclude",        {{"type","string"},  {"description","Drop hits whose line matches this regex (ECMAScript). Use this instead of piping to `grep -v`."}}},
-        }},
-    };
-}
-
 } // namespace
 
 void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
@@ -1563,8 +1494,8 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "function/class when detectable (e.g. `### fn foo \xe2\x80\xba L12-14`). "
         "Paginated 20 results per page (`limit` changes that). Case-insensitive by default; pass "
         "case_sensitive=true for exact case. Use offset for subsequent pages.",
-        grep_schema(), EffectSet{Effect::ReadFs},
-        body_with<GrepArgs>([exec](const Call& c, const GrepArgs& a) { return run_grep(c, a, exec.get()); }, parse_grep_args), 30'000);
+        kGrepArgs.schema(), EffectSet{Effect::ReadFs},
+        body<GrepArgs>([exec](const Call& c, const GrepArgs& a) { return run_grep(c, a, exec.get()); }, kGrepArgs, check_grep), 30'000);
 
     sh.add("glob",
         "Find files by glob pattern. Supports `*` (any run), `?` (one char), "
@@ -1572,8 +1503,8 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "the FILENAME anywhere in the tree (`*.cpp`); a pattern containing a "
         "slash matches the workspace-relative PATH (`src/*.ts`, `**/util/*.hpp`). "
         "Case-insensitive on Windows.",
-        glob_schema(), EffectSet{Effect::ReadFs},
-        body<GlobArgs>(run_glob, parse_glob_args), 25'000);
+        kGlobArgs.schema(), EffectSet{Effect::ReadFs},
+        body<GlobArgs>(run_glob, kGlobArgs, check_glob), 25'000);
 
     if (!exec) return;   // find_definition runs ripgrep
     sh.add("find_definition",
@@ -1583,8 +1514,8 @@ void register_search_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
         "it returns the declaration, not a ranked overview (that's `repo_map`). "
         "To find USES of a symbol, use `grep` with word=true; for calls with a "
         "specific shape use `search_structural`.",
-        find_definition_schema(), EffectSet{Effect::ReadFs},
-        body_with<FindDefinitionArgs>([exec](const Call& c, const FindDefinitionArgs& a) { CallExec ce{*exec, c}; return run_find_definition(c, a, ce); }, parse_find_definition_args), 25'000);
+        kFindDefinitionArgs.schema(), EffectSet{Effect::ReadFs},
+        body<FindDefinitionArgs>([exec](const Call& c, const FindDefinitionArgs& a) { CallExec ce{*exec, c}; return run_find_definition(c, a, ce); }, kFindDefinitionArgs), 25'000);
 }
 
 } // namespace mcp::tools::detail

@@ -19,6 +19,7 @@
 
 #include <mcp/tools/util/arg_reader.hpp>
 #include <mcp/tools/util/error.hpp>
+#include <mcp/tools/util/fs_helpers.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -181,12 +182,28 @@ public:
         (add(std::move(args)), ...);
     }
 
+    /// A pass over the raw call before the fields are read, for tools that
+    /// fold shapes a model sends (`file:10-20`, a `paths` list) into the
+    /// declared keys. Returns the object to decode.
+    using Tidy = nlohmann::json (*)(const nlohmann::json&, const Bounds&);
+    ArgSpec& tidy(Tidy t) { tidy_ = t; return *this; }
+
+    /// Keep the (tidied) input object in `member`, for a check that needs to
+    /// know which keys arrived, not just their values.
+    ArgSpec& raw(nlohmann::json A::* member) { raw_ = member; return *this; }
+
     /// Decode a call's arguments. Lenient on shape, strict on what's required.
-    [[nodiscard]] std::expected<A, ToolError> decode(const nlohmann::json& j) const {
+    /// `b` is the call's bounds, for a tidy pass that resolves paths.
+    [[nodiscard]] std::expected<A, ToolError> decode(const nlohmann::json& j,
+                                                     const Bounds* b = nullptr) const {
         A out{};
-        ArgReader r(j);
+        nlohmann::json tidied;
+        if (tidy_ && b) tidied = tidy_(j, *b);
+        const nlohmann::json& in = (tidy_ && b) ? tidied : j;
+        ArgReader r(in);
         for (const auto& f : readers_)
             if (auto err = f(r, out)) return std::unexpected(std::move(*err));
+        if (raw_) out.*raw_ = in;
         return out;
     }
 
@@ -213,6 +230,8 @@ private:
     std::vector<std::function<void(nlohmann::json&, const A&)>>                      describers_;
     std::vector<std::function<std::optional<ToolError>(const ArgReader&, A&)>>       readers_;
     std::vector<std::string>                                                         required_;
+    Tidy                                                                             tidy_ = nullptr;
+    nlohmann::json A::*                                                              raw_ = nullptr;
 };
 
 }  // namespace mcp::tools::util

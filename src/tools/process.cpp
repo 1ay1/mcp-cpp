@@ -114,17 +114,21 @@ Session::Read read_for(const Call& call, Session& s, std::chrono::milliseconds w
 
 namespace {
 
-struct StartArgs { std::string command; std::string cwd; };
+struct StartArgs { std::string command; std::string cwd = "."; };
 
-std::expected<StartArgs, ToolError> parse_start(const json& args, const util::Bounds& b) {
-    util::ArgReader reader(args);
-    auto command = reader.require_str("command");
-    if (!command || command->empty())
-        return std::unexpected(ToolError::invalid_args("command is required"));
-    auto cwd = reader.str("cwd", ".");
-    auto checked = util::make_workspace_path_checked(cwd, "process_start", b);
+const util::ArgSpec<StartArgs> kStartArgs{
+    util::arg(&StartArgs::command, "command",
+              "Shell command to run as a persistent background process (dev "
+              "server, file watcher, log tail).").required(),
+    util::arg(&StartArgs::cwd, "cwd", "Working directory, relative to the workspace root."),
+};
+
+// The cwd must be inside the workspace; resolved to an absolute path.
+std::expected<StartArgs, ToolError> check_start(StartArgs a, const util::Bounds& b) {
+    auto checked = util::make_workspace_path_checked(a.cwd, "process_start", b);
     if (!checked) return std::unexpected(checked.error());
-    return StartArgs{*command, checked->string()};
+    a.cwd = checked->string();
+    return a;
 }
 
 ExecResult run_start(const Call& call, const StartArgs& args, CallExec& exec) {
@@ -229,16 +233,20 @@ ExecResult run_start(const Call& call, const StartArgs& args, CallExec& exec) {
 }
 
 struct PollArgs { std::string id; int max_chars = 30000; int wait_ms = 250; };
-std::expected<PollArgs, ToolError> parse_poll(const json& args) {
-    util::ArgReader reader(args);
-    auto id = reader.require_str("id");
-    if (!id || id->empty()) return std::unexpected(ToolError::invalid_args("id is required"));
-    // wait_ms up to 300 s (matches the shell tool's max). A long block is safe:
-    // the host returns the instant output arrives OR the child exits, and
-    // the wait is sliced so a cancel is noticed.
-    return PollArgs{*id, std::clamp(reader.integer("max_chars", 30000), 1000, 100000),
-                    std::clamp(reader.integer("wait_ms", 250), 0, 300000)};
-}
+
+// wait_ms up to 300 s (the shell tool's max). A long block is safe: the
+// host returns the instant output arrives OR the child exits, and the wait
+// is sliced so a cancel is noticed.
+const util::ArgSpec<PollArgs> kPollArgs{
+    util::arg(&PollArgs::id, "id", "Session id returned by process_start.").required(),
+    util::arg(&PollArgs::max_chars, "max_chars",
+              "Cap on bytes of new output returned this poll (most recent kept).")
+        .range(1000, 100000),
+    util::arg(&PollArgs::wait_ms, "wait_ms",
+              "Block up to this long (ms) waiting for new output. Returns the "
+              "instant output arrives or the process exits, so a big value is "
+              "free for a quiet process.").range(0, 300000),
+};
 
 ExecResult run_poll(const Call& call, const PollArgs& args, CallExec&) {
     const auto entry = find_entry(call, args.id);
@@ -276,12 +284,10 @@ ExecResult run_poll(const Call& call, const PollArgs& args, CallExec&) {
 }
 
 struct StopArgs { std::string id; };
-std::expected<StopArgs, ToolError> parse_stop(const json& args) {
-    util::ArgReader reader(args);
-    auto id = reader.require_str("id");
-    if (!id || id->empty()) return std::unexpected(ToolError::invalid_args("id is required"));
-    return StopArgs{*id};
-}
+
+const util::ArgSpec<StopArgs> kStopArgs{
+    util::arg(&StopArgs::id, "id", "Session id to terminate and reap.").required(),
+};
 
 ExecResult run_stop(const Call& call, const StopArgs& args, CallExec&) {
     // Out of the map first: from here this call is the only one that can
@@ -305,36 +311,6 @@ ExecResult run_stop(const Call& call, const StopArgs& args, CallExec&) {
     return ToolOutput{std::move(text), std::nullopt};
 }
 
-json start_schema() {
-    return json{{"type","object"}, {"required", {"command"}}, {"properties", {
-        {"command", {{"type","string"}, {"description",
-            "Shell command to run as a persistent background process (dev "
-            "server, file watcher, log tail). For a command that finishes on "
-            "its own, use shell instead."}}},
-        {"cwd", {{"type","string"}, {"description",
-            "Working directory, relative to the workspace root (default: "
-            "workspace root)."}}}
-    }}};
-}
-json poll_schema() {
-    return json{{"type","object"}, {"required", {"id"}}, {"properties", {
-        {"id", {{"type","string"}, {"description","Session id returned by process_start."}}},
-        {"max_chars", {{"type","integer"}, {"minimum",1000}, {"maximum",100000}, {"default",30000},
-                       {"description","Cap on bytes of new output returned this poll (most recent kept)."}}},
-        {"wait_ms", {{"type","integer"}, {"minimum",0}, {"maximum",300000}, {"default",250},
-                     {"description","Block up to this long (ms, max 300000 = 5 min) waiting for "
-                                    "new output before returning — returns THE INSTANT output arrives "
-                                    "or the process exits, so a big value is free for a quiet process. "
-                                    "Raise it (e.g. 60000) to wait on a slow build/boot instead of "
-                                    "busy-polling; the wait stays interruptible."}}}
-    }}};
-}
-json stop_schema() {
-    return json{{"type","object"}, {"required", {"id"}}, {"properties", {
-        {"id", {{"type","string"}, {"description","Session id to terminate and reap."}}}
-    }}};
-}
-
 } // namespace
 
 void register_process_tools(Shells& shells, const std::shared_ptr<Exec>& exec) {
@@ -344,22 +320,21 @@ void register_process_tools(Shells& shells, const std::shared_ptr<Exec>& exec) {
         "Start a long-running background process (dev server, watcher, log tail) "
         "and return a session id. Waits ~300ms so an immediate crash is reported "
         "right away with its exit code and output; otherwise it keeps running for "
-        "process_poll (incremental output) and process_stop (cleanup). Use bash "
-        "for commands that finish on their own.",
-        start_schema(), EffectSet{Effect::Exec},
-        body_with<StartArgs>([exec](const Call& c, const StartArgs& a) { CallExec ce{*exec, c}; return run_start(c, a, ce); }, parse_start), 4000);
+        "process_poll (incremental output) and process_stop (cleanup).",
+        kStartArgs.schema(), EffectSet{Effect::Exec},
+        body<StartArgs>([exec](const Call& c, const StartArgs& a) { CallExec ce{*exec, c}; return run_start(c, a, ce); }, kStartArgs, check_start), 4000);
     shells.add("process_poll",
         "Fetch output produced by a background session SINCE THE LAST POLL, plus "
         "its status (running + uptime, or exited + exit code). Blocks briefly for "
         "new output. Reports if any output scrolled past the rolling buffer.",
-        poll_schema(), EffectSet{Effect::Exec},
-        body_with<PollArgs>([exec](const Call& c, const PollArgs& a) { CallExec ce{*exec, c}; return run_poll(c, a, ce); }, parse_poll), 30000);
+        kPollArgs.schema(), EffectSet{Effect::Exec},
+        body<PollArgs>([exec](const Call& c, const PollArgs& a) { CallExec ce{*exec, c}; return run_poll(c, a, ce); }, kPollArgs), 30000);
     shells.add("process_stop",
         "Terminate (SIGTERM→SIGKILL) and reap a background session, returning its "
         "exit code and any final output not yet delivered by process_poll. Always "
         "call this to clean up a session you started.",
-        stop_schema(), EffectSet{Effect::Exec},
-        body_with<StopArgs>([exec](const Call& c, const StopArgs& a) { CallExec ce{*exec, c}; return run_stop(c, a, ce); }, parse_stop), 30000);
+        kStopArgs.schema(), EffectSet{Effect::Exec},
+        body<StopArgs>([exec](const Call& c, const StopArgs& a) { CallExec ce{*exec, c}; return run_stop(c, a, ce); }, kStopArgs), 30000);
 }
 
 } // namespace mcp::tools::detail

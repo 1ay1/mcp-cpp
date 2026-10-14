@@ -91,44 +91,41 @@ HttpReply http_send(HttpClient& client, const std::string& method,
 
 struct WebFetchArgs {
     std::string url;
-    std::string method;   // "GET" | "HEAD" | "POST"
+    std::string method = "GET";   // "GET" | "HEAD" | "POST"
     std::vector<std::pair<std::string, std::string>> headers;
     std::string display_description;
     bool allow_jina = true;
+    json raw_headers;
 };
 
-std::expected<WebFetchArgs, ToolError> parse_web_fetch_args(const json& j) {
-    util::ArgReader ar(j);
-    auto url_opt = ar.require_str("url");
-    if (!url_opt)
-        return std::unexpected(ToolError::invalid_args("url required"));
-    std::string url = *std::move(url_opt);
-    if (!url.starts_with("https://"))
+const util::ArgSpec<WebFetchArgs> kWebFetchArgs{
+    util::arg(&WebFetchArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&WebFetchArgs::url, "url", "The URL to fetch (https only)").required(),
+    util::arg(&WebFetchArgs::method, "method", "HTTP method (default: GET)"),
+    util::arg(&WebFetchArgs::raw_headers, "headers", "Additional headers as key-value pairs")
+        .shape(json{{"type", "object"}}),
+};
+
+// TLS only; headers lowercased, x-no-jina pulled out; unknown method -> GET.
+std::expected<WebFetchArgs, ToolError> check_web_fetch(WebFetchArgs a, const util::Bounds&) {
+    if (!a.url.starts_with("https://"))
         return std::unexpected(ToolError::invalid_args(
             "url must start with https:// (web_fetch is TLS-only)"));
-    std::vector<std::pair<std::string, std::string>> hdrs;
-    bool allow_jina = true;
-    if (const json* h = ar.raw("headers"); h && h->is_object()) {
-        for (auto& [k, v] : h->items()) {
+    if (a.raw_headers.is_object()) {
+        for (auto& [k, v] : a.raw_headers.items()) {
             std::string lower; lower.reserve(k.size());
             for (char c : k) lower.push_back(static_cast<char>(std::tolower((unsigned char)c)));
             std::string val = v.is_string() ? v.get<std::string>() : v.dump();
             if (lower == "x-no-jina") {
-                allow_jina = !(val == "1" || val == "true" || val == "yes");
+                a.allow_jina = !(val == "1" || val == "true" || val == "yes");
                 continue;
             }
-            hdrs.emplace_back(std::move(lower), std::move(val));
+            a.headers.emplace_back(std::move(lower), std::move(val));
         }
     }
-    std::string method = ar.str("method", "GET");
-    if (method == "HEAD" || method == "POST" || method == "GET") {} else method = "GET";
-    return WebFetchArgs{
-        std::move(url),
-        std::move(method),
-        std::move(hdrs),
-        ar.str("display_description", ""),
-        allow_jina,
-    };
+    if (a.method == "HEAD" || a.method == "POST" || a.method == "GET") {} else a.method = "GET";
+    return a;
 }
 
 constexpr size_t kMaxFetchBytes = 64'000;
@@ -1099,21 +1096,16 @@ ExecResult run_web_fetch(HttpClient& client, const WebFetchArgs& a, bool jina) {
 
 struct WebSearchArgs {
     std::string query;
-    int count;
+    int count = 10;
     std::string display_description;
 };
 
-std::expected<WebSearchArgs, ToolError> parse_web_search_args(const json& j) {
-    util::ArgReader ar(j);
-    auto q_opt = ar.require_str("query");
-    if (!q_opt)
-        return std::unexpected(ToolError::invalid_args("query required"));
-    return WebSearchArgs{
-        *std::move(q_opt),
-        ar.integer("count", 10),
-        ar.str("display_description", ""),
-    };
-}
+const util::ArgSpec<WebSearchArgs> kWebSearchArgs{
+    util::arg(&WebSearchArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&WebSearchArgs::query, "query", "Search query").required(),
+    util::arg(&WebSearchArgs::count, "count", "Max results (default: 10)"),
+};
 
 std::string url_unescape(std::string_view s) {
     std::string out;
@@ -1481,35 +1473,6 @@ ExecResult run_web_search(HttpClient& client, const WebSearchPlan& plan,
     return ToolOutput{std::move(s), std::nullopt};
 }
 
-// ── Schemas ────────────────────────────────────────────────────────────
-
-json web_fetch_schema() {
-    return json{
-        {"type","object"},
-        {"required", {"url"}},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"url",     {{"type","string"}, {"description","The URL to fetch (https only)"}}},
-            {"method",  {{"type","string"}, {"description","HTTP method (default: GET)"}}},
-            {"headers", {{"type","object"}, {"description","Additional headers as key-value pairs"}}},
-        }},
-    };
-}
-
-json web_search_schema() {
-    return json{
-        {"type","object"},
-        {"required", {"query"}},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"query", {{"type","string"}, {"description","Search query"}}},
-            {"count", {{"type","integer"}, {"description","Max results (default: 10)"}}},
-        }},
-    };
-}
-
 } // namespace
 
 void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http, bool jina,
@@ -1524,12 +1487,10 @@ void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http, boo
         "JS/SPA pages are auto-rendered via r.jina.ai when the primary "
         "fetch returns a near-empty shell (disable per-request by sending "
         "a `x-no-jina: 1` header).",
-        web_fetch_schema(), EffectSet{Effect::Net},
-        [http, jina](const json& args) -> mcp::cap::Result {
-            auto parsed = parse_web_fetch_args(args);
-            if (!parsed) return mcp::cap::Result::error(parsed.error().render());
-            return lower(run_web_fetch(*http, *parsed, jina));
-        }, 20'000);
+        kWebFetchArgs.schema(), EffectSet{Effect::Net},
+        body<WebFetchArgs>([http, jina](const WebFetchArgs& a) {
+            return run_web_fetch(*http, a, jina);
+        }, kWebFetchArgs, check_web_fetch), 20'000);
 
     sh.add("web_search",
         "Search the web. Tries the configured search services in order until one "
@@ -1538,15 +1499,13 @@ void register_web_tools(Shells& sh, const std::shared_ptr<HttpClient>& http, boo
         "to read the page. Standard search operators work in the query: "
         "`site:docs.python.org`, `\"exact phrase\"`, `-exclude`. Duplicate "
         "URLs (AMP / mobile / archive mirrors) are auto-deduped.",
-        web_search_schema(), EffectSet{Effect::Net},
-        [http, plans](const json& args) -> mcp::cap::Result {
-            auto parsed = parse_web_search_args(args);
-            if (!parsed) return mcp::cap::Result::error(parsed.error().render());
+        kWebSearchArgs.schema(), EffectSet{Effect::Net},
+        body<WebSearchArgs>([http, plans](const WebSearchArgs& a) {
             // Read the plan per call so a change in the host's settings reaches
             // the very next search. No source means the key-less default chain.
             const WebSearchPlan plan = plans ? plans->plan() : default_web_search_plan();
-            return lower(run_web_search(*http, plan, *parsed));
-        }, 0);
+            return run_web_search(*http, plan, a);
+        }, kWebSearchArgs), 0);
 }
 
 } // namespace mcp::tools::detail

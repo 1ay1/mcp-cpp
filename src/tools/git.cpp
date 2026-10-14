@@ -439,17 +439,15 @@ struct GitStatusArgs {
     std::string display_description;
 };
 
-std::expected<GitStatusArgs, ToolError> parse_git_status_args(const json& j) {
-    util::ArgReader ar(j);
-    // Default is empty, NOT ".": an empty path lets resolve_git_dir() pick
-    // the smart default (the process cwd / the project). A literal "." is
-    // workspace-checked into the access boundary, which under `--workspace /`
-    // becomes `/` and makes `git -C / status` fail "not a git repository".
-    return GitStatusArgs{
-        ar.str("path", ""),
-        ar.str("display_description", ""),
-    };
-}
+// Default is empty, NOT ".": an empty path lets resolve_git_dir() pick
+// the smart default (the process cwd / the project). A literal "." is
+// workspace-checked into the access boundary, which under `--workspace /`
+// becomes `/` and makes `git -C / status` fail "not a git repository".
+const util::ArgSpec<GitStatusArgs> kGitStatusArgs{
+    util::arg(&GitStatusArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&GitStatusArgs::root, "path", "Repository path (default: cwd)"),
+};
 
 ExecResult run_git_status(const Call& call, const GitStatusArgs& a, CallExec& exec) {
     const auto b = bounds(call);
@@ -517,24 +515,24 @@ ExecResult run_git_status(const Call& call, const GitStatusArgs& a, CallExec& ex
 
 struct GitDiffArgs {
     std::string path;
-    bool staged;
+    bool staged = false;
     std::string ref;
-    bool stat_only;
-    int context;
+    bool stat_only = false;
+    int context = 3;
     std::string display_description;
 };
 
-std::expected<GitDiffArgs, ToolError> parse_git_diff_args(const json& j) {
-    util::ArgReader ar(j);
-    return GitDiffArgs{
-        ar.str("path", ""),
-        ar.boolean("staged", false),
-        ar.str("ref", ""),
-        ar.boolean("stat_only", false),
-        ar.integer("context", 3),
-        ar.str("display_description", ""),
-    };
-}
+const util::ArgSpec<GitDiffArgs> kGitDiffArgs{
+    util::arg(&GitDiffArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&GitDiffArgs::path, "path", "File or directory to diff"),
+    util::arg(&GitDiffArgs::staged, "staged", "Show staged changes (default: false)"),
+    util::arg(&GitDiffArgs::ref, "ref", "Git ref or range (e.g. HEAD~3, main..HEAD)"),
+    util::arg(&GitDiffArgs::stat_only, "stat_only", "Only the per-file "
+              "change summary, no patch body — cheap for large diffs (default: false)"),
+    util::arg(&GitDiffArgs::context, "context", "Lines of context "
+              "around each hunk (default: 3, 0–100)").range(0, 100),
+};
 
 ExecResult run_git_diff(const Call& call, const GitDiffArgs& a, CallExec& exec) {
     const auto b = bounds(call);
@@ -609,23 +607,21 @@ ExecResult run_git_diff(const Call& call, const GitDiffArgs& a, CallExec& exec) 
 // ── git_log ────────────────────────────────────────────────────────────
 
 struct GitLogArgs {
-    int count;
+    int count = 20;
     std::string path;
-    std::string ref;
-    bool oneline;
+    std::string ref = "HEAD";
+    bool oneline = false;
     std::string display_description;
 };
 
-std::expected<GitLogArgs, ToolError> parse_git_log_args(const json& j) {
-    util::ArgReader ar(j);
-    return GitLogArgs{
-        ar.integer("count", 20),
-        ar.str("path", ""),
-        ar.str("ref", "HEAD"),
-        ar.boolean("oneline", false),
-        ar.str("display_description", ""),
-    };
-}
+const util::ArgSpec<GitLogArgs> kGitLogArgs{
+    util::arg(&GitLogArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&GitLogArgs::count, "count", "Number of commits (default: 20)"),
+    util::arg(&GitLogArgs::path, "path", "Filter by file path"),
+    util::arg(&GitLogArgs::ref, "ref", "Branch or ref (default: HEAD)"),
+    util::arg(&GitLogArgs::oneline, "oneline", "One-line format (default: false)"),
+};
 
 ExecResult run_git_log(const Call& call, const GitLogArgs& a, CallExec& exec) {
     const auto b = bounds(call);
@@ -671,16 +667,32 @@ ExecResult run_git_log(const Call& call, const GitLogArgs& a, CallExec& exec) {
 struct GitCommitArgs {
     std::string message;
     std::vector<std::string> files;
-    bool stage_all;
-    bool amend;
+    bool stage_all = false;
+    bool amend = false;
     std::string path;
     std::string display_description;
+    std::optional<std::string> raw_message;
+    json raw_files;
 };
 
-std::expected<GitCommitArgs, ToolError> parse_git_commit_args(const json& j) {
-    util::ArgReader ar(j);
-    const bool amend = ar.boolean("amend", false);
-    auto msg_opt = ar.require_str("message");
+const util::ArgSpec<GitCommitArgs> kGitCommitArgs{
+    util::arg(&GitCommitArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&GitCommitArgs::raw_message, "message", "Commit message "
+              "(required unless amend=true, where it defaults to the existing message)"),
+    util::arg(&GitCommitArgs::raw_files, "files", "Files to stage before committing")
+        .shape(json{{"type","array"}, {"items",{{"type","string"}}}}),
+    util::arg(&GitCommitArgs::stage_all, "stage_all", "Stage all changes (default: false)"),
+    util::arg(&GitCommitArgs::amend, "amend", "Amend the previous "
+              "commit instead of creating a new one; omit message to keep it (default: false)"),
+    util::arg(&GitCommitArgs::path, "path", "Repository path "
+              "(default: derived from files, else the current project)"),
+};
+
+// Message trimmed and required unless amending; files keeps non-empty strings.
+std::expected<GitCommitArgs, ToolError> check_git_commit(GitCommitArgs a, const util::Bounds&) {
+    const bool amend = a.amend;
+    auto& msg_opt = a.raw_message;
     // An amend may reuse the existing message (`--amend --no-edit`), so the
     // message is optional in that mode only.
     if (!msg_opt && !amend)
@@ -701,25 +713,17 @@ std::expected<GitCommitArgs, ToolError> parse_git_commit_args(const json& j) {
         }
     }
 
-    std::vector<std::string> files;
-    if (const json* f = ar.raw("files"); f && f->is_array()) {
-        files.reserve(f->size());
+    a.message = std::move(msg);
+    if (const json* f = &a.raw_files; f->is_array()) {
+        a.files.reserve(f->size());
         for (const auto& el : *f) {
             if (el.is_string()) {
                 auto s = el.get<std::string>();
-                if (!s.empty()) files.push_back(std::move(s));
+                if (!s.empty()) a.files.push_back(std::move(s));
             }
         }
     }
-
-    return GitCommitArgs{
-        std::move(msg),
-        std::move(files),
-        ar.boolean("stage_all", false),
-        amend,
-        ar.str("path", ""),
-        ar.str("display_description", ""),
-    };
+    return a;
 }
 
 ExecResult run_git_commit(const Call& call, const GitCommitArgs& a, CallExec& exec) {
@@ -859,20 +863,26 @@ ExecResult run_git_commit(const Call& call, const GitCommitArgs& a, CallExec& ex
 // ── git_show / git_blame ───────────────────────────────────────────────
 
 struct GitShowArgs {
-    std::string ref;
+    std::string ref = "HEAD";
     std::string path;
     bool file_content = false;
+    std::string format = "commit";
 };
 
-std::expected<GitShowArgs, ToolError> parse_git_show_args(const json& j) {
-    util::ArgReader ar(j);
-    const auto format = ar.str("format", "commit");
-    if (format != "commit" && format != "file")
-        return std::unexpected(ToolError::invalid_args("format must be 'commit' or 'file'"));
-    auto path = ar.str("path", "");
-    if (format == "file" && path.empty())
+const util::ArgSpec<GitShowArgs> kGitShowArgs{
+    util::arg(&GitShowArgs::ref, "ref", "Commit/ref (default HEAD)."),
+    util::arg(&GitShowArgs::path, "path", "Optional workspace file/path filter."),
+    util::arg(&GitShowArgs::format, "format",
+              "commit shows metadata+patch; file shows file contents at ref.")
+        .one_of({"commit", "file"}),
+};
+
+// format=file needs a path.
+std::expected<GitShowArgs, ToolError> check_git_show(GitShowArgs a, const util::Bounds&) {
+    if (a.format == "file" && a.path.empty())
         return std::unexpected(ToolError::invalid_args("path is required when format=file"));
-    return GitShowArgs{ar.str("ref", "HEAD"), std::move(path), format == "file"};
+    a.file_content = a.format == "file";
+    return a;
 }
 
 ExecResult run_git_show(const Call& call, const GitShowArgs& a, CallExec& exec) {
@@ -905,18 +915,29 @@ ExecResult run_git_show(const Call& call, const GitShowArgs& a, CallExec& exec) 
     return ToolOutput{out->empty() ? "(no output)" : std::move(*out), std::nullopt};
 }
 
-struct GitBlameArgs { std::string path; std::string ref; int start = 0; int end = 0; };
+struct GitBlameArgs {
+    std::string path; std::string ref = "HEAD"; int start = 0; int end = 0;
+    json raw_start, raw_end;
+};
 
-std::expected<GitBlameArgs, ToolError> parse_git_blame_args(const json& j) {
-    util::ArgReader ar(j);
-    auto path = ar.require_str("path");
-    if (!path || path->empty())
-        return std::unexpected(ToolError::invalid_args("path is required"));
-    int start = ar.integer("start_line", 0);
-    int end = ar.integer("end_line", 0);
-    if ((start > 0 || end > 0) && (start < 1 || end < start))
+const util::ArgSpec<GitBlameArgs> kGitBlameArgs{
+    util::arg(&GitBlameArgs::path, "path", "Workspace file to annotate.").required(),
+    util::arg(&GitBlameArgs::ref, "ref", "Commit/ref (default HEAD)."),
+    util::arg(&GitBlameArgs::raw_start, "start_line", "")
+        .shape(json{{"type","integer"}, {"minimum",1}}),
+    util::arg(&GitBlameArgs::raw_end, "end_line", "")
+        .shape(json{{"type","integer"}, {"minimum",1}}),
+};
+
+// Lines read leniently ("42" ok); a given range must satisfy 1 <= start <= end.
+std::expected<GitBlameArgs, ToolError> check_git_blame(GitBlameArgs a, const util::Bounds&) {
+    const json lines{{"s", a.raw_start}, {"e", a.raw_end}};
+    util::ArgReader ar(lines);
+    a.start = ar.integer("s", 0);
+    a.end = ar.integer("e", 0);
+    if ((a.start > 0 || a.end > 0) && (a.start < 1 || a.end < a.start))
         return std::unexpected(ToolError::invalid_args("line range must satisfy 1 <= start_line <= end_line"));
-    return GitBlameArgs{*path, ar.str("ref", "HEAD"), start, end};
+    return a;
 }
 
 ExecResult run_git_blame(const Call& call, const GitBlameArgs& a, CallExec& exec) {
@@ -943,7 +964,7 @@ ExecResult run_git_blame(const Call& call, const GitBlameArgs& a, CallExec& exec
 // creating), delete. Kept as ONE tool rather than four so the model has a
 // small, obvious surface — mirrors how `git_show` folds commit/file.
 struct GitBranchArgs {
-    std::string action;   // list | create | switch | delete
+    std::string action = "list";   // list | create | switch | delete
     std::string name;
     std::string start_point;
     bool force = false;
@@ -951,14 +972,25 @@ struct GitBranchArgs {
     std::string display_description;
 };
 
-std::expected<GitBranchArgs, ToolError> parse_git_branch_args(const json& j) {
-    util::ArgReader ar(j);
-    std::string action = ar.str("action", "list");
-    if (action != "list" && action != "create"
-     && action != "switch" && action != "delete")
-        return std::unexpected(ToolError::invalid_args(
-            "action must be one of: list, create, switch, delete"));
-    std::string name = ar.str("name", "");
+const util::ArgSpec<GitBranchArgs> kGitBranchArgs{
+    util::arg(&GitBranchArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&GitBranchArgs::action, "action", "list (default, read-only) | create | "
+              "switch (checkout, creating if needed) | delete")
+        .one_of({"list", "create", "switch", "delete"}),
+    util::arg(&GitBranchArgs::name, "name", "Branch name "
+              "(required for create/switch/delete)"),
+    util::arg(&GitBranchArgs::start_point, "start_point", "Ref to base a "
+              "new branch on (create/switch); default HEAD"),
+    util::arg(&GitBranchArgs::force, "force", "create: reset an "
+              "existing branch; delete: drop even if unmerged (default: false)"),
+    util::arg(&GitBranchArgs::path, "path", "Repository path "
+              "(default: the current project)"),
+};
+
+std::expected<GitBranchArgs, ToolError> check_git_branch(GitBranchArgs a, const util::Bounds&) {
+    const std::string& action = a.action;
+    const std::string& name = a.name;
     if (action != "list" && name.empty())
         return std::unexpected(ToolError::invalid_args(
             "branch `name` is required for action=" + action));
@@ -973,14 +1005,7 @@ std::expected<GitBranchArgs, ToolError> parse_git_branch_args(const json& j) {
             return std::unexpected(ToolError::invalid_args(
                 "branch name may not contain whitespace: '" + name + "'"));
     }
-    return GitBranchArgs{
-        std::move(action),
-        std::move(name),
-        ar.str("start_point", ""),
-        ar.boolean("force", false),
-        ar.str("path", ""),
-        ar.str("display_description", ""),
-    };
+    return a;
 }
 
 ExecResult run_git_branch(const Call& call, const GitBranchArgs& a, CallExec& exec) {
@@ -1092,7 +1117,7 @@ ToolError sequencer_conflict(const RunResult& r,
 // the safe default), pop, apply, drop, show. A stash `ref` (e.g. stash@{1})
 // targets a specific entry for pop/apply/drop/show; default is the latest.
 struct GitStashArgs {
-    std::string action;   // list | push | pop | apply | drop | show
+    std::string action = "list";   // list | push | pop | apply | drop | show
     std::string message;
     std::string ref;
     bool include_untracked = false;
@@ -1100,26 +1125,27 @@ struct GitStashArgs {
     std::string display_description;
 };
 
-std::expected<GitStashArgs, ToolError> parse_git_stash_args(const json& j) {
-    util::ArgReader ar(j);
-    std::string action = ar.str("action", "list");
-    if (action != "list" && action != "push" && action != "pop"
-     && action != "apply" && action != "drop" && action != "show")
-        return std::unexpected(ToolError::invalid_args(
-            "action must be one of: list, push, pop, apply, drop, show"));
-    std::string ref = ar.str("ref", "");
-    if (!ref.empty()) {
-        if (auto v = validate_ref(ref); !v)
+const util::ArgSpec<GitStashArgs> kGitStashArgs{
+    util::arg(&GitStashArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&GitStashArgs::action, "action", "list (default, read-only) | push (shelve "
+              "changes) | pop | apply | drop | show")
+        .one_of({"list", "push", "pop", "apply", "drop", "show"}),
+    util::arg(&GitStashArgs::message, "message", "Label for a push"),
+    util::arg(&GitStashArgs::ref, "ref", "Stash entry for "
+              "pop/apply/drop/show, e.g. stash@{1} (default: latest)"),
+    util::arg(&GitStashArgs::include_untracked, "include_untracked", "push: also "
+              "stash untracked files (default: false)"),
+    util::arg(&GitStashArgs::path, "path", "Repository path "
+              "(default: the current project)"),
+};
+
+std::expected<GitStashArgs, ToolError> check_git_stash(GitStashArgs a, const util::Bounds&) {
+    if (!a.ref.empty()) {
+        if (auto v = validate_ref(a.ref); !v)
             return std::unexpected(std::move(v.error()));
     }
-    return GitStashArgs{
-        std::move(action),
-        ar.str("message", ""),
-        std::move(ref),
-        ar.boolean("include_untracked", false),
-        ar.str("path", ""),
-        ar.str("display_description", ""),
-    };
+    return a;
 }
 
 ExecResult run_git_stash(const Call& call, const GitStashArgs& a, CallExec& exec) {
@@ -1202,30 +1228,33 @@ struct GitRebaseArgs {
     std::string display_description;
 };
 
-std::expected<GitRebaseArgs, ToolError> parse_git_rebase_args(const json& j) {
-    util::ArgReader ar(j);
-    std::string action = ar.str("action", "");
-    if (action != "onto" && action != "continue"
-     && action != "abort" && action != "skip")
-        return std::unexpected(ToolError::invalid_args(
-            "action must be one of: onto, continue, abort, skip"));
-    std::string upstream = ar.str("upstream", "");
-    if (action == "onto" && upstream.empty())
+const util::ArgSpec<GitRebaseArgs> kGitRebaseArgs{
+    util::arg(&GitRebaseArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&GitRebaseArgs::action, "action", "onto (rebase onto <upstream>) | "
+              "continue | abort | skip — drive an in-progress rebase")
+        .required().one_of({"onto", "continue", "abort", "skip"}),
+    util::arg(&GitRebaseArgs::upstream, "upstream", "Ref to rebase onto "
+              "(required for action=onto), e.g. main or origin/main"),
+    util::arg(&GitRebaseArgs::branch, "branch", "Branch to rebase "
+              "(action=onto; default: current branch)"),
+    util::arg(&GitRebaseArgs::path, "path", "Repository path "
+              "(default: the current project)"),
+};
+
+std::expected<GitRebaseArgs, ToolError> check_git_rebase(GitRebaseArgs a, const util::Bounds&) {
+    if (a.action == "onto" && a.upstream.empty())
         return std::unexpected(ToolError::invalid_args(
             "`upstream` (the ref to rebase onto) is required for action=onto"));
-    if (!upstream.empty()) {
-        if (auto v = validate_ref(upstream); !v)
+    if (!a.upstream.empty()) {
+        if (auto v = validate_ref(a.upstream); !v)
             return std::unexpected(std::move(v.error()));
     }
-    std::string branch = ar.str("branch", "");
-    if (!branch.empty()) {
-        if (auto v = validate_ref(branch); !v)
+    if (!a.branch.empty()) {
+        if (auto v = validate_ref(a.branch); !v)
             return std::unexpected(std::move(v.error()));
     }
-    return GitRebaseArgs{
-        std::move(action), std::move(upstream), std::move(branch),
-        ar.str("path", ""), ar.str("display_description", ""),
-    };
+    return a;
 }
 
 ExecResult run_git_rebase(const Call& call, const GitRebaseArgs& a, CallExec& exec) {
@@ -1276,23 +1305,35 @@ ExecResult run_git_rebase(const Call& call, const GitRebaseArgs& a, CallExec& ex
 // in-progress cherry-pick. action: pick (default; needs `commits`), continue,
 // abort, skip.
 struct GitCherryPickArgs {
-    std::string action;   // pick | continue | abort | skip
+    std::string action = "pick";   // pick | continue | abort | skip
     std::vector<std::string> commits;
     bool no_commit = false;   // stage the changes but don't commit (-n)
     std::string path;
     std::string display_description;
+    json raw_commits;
 };
 
+const util::ArgSpec<GitCherryPickArgs> kGitCherryPickArgs{
+    util::arg(&GitCherryPickArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&GitCherryPickArgs::action, "action", "pick (default; apply `commits` onto HEAD) "
+              "| continue | abort | skip")
+        .one_of({"pick", "continue", "abort", "skip"}),
+    util::arg(&GitCherryPickArgs::raw_commits, "commits", "Commit ref(s) to apply (required for "
+              "action=pick); a single string is also accepted")
+        .shape(json{{"type","array"}, {"items",{{"type","string"}}}}),
+    util::arg(&GitCherryPickArgs::no_commit, "no_commit", "Stage the changes "
+              "without committing (default: false)"),
+    util::arg(&GitCherryPickArgs::path, "path", "Repository path "
+              "(default: the current project)"),
+};
+
+// commits: a string or an array of strings, empties dropped, each ref-checked.
 std::expected<GitCherryPickArgs, ToolError>
-parse_git_cherry_pick_args(const json& j) {
-    util::ArgReader ar(j);
-    std::string action = ar.str("action", "pick");
-    if (action != "pick" && action != "continue"
-     && action != "abort" && action != "skip")
-        return std::unexpected(ToolError::invalid_args(
-            "action must be one of: pick, continue, abort, skip"));
-    std::vector<std::string> commits;
-    if (const json* c = ar.raw("commits"); c) {
+check_git_cherry_pick(GitCherryPickArgs a, const util::Bounds&) {
+    const std::string& action = a.action;
+    std::vector<std::string>& commits = a.commits;
+    if (const json* c = &a.raw_commits; !c->is_null()) {
         if (c->is_string()) {
             auto s = c->get<std::string>();
             if (!s.empty()) commits.push_back(std::move(s));
@@ -1310,11 +1351,7 @@ parse_git_cherry_pick_args(const json& j) {
     for (const auto& c : commits)
         if (auto v = validate_ref(c); !v)
             return std::unexpected(std::move(v.error()));
-    return GitCherryPickArgs{
-        std::move(action), std::move(commits),
-        ar.boolean("no_commit", false),
-        ar.str("path", ""), ar.str("display_description", ""),
-    };
+    return a;
 }
 
 ExecResult run_git_cherry_pick(const Call& call, const GitCherryPickArgs& a, CallExec& exec) {
@@ -1361,171 +1398,6 @@ ExecResult run_git_cherry_pick(const Call& call, const GitCherryPickArgs& a, Cal
     return ToolOutput{"cherry-pick " + a.action + "d", std::nullopt};
 }
 
-// ── Schemas ────────────────────────────────────────────────────────────
-
-json git_status_schema() {
-    return json{
-        {"type","object"},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"path", {{"type","string"}, {"description","Repository path (default: cwd)"}}},
-        }},
-    };
-}
-
-json git_diff_schema() {
-    return json{
-        {"type","object"},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"path",    {{"type","string"}, {"description","File or directory to diff"}}},
-            {"staged",  {{"type","boolean"}, {"description","Show staged changes (default: false)"}}},
-            {"ref",     {{"type","string"}, {"description","Git ref or range (e.g. HEAD~3, main..HEAD)"}}},
-            {"stat_only", {{"type","boolean"}, {"description","Only the per-file "
-                           "change summary, no patch body — cheap for large diffs (default: false)"}}},
-            {"context", {{"type","integer"}, {"description","Lines of context "
-                         "around each hunk (default: 3, 0–100)"}}},
-        }},
-    };
-}
-
-json git_log_schema() {
-    return json{
-        {"type","object"},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"count",   {{"type","integer"}, {"description","Number of commits (default: 20)"}}},
-            {"path",    {{"type","string"}, {"description","Filter by file path"}}},
-            {"ref",     {{"type","string"}, {"description","Branch or ref (default: HEAD)"}}},
-            {"oneline", {{"type","boolean"}, {"description","One-line format (default: false)"}}},
-        }},
-    };
-}
-
-json git_show_schema() {
-    return json{{"type","object"}, {"properties", {
-        {"ref", {{"type","string"}, {"description","Commit/ref (default HEAD)."}}},
-        {"path", {{"type","string"}, {"description","Optional workspace file/path filter."}}},
-        {"format", {{"type","string"}, {"enum", {"commit","file"}},
-                    {"description","commit shows metadata+patch; file shows file contents at ref."}}}
-    }}};
-}
-
-json git_blame_schema() {
-    return json{{"type","object"}, {"required", {"path"}}, {"properties", {
-        {"path", {{"type","string"}, {"description","Workspace file to annotate."}}},
-        {"ref", {{"type","string"}, {"description","Commit/ref (default HEAD)."}}},
-        {"start_line", {{"type","integer"}, {"minimum",1}}},
-        {"end_line", {{"type","integer"}, {"minimum",1}}}
-    }}};
-}
-
-json git_commit_schema() {
-    return json{
-        {"type","object"},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"message",   {{"type","string"}, {"description","Commit message "
-                           "(required unless amend=true, where it defaults to the existing message)"}}},
-            {"files",     {{"type","array"}, {"items",{{"type","string"}}},
-                           {"description","Files to stage before committing"}}},
-            {"stage_all", {{"type","boolean"}, {"description","Stage all changes (default: false)"}}},
-            {"amend",     {{"type","boolean"}, {"description","Amend the previous "
-                           "commit instead of creating a new one; omit message to keep it (default: false)"}}},
-            {"path",      {{"type","string"}, {"description","Repository path "
-                           "(default: derived from files, else the current project)"}}},
-        }},
-    };
-}
-
-json git_branch_schema() {
-    return json{
-        {"type","object"},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"action", {{"type","string"}, {"enum", {"list","create","switch","delete"}},
-                        {"description","list (default, read-only) | create | "
-                         "switch (checkout, creating if needed) | delete"}}},
-            {"name",   {{"type","string"}, {"description","Branch name "
-                        "(required for create/switch/delete)"}}},
-            {"start_point", {{"type","string"}, {"description","Ref to base a "
-                             "new branch on (create/switch); default HEAD"}}},
-            {"force",  {{"type","boolean"}, {"description","create: reset an "
-                        "existing branch; delete: drop even if unmerged (default: false)"}}},
-            {"path",   {{"type","string"}, {"description","Repository path "
-                        "(default: the current project)"}}},
-        }},
-    };
-}
-
-json git_stash_schema() {
-    return json{
-        {"type","object"},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"action", {{"type","string"},
-                        {"enum", {"list","push","pop","apply","drop","show"}},
-                        {"description","list (default, read-only) | push (shelve "
-                         "changes) | pop | apply | drop | show"}}},
-            {"message", {{"type","string"}, {"description","Label for a push"}}},
-            {"ref",     {{"type","string"}, {"description","Stash entry for "
-                         "pop/apply/drop/show, e.g. stash@{1} (default: latest)"}}},
-            {"include_untracked", {{"type","boolean"}, {"description","push: also "
-                                   "stash untracked files (default: false)"}}},
-            {"path",    {{"type","string"}, {"description","Repository path "
-                         "(default: the current project)"}}},
-        }},
-    };
-}
-
-json git_rebase_schema() {
-    return json{
-        {"type","object"},
-        {"required", {"action"}},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"action",   {{"type","string"},
-                          {"enum", {"onto","continue","abort","skip"}},
-                          {"description","onto (rebase onto <upstream>) | "
-                           "continue | abort | skip — drive an in-progress rebase"}}},
-            {"upstream", {{"type","string"}, {"description","Ref to rebase onto "
-                          "(required for action=onto), e.g. main or origin/main"}}},
-            {"branch",   {{"type","string"}, {"description","Branch to rebase "
-                          "(action=onto; default: current branch)"}}},
-            {"path",     {{"type","string"}, {"description","Repository path "
-                          "(default: the current project)"}}},
-        }},
-    };
-}
-
-json git_cherry_pick_schema() {
-    return json{
-        {"type","object"},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"action",  {{"type","string"},
-                         {"enum", {"pick","continue","abort","skip"}},
-                         {"description","pick (default; apply `commits` onto HEAD) "
-                          "| continue | abort | skip"}}},
-            {"commits", {{"type","array"}, {"items",{{"type","string"}}},
-                         {"description","Commit ref(s) to apply (required for "
-                          "action=pick); a single string is also accepted"}}},
-            {"no_commit", {{"type","boolean"}, {"description","Stage the changes "
-                           "without committing (default: false)"}}},
-            {"path",    {{"type","string"}, {"description","Repository path "
-                         "(default: the current project)"}}},
-        }},
-    };
-}
-
 } // namespace
 
 void register_git_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
@@ -1534,60 +1406,60 @@ void register_git_tools(Shells& sh, const std::shared_ptr<Exec>& exec) {
     sh.add("git_status",
         "Show the current git status: branch, staged/unstaged changes, "
         "untracked files, ahead/behind counts.",
-        git_status_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitStatusArgs>([exec](const Call& c, const GitStatusArgs& a) { CallExec ce{*exec, c}; return run_git_status(c, a, ce); }, parse_git_status_args), 30'000);
+        kGitStatusArgs.schema(), EffectSet{Effect::ReadFs},
+        body<GitStatusArgs>([exec](const Call& c, const GitStatusArgs& a) { CallExec ce{*exec, c}; return run_git_status(c, a, ce); }, kGitStatusArgs), 30'000);
 
     sh.add("git_diff",
         "Show git diff. By default shows unstaged changes. Use staged=true "
         "for staged changes, or specify a ref/range.",
-        git_diff_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitDiffArgs>([exec](const Call& c, const GitDiffArgs& a) { CallExec ce{*exec, c}; return run_git_diff(c, a, ce); }, parse_git_diff_args), 60'000);
+        kGitDiffArgs.schema(), EffectSet{Effect::ReadFs},
+        body<GitDiffArgs>([exec](const Call& c, const GitDiffArgs& a) { CallExec ce{*exec, c}; return run_git_diff(c, a, ce); }, kGitDiffArgs), 60'000);
 
     sh.add("git_log",
         "Show git commit history. Returns commit hash, author, date, and message.",
-        git_log_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitLogArgs>([exec](const Call& c, const GitLogArgs& a) { CallExec ce{*exec, c}; return run_git_log(c, a, ce); }, parse_git_log_args), 30'000);
+        kGitLogArgs.schema(), EffectSet{Effect::ReadFs},
+        body<GitLogArgs>([exec](const Call& c, const GitLogArgs& a) { CallExec ce{*exec, c}; return run_git_log(c, a, ce); }, kGitLogArgs), 30'000);
 
     sh.add("git_show",
         "Show a commit with metadata and patch, or read one file exactly as it existed at a revision.",
-        git_show_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitShowArgs>([exec](const Call& c, const GitShowArgs& a) { CallExec ce{*exec, c}; return run_git_show(c, a, ce); }, parse_git_show_args), 60'000);
+        kGitShowArgs.schema(), EffectSet{Effect::ReadFs},
+        body<GitShowArgs>([exec](const Call& c, const GitShowArgs& a) { CallExec ce{*exec, c}; return run_git_show(c, a, ce); }, kGitShowArgs, check_git_show), 60'000);
 
     sh.add("git_blame",
         "Annotate a file or line range with the commit, author, date, and source line that last changed it.",
-        git_blame_schema(), EffectSet{Effect::ReadFs},
-        body_with<GitBlameArgs>([exec](const Call& c, const GitBlameArgs& a) { CallExec ce{*exec, c}; return run_git_blame(c, a, ce); }, parse_git_blame_args), 40'000);
+        kGitBlameArgs.schema(), EffectSet{Effect::ReadFs},
+        body<GitBlameArgs>([exec](const Call& c, const GitBlameArgs& a) { CallExec ce{*exec, c}; return run_git_blame(c, a, ce); }, kGitBlameArgs, check_git_blame), 40'000);
 
     sh.add("git_commit",
         "Stage files and create a git commit. Specify files to stage, "
         "or use stage_all to stage everything.",
-        git_commit_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitCommitArgs>([exec](const Call& c, const GitCommitArgs& a) { CallExec ce{*exec, c}; return run_git_commit(c, a, ce); }, parse_git_commit_args), 0);
+        kGitCommitArgs.schema(), EffectSet{Effect::WriteFs},
+        body<GitCommitArgs>([exec](const Call& c, const GitCommitArgs& a) { CallExec ce{*exec, c}; return run_git_commit(c, a, ce); }, kGitCommitArgs, check_git_commit), 0);
 
     sh.add("git_branch",
         "List, create, switch, or delete git branches. action=list (default) "
         "is read-only; create/switch/delete take a `name`.",
-        git_branch_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitBranchArgs>([exec](const Call& c, const GitBranchArgs& a) { CallExec ce{*exec, c}; return run_git_branch(c, a, ce); }, parse_git_branch_args), 20'000);
+        kGitBranchArgs.schema(), EffectSet{Effect::WriteFs},
+        body<GitBranchArgs>([exec](const Call& c, const GitBranchArgs& a) { CallExec ce{*exec, c}; return run_git_branch(c, a, ce); }, kGitBranchArgs, check_git_branch), 20'000);
 
     sh.add("git_stash",
         "Shelve or restore uncommitted work. action=list (default) is "
         "read-only; push/pop/apply/drop/show manage the stash.",
-        git_stash_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitStashArgs>([exec](const Call& c, const GitStashArgs& a) { CallExec ce{*exec, c}; return run_git_stash(c, a, ce); }, parse_git_stash_args), 50'000);
+        kGitStashArgs.schema(), EffectSet{Effect::WriteFs},
+        body<GitStashArgs>([exec](const Call& c, const GitStashArgs& a) { CallExec ce{*exec, c}; return run_git_stash(c, a, ce); }, kGitStashArgs, check_git_stash), 50'000);
 
     sh.add("git_rebase",
         "Reapply commits onto a new base (action=onto upstream=<ref>), or "
         "drive an in-progress rebase (continue/abort/skip).",
-        git_rebase_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitRebaseArgs>([exec](const Call& c, const GitRebaseArgs& a) { CallExec ce{*exec, c}; return run_git_rebase(c, a, ce); }, parse_git_rebase_args), 50'000);
+        kGitRebaseArgs.schema(), EffectSet{Effect::WriteFs},
+        body<GitRebaseArgs>([exec](const Call& c, const GitRebaseArgs& a) { CallExec ce{*exec, c}; return run_git_rebase(c, a, ce); }, kGitRebaseArgs, check_git_rebase), 50'000);
 
     sh.add("git_cherry_pick",
         "Apply the changes from existing commit(s) onto HEAD "
         "(action=pick commits=[...]), or drive one in progress "
         "(continue/abort/skip).",
-        git_cherry_pick_schema(), EffectSet{Effect::WriteFs},
-        body_with<GitCherryPickArgs>([exec](const Call& c, const GitCherryPickArgs& a) { CallExec ce{*exec, c}; return run_git_cherry_pick(c, a, ce); }, parse_git_cherry_pick_args),
+        kGitCherryPickArgs.schema(), EffectSet{Effect::WriteFs},
+        body<GitCherryPickArgs>([exec](const Call& c, const GitCherryPickArgs& a) { CallExec ce{*exec, c}; return run_git_cherry_pick(c, a, ce); }, kGitCherryPickArgs, check_git_cherry_pick),
         50'000);
 }
 

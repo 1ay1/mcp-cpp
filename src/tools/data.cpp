@@ -219,24 +219,27 @@ struct Step {
 struct QueryArgs {
     std::string path;      // file path (mutually exclusive-ish with json_text)
     std::string json_text; // inline JSON
-    std::string query;
+    std::string query = ".";
     bool        raw = false;   // print strings unquoted
     bool        compact = true;
     std::string display_description;
 };
 
-std::expected<QueryArgs, ToolError> parse_query_args(const json& j) {
-    util::ArgReader r(j);
-    if (!r.is_object())
-        return std::unexpected(ToolError::invalid_args("expected a JSON object"));
-    QueryArgs a;
-    a.path      = r.str("path");
-    a.json_text = r.str("json");
-    a.query     = r.str("query", ".");
+const util::ArgSpec<QueryArgs> kQueryArgs{
+    util::arg(&QueryArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&QueryArgs::query, "query",
+              "jq-lite path: `.` (whole doc), `.key`, `.[\"key with space\"]`, `[i]` (negative = from end), `[lo:hi]` slice, `[]` iterate, and pipeline verbs `| keys | values | length | type | has(k)`. E.g. `.scripts | keys`, `.dependencies.react`, `.services[].name`."),
+    util::arg(&QueryArgs::path, "path", "A .json file to query. Provide this OR inline `json`."),
+    util::arg(&QueryArgs::json_text, "json", "Inline JSON to query instead of a file."),
+    util::arg(&QueryArgs::raw, "raw", "Print string results unquoted (jq -r)."),
+    util::arg(&QueryArgs::compact, "compact",
+              "Compact one-line JSON per result (default true); false pretty-prints."),
+};
+
+// An empty query means the whole doc; a file or inline JSON is needed.
+std::expected<QueryArgs, ToolError> check_query(QueryArgs a, const util::Bounds&) {
     if (a.query.empty()) a.query = ".";
-    a.raw       = r.boolean("raw", false);
-    a.compact   = r.boolean("compact", true);
-    a.display_description = r.str("display_description");
     if (a.path.empty() && a.json_text.empty())
         return std::unexpected(ToolError::invalid_args(
             "provide `path` (a .json file) or inline `json`"));
@@ -299,17 +302,6 @@ ExecResult run_json_query(const Call& call, const QueryArgs& a) {
     return ToolOutput{util::to_valid_utf8(std::move(body)), std::nullopt};
 }
 
-json json_query_schema() {
-    return json{{"type","object"},{"required",{"query"}},{"properties",{
-        {"display_description",{{"type","string"},{"description","One-line summary shown in the UI. Optional."}}},
-        {"query",{{"type","string"},{"description","jq-lite path: `.` (whole doc), `.key`, `.[\"key with space\"]`, `[i]` (negative = from end), `[lo:hi]` slice, `[]` iterate, and pipeline verbs `| keys | values | length | type | has(k)`. E.g. `.scripts | keys`, `.dependencies.react`, `.services[].name`."}}},
-        {"path",{{"type","string"},{"description","A .json file to query. Provide this OR inline `json`."}}},
-        {"json",{{"type","string"},{"description","Inline JSON to query instead of a file."}}},
-        {"raw",{{"type","boolean"},{"description","Print string results unquoted (jq -r)."}}},
-        {"compact",{{"type","boolean"},{"description","Compact one-line JSON per result (default true); false pretty-prints."}}},
-    }}};
-}
-
 } // namespace
 
 void register_data_tools(Shells& sh) {
@@ -324,8 +316,8 @@ void register_data_tools(Shells& sh) {
         "`[]` iteration, and `| keys | values | length | type | has(k)`. Each "
         "result prints as one compact JSON line (`raw:true` unquotes strings). "
         "JSON only.",
-        json_query_schema(), EffectSet{Effect::ReadFs},
-        body<QueryArgs>(run_json_query, parse_query_args), 25'000);
+        kQueryArgs.schema(), EffectSet{Effect::ReadFs},
+        body<QueryArgs>(run_json_query, kQueryArgs, check_query), 25'000);
 }
 
 } // namespace mcp::tools::detail

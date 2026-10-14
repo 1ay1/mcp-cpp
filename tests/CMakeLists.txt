@@ -39,6 +39,7 @@ add_executable(mcp_tests
     web_tools_test.cpp
     web_search_services_test.cpp
     arg_reader_test.cpp
+    arg_spec_test.cpp
     terminal_strip_test.cpp
     bash_validate_test.cpp
     fuzzy_match_test.cpp

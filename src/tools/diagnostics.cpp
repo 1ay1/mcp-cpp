@@ -65,13 +65,12 @@ enum class BuildSystem { None, CMake, Cargo, Go, Node, Make };
     return {};
 }
 
-std::expected<DiagnosticsArgs, ToolError> parse_diagnostics_args(const json& j) {
-    util::ArgReader ar(j);
-    return DiagnosticsArgs{
-        ar.str("command", ""),
-        ar.str("display_description", ""),
-    };
-}
+const util::ArgSpec<DiagnosticsArgs> kDiagnosticsArgs{
+    util::arg(&DiagnosticsArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&DiagnosticsArgs::command, "command",
+              "Custom build command. If omitted, auto-detects."),
+};
 
 // One shape for "run this and give me the bytes", whether the caller has an
 // argv or a command line. The shell is just another program you name.
@@ -178,16 +177,22 @@ struct TestArgs {
     std::string filter;
     int timeout_seconds = 120;
     int repeat = 1;
+    std::string target;
 };
 
-std::expected<TestArgs, ToolError> parse_test_args(const json& j) {
-    util::ArgReader ar(j);
-    return TestArgs{
-        ar.str("command", ""),
-        ar.str("filter", ar.str("target", "")),
-        std::clamp(ar.integer("timeout_seconds", 120), 1, 1800),
-        std::clamp(ar.integer("repeat", 1), 1, 100),
-    };
+const util::ArgSpec<TestArgs> kTestArgs{
+    util::arg(&TestArgs::command, "command", "Custom test command; otherwise auto-detect."),
+    util::arg(&TestArgs::filter, "filter",
+              "CTest regex, Cargo test name, Go -run regex, or npm test filter."),
+    util::arg(&TestArgs::target, "target", "Alias for filter."),
+    util::arg(&TestArgs::timeout_seconds, "timeout_seconds", "").range(1, 1800),
+    util::arg(&TestArgs::repeat, "repeat", "").range(1, 100),
+};
+
+// `target` stands in for `filter` when filter is absent.
+std::expected<TestArgs, ToolError> check_test(TestArgs a, const util::Bounds&) {
+    if (a.filter.empty()) a.filter = a.target;
+    return a;
 }
 
 std::vector<std::string> test_argv_for(BuildSystem bs, const TestArgs& a, const fs::path& project) {
@@ -306,28 +311,6 @@ ExecResult run_tests(const Call& call, const TestArgs& a, CallExec& exec) {
     return ToolOutput{summary.str(), std::nullopt};
 }
 
-json test_schema() {
-    return json{{"type","object"}, {"properties", {
-        {"command", {{"type","string"}, {"description","Custom test command; otherwise auto-detect."}}},
-        {"filter", {{"type","string"}, {"description","CTest regex, Cargo test name, Go -run regex, or npm test filter."}}},
-        {"target", {{"type","string"}, {"description","Alias for filter."}}},
-        {"timeout_seconds", {{"type","integer"}, {"minimum",1}, {"maximum",1800}, {"default",120}}},
-        {"repeat", {{"type","integer"}, {"minimum",1}, {"maximum",100}, {"default",1}}}
-    }}};
-}
-
-json diagnostics_schema() {
-    return json{
-        {"type","object"},
-        {"properties", {
-            {"display_description", {{"type","string"},
-                {"description","One-line summary shown in the UI. Optional."}}},
-            {"command", {{"type","string"}, {"description",
-                "Custom build command. If omitted, auto-detects."}}},
-        }},
-    };
-}
-
 } // namespace
 
 void register_diagnostics_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
@@ -336,8 +319,8 @@ void register_diagnostics_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
     sh.add("diagnostics",
         "Run the project's build or lint command and return errors/warnings. "
         "Auto-detects build system (CMake, cargo, go, npm, make).",
-        diagnostics_schema(), EffectSet{Effect::Exec},
-        body_with<DiagnosticsArgs>([exec](const Call& c, const DiagnosticsArgs& a) { CallExec ce{*exec, c}; return run_diagnostics(c, a, ce); }, parse_diagnostics_args), 30'000);
+        kDiagnosticsArgs.schema(), EffectSet{Effect::Exec},
+        body<DiagnosticsArgs>([exec](const Call& c, const DiagnosticsArgs& a) { CallExec ce{*exec, c}; return run_diagnostics(c, a, ce); }, kDiagnosticsArgs), 30'000);
 }
 
 void register_test_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
@@ -346,8 +329,8 @@ void register_test_tool(Shells& sh, const std::shared_ptr<Exec>& exec) {
     sh.add("test",
         "Run focused project tests with structured pass/fail status, live output, filtering, repetition, and timeout. "
         "Auto-detects CTest, Cargo, Go, npm, or Make; pass command for custom runners.",
-        test_schema(), EffectSet{Effect::Exec},
-        body_with<TestArgs>([exec](const Call& c, const TestArgs& a) { CallExec ce{*exec, c}; return run_tests(c, a, ce); }, parse_test_args), 40'000);
+        kTestArgs.schema(), EffectSet{Effect::Exec},
+        body<TestArgs>([exec](const Call& c, const TestArgs& a) { CallExec ce{*exec, c}; return run_tests(c, a, ce); }, kTestArgs, check_test), 40'000);
 }
 
 } // namespace mcp::tools::detail

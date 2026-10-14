@@ -910,26 +910,47 @@ std::pair<int,int> indent_scope(const std::vector<std::string>& lines,
 // ── Tool args ───────────────────────────────────────────────────────────
 struct StructArgs {
     std::string pattern;
-    std::string root;
+    std::string root = ".";
     std::string glob;    // optional extension/name filter
     bool        expand = false;   // return the whole enclosing block per match
     std::string display_description;
 };
 
-std::expected<StructArgs, ToolError> parse_args(const json& j) {
-    util::ArgReader ar(j);
-    auto pat = ar.require_str("pattern");
-    if (!pat) return std::unexpected(ToolError::invalid_args("pattern required"));
-    std::string p = *std::move(pat);
-    if (p.find_first_not_of(" \t\r\n") == std::string::npos)
+const util::ArgSpec<StructArgs> kStructArgs{
+    util::arg(&StructArgs::pattern, "pattern",
+              "A code SHAPE to match on a nested-document model (like "
+              "Semgrep generic / ast-grep), tokenized language-aware so it "
+              "NEVER matches inside comments or string literals. "
+              "Metavariables: $NAME matches exactly ONE node — one "
+              "identifier/literal OR one balanced (…)/[…]/{…} group — and "
+              "binds it (reuse $NAME to require the same text); $$$NAME "
+              "matches a run of ZERO OR MORE nodes (e.g. an argument list or "
+              "a multi-token condition). $_ / $$$ are anonymous. So "
+              "`malloc($N)` matches malloc(n) but NOT malloc(a*b) (2 nodes) "
+              "— use `malloc($$$)` for that. Examples: 'foo($$$)' finds every "
+              "foo call; 'if ($$$C) return $X;' finds guarded returns; "
+              "'$X == $X' finds self-comparisons; 'catch ($$$) {}' finds "
+              "empty catch blocks. Nested calls match too (the matcher "
+              "recurses into groups).").required(),
+    util::arg(&StructArgs::root, "path", "Directory to search (default: workspace root)."),
+    util::arg(&StructArgs::glob, "glob", "Optional filename glob filter, e.g. '*.ts'."),
+    util::arg(&StructArgs::expand, "expand",
+              "When true, return the WHOLE enclosing function/block "
+              "around each match instead of ±1 context line — so the "
+              "result is self-sufficient and you rarely need a "
+              "follow-up `read`. Default false."),
+    util::arg(&StructArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+};
+
+[[nodiscard]] bool is_blank(std::string_view s) noexcept {
+    return s.find_first_not_of(" \t\r\n") == std::string_view::npos;
+}
+
+std::expected<StructArgs, ToolError> check_struct(StructArgs a, const util::Bounds&) {
+    if (is_blank(a.pattern))
         return std::unexpected(ToolError::invalid_args("pattern must not be blank"));
-    return StructArgs{
-        std::move(p),
-        ar.str("path", "."),
-        ar.str("glob", ""),
-        ar.boolean("expand", false),
-        ar.str("display_description", ""),
-    };
+    return a;
 }
 
 struct FileMatch {
@@ -1312,7 +1333,7 @@ ExecResult run_structural(const Call& call, const StructArgs& a, DocRetriever* s
 struct RewriteArgs {
     std::string pattern;
     std::string rewrite;
-    std::string root;
+    std::string root = ".";
     std::string glob;
     bool        apply = false;      // false ⇒ dry-run preview
     std::string display_description;
@@ -1381,23 +1402,33 @@ void pattern_vars(const std::vector<PNode>& pat, std::vector<std::string>& out) 
     }
 }
 
-std::expected<RewriteArgs, ToolError> parse_rewrite_args(const json& j) {
-    util::ArgReader ar(j);
-    auto pat = ar.require_str("pattern");
-    if (!pat) return std::unexpected(ToolError::invalid_args("pattern required"));
-    auto rw = ar.require_str("rewrite");
-    if (!rw) return std::unexpected(ToolError::invalid_args("rewrite required"));
-    std::string p = *std::move(pat);
-    if (p.find_first_not_of(" \t\r\n") == std::string::npos)
+const util::ArgSpec<RewriteArgs> kRewriteArgs{
+    util::arg(&RewriteArgs::pattern, "pattern",
+              "The code SHAPE to find — same language as search_structural "
+              "($NAME binds one node, $$$NAME binds a run, back-refs must "
+              "match). Every match's exact byte span is replaced.").required(),
+    util::arg(&RewriteArgs::rewrite, "rewrite",
+              "Replacement template. $NAME / $$$NAME splice the VERBATIM "
+              "source bytes that metavariable captured (original spacing "
+              "kept). Example: pattern 'assertEquals($A, $B)' rewrite "
+              "'assertEqual($B, $A)' swaps the arguments at every call "
+              "site. Every $NAME in the template must be bound by the "
+              "pattern.").required(),
+    util::arg(&RewriteArgs::root, "path", "Directory to rewrite under (default: workspace root)."),
+    util::arg(&RewriteArgs::glob, "glob", "Optional filename glob filter, e.g. '*.py'."),
+    util::arg(&RewriteArgs::apply, "apply",
+              "false (default) = DRY RUN: show every before/after "
+              "pair without touching disk. true = write the files "
+              "(atomic per file). ALWAYS dry-run first and read the "
+              "preview before applying."),
+    util::arg(&RewriteArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+};
+
+std::expected<RewriteArgs, ToolError> check_rewrite(RewriteArgs a, const util::Bounds&) {
+    if (is_blank(a.pattern))
         return std::unexpected(ToolError::invalid_args("pattern must not be blank"));
-    return RewriteArgs{
-        std::move(p),
-        *std::move(rw),
-        ar.str("path", "."),
-        ar.str("glob", ""),
-        ar.boolean("apply", false),
-        ar.str("display_description", ""),
-    };
+    return a;
 }
 
 ExecResult run_rewrite(const Call& call, const RewriteArgs& a) {
@@ -1570,83 +1601,6 @@ ExecResult run_rewrite(const Call& call, const RewriteArgs& a) {
                       files_changed == 1 ? std::move(change) : std::nullopt};
 }
 
-json structural_schema() {
-    return json{
-        {"type", "object"},
-        {"properties", {
-            {"pattern", {
-                {"type", "string"},
-                {"description",
-                 "A code SHAPE to match on a nested-document model (like "
-                 "Semgrep generic / ast-grep), tokenized language-aware so it "
-                 "NEVER matches inside comments or string literals. "
-                 "Metavariables: $NAME matches exactly ONE node — one "
-                 "identifier/literal OR one balanced (…)/[…]/{…} group — and "
-                 "binds it (reuse $NAME to require the same text); $$$NAME "
-                 "matches a run of ZERO OR MORE nodes (e.g. an argument list or "
-                 "a multi-token condition). $_ / $$$ are anonymous. So "
-                 "`malloc($N)` matches malloc(n) but NOT malloc(a*b) (2 nodes) "
-                 "— use `malloc($$$)` for that. Examples: 'foo($$$)' finds every "
-                 "foo call; 'if ($$$C) return $X;' finds guarded returns; "
-                 "'$X == $X' finds self-comparisons; 'catch ($$$) {}' finds "
-                 "empty catch blocks. Nested calls match too (the matcher "
-                 "recurses into groups)."}
-            }},
-            {"path", {{"type", "string"},
-                      {"description", "Directory to search (default: workspace root)."}}},
-            {"glob", {{"type", "string"},
-                      {"description", "Optional filename glob filter, e.g. '*.ts'."}}},
-            {"expand", {{"type", "boolean"},
-                      {"description",
-                       "When true, return the WHOLE enclosing function/block "
-                       "around each match instead of ±1 context line — so the "
-                       "result is self-sufficient and you rarely need a "
-                       "follow-up `read`. Default false."}}},
-            {"display_description", {{"type", "string"},
-                      {"description", "One-line summary shown in the UI. Optional."}}},
-        }},
-        {"required", json::array({"pattern"})},
-    };
-}
-
-json rewrite_schema() {
-    return json{
-        {"type", "object"},
-        {"properties", {
-            {"pattern", {
-                {"type", "string"},
-                {"description",
-                 "The code SHAPE to find — same language as search_structural "
-                 "($NAME binds one node, $$$NAME binds a run, back-refs must "
-                 "match). Every match's exact byte span is replaced."}
-            }},
-            {"rewrite", {
-                {"type", "string"},
-                {"description",
-                 "Replacement template. $NAME / $$$NAME splice the VERBATIM "
-                 "source bytes that metavariable captured (original spacing "
-                 "kept). Example: pattern 'assertEquals($A, $B)' rewrite "
-                 "'assertEqual($B, $A)' swaps the arguments at every call "
-                 "site. Every $NAME in the template must be bound by the "
-                 "pattern."}
-            }},
-            {"path", {{"type", "string"},
-                      {"description", "Directory to rewrite under (default: workspace root)."}}},
-            {"glob", {{"type", "string"},
-                      {"description", "Optional filename glob filter, e.g. '*.py'."}}},
-            {"apply", {{"type", "boolean"},
-                      {"description",
-                       "false (default) = DRY RUN: show every before/after "
-                       "pair without touching disk. true = write the files "
-                       "(atomic per file). ALWAYS dry-run first and read the "
-                       "preview before applying."}}},
-            {"display_description", {{"type", "string"},
-                      {"description", "One-line summary shown in the UI. Optional."}}},
-        }},
-        {"required", json::array({"pattern", "rewrite"})},
-    };
-}
-
 } // namespace
 
 void register_structural_tools(Shells& sh,
@@ -1665,13 +1619,11 @@ void register_structural_tools(Shells& sh,
            "`search_code`. When the code index is available, zero hits come "
            "back with semantically-nearest leads (verified against disk), and "
            "over-budget result sets render the most task-relevant files first.",
-           structural_schema(),
+           kStructArgs.schema(),
            EffectSet{Effect::ReadFs},
-           [sem](const Call& call, const Json& j) -> mcp::cap::Result {
-               auto parsed = parse_args(j);
-               if (!parsed) return mcp::cap::Result::error(parsed.error().render());
-               return lower(run_structural(call, *parsed, sem.get()));
-           },
+           body<StructArgs>([sem](const Call& c, const StructArgs& a) {
+               return run_structural(c, a, sem.get());
+           }, kStructArgs, check_struct),
            /*token_budget=*/30'000);
 
     sh.add("rewrite_structural",
@@ -1687,9 +1639,9 @@ void register_structural_tools(Shells& sh,
            "preview of every before/after pair; re-run with apply:true to "
            "write. Use `edit` for one-off changes; use THIS for the same "
            "shape change across many sites.",
-           rewrite_schema(),
+           kRewriteArgs.schema(),
            EffectSet{Effect::ReadFs, Effect::WriteFs},
-           body<RewriteArgs>(run_rewrite, parse_rewrite_args),
+           body<RewriteArgs>(run_rewrite, kRewriteArgs, check_rewrite),
            /*token_budget=*/30'000);
 }
 

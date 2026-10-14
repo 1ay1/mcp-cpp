@@ -208,7 +208,7 @@ struct Projection {
 // ═══════════════════════════════════════════════════════════════════════════
 
 struct ExtractArgs {
-    std::string root;
+    std::string root = ".";
     std::string pattern;         // regex (or literal) selecting matches
     std::string file_glob;
     bool        case_sensitive = false;
@@ -223,34 +223,50 @@ struct ExtractArgs {
     bool        with_location = false; // annotate each value with file:line
     int         limit = 500;     // cap emitted rows
     std::string display_description;
+    json        response_format;  // "detailed" turns on with_location
 };
 
-std::expected<ExtractArgs, ToolError> parse_extract_args(const json& j) {
-    util::ArgReader r(j);
-    if (!r.is_object())
-        return std::unexpected(ToolError::invalid_args("expected a JSON object"));
-    auto pat = r.require_str("pattern");
-    if (!pat || pat->empty())
-        return std::unexpected(ToolError::invalid_args("`pattern` is required"));
-    ExtractArgs a;
-    a.pattern        = *pat;
-    a.root           = r.str("path", ".");
-    if (a.root.empty()) a.root = ".";
-    a.file_glob      = r.str("glob");
-    a.case_sensitive = r.boolean("case_sensitive", false);
-    a.group          = r.integer("group", 0);
-    a.delimiter      = r.str("delimiter");
-    a.column         = r.integer("column", 0);
-    a.unique         = r.boolean("unique", false);
-    a.count          = r.boolean("count", false);
-    a.sort           = r.boolean("sort", false);
-    a.with_location  = r.boolean("with_location", false);
-    // Anthropic's response_format token-economy pattern: `concise` (default)
-    // emits just the values; `detailed` adds file:line provenance. An
-    // explicit with_location still wins so the fine-grained flag isn't lost.
-    if (r.str("response_format") == "detailed") a.with_location = true;
-    a.limit          = std::clamp(r.integer("limit", 500), 1, 5000);
-    a.display_description = r.str("display_description");
+const util::ArgSpec<ExtractArgs> kExtractArgs{
+    util::arg(&ExtractArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&ExtractArgs::pattern, "pattern",
+              "Regex (ECMAScript) or literal selecting each match. With a regex, `group` picks which capture to emit.").required(),
+    util::arg(&ExtractArgs::root, "path",
+              "Directory to scan (default: cwd)."),
+    util::arg(&ExtractArgs::file_glob, "glob",
+              "Filter files, e.g. *.ts or src/**/*.go."),
+    util::arg(&ExtractArgs::case_sensitive, "case_sensitive",
+              "Case-sensitive match (default: false)."),
+    util::arg(&ExtractArgs::group, "group",
+              "Capture group to emit per match (0 = whole match, 1 = first group). Mutually exclusive with `column`."),
+    util::arg(&ExtractArgs::delimiter, "delimiter",
+              "Field mode (awk): split each matching line by this delimiter (\"\" = whitespace runs) and emit field `column`."),
+    util::arg(&ExtractArgs::column, "column",
+              "1-based field to emit in delimiter/awk mode. Overrides `group`."),
+    util::arg(&ExtractArgs::unique, "unique",
+              "Dedup values (first-seen order)."),
+    util::arg(&ExtractArgs::count, "count",
+              "Emit `value → occurrences` sorted desc (like sort|uniq -c)."),
+    util::arg(&ExtractArgs::sort, "sort",
+              "Sort values lexically."),
+    util::arg(&ExtractArgs::with_location, "with_location",
+              "Prefix each value with file:line (same as response_format=detailed)."),
+    util::arg(&ExtractArgs::response_format, "response_format",
+              "concise (default) = values only; detailed = each value tagged with file:line. Ask for concise unless you need provenance — it's cheaper.")
+        .shape(json{{"type", "string"}, {"enum", {"concise", "detailed"}}}),
+    util::arg(&ExtractArgs::limit, "limit",
+              "Max rows emitted (default 500).").range(1, 5000),
+};
+
+// A json-typed arg read the way ArgReader::str reads a string slot.
+[[nodiscard]] std::string json_str(const json& v, std::string def = {}) {
+    return util::ArgReader(json{{"v", v}}).str("v", std::move(def));
+}
+
+// Anthropic's response_format token-economy pattern: `concise` (default)
+// emits just the values; `detailed` adds file:line provenance.
+std::expected<ExtractArgs, ToolError> check_extract(ExtractArgs a, const util::Bounds&) {
+    if (json_str(a.response_format) == "detailed") a.with_location = true;
     if (a.group < 0)
         return std::unexpected(ToolError::invalid_args("`group` must be >= 0"));
     if (a.column < 0)
@@ -487,7 +503,7 @@ ExecResult run_extract(const Call& call, const ExtractArgs& a) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 struct AggregateArgs {
-    std::string root;
+    std::string root = ".";
     std::string pattern;
     std::string file_glob;
     bool        case_sensitive = false;
@@ -499,30 +515,31 @@ struct AggregateArgs {
     std::string display_description;
 };
 
-std::expected<AggregateArgs, ToolError> parse_aggregate_args(const json& j) {
-    util::ArgReader r(j);
-    if (!r.is_object())
-        return std::unexpected(ToolError::invalid_args("expected a JSON object"));
-    auto pat = r.require_str("pattern");
-    if (!pat || pat->empty())
-        return std::unexpected(ToolError::invalid_args("`pattern` is required"));
-    AggregateArgs a;
-    a.pattern        = *pat;
-    a.root           = r.str("path", "."); if (a.root.empty()) a.root = ".";
-    a.file_glob      = r.str("glob");
-    a.case_sensitive = r.boolean("case_sensitive", false);
-    a.word           = r.boolean("word", false);
-    a.by             = r.str("by", "file");
-    a.group          = r.integer("group", 1);
-    a.op             = r.str("op", "count");
-    a.limit          = std::clamp(r.integer("limit", 100), 1, 2000);
-    a.display_description = r.str("display_description");
-    if (a.by != "file" && a.by != "match" && a.by != "capture")
-        return std::unexpected(ToolError::invalid_args(
-            "`by` must be file | match | capture"));
-    if (a.op != "count" && a.op != "list" && a.op != "sum")
-        return std::unexpected(ToolError::invalid_args(
-            "`op` must be count | list | sum"));
+const util::ArgSpec<AggregateArgs> kAggregateArgs{
+    util::arg(&AggregateArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&AggregateArgs::pattern, "pattern",
+              "Regex or literal whose matches are grouped and reduced.").required(),
+    util::arg(&AggregateArgs::root, "path",
+              "Directory to scan (default: cwd)."),
+    util::arg(&AggregateArgs::file_glob, "glob",
+              "Filter files, e.g. *.py."),
+    util::arg(&AggregateArgs::case_sensitive, "case_sensitive"),
+    util::arg(&AggregateArgs::word, "word",
+              "Whole-word match."),
+    util::arg(&AggregateArgs::by, "by",
+              "Group key: `file` (which files touch X, and how often), `match` (the whole matched text), or `capture` (a regex group — set `group`).")
+        .one_of({"file", "match", "capture"}),
+    util::arg(&AggregateArgs::group, "group",
+              "Capture group for by=capture (default 1)."),
+    util::arg(&AggregateArgs::op, "op",
+              "Reduce: `count` per group, `list` (count + up to 5 sample lines), or `sum` (parse each matched text as a number and total it).").one_of({"count", "list", "sum"}),
+    util::arg(&AggregateArgs::limit, "limit",
+              "Max groups shown (default 100).").range(1, 2000),
+};
+
+std::expected<AggregateArgs, ToolError> check_aggregate(AggregateArgs a, const util::Bounds&) {
+    if (a.root.empty()) a.root = ".";
     return a;
 }
 
@@ -661,9 +678,10 @@ ExecResult run_aggregate(const Call& call, const AggregateArgs& a) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 struct ReplaceArgs {
-    std::string root;
+    std::string root = ".";
     std::string find;
     std::string replacement;
+    json        replacement_arg;   // required but may be "" (delete matches)
     std::string file_glob;
     bool        regex = false;
     bool        case_sensitive = true;   // literal replace defaults to exact
@@ -672,25 +690,31 @@ struct ReplaceArgs {
     std::string display_description;
 };
 
-std::expected<ReplaceArgs, ToolError> parse_replace_args(const json& j) {
-    util::ArgReader r(j);
-    if (!r.is_object())
-        return std::unexpected(ToolError::invalid_args("expected a JSON object"));
-    auto find = r.require_str("find");
-    if (!find || find->empty())
-        return std::unexpected(ToolError::invalid_args("`find` is required"));
-    if (!r.has("replacement"))
-        return std::unexpected(ToolError::invalid_args("`replacement` is required"));
-    ReplaceArgs a;
-    a.find           = *find;
-    a.replacement    = r.str("replacement");
-    a.root           = r.str("path", "."); if (a.root.empty()) a.root = ".";
-    a.file_glob      = r.str("glob");
-    a.regex          = r.boolean("regex", false);
-    a.case_sensitive = r.boolean("case_sensitive", true);
-    a.apply          = r.boolean("apply", false);
-    a.max_preview    = std::clamp(r.integer("max_preview", 40), 1, 200);
-    a.display_description = r.str("display_description");
+const util::ArgSpec<ReplaceArgs> kReplaceArgs{
+    util::arg(&ReplaceArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&ReplaceArgs::find, "find",
+              "Literal text (default) or regex (regex:true) to find in every file.").required(),
+    util::arg(&ReplaceArgs::replacement_arg, "replacement",
+              "Replacement. In regex mode, $1-$9/$& insert capture groups.")
+        .shape(json{{"type", "string"}}).required(),
+    util::arg(&ReplaceArgs::root, "path",
+              "Directory to scan (default: cwd)."),
+    util::arg(&ReplaceArgs::file_glob, "glob",
+              "Filter files — STRONGLY recommended to bound the blast radius, e.g. src/**/*.ts."),
+    util::arg(&ReplaceArgs::regex, "regex",
+              "Treat `find` as an ECMAScript regex (default: literal)."),
+    util::arg(&ReplaceArgs::case_sensitive, "case_sensitive",
+              "Default true. In regex mode false adds the icase flag."),
+    util::arg(&ReplaceArgs::apply, "apply",
+              "false (default) = DRY RUN preview; true = write the files."),
+    util::arg(&ReplaceArgs::max_preview, "max_preview",
+              "Max per-file diff lines shown in the preview (default 40).").range(1, 200),
+};
+
+std::expected<ReplaceArgs, ToolError> check_replace(ReplaceArgs a, const util::Bounds&) {
+    a.replacement = json_str(a.replacement_arg);
+    if (a.root.empty()) a.root = ".";
     return a;
 }
 
@@ -841,27 +865,23 @@ struct ReadFilterArgs {
     std::string display_description;
 };
 
-std::expected<ReadFilterArgs, ToolError> parse_read_filter_args(const json& j) {
-    util::ArgReader r(j);
-    if (!r.is_object())
-        return std::unexpected(ToolError::invalid_args("expected a JSON object"));
-    auto path = r.require_str("path");
-    if (!path || path->empty())
-        return std::unexpected(ToolError::invalid_args("`path` is required"));
-    auto pat = r.require_str("pattern");
-    if (!pat || pat->empty())
-        return std::unexpected(ToolError::invalid_args("`pattern` is required"));
-    ReadFilterArgs a;
-    a.path           = *path;
-    a.pattern        = *pat;
-    a.case_sensitive = r.boolean("case_sensitive", false);
-    a.word           = r.boolean("word", false);
-    a.invert         = r.boolean("invert", false);
-    a.context        = std::clamp(r.integer("context", 2), 0, 20);
-    a.max_lines      = std::clamp(r.integer("max_lines", 800), 1, 5000);
-    a.display_description = r.str("display_description");
-    return a;
-}
+const util::ArgSpec<ReadFilterArgs> kReadFilterArgs{
+    util::arg(&ReadFilterArgs::display_description, "display_description",
+              "One-line summary shown in the UI. Optional."),
+    util::arg(&ReadFilterArgs::path, "path",
+              "File to read.").required(),
+    util::arg(&ReadFilterArgs::pattern, "pattern",
+              "Regex or literal — only lines matching this (plus context) are emitted; the rest collapse to `⋯ N lines ⋯`.").required(),
+    util::arg(&ReadFilterArgs::case_sensitive, "case_sensitive"),
+    util::arg(&ReadFilterArgs::word, "word",
+              "Whole-word match."),
+    util::arg(&ReadFilterArgs::invert, "invert",
+              "Keep NON-matching lines instead (grep -v)."),
+    util::arg(&ReadFilterArgs::context, "context",
+              "Lines of context around each kept line (default 2, max 20).").range(0, 20),
+    util::arg(&ReadFilterArgs::max_lines, "max_lines",
+              "Cap on emitted lines (default 800).").range(1, 5000),
+};
 
 ExecResult run_read_filter(const Call& call, const ReadFilterArgs& a) {
     const auto b = bounds(call);
@@ -972,69 +992,6 @@ ExecResult run_read_filter(const Call& call, const ReadFilterArgs& a) {
     return ToolOutput{util::to_valid_utf8(std::move(body)), std::nullopt};
 }
 
-// ── Schemas ────────────────────────────────────────────────────────────────
-
-json extract_schema() {
-    return json{{"type","object"},{"required",{"pattern"}},{"properties",{
-        {"display_description",{{"type","string"},{"description","One-line summary shown in the UI. Optional."}}},
-        {"pattern",{{"type","string"},{"description","Regex (ECMAScript) or literal selecting each match. With a regex, `group` picks which capture to emit."}}},
-        {"path",{{"type","string"},{"description","Directory to scan (default: cwd)."}}},
-        {"glob",{{"type","string"},{"description","Filter files, e.g. *.ts or src/**/*.go."}}},
-        {"case_sensitive",{{"type","boolean"},{"description","Case-sensitive match (default: false)."}}},
-        {"group",{{"type","integer"},{"description","Capture group to emit per match (0 = whole match, 1 = first group). Mutually exclusive with `column`."}}},
-        {"delimiter",{{"type","string"},{"description","Field mode (awk): split each matching line by this delimiter (\"\" = whitespace runs) and emit field `column`."}}},
-        {"column",{{"type","integer"},{"description","1-based field to emit in delimiter/awk mode. Overrides `group`."}}},
-        {"unique",{{"type","boolean"},{"description","Dedup values (first-seen order)."}}},
-        {"count",{{"type","boolean"},{"description","Emit `value → occurrences` sorted desc (like sort|uniq -c)."}}},
-        {"sort",{{"type","boolean"},{"description","Sort values lexically."}}},
-        {"with_location",{{"type","boolean"},{"description","Prefix each value with file:line (same as response_format=detailed)."}}},
-        {"response_format",{{"type","string"},{"enum",{"concise","detailed"}},{"description","concise (default) = values only; detailed = each value tagged with file:line. Ask for concise unless you need provenance — it's cheaper."}}},
-        {"limit",{{"type","integer"},{"description","Max rows emitted (default 500)."}}},
-    }}};
-}
-
-json aggregate_schema() {
-    return json{{"type","object"},{"required",{"pattern"}},{"properties",{
-        {"display_description",{{"type","string"},{"description","One-line summary shown in the UI. Optional."}}},
-        {"pattern",{{"type","string"},{"description","Regex or literal whose matches are grouped and reduced."}}},
-        {"path",{{"type","string"},{"description","Directory to scan (default: cwd)."}}},
-        {"glob",{{"type","string"},{"description","Filter files, e.g. *.py."}}},
-        {"case_sensitive",{{"type","boolean"}}},
-        {"word",{{"type","boolean"},{"description","Whole-word match."}}},
-        {"by",{{"type","string"},{"enum",{"file","match","capture"}},{"description","Group key: `file` (which files touch X, and how often), `match` (the whole matched text), or `capture` (a regex group — set `group`)."}}},
-        {"group",{{"type","integer"},{"description","Capture group for by=capture (default 1)."}}},
-        {"op",{{"type","string"},{"enum",{"count","list","sum"}},{"description","Reduce: `count` per group, `list` (count + up to 5 sample lines), or `sum` (parse each matched text as a number and total it)."}}},
-        {"limit",{{"type","integer"},{"description","Max groups shown (default 100)."}}},
-    }}};
-}
-
-json replace_schema() {
-    return json{{"type","object"},{"required",{"find","replacement"}},{"properties",{
-        {"display_description",{{"type","string"},{"description","One-line summary shown in the UI. Optional."}}},
-        {"find",{{"type","string"},{"description","Literal text (default) or regex (regex:true) to find in every file."}}},
-        {"replacement",{{"type","string"},{"description","Replacement. In regex mode, $1-$9/$& insert capture groups."}}},
-        {"path",{{"type","string"},{"description","Directory to scan (default: cwd)."}}},
-        {"glob",{{"type","string"},{"description","Filter files — STRONGLY recommended to bound the blast radius, e.g. src/**/*.ts."}}},
-        {"regex",{{"type","boolean"},{"description","Treat `find` as an ECMAScript regex (default: literal)."}}},
-        {"case_sensitive",{{"type","boolean"},{"description","Default true. In regex mode false adds the icase flag."}}},
-        {"apply",{{"type","boolean"},{"description","false (default) = DRY RUN preview; true = write the files."}}},
-        {"max_preview",{{"type","integer"},{"description","Max per-file diff lines shown in the preview (default 40)."}}},
-    }}};
-}
-
-json read_filter_schema() {
-    return json{{"type","object"},{"required",{"path","pattern"}},{"properties",{
-        {"display_description",{{"type","string"},{"description","One-line summary shown in the UI. Optional."}}},
-        {"path",{{"type","string"},{"description","File to read."}}},
-        {"pattern",{{"type","string"},{"description","Regex or literal — only lines matching this (plus context) are emitted; the rest collapse to `⋯ N lines ⋯`."}}},
-        {"case_sensitive",{{"type","boolean"}}},
-        {"word",{{"type","boolean"},{"description","Whole-word match."}}},
-        {"invert",{{"type","boolean"},{"description","Keep NON-matching lines instead (grep -v)."}}},
-        {"context",{{"type","integer"},{"description","Lines of context around each kept line (default 2, max 20)."}}},
-        {"max_lines",{{"type","integer"},{"description","Cap on emitted lines (default 800)."}}},
-    }}};
-}
-
 } // namespace
 
 void register_textproc_tools(Shells& sh) {
@@ -1048,8 +1005,8 @@ void register_textproc_tools(Shells& sh) {
         "value\xe2\x86\x92" "frequency (sort|uniq -c), `sort` orders them, "
         "response_format=detailed tags each with file:line. One call replaces "
         "grep\xe2\x86\x92read\xe2\x86\x92hand-aggregate.",
-        extract_schema(), EffectSet{Effect::ReadFs},
-        body<ExtractArgs>(run_extract, parse_extract_args), 25'000);
+        kExtractArgs.schema(), EffectSet{Effect::ReadFs},
+        body<ExtractArgs>(run_extract, kExtractArgs, check_extract), 25'000);
 
     sh.add("aggregate",
         "USE WHEN the question is \"how many X per Y\" or \"which Y has the most "
@@ -1061,8 +1018,8 @@ void register_textproc_tools(Shells& sh) {
         "count (default), list (count + sample lines), or sum (total the matched "
         "numbers). Sorted by magnitude — dominant group first. Reach for this "
         "over grep whenever you'd otherwise count matches yourself.",
-        aggregate_schema(), EffectSet{Effect::ReadFs},
-        body<AggregateArgs>(run_aggregate, parse_aggregate_args), 25'000);
+        kAggregateArgs.schema(), EffectSet{Effect::ReadFs},
+        body<AggregateArgs>(run_aggregate, kAggregateArgs, check_aggregate), 25'000);
 
     sh.add("replace",
         "RULES: DRY-RUN by default — returns a per-file before/after preview + "
@@ -1073,8 +1030,8 @@ void register_textproc_tools(Shells& sh) {
         "plain-text sibling of rewrite_structural, for renames / string swaps "
         "that aren't an AST shape. For code-shape changes (call sites, control "
         "flow) prefer rewrite_structural; for a single file prefer edit.",
-        replace_schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
-        body<ReplaceArgs>(run_replace, parse_replace_args), 25'000);
+        kReplaceArgs.schema(), EffectSet{Effect::ReadFs, Effect::WriteFs},
+        body<ReplaceArgs>(run_replace, kReplaceArgs, check_replace), 25'000);
 
     sh.add("read_filter",
         "Read a file but keep ONLY the lines matching a pattern (plus context), "
@@ -1083,8 +1040,8 @@ void register_textproc_tools(Shells& sh) {
         "path, every `TODO`, every route registration out of a 3k-line file at a "
         "fraction of the context cost of reading it whole. `invert:true` keeps "
         "non-matching lines (grep -v); `context` sets the \xc2\xb1N window.",
-        read_filter_schema(), EffectSet{Effect::ReadFs},
-        body<ReadFilterArgs>(run_read_filter, parse_read_filter_args), 25'000);
+        kReadFilterArgs.schema(), EffectSet{Effect::ReadFs},
+        body<ReadFilterArgs>(run_read_filter, kReadFilterArgs), 25'000);
 }
 
 } // namespace mcp::tools::detail
