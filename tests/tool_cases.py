@@ -351,5 +351,52 @@ case("process_stop unknown id is an error",
      {}, "process_stop", {"id": "proc-nope"},
      lambda t, e, r, _: None if e else "no error")
 
+# ── read cache across calls (one server) ──────────────────────────────────────────────────────────
+def calls(root, seq, timeout=30):
+    """Several tool calls on ONE server, so per-session caches carry over."""
+    init = {"protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "tool_cases", "version": "1"}}
+    reqs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": init},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, (tool, args) in enumerate(seq):
+        reqs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call",
+                     "params": {"name": tool, "arguments": args}})
+    argv = ([SERVER, "mcp-serve"] if os.environ.get("MCP_SERVE") else [SERVER, "-w", root])
+    p = subprocess.run(argv, cwd=root, input="\n".join(map(json.dumps, reqs)) + "\n",
+                       capture_output=True, text=True, timeout=timeout, errors="replace")
+    out = {}
+    for line in p.stdout.splitlines():
+        try:
+            j = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(j.get("id"), int) and j["id"] >= 10:
+            r = j.get("result") or {}
+            out[j["id"] - 10] = "".join(c.get("text", "") for c in r.get("content", []))
+    return [out.get(i, "") for i in range(len(seq))]
+
+def symbol_then_range():
+    global fails
+    name = "read: a symbol read never answers a later line range"
+    if ONLY and ONLY not in name:
+        return
+    root = tempfile.mkdtemp(prefix="tc_")
+    body = "".join(f"// filler {i}\n" for i in range(1, 100)) \
+         + "int target_fn(int x) {\n    return x + 1;\n}\n" \
+         + "".join(f"// more {i}\n" for i in range(1, 100))
+    open(os.path.join(root, "f.c"), "w").write(body)
+    p = os.path.join(root, "f.c")
+    r = calls(root, [("read", {"path": p, "symbol": "target_fn"}),
+                     ("read", {"path": p, "start_line": 10, "end_line": 12}),
+                     ("read", {"path": p, "start_line": "20", "end_line": 21})])
+    bad = [i for i, t in ((1, r[1]), (2, r[2])) if "target_fn" in t]
+    ok = not bad and "filler 10" in r[1] and "filler 20" in r[2]
+    if ok:
+        print(f"ok   {name}")
+    else:
+        fails += 1
+        print(f"FAIL {name}: replies {bad} replayed the symbol\n     reply: {r[1][:200]!r}")
+symbol_then_range()
+
 print(f"\n{fails} failure(s)")
 sys.exit(1 if fails else 0)

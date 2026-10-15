@@ -756,19 +756,22 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
             // one the caller still has. Keeping a union here would refuse
             // ranges whose bytes have already been collapsed away.
             //
-            // Stored as the RAW request (a.offset/a.limit), not the resolved
-            // eff_* — a symbol= read resolves to line numbers the caller
-            // never asked for and cannot ask for again, so recording those
-            // would refuse an unrelated later range that happens to overlap.
-            //
             // `out` is exactly what the caller receives, headers and all, so
             // a cache hit replays the identical answer under a [cached] tag
             // rather than pointing at a tool_result that may be gone. Bounded
             // by kMaxBytes per live path, and OVERWRITE means one entry per
             // file, not a growing set.
+            //
+            // A symbol= read is cached as covering nothing. It served one
+            // definition, not the lines its default offset/limit describe, and
+            // storing it under that range made every later line-range read of
+            // the file replay the symbol body as "[cached]" instead of the
+            // lines asked for.
+            ReadCacheEntry entry = a.symbol.empty()
+                ? ReadCacheEntry{current_mtime, a.offset, a.limit, total_lines, out}
+                : ReadCacheEntry{current_mtime, 1, 1, 0, {}};
             call.with([&](ToolState& st) {
-                st.reads[{call.reader, canon.string()}] =
-                    ReadCacheEntry{current_mtime, a.offset, a.limit, total_lines, out};
+                st.reads[{call.reader, canon.string()}] = std::move(entry);
             });
         }
     }
