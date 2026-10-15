@@ -266,8 +266,12 @@ int main() {
     //       block on a slow build returned early every time and the model
     //       had to busy-spin.
     {
+        // The delay must clear process_start's 300 ms settle window by a wide
+        // margin: at 0.4 s a loaded CI runner (macOS, seen) printed the line
+        // inside that window, so it came back with the start reply and the
+        // poll only ever saw the exit.
         mcp::Json a = mcp::Json::object();
-        a["command"] = "sleep 0.4; echo delayed-line";
+        a["command"] = "sleep 1.5; echo delayed-line";
         auto r = call(*provider, "process_start", a);
         CHECK(!r.is_error);
         auto id = extract_id(r.text);
@@ -281,6 +285,9 @@ int main() {
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         CHECK(!pr.is_error);
+        if (!contains(pr.text, "delayed-line"))
+            std::fprintf(stderr, "poll returned after %lld ms:\n%s\n",
+                         static_cast<long long>(elapsed), pr.text.c_str());
         CHECK(contains(pr.text, "delayed-line"));   // got the output
         CHECK(elapsed < 5000);                        // returned when it arrived, not at the deadline
         std::puts("large wait_ms early-return: ok");
