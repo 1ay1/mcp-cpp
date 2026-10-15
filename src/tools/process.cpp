@@ -233,6 +233,9 @@ ExecResult run_start(const Call& call, const StartArgs& args, CallExec& exec) {
 }
 
 struct PollArgs { std::string id; int max_chars = 30000; int wait_ms = 250; };
+// process_poll's output budget (register_process_tools). The provider cuts a
+// reply longer than this from the end.
+constexpr std::size_t kPollBudget = 30000;
 
 // wait_ms up to 300 s (the shell tool's max). A long block is safe: the
 // host returns the instant output arrives OR the child exits, and the wait
@@ -241,7 +244,7 @@ const util::ArgSpec<PollArgs> kPollArgs{
     util::arg(&PollArgs::id, "id", "Session id returned by process_start.").required(),
     util::arg(&PollArgs::max_chars, "max_chars",
               "Cap on bytes of new output returned this poll (most recent kept).")
-        .range(1000, 100000),
+        .range(1000, 30000),
     util::arg(&PollArgs::wait_ms, "wait_ms",
               "Block up to this long (ms) waiting for new output. Returns the "
               "instant output arrives or the process exits, so a big value is "
@@ -254,8 +257,14 @@ ExecResult run_poll(const Call& call, const PollArgs& args, CallExec&) {
         return std::unexpected(ToolError::not_found(
             "unknown process session: " + args.id + live_session_hint(call)));
 
+    // The reply also carries a status line and maybe a dropped-bytes note,
+    // and the whole text is cut from the END to the tool's budget. Leave room
+    // for them, or that cut drops the newest output, the part that matters.
+    constexpr std::size_t kHeaderRoom = 256;
+    const std::size_t room = std::min<std::size_t>(
+        static_cast<std::size_t>(args.max_chars), kPollBudget - kHeaderRoom);
     const auto r = read_for(call, *entry->session, std::chrono::milliseconds{args.wait_ms},
-                            static_cast<std::size_t>(args.max_chars));
+                            room);
 
     std::string text = args.id;
     if (r.running) {
@@ -302,7 +311,7 @@ ExecResult run_stop(const Call& call, const StopArgs& args, CallExec&) {
     // Give it the TERM->KILL grace to finish, so the reply carries the exit
     // code and the last output. Bounded: a call never hangs on a stop.
     constexpr auto kReapWait = std::chrono::milliseconds{3000};
-    const auto r = read_for(call, s, kReapWait, 30000, /*until_end=*/true);
+    const auto r = read_for(call, s, kReapWait, kPollBudget - 256, /*until_end=*/true);
     std::string text = (was_running ? "Stopped " : "Reaped ") + args.id;
     if (const auto code = exit_code_of(r.outcome)) text += " (exit " + std::to_string(*code) + ")";
     if (r.dropped)
@@ -328,13 +337,13 @@ void register_process_tools(Shells& shells, const std::shared_ptr<Exec>& exec) {
         "its status (running + uptime, or exited + exit code). Blocks briefly for "
         "new output. Reports if any output scrolled past the rolling buffer.",
         kPollArgs.schema(), EffectSet{Effect::Exec},
-        body<PollArgs>([exec](const Call& c, const PollArgs& a) { CallExec ce{*exec, c}; return run_poll(c, a, ce); }, kPollArgs), 30000);
+        body<PollArgs>([exec](const Call& c, const PollArgs& a) { CallExec ce{*exec, c}; return run_poll(c, a, ce); }, kPollArgs), static_cast<int>(kPollBudget));
     shells.add("process_stop",
         "Terminate (SIGTERM→SIGKILL) and reap a background session, returning its "
         "exit code and any final output not yet delivered by process_poll. Always "
         "call this to clean up a session you started.",
         kStopArgs.schema(), EffectSet{Effect::Exec},
-        body<StopArgs>([exec](const Call& c, const StopArgs& a) { CallExec ce{*exec, c}; return run_stop(c, a, ce); }, kStopArgs), 30000);
+        body<StopArgs>([exec](const Call& c, const StopArgs& a) { CallExec ce{*exec, c}; return run_stop(c, a, ce); }, kStopArgs), static_cast<int>(kPollBudget));
 }
 
 } // namespace mcp::tools::detail
