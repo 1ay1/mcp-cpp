@@ -183,6 +183,25 @@ TEST_CASE("web search: dials offer each vendor's documented values") {
         }
 }
 
+TEST_CASE("web search: the new dials pass validation and fill the rows") {
+    auto dials = [](std::string_view id) { return svc(id).dials.size(); };
+    CHECK(dials("tavily-free") == kMaxWebSearchDials);
+    CHECK(dials("tavily-api") == kMaxWebSearchDials);
+    CHECK(dials("firecrawl-free") == 5);
+    CHECK(dials("firecrawl-api") == 5);
+    CHECK(dials("brave-api") == 4);
+    CHECK(dials("exa-api") == 5);
+    CHECK(dials("perplexity-api") == 3);
+    WebSearchSlot t{"tavily-free", {}, {{"exact_match", "true"}, {"language_filter", "only"},
+                                       {"country", "JP"}, {"safe_search", "true"},
+                                       {"depth", "ultra-fast"}}};
+    CHECK(validate_dials(svc("tavily-free"), t).size() == 5);
+    WebSearchSlot f{"firecrawl-api", {}, {{"sort", "date"}, {"safe", "true"}}};
+    CHECK(validate_dials(svc("firecrawl-api"), f).size() == 2);
+    WebSearchSlot e{"exa-api", {}, {{"moderation", "true"}, {"country", "GB"}}};
+    CHECK(validate_dials(svc("exa-api"), e).size() == 2);
+}
+
 TEST_CASE("web search: keys are checked before they become a header") {
     CHECK(clean_api_key("  tvly-abc123 \n") == "tvly-abc123");
     CHECK(clean_api_key("abc\r\nx-evil: 1").empty());
@@ -251,6 +270,42 @@ TEST_CASE("web search: Tavily request: keyless header vs bearer key, exclusions 
     CHECK(keyed.url.find("tvly-k") == std::string::npos);
 }
 
+TEST_CASE("web search: Tavily filters follow the reference's rules") {
+    auto body = [](std::string_view id, const WebSearchQuery& q) {
+        return json::parse(build_web_search_request(svc(id), "", q).body);
+    };
+    auto q = query(); q.language = "de";
+    q.dials = {{"exact_match", "true"}, {"language_filter", "only"},
+               {"country", "NZ"}, {"safe_search", "true"}, {"depth", "advanced"}};
+    for (const char* id : {"tavily-free", "tavily-api"}) {
+        INFO(id);
+        auto b = body(id, q);
+        CHECK(b["exact_match"] == true);
+        CHECK(b["filter_by_language"] == true);
+        CHECK(b["country"] == "new zealand");      // Tavily wants the name
+        CHECK(b["safe_search"] == true);
+        CHECK(b["search_depth"] == "advanced");    // key-less now offers depth too
+    }
+    // country is for the general topic only.
+    q.dials = {{"country", "NZ"}, {"topic", "news"}};
+    CHECK(!body("tavily-free", q).contains("country"));
+    // safe_search is not supported with the fast depths.
+    for (const char* depth : {"fast", "ultra-fast"}) {
+        q.dials = {{"safe_search", "true"}, {"depth", depth}};
+        CHECK(!body("tavily-free", q).contains("safe_search"), depth);
+    }
+    // filter_by_language without a language is a 400, so it is not sent.
+    q.language.clear();
+    q.dials = {{"language_filter", "only"}};
+    CHECK(!body("tavily-free", q).contains("filter_by_language"));
+    // Defaults send nothing new.
+    q.dials = {};
+    const auto plain = body("tavily-free", q);
+    for (const char* k : {"exact_match", "filter_by_language", "country",
+                          "safe_search", "search_depth"})
+        CHECK(!plain.contains(k), k);
+}
+
 TEST_CASE("web search: Firecrawl request") {
     auto q = query(); q.exclude = {"github.com"};
     q.dials = {{"freshness", "qdr:m"}, {"category", "research"}, {"country", "NZ"}};
@@ -263,8 +318,21 @@ TEST_CASE("web search: Firecrawl request") {
     CHECK(b["tbs"] == "qdr:m");
     CHECK(b["categories"] == json::array({"research"}));
     CHECK(b["country"] == "NZ");
+    CHECK(!b.contains("safe"));
     CHECK(header(build_web_search_request(svc("firecrawl-api"), "fc-1", q),
                  "authorization") == "Bearer fc-1");
+
+    // Sorting by date joins the window in tbs; alone it is just sbd:1.
+    q.dials = {{"freshness", "qdr:w"}, {"sort", "date"}, {"safe", "true"}};
+    for (const char* id : {"firecrawl-free", "firecrawl-api"}) {
+        INFO(id);
+        auto sb = json::parse(build_web_search_request(svc(id), "k", q).body);
+        CHECK(sb["tbs"] == "sbd:1,qdr:w");
+        CHECK(sb["safe"] == true);
+    }
+    q.dials = {{"sort", "date"}};
+    CHECK(json::parse(build_web_search_request(svc("firecrawl-free"), "", q).body)
+          ["tbs"] == "sbd:1");
 }
 
 TEST_CASE("web search: Brave API request keeps the key out of the URL") {
@@ -284,6 +352,11 @@ TEST_CASE("web search: Brave API request keeps the key out of the URL") {
     q.language = "zh";
     CHECK(build_web_search_request(svc("brave-api"), "k", q).url
           .find("search_lang=zh-hans") != std::string::npos);
+    // Spell correction off is sent; on is Brave's default and sends nothing.
+    q.dials = {{"spellcheck", "false"}, {"country", "ALL"}};
+    const auto url = build_web_search_request(svc("brave-api"), "k", q).url;
+    CHECK(url.find("&spellcheck=false") != std::string::npos);
+    CHECK(url.find("&country=ALL") != std::string::npos);
 }
 
 TEST_CASE("web search: Exa, Serper and Perplexity requests") {
@@ -305,6 +378,12 @@ TEST_CASE("web search: Exa, Serper and Perplexity requests") {
     q.dials = {{"type", "deep-reasoning"}};
     CHECK(json::parse(build_web_search_request(svc("exa-api"), "k", q).body)
           ["type"] == "deep-reasoning");
+    q.dials = {{"moderation", "true"}, {"country", "NZ"}};
+    auto em = json::parse(build_web_search_request(svc("exa-api"), "k", q).body);
+    CHECK(em["moderation"] == true);
+    CHECK(em["userLocation"] == "NZ");
+    CHECK(!eb.contains("moderation"));
+    CHECK(!eb.contains("userLocation"));
 
     q.dials = {{"country", "NZ"}, {"freshness", "qdr:d"}, {"autocorrect", "false"}};
     auto s = build_web_search_request(svc("serper-api"), "sp-k", q);
@@ -327,6 +406,10 @@ TEST_CASE("web search: Exa, Serper and Perplexity requests") {
     CHECK(pb["country"] == "NZ");
     CHECK(pb["search_recency_filter"] == "month");
     CHECK(pb["search_language_filter"] == json::array({"fr"}));
+    CHECK(!pb.contains("search_type"));
+    q.dials = {{"search_type", "fast"}};
+    CHECK(json::parse(build_web_search_request(svc("perplexity-api"), "k", q).body)
+          ["search_type"] == "fast");
 }
 
 TEST_CASE("web search: reply parsers") {
