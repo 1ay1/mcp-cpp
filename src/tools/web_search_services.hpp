@@ -70,8 +70,9 @@ struct WebSearchQuery {
     [[nodiscard]] std::string_view dial(std::string_view id) const noexcept;
 };
 
-// Keep only the dial choices `svc` actually offers, with a value it lists,
-// and drop the default. Anything else is discarded rather than forwarded.
+// Keep only the dials `svc` actually offers, with a value that passes
+// web_search_dial_value_ok, and drop the default. Anything else is discarded
+// rather than forwarded.
 [[nodiscard]] std::vector<std::pair<std::string, std::string>>
 validate_dials(const WebSearchService& svc, const WebSearchSlot& slot);
 

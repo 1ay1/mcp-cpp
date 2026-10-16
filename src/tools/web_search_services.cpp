@@ -88,6 +88,16 @@ WebSearchDial firecrawl_sort_dial() {
         V("", "Relevance (default)"), V("date", "Newest first")}};
 }
 
+// Firecrawl's location is free text; its reference pairs it with country.
+WebSearchDial firecrawl_location_dial() {
+    WebSearchDial d{"location", "Location",
+        "A place to search from, e.g. San Francisco,California,United States. "
+        "Works best with Country set too.", {}};
+    d.text = WebSearchText::Line;
+    d.max_bytes = 200;
+    return d;
+}
+
 WebSearchDial on_off_dial(std::string id, std::string label, std::string help) {
     return WebSearchDial{std::move(id), std::move(label), std::move(help), {
         V("", "Off (default)"), V("true", "On")}};
@@ -216,6 +226,7 @@ std::vector<WebSearchService> make_catalogue() {
         s.dials.push_back(on_off_dial("safe", "Safe search",
             "Filters explicit content (Firecrawl's safe)."));
         s.dials.push_back(firecrawl_sort_dial());
+        s.dials.push_back(firecrawl_location_dial());
         c.push_back(std::move(s));
     }
 
@@ -239,6 +250,14 @@ std::vector<WebSearchService> make_catalogue() {
             "When on, Brave searches its corrected query instead of the one "
             "sent, which can change identifiers and error strings.", {
             V("", "On (default)"), V("false", "Off")}});
+        // One hosted Goggle; Brave advises hosted files over inline rules.
+        WebSearchDial goggle{"goggles", "Goggle",
+            "Re-ranks results by a Goggle's rules: the https URL of a Goggle "
+            "file on GitHub, GitLab or a Gist, registered at "
+            "search.brave.com/goggles/create.", {}};
+        goggle.text = WebSearchText::HttpsUrl;
+        goggle.max_bytes = 2048;
+        s.dials.push_back(std::move(goggle));
         c.push_back(std::move(s));
     }
     {
@@ -270,6 +289,7 @@ std::vector<WebSearchService> make_catalogue() {
         s.dials.push_back(on_off_dial("safe", "Safe search",
             "Filters explicit content (Firecrawl's safe)."));
         s.dials.push_back(firecrawl_sort_dial());
+        s.dials.push_back(firecrawl_location_dial());
         c.push_back(std::move(s));
     }
     {
@@ -575,6 +595,7 @@ HttpRequest req_firecrawl(const WebSearchQuery& q, std::string_view key) {
     if (auto v = q.dial("category"); !v.empty())  b["categories"] = json::array({std::string{v}});
     if (auto v = q.dial("country"); !v.empty())   b["country"] = std::string{v};
     if (q.dial("safe") == "true")                 b["safe"] = true;
+    if (auto v = q.dial("location"); !v.empty())  b["location"] = std::string{v};
     std::vector<std::pair<std::string, std::string>> h;
     if (!key.empty()) h.push_back({"authorization", "Bearer " + std::string{key}});
     return json_post("https://api.firecrawl.dev/v2/search", b, std::move(h));
@@ -599,6 +620,8 @@ HttpRequest req_brave_api(const WebSearchQuery& q, std::string_view key) {
         r.url += "&safesearch=" + url_escape(v);
     if (q.dial("spellcheck") == "false")
         r.url += "&spellcheck=false";
+    if (auto v = q.dial("goggles"); !v.empty())
+        r.url += "&goggles=" + url_escape(v);
     r.headers.push_back({"accept", "application/json"});
     r.headers.push_back({"x-subscription-token", std::string{key}});
     return r;
@@ -748,10 +771,8 @@ validate_dials(const WebSearchService& svc, const WebSearchSlot& slot) {
     std::vector<std::pair<std::string, std::string>> out;
     for (const auto& d : svc.dials) {
         for (const auto& [id, val] : slot.dials) {
-            if (id != d.id || val.empty()) continue;
-            const bool known = std::any_of(d.values.begin(), d.values.end(),
-                [&](const WebSearchDialValue& v) { return v.id == val; });
-            if (known) out.emplace_back(id, val);
+            if (id != d.id) continue;
+            if (web_search_dial_value_ok(d, val)) out.emplace_back(id, val);
             break;
         }
     }
@@ -909,6 +930,26 @@ JsonHits parse_json_hits(std::string_view service_id, std::string_view body,
 } // namespace mcp::tools::detail
 
 namespace mcp::tools {
+
+bool web_search_dial_value_ok(const WebSearchDial& d, std::string_view value) noexcept {
+    if (value.empty()) return false;
+    if (d.text == WebSearchText::None)
+        return std::any_of(d.values.begin(), d.values.end(),
+            [&](const WebSearchDialValue& v) { return v.id == value; });
+    if (value.size() > d.max_bytes || !util::is_valid_utf8(value)) return false;
+    // No control characters in either kind: the value lands in a URL or a
+    // JSON string, and a newline could start a second Goggles rule.
+    const bool url = d.text == WebSearchText::HttpsUrl;
+    for (char ch : value) {
+        const auto u = static_cast<unsigned char>(ch);
+        if (u < 0x20 || u == 0x7f || (url && u == ' ')) return false;
+    }
+    if (url) {
+        constexpr std::string_view kScheme = "https://";
+        if (value.size() <= kScheme.size() || !value.starts_with(kScheme)) return false;
+    }
+    return true;
+}
 
 const std::vector<WebSearchService>& web_search_services() {
     static const std::vector<WebSearchService> c = detail::make_catalogue();

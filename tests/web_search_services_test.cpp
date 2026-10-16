@@ -108,6 +108,12 @@ TEST_CASE("web search: search catalogue is well formed") {
         CHECK(s.dials.size() <= kMaxWebSearchDials);
         CHECK(s.needs_key == !s.signup.empty());
         for (const auto& d : s.dials) {
+            INFO(d.id);
+            if (d.text != WebSearchText::None) {   // free text: no list, a bound
+                CHECK(d.values.empty());
+                CHECK(d.max_bytes > 0);
+                continue;
+            }
             REQUIRE(!d.values.empty());
             CHECK(d.values.front().id.empty());   // [0] is "send nothing"
         }
@@ -187,9 +193,9 @@ TEST_CASE("web search: the new dials pass validation and fill the rows") {
     auto dials = [](std::string_view id) { return svc(id).dials.size(); };
     CHECK(dials("tavily-free") == kMaxWebSearchDials);
     CHECK(dials("tavily-api") == kMaxWebSearchDials);
-    CHECK(dials("firecrawl-free") == 5);
-    CHECK(dials("firecrawl-api") == 5);
-    CHECK(dials("brave-api") == 4);
+    CHECK(dials("firecrawl-free") == 6);
+    CHECK(dials("firecrawl-api") == 6);
+    CHECK(dials("brave-api") == 5);
     CHECK(dials("exa-api") == 5);
     CHECK(dials("perplexity-api") == 3);
     WebSearchSlot t{"tavily-free", {}, {{"exact_match", "true"}, {"language_filter", "only"},
@@ -200,6 +206,37 @@ TEST_CASE("web search: the new dials pass validation and fill the rows") {
     CHECK(validate_dials(svc("firecrawl-api"), f).size() == 2);
     WebSearchSlot e{"exa-api", {}, {{"moderation", "true"}, {"country", "GB"}}};
     CHECK(validate_dials(svc("exa-api"), e).size() == 2);
+}
+
+TEST_CASE("web search: text dials take checked free text") {
+    const WebSearchDial* goggle = nullptr;
+    for (const auto& d : svc("brave-api").dials) if (d.id == "goggles") goggle = &d;
+    REQUIRE(goggle != nullptr);
+    const std::string url = "https://raw.githubusercontent.com/brave/goggles-quickstart/"
+                            "main/goggles/tech_blogs.goggle";
+    CHECK(web_search_dial_value_ok(*goggle, url));
+    CHECK(!web_search_dial_value_ok(*goggle, ""));
+    CHECK(!web_search_dial_value_ok(*goggle, "https://"));
+    CHECK(!web_search_dial_value_ok(*goggle, "http://example.com/a.goggle"));
+    CHECK(!web_search_dial_value_ok(*goggle, "$boost=3,site=dev.to"));   // inline rules
+    CHECK(!web_search_dial_value_ok(*goggle, "https://a.com/x y"));
+    CHECK(!web_search_dial_value_ok(*goggle, "https://a.com/x\n$discard"));
+    CHECK(!web_search_dial_value_ok(*goggle, "https://a.com/" + std::string(2048, 'x')));
+
+    const WebSearchDial* where = nullptr;
+    for (const auto& d : svc("firecrawl-free").dials) if (d.id == "location") where = &d;
+    REQUIRE(where != nullptr);
+    CHECK(web_search_dial_value_ok(*where, "San Francisco,California,United States"));
+    CHECK(web_search_dial_value_ok(*where, "Z\xc3\xbcrich"));          // UTF-8 is fine
+    CHECK(!web_search_dial_value_ok(*where, "Z\xfcrich"));             // Latin-1 is not
+    CHECK(!web_search_dial_value_ok(*where, "line one\r\nline two"));
+    CHECK(!web_search_dial_value_ok(*where, std::string(201, 'a')));
+
+    // validate_dials applies the same rule, so a bad value never reaches a slot.
+    WebSearchSlot ok{"brave-api", {}, {{"goggles", url}}};
+    CHECK(validate_dials(svc("brave-api"), ok).size() == 1);
+    WebSearchSlot bad{"brave-api", {}, {{"goggles", "javascript:alert(1)"}}};
+    CHECK(validate_dials(svc("brave-api"), bad).empty());
 }
 
 TEST_CASE("web search: keys are checked before they become a header") {
@@ -323,12 +360,14 @@ TEST_CASE("web search: Firecrawl request") {
                  "authorization") == "Bearer fc-1");
 
     // Sorting by date joins the window in tbs; alone it is just sbd:1.
-    q.dials = {{"freshness", "qdr:w"}, {"sort", "date"}, {"safe", "true"}};
+    q.dials = {{"freshness", "qdr:w"}, {"sort", "date"}, {"safe", "true"},
+               {"location", "Germany"}};
     for (const char* id : {"firecrawl-free", "firecrawl-api"}) {
         INFO(id);
         auto sb = json::parse(build_web_search_request(svc(id), "k", q).body);
         CHECK(sb["tbs"] == "sbd:1,qdr:w");
         CHECK(sb["safe"] == true);
+        CHECK(sb["location"] == "Germany");
     }
     q.dials = {{"sort", "date"}};
     CHECK(json::parse(build_web_search_request(svc("firecrawl-free"), "", q).body)
@@ -357,6 +396,11 @@ TEST_CASE("web search: Brave API request keeps the key out of the URL") {
     const auto url = build_web_search_request(svc("brave-api"), "k", q).url;
     CHECK(url.find("&spellcheck=false") != std::string::npos);
     CHECK(url.find("&country=ALL") != std::string::npos);
+    CHECK(url.find("goggles") == std::string::npos);
+    // A Goggle URL is percent-encoded into its own parameter.
+    q.dials = {{"goggles", "https://g.example/a b.goggle?x=1&y"}};
+    CHECK(build_web_search_request(svc("brave-api"), "k", q).url.find(
+          "&goggles=https%3A%2F%2Fg.example%2Fa%20b.goggle%3Fx%3D1%26y") != std::string::npos);
 }
 
 TEST_CASE("web search: Exa, Serper and Perplexity requests") {
