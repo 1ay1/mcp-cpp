@@ -1,10 +1,12 @@
 #include <mcp/tools/util/fs_helpers.hpp>
+#include <mcp/tools/util/glob.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <format>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -265,9 +267,23 @@ promote_to_workspace_path(NormalizedPath p, std::string_view tool_name, const Bo
     return WorkspacePath{std::move(p)};
 }
 
+bool is_private(const fs::path& p, const Bounds& b) {
+    if (b.private_names.empty()) return false;
+    const std::string name = p.filename().string();
+    if (name.empty()) return false;
+    for (const auto& g : b.private_names)
+        if (glob_match(g, name)) return true;
+    return false;
+}
+
 std::expected<WorkspacePath, ToolError>
 make_readable_path_checked(std::string_view raw, std::string_view tool_name, const Bounds& b) {
     NormalizedPath p{raw, b};
+    if (is_private(p.path(), b))
+        return std::unexpected(ToolError::denied(std::format(
+            "{} refused: '{}' matches the private files list (secrets like .env, "
+            "keys and certificates). Ask the user for the value you need instead.",
+            tool_name, std::string{raw})));
     if (is_within_workspace(p.path(), b) || is_read_allowlisted(p.path(), b))
         return WorkspacePath{std::move(p)};
     // Name the ACTUAL readable roots. Observed failure: skills live in

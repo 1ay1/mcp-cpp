@@ -1568,6 +1568,10 @@ ExecResult run_grep(const Call& call, const GrepArgs& a, Exec* exec) {
         tidy.root = util::tidy_model_path(call.fs(), bounds(call), a.root).path;
     auto wp = util::make_workspace_path_checked(tidy.root, "grep", bounds(call));
     if (!wp) return std::unexpected(std::move(wp.error()));
+    if (util::is_private(wp->path(), bounds(call)))
+        return std::unexpected(ToolError::denied(
+            "grep refused: '" + a.root + "' matches the private files list (secrets "
+            "like .env, keys and certificates). Ask the user for the value you need instead."));
     if (!call.fs().stat(wp->path()).exists)
         return std::unexpected(ToolError::not_found(
             "path not found: " + wp->string() + ". Use glob or list_dir to find it"

@@ -37,7 +37,12 @@ struct Bounds {
     fs::path              project;
     // The host's "how to widen the boundary" advice (ToolState::widen_hint).
     std::string           widen_hint;
+    // Basename globs that file tools refuse to read (ToolState::private_names).
+    std::vector<std::string> private_names;
 };
+
+// True when `p`'s filename matches one of b.private_names.
+[[nodiscard]] bool is_private(const fs::path& p, const Bounds& b);
 
 // A Bounds from the state's fields. An empty workspace means the cwd.
 [[nodiscard]] Bounds bounds_from(FileSystem& files, const fs::path& workspace,

@@ -116,6 +116,9 @@ struct ToolState {
     // widen the boundary ("pass --workspace <dir>"). Empty says nothing,
     // since only the host knows its own flags.
     std::string widen_hint;
+    // Basename globs the file tools refuse to read (".env", "*.pem"), like
+    // zed's private_files. The host fills it; empty refuses nothing.
+    std::vector<std::string> private_names;
 
     // `read`'s memory, keyed (reader, canonical path).
     std::map<std::pair<std::string, std::string>, state::ReadSeen> reads;

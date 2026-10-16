@@ -449,5 +449,28 @@ def zed_robustness():
             print(f"FAIL {name}\n     reply: {r[0][:200]!r}\n     disk: {got!r}")
 zed_robustness()
 
+def private_files():
+    global fails
+    name = "read/grep refuse .env and keys; ordinary files still read"
+    if ONLY and ONLY not in name:
+        return
+    root = tempfile.mkdtemp(prefix="tc_")
+    open(os.path.join(root, ".env"), "w").write("API_KEY=sk-live-1\n")
+    open(os.path.join(root, "server.pem"), "w").write("-----BEGIN-----\n")
+    open(os.path.join(root, "ok.txt"), "w").write("fine\n")
+    r = calls(root, [("read", {"path": ".env"}),
+                     ("grep", {"pattern": "API", "path": ".env"}),
+                     ("read", {"path": "server.pem"}),
+                     ("read", {"path": "ok.txt"})])
+    leaked = [i for i in (0, 1, 2) if "sk-live" in r[i] or "BEGIN" in r[i]]
+    if not leaked and all("private files" in r[i] for i in (0, 1, 2)) and "fine" in r[3]:
+        print(f"ok   {name}")
+    else:
+        fails += 1
+        print(f"FAIL {name}\n     replies: {[x[:100] for x in r]!r}")
+# Only the agentty host fills the private list; the bare eval server doesn't.
+if "agentty" in os.path.basename(SERVER):
+    private_files()
+
 print(f"\n{fails} failure(s)")
 sys.exit(1 if fails else 0)

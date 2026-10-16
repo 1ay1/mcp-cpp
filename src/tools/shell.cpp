@@ -618,7 +618,8 @@ const util::ArgSpec<BashArgs> kBashArgs = [] {
         util::arg(&BashArgs::cd, "cd",
                 "Working directory to run the command in (a real chdir in the "
                 "child, so relative paths and the command's own $PWD are "
-                "correct). Must be an existing directory inside the workspace."),
+                "correct). Must be an existing directory inside the workspace. "
+                "Use this instead of starting the command with `cd dir &&`."),
         util::arg(&BashArgs::env_in, "env",
                 "Extra environment variables for THIS command, e.g. "
                 "{\"CI\":\"1\",\"RUST_LOG\":\"debug\"}. Layered on top of the "
