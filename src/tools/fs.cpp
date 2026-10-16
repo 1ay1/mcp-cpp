@@ -93,6 +93,59 @@ using ReadCacheEntry = state::ReadSeen;
     return want_lo >= have_lo && want_hi <= have_hi;
 }
 
+// The lines [offset, offset+limit) of a cached read, with the same footer a
+// fresh read writes. The cache holds the earlier ANSWER (cat -n lines plus
+// notes), not the file, so it's cut by the line numbers on each line. Empty
+// when the window can't be cut cleanly (a heads-up note, an unnumbered body,
+// or a gap): the caller then reads the file fresh, which is always right.
+[[nodiscard]] std::string slice_cached(std::string_view cached, int offset, int limit,
+                                       int total) {
+    if (offset < 1 || limit < 1 || total < 1) return {};
+    const long long last_wanted = static_cast<long long>(offset) + limit - 1;
+    std::string out;
+    int first = 0, last = 0;
+    std::size_t pos = 0;
+    bool body_done = false;
+    while (pos < cached.size()) {
+        std::size_t nl = cached.find('\n', pos);
+        const std::string_view line = cached.substr(pos, nl == std::string_view::npos
+                                                             ? std::string_view::npos : nl - pos);
+        pos = nl == std::string_view::npos ? cached.size() : nl + 1;
+        if (body_done) continue;   // the footer: rebuilt below
+        // "%6d\t": spaces, digits, a tab.
+        std::size_t i = 0;
+        while (i < line.size() && line[i] == ' ') ++i;
+        std::size_t j = i;
+        while (j < line.size() && line[j] >= '0' && line[j] <= '9') ++j;
+        if (j > i && j < line.size() && line[j] == '\t' && j <= 12) {
+            const int n = std::atoi(std::string{line.substr(i, j - i)}.c_str());
+            if (n < offset || n > last_wanted) continue;
+            if (last != 0 && n != last + 1) return {};      // a gap: not a clean cut
+            if (first == 0) first = n;
+            last = n;
+            out.append(line);
+            out.push_back('\n');
+            continue;
+        }
+        // The body ends at the first blank line (the footer follows it).
+        // Anything else unnumbered is a heads-up note: don't guess.
+        if (line.empty()) { body_done = true; continue; }
+        return {};
+    }
+    if (first != offset || out.empty()) return {};
+    if (first > 1 || last < total) {
+        out += std::format("\n[showing lines {}-{} of {}", first, last, total);
+        if (last < total)
+            out += std::format("; {} more \xe2\x80\x94 pass offset={} (or start_line={}) "
+                               "for the next chunk",
+                               total - last, last + 1, last + 1);
+        out += "]";
+    } else {
+        out.pop_back();   // whole file: no trailing newline, as a fresh read
+    }
+    return out;
+}
+
 
 constexpr std::size_t kAutoOutlineSize = 32 * 1024;
 
@@ -354,29 +407,20 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
                     && seen->mtime == current_mtime
                     && covers(*seen, a.offset, a.limit, seen->total)
                     && !seen->content.empty()) {
-                    // SERVE, don't refuse.
-                    //
-                    // This used to return a bare "refer to the earlier
-                    // tool_result instead" and nothing else, which is a
-                    // pointer into the caller's context -- sound only while
-                    // that result is still there. Compaction, a wire-level
-                    // read-collapse and subagent boundaries all break that
-                    // assumption, and when it breaks the caller is told to
-                    // consult bytes that exist nowhere. Measured outcome: the
-                    // model falls back to `cat`, which is the read-loop
-                    // KhazAkar reported and the same failure Claude Code has
-                    // open as issues #53578 and #60684.
-                    //
-                    // Annotating rather than refusing keeps the token saving
-                    // that motivated the cache (no re-read of the file, no
-                    // second line scan) while making the answer unconditional.
-                    // The tag is for the MODEL: it says "you have seen this,
-                    // it has not changed" so a careful one does not re-reason
-                    // over it, and a confused one still gets the content.
-                    return ToolOutput{
-                        "[cached \xe2\x80\x94 unchanged since your last read of this "
-                        "file]\n" + seen->content,
-                        std::nullopt};
+                    // Serve from the cache (don't refuse with "refer to the
+                    // earlier result": compaction, wire read-collapse and
+                    // subagents can remove that result, and the model then
+                    // falls back to `cat`). Return only the requested window:
+                    // replaying the whole earlier answer for a narrower request
+                    // (whole file, then offset:430) showed lines 1-484 for
+                    // "430+", and the model asked again (issue #104). If the
+                    // window can't be cut cleanly, read the file fresh below.
+                    std::string body = slice_cached(seen->content, a.offset, a.limit, seen->total);
+                    if (!body.empty())
+                        return ToolOutput{
+                            "[cached \xe2\x80\x94 unchanged since your last read of this "
+                            "file]\n" + std::move(body),
+                            std::nullopt};
                 }
             }
         }

@@ -398,6 +398,34 @@ def symbol_then_range():
         print(f"FAIL {name}: replies {bad} replayed the symbol\n     reply: {r[1][:200]!r}")
 symbol_then_range()
 
+def cached_window():
+    # Issue #104: after a whole-file read, offset:430 came back [cached] with
+    # lines 1-484, so the card showed some other part of the file and the
+    # model asked again, and again.
+    global fails
+    name = "read: a cached read returns only the window asked for"
+    if ONLY and ONLY not in name:
+        return
+    root = tempfile.mkdtemp(prefix="tc_")
+    p = os.path.join(root, "C.kt")
+    open(p, "w").write("".join(f"line {i}\n" for i in range(1, 485)))
+    r = calls(root, [("read", {"path": p}),
+                     ("read", {"path": p, "offset": 430}),
+                     ("read", {"path": p, "start_line": 270, "end_line": 277})])
+    def nums(t):
+        return [int(l.split("\t")[0]) for l in t.splitlines()
+                if "\t" in l and l.split("\t")[0].strip().isdigit()]
+    a, b = nums(r[1]), nums(r[2])
+    ok = (r[1].startswith("[cached") and a == list(range(430, 485))
+          and "[showing lines 430-484 of 484]" in r[1]
+          and b == list(range(270, 278)) and "pass offset=278" in r[2])
+    if ok:
+        print(f"ok   {name}")
+    else:
+        fails += 1
+        print(f"FAIL {name}\n     offset:430 -> {a[:3]}..{a[-3:]}\n     270-277 -> {b[:3]}..{b[-3:]}")
+cached_window()
+
 def numbered_read_roundtrip():
     global fails
     name = "read numbers lines; edit drops pasted prefixes; no description echo"
