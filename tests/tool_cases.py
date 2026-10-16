@@ -418,5 +418,36 @@ def numbered_read_roundtrip():
         print(f"FAIL {name}\n     read: {r[0][:120]!r}\n     edit: {r[1][:160]!r}\n     disk: {disk!r}")
 numbered_read_roundtrip()
 
+def zed_robustness():
+    global fails
+    root = tempfile.mkdtemp(prefix="tc_")
+    p = os.path.join(root, "g.py")
+    src = "class A:\n    def f(self):\n        x = 1\n        return x\n"
+    open(p, "w").write(src)
+    # 1. edits sent as a JSON string, like zed's deserialize_maybe_stringified.
+    name = "edit: a stringified edits array still applies"
+    if not ONLY or ONLY in name:
+        r = calls(root, [("edit", {"path": p, "edits": json.dumps(
+            [{"old_text": "x = 1", "new_text": "x = 2"}])})])
+        if "x = 2" in open(p).read():
+            print(f"ok   {name}")
+        else:
+            fails += 1
+            print(f"FAIL {name}\n     reply: {r[0][:200]!r}")
+    # 2. Only line 1 lost its indent (copied from mid-line); the rest kept it.
+    name = "edit: first line unindented, rest indented, reindents right"
+    if not ONLY or ONLY in name:
+        open(p, "w").write(src)
+        r = calls(root, [("edit", {"path": p, "edits": [{
+            "old_text": "x = 1\n    return x",
+            "new_text": "y = 1\n    return y"}]})])
+        got = open(p).read()
+        if got == "class A:\n    def f(self):\n        y = 1\n        return y\n":
+            print(f"ok   {name}")
+        else:
+            fails += 1
+            print(f"FAIL {name}\n     reply: {r[0][:200]!r}\n     disk: {got!r}")
+zed_robustness()
+
 print(f"\n{fails} failure(s)")
 sys.exit(1 if fails else 0)

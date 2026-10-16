@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -308,6 +309,10 @@ struct IndentDelta {
     bool        have = false;
     std::string needle_base;
     std::string file_base;
+    // Zed's case: the model dropped the indent on line 1 only (copied from
+    // mid-line). Then line 1 and the rest need different fixes.
+    bool        split = false;
+    std::string first_needle, first_file;
 };
 
 std::size_t common_prefix_len(std::string_view a, std::string_view b) noexcept {
@@ -348,14 +353,47 @@ IndentDelta detect_indent_delta(std::string_view file_text,
     d.have = true;
     d.needle_base.assign(needle_base);
     d.file_base.assign(file_base);
+
+    // Recompute over lines 2.. of each side. When those agree on a different
+    // base than the whole block, line 1 was the odd one out.
+    auto indent_of = [](std::string_view text, const Line& L) {
+        return std::string_view{text.data() + L.start, L.indent_end - L.start};
+    };
+    auto rest_base = [&](std::string_view text, const std::vector<Line>& ls,
+                         std::size_t lo, std::size_t hi,
+                         std::string_view& first_ind) -> std::optional<std::string_view> {
+        std::optional<std::string_view> base;
+        bool seen_first = false;
+        for (std::size_t i = lo; i < hi; ++i) {
+            const auto& L = ls[i];
+            if (L.indent_end == L.trimmed_end) continue;
+            auto ind = indent_of(text, L);
+            if (!seen_first) { first_ind = ind; seen_first = true; continue; }
+            base = base ? base->substr(0, common_prefix_len(*base, ind)) : ind;
+        }
+        return base;
+    };
+    std::string_view n_first, f_first;
+    auto n_rest = rest_base(needle_text, nl, 0, nl.size(), n_first);
+    auto f_rest = rest_base(file_text, fl, fl_lo, fl_hi, f_first);
+    if (n_rest && f_rest && n_first.size() < n_rest->size()
+        && (*n_rest != needle_base || *f_rest != file_base)) {
+        d.split = true;
+        d.needle_base.assign(*n_rest);
+        d.file_base.assign(*f_rest);
+        d.first_needle.assign(n_first);
+        d.first_file.assign(f_first);
+    }
     return d;
 }
 
 std::string apply_indent_delta(std::string_view text, const IndentDelta& d) {
-    if (!d.have || d.needle_base == d.file_base) return std::string{text};
+    if (!d.have) return std::string{text};
+    if (!d.split && d.needle_base == d.file_base) return std::string{text};
     std::string out;
     out.reserve(text.size() + text.size() / 8);
     std::size_t i = 0;
+    bool first_content = true;
     while (i < text.size()) {
         std::size_t line_start = i;
         while (i < text.size() && text[i] != '\n') ++i;
@@ -367,14 +405,17 @@ std::string apply_indent_delta(std::string_view text, const IndentDelta& d) {
         if (blank) {
             out.append(text.data() + line_start, line_end - line_start);
         } else {
+            const bool use_first = d.split && first_content;
+            first_content = false;
+            const std::string& from = use_first ? d.first_needle : d.needle_base;
+            const std::string& to   = use_first ? d.first_file   : d.file_base;
             std::size_t strip = 0;
-            if (!d.needle_base.empty()
-                && line_end - line_start >= d.needle_base.size()
-                && std::string_view{text.data() + line_start,
-                                    d.needle_base.size()} == d.needle_base) {
-                strip = d.needle_base.size();
+            if (!from.empty()
+                && line_end - line_start >= from.size()
+                && std::string_view{text.data() + line_start, from.size()} == from) {
+                strip = from.size();
             }
-            out.append(d.file_base);
+            out.append(to);
             out.append(text.data() + line_start + strip,
                        line_end - line_start - strip);
         }

@@ -91,6 +91,8 @@ ExecResult run_glob(const Call& call, const GlobArgs& a) {
     };
     std::vector<Entry> entries;
     entries.reserve(512);
+    constexpr std::size_t kGlobCap = 500;
+    bool capped = false;
 
     // The walk never descends through a symlinked directory (a cyclic link
     // would never end); those entries aren't reported either.
@@ -119,10 +121,10 @@ ExecResult run_glob(const Call& call, const GlobArgs& a) {
             // paths against the project root anyway.
             // Lexical: the walk yields paths under the root as given.
             auto rel = e.path.lexically_relative(wp->path());
+            if (entries.size() >= kGlobCap) { capped = true; return WalkStep::stop; }
             entries.push_back({
                 rel.empty() ? e.path.string() : rel.generic_string(),
                 is_dir_entry, is_link, sz, mt});
-            if (entries.size() > 500) return WalkStep::stop;
         }
         return WalkStep::next;
     });
@@ -160,8 +162,13 @@ ExecResult run_glob(const Call& call, const GlobArgs& a) {
         out << "\n";
     }
 
-    std::string body = "Found " + std::to_string(entries.size()) + " file(s):\n" + out.str();
-    if (entries.size() > 500) body += "[>500, truncated]\n";
+    // A capped result is the first 500 the walk met, not the 500 newest, so
+    // say so instead of claiming an order and a count we don't have.
+    std::string body = capped
+        ? "Found more than " + std::to_string(kGlobCap) + " matches; showing the first "
+              + std::to_string(kGlobCap) + " found (not sorted by recency across all "
+              "matches). Narrow the pattern or `path` to see the rest.\n" + out.str()
+        : "Found " + std::to_string(entries.size()) + " file(s):\n" + out.str();
     return ToolOutput{std::move(body), std::nullopt};
 }
 

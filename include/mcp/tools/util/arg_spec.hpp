@@ -162,6 +162,16 @@ public:
                 return std::nullopt;
             }
             dst = *v;
+            // Models sometimes send an array/object as a JSON string
+            // ("edits": "[{...}]"). Parse it, like zed does.
+            if (v->is_string()) {
+                const auto& s = v->get_ref<const std::string&>();
+                const auto first = s.find_first_not_of(" \t\r\n");
+                if (first != std::string::npos && (s[first] == '[' || s[first] == '{')) {
+                    auto parsed = nlohmann::json::parse(s, nullptr, /*allow_exceptions=*/false);
+                    if (!parsed.is_discarded()) dst = std::move(parsed);
+                }
+            }
             return std::nullopt;
         }
     }
