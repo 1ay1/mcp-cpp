@@ -697,6 +697,63 @@ std::vector<SearchHit> collect(const json& arr, const char* url_key,
     return out;
 }
 
+// Percent-encode an id for a URL path, keeping '/' (a DOI and an old-style
+// arXiv id such as hep-th/9901001 both carry one).
+std::string path_escape(std::string_view s) {
+    std::string out;
+    for (std::size_t from = 0;;) {
+        const auto slash = s.find('/', from);
+        out += url_escape(s.substr(from, slash == std::string_view::npos
+                                             ? std::string_view::npos : slash - from));
+        if (slash == std::string_view::npos) return out;
+        out += '/';
+        from = slash + 1;
+    }
+}
+
+// A Firecrawl paper record carries ids, not a link. The four primaryId forms
+// Firecrawl documents become the paper's own page; anything else falls back
+// to Firecrawl's paper endpoint by the record's canonical paperId, which
+// answers for every record. "" when the record has neither.
+std::string paper_url(const json& r) {
+    const std::string primary = str_at(r, "primaryId");
+    if (const auto colon = primary.find(':');
+        colon != std::string::npos && colon + 1 < primary.size()) {
+        const std::string ns = lower(primary.substr(0, colon));
+        std::string id = primary.substr(colon + 1);
+        if (ns == "arxiv") return "https://arxiv.org/abs/" + path_escape(id);
+        if (ns == "pmid")  return "https://pubmed.ncbi.nlm.nih.gov/" + url_escape(id) + "/";
+        if (ns == "pmcid") {
+            // PMC writes its ids as PMC1234567; whether Firecrawl keeps the
+            // prefix is not documented, so both spellings are accepted.
+            if (lower(id.substr(0, 3)) != "pmc") id = "PMC" + id;
+            return "https://pmc.ncbi.nlm.nih.gov/articles/" + url_escape(id) + "/";
+        }
+        if (ns == "doi")   return "https://doi.org/" + path_escape(id);
+    }
+    if (const std::string paper = str_at(r, "paperId"); !paper.empty())
+        return "https://api.firecrawl.dev/v2/search/research/papers/" + url_escape(paper);
+    return {};
+}
+
+// Firecrawl's data.research: paper records (title, abstract, ids).
+std::vector<SearchHit> collect_papers(const json& arr, int count) {
+    std::vector<SearchHit> out;
+    if (!arr.is_array()) return out;
+    for (const auto& r : arr) {
+        if (static_cast<int>(out.size()) >= count) break;
+        if (!r.is_object()) continue;
+        SearchHit h;
+        h.url = paper_url(r);
+        if (h.url.empty() || h.url.size() > 2048) continue;   // never a cut-off link
+        h.title = tidy(str_at(r, "title"), 300);
+        if (h.title.empty()) h.title = h.url;
+        h.snippet = tidy(str_at(r, "abstract"), 500);
+        out.push_back(std::move(h));
+    }
+    return out;
+}
+
 } // namespace
 
 std::string_view WebSearchQuery::dial(std::string_view id) const noexcept {
@@ -905,8 +962,16 @@ JsonHits parse_json_hits(std::string_view service_id, std::string_view body,
         out.hits = collect(*need(field(j, "results")), "url", "title",
                            {"content"}, count);
     } else if (service_id == "firecrawl-free" || service_id == "firecrawl-api") {
-        out.hits = collect(*need(field(field(j, "data"), "web")), "url", "title",
-                           {"description"}, count);
+        // Web results, then paper records. From 2026-11-16 the research
+        // category answers in data.research and no longer in data.web, so
+        // either container makes a readable reply.
+        const json& data = field(j, "data");
+        const json& web = field(data, "web");
+        const json& papers = field(data, "research");
+        if (!web.is_array() && !papers.is_array()) out.ok = false;
+        out.hits = collect(web, "url", "title", {"description"}, count);
+        for (auto& h : collect_papers(papers, count - static_cast<int>(out.hits.size())))
+            out.hits.push_back(std::move(h));
     } else if (service_id == "exa-api") {
         out.hits = collect(*need(field(j, "results")), "url", "title",
                            {"highlights", "summary", "text"}, count);

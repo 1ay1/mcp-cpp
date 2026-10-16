@@ -510,6 +510,55 @@ TEST_CASE("web search: reply parsers") {
     CHECK(!parse_json_hits("firecrawl-free", R"({"success":false,"error":"x"})", 5).ok);
 }
 
+TEST_CASE("web search: Firecrawl paper records each get a link") {
+    // The record shape is the documented research example.
+    auto p = parse_json_hits("firecrawl-api",
+        R"({"success":true,"data":{"research":[)"
+        R"({"paperId":"2014215642691656232","primaryId":"arxiv:2105.05233",)"
+        R"("ids":{"arxiv":["2105.05233"]},"title":"Diffusion Models Beat GANs on Image Synthesis",)"
+        R"("abstract":"We show that diffusion models can achieve image sample quality.","score":0.016},)"
+        R"({"paperId":"1","primaryId":"pmid:31452104","title":"P"},)"
+        R"({"paperId":"2","primaryId":"pmcid:PMC6824467","title":"C"},)"
+        R"({"paperId":"3","primaryId":"pmcid:6824467","title":"C2"},)"
+        R"({"paperId":"4","primaryId":"doi:10.1038/s41586-021-03819-2","title":"D"},)"
+        R"({"paperId":"5","primaryId":"arxiv:hep-th/9901001","title":"Old arXiv"},)"
+        R"({"paperId":"6","primaryId":"doi:10.1000/a b","title":"Odd DOI"},)"
+        R"({"paperId":"7","primaryId":"openalex:W2963403868","title":"Unknown kind"},)"
+        R"({"paperId":"8","title":"No primary id"},)"
+        R"({"title":"Nothing to link"})"
+        R"(]}})", 20);
+    REQUIRE(p.ok);
+    REQUIRE(p.hits.size() == 9);   // the last record has no id at all
+    CHECK(p.hits[0].url == "https://arxiv.org/abs/2105.05233");
+    CHECK(p.hits[0].title == "Diffusion Models Beat GANs on Image Synthesis");
+    CHECK(p.hits[0].snippet == "We show that diffusion models can achieve image sample quality.");
+    CHECK(p.hits[1].url == "https://pubmed.ncbi.nlm.nih.gov/31452104/");
+    CHECK(p.hits[2].url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC6824467/");
+    CHECK(p.hits[3].url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC6824467/");
+    CHECK(p.hits[4].url == "https://doi.org/10.1038/s41586-021-03819-2");
+    CHECK(p.hits[5].url == "https://arxiv.org/abs/hep-th/9901001");
+    CHECK(p.hits[6].url == "https://doi.org/10.1000/a%20b");
+    // A kind of id Firecrawl does not document, or none: its own paper page.
+    CHECK(p.hits[7].url == "https://api.firecrawl.dev/v2/search/research/papers/7");
+    CHECK(p.hits[8].url == "https://api.firecrawl.dev/v2/search/research/papers/8");
+
+    // Web results come first, and the count covers both lists.
+    auto mixed = parse_json_hits("firecrawl-free",
+        R"({"success":true,"data":{"web":[{"url":"https://a.test/","title":"A"}],)"
+        R"("research":[{"paperId":"1","primaryId":"pmid:1","title":"P1"},)"
+        R"({"paperId":"2","primaryId":"pmid:2","title":"P2"}]}})", 2);
+    REQUIRE(mixed.ok);
+    REQUIRE(mixed.hits.size() == 2);
+    CHECK(mixed.hits[0].url == "https://a.test/");
+    CHECK(mixed.hits[1].url == "https://pubmed.ncbi.nlm.nih.gov/1/");
+
+    // Either list makes a readable reply; an empty one is "no results".
+    auto empty = parse_json_hits("firecrawl-free", R"({"success":true,"data":{"research":[]}})", 5);
+    CHECK(empty.ok);
+    CHECK(empty.hits.empty());
+    CHECK(!parse_json_hits("firecrawl-free", R"({"success":true,"data":{}})", 5).ok);
+}
+
 TEST_CASE("web search: failures are told apart") {
     const auto& brave = svc("brave-free");
     const auto& tavily = svc("tavily-api");
