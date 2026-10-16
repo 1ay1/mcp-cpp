@@ -336,9 +336,7 @@ std::vector<WebSearchService> make_catalogue() {
         WebSearchService s;
         s.id = "perplexity-api"; s.label = "Perplexity API key"; s.needs_key = true;
         s.signup = "https://docs.perplexity.ai";
-        s.note = "Perplexity's Search API (ranked results, not an answer). "
-                 "'Never return' sites are left in the query as -site: here, "
-                 "because its domain-filter syntax for excluding is not documented.";
+        s.note = "Perplexity's Search API (ranked results, not an answer).";
         s.max_count = 20; s.language = true;
         s.dials.push_back(WebSearchDial{"recency", "Freshness",
             "Only pages from this window (search_recency_filter).", {
@@ -659,13 +657,20 @@ HttpRequest req_serper(const WebSearchQuery& q, std::string_view key) {
 // Perplexity Search. [D] POST /search ; Bearer ; max_results 1-20 without a
 // tier ; country is ISO alpha-2 ; search_language_filter is a list of ISO 639-1
 // codes ; search_recency_filter is hour|day|week|month|year ; search_type is
-// web|fast|people (people is not offered: it searches for people, not pages).
+// web|fast|people (people is not offered: it searches for people, not pages) ;
+// search_domain_filter takes at most 20 hosts, a "-" in front excluding one,
+// and is either all allow or all deny (only deny is sent).
 HttpRequest req_perplexity(const WebSearchQuery& q, std::string_view key) {
     json b = {{"query", q.text}, {"max_results", q.count}};
     if (!q.language.empty()) b["search_language_filter"] = json::array({q.language});
     if (auto v = q.dial("country"); !v.empty())  b["country"] = std::string{v};
     if (auto v = q.dial("recency"); !v.empty())  b["search_recency_filter"] = std::string{v};
     if (auto v = q.dial("search_type"); !v.empty()) b["search_type"] = std::string{v};
+    if (!q.exclude.empty()) {
+        json deny = json::array();
+        for (const auto& host : q.exclude) deny.push_back("-" + host);
+        b["search_domain_filter"] = std::move(deny);
+    }
     return json_post("https://api.perplexity.ai/search", b,
                      {{"authorization", "Bearer " + std::string{key}}});
 }
@@ -843,7 +848,7 @@ bool is_html_service(std::string_view id) noexcept {
 bool has_native_exclude(std::string_view id) noexcept {
     return id == "tavily-free" || id == "tavily-api"
         || id == "firecrawl-free" || id == "firecrawl-api"
-        || id == "exa-api";
+        || id == "exa-api" || id == "perplexity-api";
 }
 
 std::string clean_api_key(std::string_view key) {

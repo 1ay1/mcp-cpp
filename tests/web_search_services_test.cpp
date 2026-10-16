@@ -259,9 +259,16 @@ TEST_CASE("web search: -site: becomes a native filter only where the service has
     auto only = split_site_exclusions("-site:reddit.com");
     CHECK(only.query == "-site:reddit.com");
     CHECK(only.exclude.empty());
+    // At most 20 lifted out (Perplexity's limit); the rest stay in the text.
+    std::string many = "q";
+    for (int i = 0; i < 21; ++i) many += " -site:s" + std::to_string(i) + ".test";
+    auto capped = split_site_exclusions(many);
+    CHECK(capped.exclude.size() == 20);
+    CHECK(capped.query == "q -site:s20.test");
 
     CHECK(has_native_exclude("tavily-free"));
     CHECK(has_native_exclude("exa-api"));
+    CHECK(has_native_exclude("perplexity-api"));
     CHECK(!has_native_exclude("brave-free"));
     CHECK(!has_native_exclude("serper-api"));
 }
@@ -451,9 +458,16 @@ TEST_CASE("web search: Exa, Serper and Perplexity requests") {
     CHECK(pb["search_recency_filter"] == "month");
     CHECK(pb["search_language_filter"] == json::array({"fr"}));
     CHECK(!pb.contains("search_type"));
+    CHECK(!pb.contains("search_domain_filter"));
     q.dials = {{"search_type", "fast"}};
     CHECK(json::parse(build_web_search_request(svc("perplexity-api"), "k", q).body)
           ["search_type"] == "fast");
+    // Excluded hosts become the deny form of its domain filter.
+    q.dials = {};
+    q.exclude = {"reddit.com", "pinterest.com"};
+    const json deny = json::array({"-reddit.com", "-pinterest.com"});
+    CHECK(json::parse(build_web_search_request(svc("perplexity-api"), "k", q).body)
+          ["search_domain_filter"] == deny);
 }
 
 TEST_CASE("web search: reply parsers") {
@@ -672,6 +686,15 @@ TEST_CASE("web search: -site: reaches a native filter, and stays in the text els
     run(http2, p2, "rust async -site:reddit.com");
     REQUIRE(http2->seen.size() == 1);
     CHECK(json::parse(http2->seen[0].body)["q"] == "rust async -site:reddit.com");
+
+    auto http3 = std::make_shared<Scripted>();
+    http3->rules.push_back({"api.perplexity.ai", reply(200, R"({"results":[]})")});
+    WebSearchPlan p3; p3.slots = {WebSearchSlot{"perplexity-api", "k", {}}};
+    run(http3, p3, "rust async -site:reddit.com");
+    REQUIRE(http3->seen.size() == 1);
+    auto pb = json::parse(http3->seen[0].body);
+    CHECK(pb["query"] == "rust async");
+    CHECK(pb["search_domain_filter"] == json::array({"-reddit.com"}));
 }
 
 TEST_CASE("web search: at most three slots are tried") {

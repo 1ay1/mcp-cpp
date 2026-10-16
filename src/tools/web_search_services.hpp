@@ -52,7 +52,8 @@ enum class WebSearchFailure {
 // unchanged with an empty list, so we never send an empty query.
 struct SiteSplit {
     std::string                query;
-    std::vector<std::string>   exclude;   // lower-case hosts, at most 20
+    std::vector<std::string>   exclude;   // lower-case hosts, at most 20 (also
+                                          // Perplexity's limit); more stay in `query`
 };
 [[nodiscard]] SiteSplit split_site_exclusions(std::string_view query);
 
