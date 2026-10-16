@@ -47,6 +47,14 @@ std::string header(const HttpRequest& r, std::string_view name) {
     return {};
 }
 
+// The value ids one dial offers, in menu order ("" first).
+std::vector<std::string> dial_ids(std::string_view service, std::string_view dial) {
+    std::vector<std::string> out;
+    for (const auto& d : svc(service).dials)
+        if (d.id == dial) for (const auto& v : d.values) out.push_back(v.id);
+    return out;
+}
+
 class Scripted : public HttpClient {
 public:
     // First rule whose needle is in the URL wins.
@@ -97,7 +105,7 @@ TEST_CASE("web search: search catalogue is well formed") {
         CHECK(!s.id.empty());
         CHECK(!s.label.empty());
         CHECK(s.max_count >= 1);
-        CHECK(s.dials.size() <= 3);               // the pane has three dial rows
+        CHECK(s.dials.size() <= kMaxWebSearchDials);
         CHECK(s.needs_key == !s.signup.empty());
         for (const auto& d : s.dials) {
             REQUIRE(!d.values.empty());
@@ -136,6 +144,43 @@ TEST_CASE("web search: dials: only listed values reach a request") {
     // The default value is "send nothing", so it is dropped too.
     WebSearchSlot d{"ddg-free", {}, {{"region", ""}}};
     CHECK(validate_dials(svc("ddg-free"), d).empty());
+}
+
+TEST_CASE("web search: dials offer each vendor's documented values") {
+    using V = std::vector<std::string>;
+    const V hourly_tbs{"", "qdr:h", "qdr:d", "qdr:w", "qdr:m", "qdr:y"};
+    const V categories{"", "developer", "research", "pdf", "gov"};
+    const V exa_types{"", "fast", "instant", "deep-lite", "deep", "deep-reasoning"};
+    const V exa_ages{"", "hour", "day", "week", "month", "year"};
+    // Firecrawl's four categories; github is no longer one.
+    for (const char* id : {"firecrawl-free", "firecrawl-api"}) {
+        INFO(id);
+        CHECK(dial_ids(id, "category") == categories);
+        CHECK(dial_ids(id, "freshness") == hourly_tbs);
+        WebSearchSlot old{id, {}, {{"category", "github"}}};
+        CHECK(validate_dials(svc(id), old).empty());
+    }
+    CHECK(dial_ids("exa-api", "type") == exa_types);
+    CHECK(dial_ids("exa-api", "freshness") == exa_ages);
+    CHECK(dial_ids("serper-api", "freshness") == hourly_tbs);
+    // Brave's "no country" sits right under the default.
+    const auto brave = dial_ids("brave-api", "country");
+    REQUIRE(brave.size() >= 2);
+    CHECK(brave[1] == "ALL");
+    // DuckDuckGo: all 68 documented regions, us-en being the "" default.
+    const auto kl = dial_ids("ddg-free", "region");
+    CHECK(kl.size() == 68);
+    CHECK(std::find(kl.begin(), kl.end(), "us-en") == kl.end());
+    for (const char* r : {"wt-wt", "nl-nl", "xl-es", "ue-es", "tw-tzh", "vn-vi"})
+        CHECK(std::find(kl.begin(), kl.end(), r) != kl.end());
+    // No dial lists a value twice.
+    for (const auto& s : web_search_services())
+        for (const auto& d : s.dials) {
+            V ids = dial_ids(s.id, d.id);
+            std::sort(ids.begin(), ids.end());
+            const std::string where = s.id + "." + d.id;
+            CHECK(std::adjacent_find(ids.begin(), ids.end()) == ids.end(), where);
+        }
 }
 
 TEST_CASE("web search: keys are checked before they become a header") {
@@ -254,6 +299,12 @@ TEST_CASE("web search: Exa, Serper and Perplexity requests") {
     CHECK(eb["type"] == "fast");
     CHECK(eb["category"] == "news");
     CHECK(eb["startPublishedDate"] == "2025-10-02T08:53:20.000Z");
+    q.dials = {{"freshness", "hour"}};
+    CHECK(json::parse(build_web_search_request(svc("exa-api"), "k", q).body)
+          ["startPublishedDate"] == "2025-10-09T07:53:20.000Z");
+    q.dials = {{"type", "deep-reasoning"}};
+    CHECK(json::parse(build_web_search_request(svc("exa-api"), "k", q).body)
+          ["type"] == "deep-reasoning");
 
     q.dials = {{"country", "NZ"}, {"freshness", "qdr:d"}, {"autocorrect", "false"}};
     auto s = build_web_search_request(svc("serper-api"), "sp-k", q);

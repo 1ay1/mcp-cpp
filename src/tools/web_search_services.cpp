@@ -47,6 +47,14 @@ std::vector<WebSearchDialValue> dwmy(std::string d, std::string w,
             V(std::move(m), "Past month"), V(std::move(y), "Past year")};
 }
 
+// The same, led by Past hour, for the services that filter down to the hour.
+std::vector<WebSearchDialValue> hdwmy(std::string h, std::string d, std::string w,
+                                   std::string m, std::string y) {
+    auto v = dwmy(std::move(d), std::move(w), std::move(m), std::move(y));
+    v.insert(v.begin(), V(std::move(h), "Past hour"));
+    return v;
+}
+
 // ISO 3166-1 alpha-2, upper case. The shared short list: enough to cover
 // where most users are, without a 250-row dropdown nobody scrolls.
 WebSearchDial country_dial(std::string help) {
@@ -60,6 +68,16 @@ WebSearchDial country_dial(std::string help) {
         V("BR", "Brazil"),        V("IN", "India"),
         V("JP", "Japan"),
     }};
+}
+
+// Firecrawl's documented categories, the same for both tiers. Only one is
+// sent, which also keeps `gov` alone as Firecrawl requires.
+WebSearchDial firecrawl_category_dial() {
+    return WebSearchDial{"category", "Category",
+        "Restrict to one kind of source. Developer: code repositories and "
+        "documentation sites. Government: laws, regulations and court opinions.", {
+        V("", "Any"), V("developer", "Developer"), V("research", "Research"),
+        V("pdf", "PDF"), V("gov", "Government")}};
 }
 
 std::vector<WebSearchService> make_catalogue() {
@@ -87,13 +105,42 @@ std::vector<WebSearchService> make_catalogue() {
         s.max_count = 30;
         s.dials.push_back(WebSearchDial{"region", "Region",
             "DuckDuckGo's kl parameter. Skews which country's results rank first.", {
+            // Every region on DuckDuckGo's URL-parameters help page, in its
+            // order. us-en is the default, so it is the "" row, not a second one.
             V("", "United States (default)"), V("wt-wt", "No region"),
-            V("uk-en", "United Kingdom"), V("au-en", "Australia"),
-            V("nz-en", "New Zealand"),   V("ca-en", "Canada"),
-            V("in-en", "India"),         V("de-de", "Germany"),
-            V("fr-fr", "France"),        V("es-es", "Spain"),
-            V("it-it", "Italy"),         V("br-pt", "Brazil"),
-            V("jp-jp", "Japan"),
+            V("xa-ar", "Arabia"),            V("xa-en", "Arabia (en)"),
+            V("ar-es", "Argentina"),         V("au-en", "Australia"),
+            V("at-de", "Austria"),           V("be-fr", "Belgium (fr)"),
+            V("be-nl", "Belgium (nl)"),      V("br-pt", "Brazil"),
+            V("bg-bg", "Bulgaria"),          V("ca-en", "Canada"),
+            V("ca-fr", "Canada (fr)"),       V("ct-ca", "Catalan"),
+            V("cl-es", "Chile"),             V("cn-zh", "China"),
+            V("co-es", "Colombia"),          V("hr-hr", "Croatia"),
+            V("cz-cs", "Czech Republic"),    V("dk-da", "Denmark"),
+            V("ee-et", "Estonia"),           V("fi-fi", "Finland"),
+            V("fr-fr", "France"),            V("de-de", "Germany"),
+            V("gr-el", "Greece"),            V("hk-tzh", "Hong Kong"),
+            V("hu-hu", "Hungary"),           V("in-en", "India"),
+            V("id-id", "Indonesia"),         V("id-en", "Indonesia (en)"),
+            V("ie-en", "Ireland"),           V("il-he", "Israel"),
+            V("it-it", "Italy"),             V("jp-jp", "Japan"),
+            V("kr-kr", "Korea"),             V("lv-lv", "Latvia"),
+            V("lt-lt", "Lithuania"),         V("xl-es", "Latin America"),
+            V("my-ms", "Malaysia"),          V("my-en", "Malaysia (en)"),
+            V("mx-es", "Mexico"),            V("nl-nl", "Netherlands"),
+            V("nz-en", "New Zealand"),       V("no-no", "Norway"),
+            V("pe-es", "Peru"),              V("ph-en", "Philippines"),
+            V("ph-tl", "Philippines (tl)"),  V("pl-pl", "Poland"),
+            V("pt-pt", "Portugal"),          V("ro-ro", "Romania"),
+            V("ru-ru", "Russia"),            V("sg-en", "Singapore"),
+            V("sk-sk", "Slovak Republic"),   V("sl-sl", "Slovenia"),
+            V("za-en", "South Africa"),      V("es-es", "Spain"),
+            V("se-sv", "Sweden"),            V("ch-de", "Switzerland (de)"),
+            V("ch-fr", "Switzerland (fr)"),  V("ch-it", "Switzerland (it)"),
+            V("tw-tzh", "Taiwan"),           V("th-th", "Thailand"),
+            V("tr-tr", "Turkey"),            V("ua-uk", "Ukraine"),
+            V("uk-en", "United Kingdom"),    V("ue-es", "United States (es)"),
+            V("ve-es", "Venezuela"),         V("vn-vi", "Vietnam"),
         }});
         s.dials.push_back(WebSearchDial{"safe", "Safe search",
             "DuckDuckGo's kp parameter.", {
@@ -123,11 +170,8 @@ std::vector<WebSearchService> make_catalogue() {
         s.max_count = 100;
         s.dials.push_back(freshness_dial("freshness",
             "Only pages from this window (Firecrawl's tbs=qdr:).",
-            dwmy("qdr:d", "qdr:w", "qdr:m", "qdr:y")));
-        s.dials.push_back(WebSearchDial{"category", "Category",
-            "Restrict to one kind of site.", {
-            V("", "Any"), V("github", "GitHub"), V("research", "Research"),
-            V("pdf", "PDF"), V("developer", "Developer docs")}});
+            hdwmy("qdr:h", "qdr:d", "qdr:w", "qdr:m", "qdr:y")));
+        s.dials.push_back(firecrawl_category_dial());
         s.dials.push_back(country_dial("Firecrawl's country parameter."));
         c.push_back(std::move(s));
     }
@@ -144,7 +188,10 @@ std::vector<WebSearchService> make_catalogue() {
             dwmy("pd", "pw", "pm", "py")));
         s.dials.push_back(WebSearchDial{"safesearch", "Safe search", "", {
             V("", "Moderate (default)"), V("off", "Off"), V("strict", "Strict")}});
-        s.dials.push_back(country_dial("Where results come from."));
+        // Brave's default is US; ALL is its documented "no country" value.
+        auto country = country_dial("Where results come from.");
+        country.values.insert(country.values.begin() + 1, V("ALL", "All regions"));
+        s.dials.push_back(std::move(country));
         c.push_back(std::move(s));
     }
     {
@@ -170,10 +217,9 @@ std::vector<WebSearchService> make_catalogue() {
         s.note = "Firecrawl's search API. 2 credits a search.";
         s.max_count = 100;
         s.dials.push_back(freshness_dial("freshness",
-            "Only pages from this window.", dwmy("qdr:d", "qdr:w", "qdr:m", "qdr:y")));
-        s.dials.push_back(WebSearchDial{"category", "Category", "", {
-            V("", "Any"), V("github", "GitHub"), V("research", "Research"),
-            V("pdf", "PDF"), V("developer", "Developer docs")}});
+            "Only pages from this window.",
+            hdwmy("qdr:h", "qdr:d", "qdr:w", "qdr:m", "qdr:y")));
+        s.dials.push_back(firecrawl_category_dial());
         s.dials.push_back(country_dial("Firecrawl's country parameter."));
         c.push_back(std::move(s));
     }
@@ -184,16 +230,19 @@ std::vector<WebSearchService> make_catalogue() {
         s.note = "Exa's neural search. Highlights are returned as the snippet.";
         s.max_count = 100;
         s.dials.push_back(WebSearchDial{"type", "Mode",
-            "Fast and instant trade depth for speed.", {
+            "Fast and instant trade depth for speed. Deep lite, deep and deep "
+            "reasoning research and synthesise: about 4, 4-15 and 12-40 seconds, "
+            "so deep reasoning can outlast a host's request timeout.", {
             V("", "Auto (default)"), V("fast", "Fast"), V("instant", "Instant"),
-            V("deep", "Deep")}});
+            V("deep-lite", "Deep lite"), V("deep", "Deep"),
+            V("deep-reasoning", "Deep reasoning")}});
         s.dials.push_back(WebSearchDial{"category", "Category",
             "Restrict to one kind of source.", {
             V("", "Any"), V("news", "News"), V("publication", "Publications"),
             V("personal site", "Personal sites")}});
         s.dials.push_back(freshness_dial("freshness",
             "Only pages published within this window (sent as startPublishedDate).",
-            dwmy("day", "week", "month", "year")));
+            hdwmy("hour", "day", "week", "month", "year")));
         c.push_back(std::move(s));
     }
     {
@@ -204,7 +253,8 @@ std::vector<WebSearchService> make_catalogue() {
         s.max_count = 20; s.language = true;
         s.dials.push_back(country_dial("Google's gl parameter."));
         s.dials.push_back(freshness_dial("freshness",
-            "Google's tbs=qdr: time filter.", dwmy("qdr:d", "qdr:w", "qdr:m", "qdr:y")));
+            "Google's tbs=qdr: time filter.",
+            hdwmy("qdr:h", "qdr:d", "qdr:w", "qdr:m", "qdr:y")));
         s.dials.push_back(WebSearchDial{"autocorrect", "Spell correction", "", {
             V("", "On (default)"), V("false", "Off")}});
         c.push_back(std::move(s));
@@ -316,10 +366,10 @@ std::string join_strings(const json& arr, std::string_view sep) {
     return out;
 }
 
-// ISO 8601 UTC, `days` before `now`.
-std::string iso_days_ago(std::chrono::system_clock::time_point now, int days) {
+// ISO 8601 UTC, `hours` before `now`.
+std::string iso_hours_ago(std::chrono::system_clock::time_point now, int hours) {
     const std::time_t t = std::chrono::system_clock::to_time_t(
-        now - std::chrono::hours(24 * days));
+        now - std::chrono::hours(hours));
     std::tm tm{};
 #ifdef _WIN32
     gmtime_s(&tm, &t);
@@ -374,11 +424,12 @@ std::vector<std::pair<std::string, std::string>> browser_headers(
     return h;
 }
 
-int days_for(std::string_view v) {
-    if (v == "day")   return 1;
-    if (v == "week")  return 7;
-    if (v == "month") return 30;
-    if (v == "year")  return 365;
+int hours_for(std::string_view v) {
+    if (v == "hour")  return 1;
+    if (v == "day")   return 24;
+    if (v == "week")  return 24 * 7;
+    if (v == "month") return 24 * 30;
+    if (v == "year")  return 24 * 365;
     return 0;
 }
 
@@ -472,9 +523,9 @@ HttpRequest req_exa(const WebSearchQuery& q, std::string_view key) {
     if (!q.exclude.empty()) b["excludeDomains"] = q.exclude;
     if (auto v = q.dial("type"); !v.empty())     b["type"] = std::string{v};
     if (auto v = q.dial("category"); !v.empty()) b["category"] = std::string{v};
-    if (int d = days_for(q.dial("freshness")); d > 0
+    if (int h = hours_for(q.dial("freshness")); h > 0
         && q.now != std::chrono::system_clock::time_point{})   // host gave the time
-        b["startPublishedDate"] = iso_days_ago(q.now, d);
+        b["startPublishedDate"] = iso_hours_ago(q.now, h);
     return json_post("https://api.exa.ai/search", b,
                      {{"x-api-key", std::string{key}}});
 }

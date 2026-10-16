@@ -25,6 +25,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -40,7 +41,7 @@ struct WebSearchDialValue {
 };
 
 // One extra knob a service honours (freshness, region, ...). A service
-// declares at most three. `values[0]` is always the default (id "").
+// declares at most kMaxWebSearchDials. `values[0]` is always the default (id "").
 struct WebSearchDial {
     std::string id;
     std::string label;
@@ -56,8 +57,12 @@ struct WebSearchService {
     std::string note;      // one honest line about limits and caveats
     int         max_count = 20;  // most results one request can ask for
     bool        language = false;  // honours WebSearchPlan::language
-    std::vector<WebSearchDial> dials;  // 0..3
+    std::vector<WebSearchDial> dials;  // 0..kMaxWebSearchDials
 };
+
+// The most dials one service declares, so a host can size its settings
+// page. Tavily needs all seven.
+inline constexpr std::size_t kMaxWebSearchDials = 7;
 
 // Every service, in menu order: the Free ones first, then the API-key ones.
 [[nodiscard]] const std::vector<WebSearchService>& web_search_services();
