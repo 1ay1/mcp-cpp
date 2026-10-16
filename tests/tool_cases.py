@@ -398,5 +398,25 @@ def symbol_then_range():
         print(f"FAIL {name}: replies {bad} replayed the symbol\n     reply: {r[1][:200]!r}")
 symbol_then_range()
 
+def numbered_read_roundtrip():
+    global fails
+    name = "read numbers lines; edit drops pasted prefixes; no description echo"
+    if ONLY and ONLY not in name:
+        return
+    root = tempfile.mkdtemp(prefix="tc_")
+    p = os.path.join(root, "f.c")
+    open(p, "w").write("a\n\tb\nc\n")
+    r = calls(root, [("read", {"path": p, "display_description": "DESC"}),
+                     ("edit", {"path": p, "edits": [{"old_text": "     2\t\tb",
+                                                      "new_text": "     2\t\tB"}]})])
+    disk = open(p).read()
+    if (r[0].startswith("     1\ta\n     2\t\tb\n     3\tc")
+            and "DESC" not in r[0] and disk == "a\n\tB\nc\n"):
+        print(f"ok   {name}")
+    else:
+        fails += 1
+        print(f"FAIL {name}\n     read: {r[0][:120]!r}\n     edit: {r[1][:160]!r}\n     disk: {disk!r}")
+numbered_read_roundtrip()
+
 print(f"\n{fails} failure(s)")
 sys.exit(1 if fails else 0)

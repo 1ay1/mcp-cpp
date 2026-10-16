@@ -604,8 +604,6 @@ ExecResult run_bash(const BashArgs& a, CallExec& exec) {
     // ignore; naming the parameter fixes the belief behind the pipe.
     if (auto tip = util::bash_tool_suggestion(a.command); !tip.empty())
         body = tip + "\n\n" + body;
-    if (!a.display_description.empty())
-        body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
 }
 

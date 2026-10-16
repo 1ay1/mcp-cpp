@@ -255,7 +255,10 @@ ExecResult run_poll(const Call& call, const PollArgs& args, CallExec&) {
     const auto entry = find_entry(call, args.id);
     if (!entry)
         return std::unexpected(ToolError::not_found(
-            "unknown process session: " + args.id + live_session_hint(call)));
+            "unknown process session: " + args.id + live_session_hint(call)
+            + ". Sessions live only as long as this agentty process; one "
+            "started before a restart, or stopped/reaped, is gone. Its "
+            "output may still be in the log it wrote to."));
 
     // The reply also carries a status line and maybe a dropped-bytes note,
     // and the whole text is cut from the END to the tool's budget. Leave room
@@ -304,7 +307,10 @@ ExecResult run_stop(const Call& call, const StopArgs& args, CallExec&) {
     const auto entry = take_entry(call, args.id);
     if (!entry)
         return std::unexpected(ToolError::not_found(
-            "unknown process session: " + args.id + live_session_hint(call)));
+            "unknown process session: " + args.id + live_session_hint(call)
+            + ". Sessions live only as long as this agentty process; one "
+            "started before a restart, or stopped/reaped, is gone. Its "
+            "output may still be in the log it wrote to."));
     auto& s = *entry->session;
     const bool was_running = s.read(std::chrono::milliseconds{0}, 0).running;
     s.stop();

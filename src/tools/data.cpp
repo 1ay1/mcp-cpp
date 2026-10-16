@@ -292,7 +292,6 @@ ExecResult run_json_query(const Call& call, const QueryArgs& a) {
         return ToolOutput{"(no match \u2014 the path selected nothing)", std::nullopt};
 
     std::ostringstream out;
-    if (!a.display_description.empty()) out << a.display_description << "\n";
     int shown = 0;
     for (const json* vp : cur) {
         if (shown++ >= kMaxResults) { out << "\u2026 " << (cur.size()-kMaxResults)

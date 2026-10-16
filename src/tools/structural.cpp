@@ -610,7 +610,6 @@ ExecResult run_structural(const Call& call, const StructArgs& a, DocRetriever* s
         semantic_order(sem, a, probe_pat, results);
 
     std::ostringstream out;
-    if (!a.display_description.empty()) out << a.display_description << "\n";
     out << "Found " << match_count << " structural match(es) in "
         << file_count << " file(s):\n";
 
@@ -853,7 +852,6 @@ ExecResult run_rewrite(const Call& call, const RewriteArgs& a) {
     }
 
     std::ostringstream out;
-    if (!a.display_description.empty()) out << a.display_description << "\n";
     std::size_t total_repl = 0, files_changed = 0;
     bool truncated = false;
     std::optional<FileChange> change;   // carried for single-file applies

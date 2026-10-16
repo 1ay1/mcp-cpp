@@ -493,7 +493,6 @@ ExecResult run_extract(const Call& call, const ExtractArgs& a) {
         }
     }
     std::string body = out.str();
-    if (!a.display_description.empty()) body = a.display_description + "\n" + body;
     return ToolOutput{util::to_valid_utf8(std::move(body)), std::nullopt};
 }
 
@@ -668,7 +667,6 @@ ExecResult run_aggregate(const Call& call, const AggregateArgs& a) {
         if ((std::size_t)out.tellp() >= kMaxOutputBytes) { out << "[capped]\n"; break; }
     }
     std::string body = out.str();
-    if (!a.display_description.empty()) body = a.display_description + "\n" + body;
     return ToolOutput{util::to_valid_utf8(std::move(body)), std::nullopt};
 }
 
@@ -839,7 +837,6 @@ ExecResult run_replace(const Call& call, const ReplaceArgs& a) {
         out << "\nRe-run with apply:true to write these changes.";
     }
     std::string body = out.str();
-    if (!a.display_description.empty()) body = a.display_description + "\n" + body;
     ToolOutput tout{util::to_valid_utf8(std::move(body)), std::nullopt};
     tout.changes = std::move(file_changes);
     return tout;
@@ -983,7 +980,6 @@ ExecResult run_read_filter(const Call& call, const ReadFilterArgs& a) {
                "drop `context`]";
 
     std::string body = out.str();
-    if (!a.display_description.empty()) body = a.display_description + "\n" + body;
     return ToolOutput{util::to_valid_utf8(std::move(body)), std::nullopt};
 }
 

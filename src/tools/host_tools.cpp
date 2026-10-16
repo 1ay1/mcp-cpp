@@ -85,7 +85,6 @@ void register_todo_tool(Shells& sh, const std::shared_ptr<TodoSink>& sink) {
         EffectSet{},
         spec_body(spec, [sink](const TodoArgs& a) -> mcp::cap::Result {
             std::string out;
-            if (!a.display_description.empty()) out += a.display_description + "\n\n";
             std::vector<TodoItem> items;
             if (a.todos.is_array()) {
                 // Each item is a small record; malformed ones are skipped.
@@ -178,7 +177,6 @@ void register_search_docs_tool(Shells& sh, const std::shared_ptr<DocRetriever>& 
             if (!err.empty()) return mcp::cap::Result::error("search_docs: " + err);
 
             std::string body;
-            if (!a.display_description.empty()) body += a.display_description + "\n";
             if (hits.empty())
                 return mcp::cap::Result::ok(body + "No matching documents for: " + q.query);
 
@@ -224,7 +222,6 @@ void register_search_code_tool(Shells& sh, const std::shared_ptr<DocRetriever>& 
             if (!err.empty()) return mcp::cap::Result::error("search_code: " + err);
 
             std::string body;
-            if (!a.display_description.empty()) body += a.display_description + "\n";
             if (hits.empty())
                 return mcp::cap::Result::ok(body + "No semantically similar code for: "
                                             + q.query + "\nTry grep for exact tokens.");

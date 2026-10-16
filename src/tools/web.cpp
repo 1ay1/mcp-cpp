@@ -1085,8 +1085,6 @@ ExecResult run_web_fetch(HttpClient& client, const WebFetchArgs& a, bool jina) {
         out << "\n[body truncated at 64KB]";
     }
     std::string s = out.str();
-    if (!a.display_description.empty())
-        s = a.display_description + "\n" + s;
     return ToolOutput{std::move(s), std::nullopt};
 }
 
@@ -1468,8 +1466,6 @@ ExecResult run_web_search(HttpClient& client, const WebSearchPlan& plan,
         out << "\n";
     }
     std::string s = out.str();
-    if (!a.display_description.empty())
-        s = a.display_description + "\n" + s;
     return ToolOutput{std::move(s), std::nullopt};
 }
 

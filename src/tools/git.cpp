@@ -398,12 +398,16 @@ std::string status_summary(std::string_view porcelain) {
         if (!seen_branch && line.rfind("## ", 0) == 0) {
             seen_branch = true;
             std::string_view b = line.substr(3);
+            // Unborn branch: "No commits yet on X" (old git: "Initial commit on X").
+            for (std::string_view pre : {"No commits yet on ", "Initial commit on "})
+                if (b.starts_with(pre)) b.remove_prefix(pre.size());
             size_t cut = b.size();
             if (auto d = b.find("..."); d != std::string_view::npos)
                 cut = std::min(cut, d);
             if (auto s = b.find(' '); s != std::string_view::npos)
                 cut = std::min(cut, s);
             branch = std::string{b.substr(0, cut)};
+            if (b.starts_with("HEAD (no branch)")) branch.clear();
             // Ahead/behind live in the trailing `[ahead N, behind M]`.
             if (auto lb = b.find('['); lb != std::string_view::npos) {
                 if (auto rb = b.find(']', lb); rb != std::string_view::npos)
@@ -511,8 +515,6 @@ ExecResult run_git_status(const Call& call, const GitStatusArgs& a, CallExec& ex
         for (size_t i = 0; i < subs.size(); ++i)
             output += (i ? ", " : "") + subs[i];
     }
-    if (!a.display_description.empty())
-        output = a.display_description + "\n" + output;
     if (!summary.empty())
         output = summary + "\n" + output;
     return ToolOutput{std::move(output), std::nullopt};
@@ -595,8 +597,6 @@ ExecResult run_git_diff(const Call& call, const GitDiffArgs& a, CallExec& exec) 
         }
         return ToolOutput{"no changes", std::nullopt};
     }
-    if (!a.display_description.empty())
-        output = a.display_description + "\n" + output;
     // run_git appends a bare "[output truncated]" when the patch overruns the
     // 50 KB cap. For a diff that's a trap: an incomplete patch can end
     // mid-hunk, so the model must NOT feed it to apply_patch. Upgrade the
@@ -664,8 +664,6 @@ ExecResult run_git_log(const Call& call, const GitLogArgs& a, CallExec& exec) {
     if (!out) return std::unexpected(std::move(out.error()));
     std::string output = std::move(*out);
     if (output.empty()) return ToolOutput{"no commits", std::nullopt};
-    if (!a.display_description.empty())
-        output = a.display_description + "\n" + output;
     return ToolOutput{std::move(output), std::nullopt};
 }
 
@@ -851,8 +849,6 @@ ExecResult run_git_commit(const Call& call, const GitCommitArgs& a, CallExec& ex
         if (!s.empty()) output += "\n  " + s;
         if (!summary_line.empty()) output += "\n  " + summary_line;
     }
-    if (!a.display_description.empty())
-        output = a.display_description + "\n" + output;
     return ToolOutput{std::move(output), std::nullopt};
 }
 

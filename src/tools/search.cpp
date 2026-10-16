@@ -162,8 +162,6 @@ ExecResult run_glob(const Call& call, const GlobArgs& a) {
 
     std::string body = "Found " + std::to_string(entries.size()) + " file(s):\n" + out.str();
     if (entries.size() > 500) body += "[>500, truncated]\n";
-    if (!a.display_description.empty())
-        body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
 }
 
@@ -281,8 +279,6 @@ ExecResult run_find_definition(const Call& call, const FindDefinitionArgs& a, Ca
             }
             std::string body = r.output;
             while (!body.empty() && body.back() == '\n') body.pop_back();
-            if (!a.display_description.empty())
-                body = a.display_description + "\n" + body;
             return ToolOutput{std::move(body), std::nullopt};
         }
     }
@@ -344,8 +340,6 @@ ExecResult run_find_definition(const Call& call, const FindDefinitionArgs& a, Ca
     if (matches == 0) return ToolOutput{"no definitions found for '" + a.symbol + "'", std::nullopt};
     if (matches > 50) out << "[>50 definitions, truncated]\n";
     std::string body = out.str();
-    if (!a.display_description.empty())
-        body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
 }
 
@@ -1009,7 +1003,6 @@ ExecResult run_ripgrep_counts(const GrepArgs& a, CallExec& exec) {
             o << f.n << "\t" << f.path << "\n";
     }
     std::string body = o.str();
-    if (!a.display_description.empty()) body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
 }
 
@@ -1258,8 +1251,6 @@ ExecResult run_ripgrep(const GrepArgs& a, CallExec& exec) {
         out << "Showing all " << total_matches << " matches.";
     }
     std::string body = out.str();
-    if (!a.display_description.empty())
-        body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
 }
 
@@ -1558,8 +1549,6 @@ ExecResult run_builtin(const Call& call, const GrepArgs& a) {
         out << "Showing all " << total << " matches.";
     }
     std::string body = out.str();
-    if (!a.display_description.empty())
-        body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
 }
 

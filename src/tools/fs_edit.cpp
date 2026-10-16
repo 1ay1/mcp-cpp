@@ -738,6 +738,33 @@ int apply_one(std::string& buf, const OneEdit& e,
     return 1;
 }
 
+// True when every line of `s` starts with read's `cat -n` prefix (spaces,
+// digits, one tab); strips the prefixes in place. Anything else is left alone.
+bool strip_read_line_numbers(std::string& s) {
+    if (s.empty()) return false;
+    std::string out;
+    out.reserve(s.size());
+    std::size_t pos = 0;
+    while (pos < s.size()) {
+        std::size_t eol = s.find('\n', pos);
+        if (eol == std::string::npos) eol = s.size();
+        std::size_t k = pos;
+        while (k < eol && s[k] == ' ') ++k;
+        const std::size_t digits = k;
+        while (k < eol && s[k] >= '0' && s[k] <= '9') ++k;
+        if (k == digits || k >= eol || s[k] != '\t') {
+            // A trailing empty line (text ending in '\n') is fine.
+            if (pos == eol && eol == s.size()) break;
+            return false;
+        }
+        out.append(s, k + 1, eol - k - 1);
+        if (eol < s.size()) out.push_back('\n');
+        pos = eol + 1;
+    }
+    s = std::move(out);
+    return true;
+}
+
 ExecResult run_edit(const Call& call, const EditArgs& a) {
     const auto& p = a.path->path();
     std::error_code ec;
@@ -852,6 +879,19 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
         // so an edit that fails its count can be undone exactly.
         std::string before_this = updated;
         int n = apply_one(updated, ed, a.path->string(), err);
+        // old_text copied straight out of a read keeps its "   12\t" prefixes.
+        // Strip them from both sides and try once more.
+        if (n == 0 && !ed.regex) {
+            OneEdit bare = ed;
+            if (strip_read_line_numbers(bare.old_text)) {
+                (void)strip_read_line_numbers(bare.new_text);
+                std::string retry_err;
+                updated = before_this;
+                const int m = apply_one(updated, bare, a.path->string(), retry_err);
+                if (m != 0) n = m;
+                else updated = before_this;
+            }
+        }
         if (n == kIdempotentNoOp) {
             ++idempotent;
             outcomes.push_back({i, kIdempotentNoOp, false, {}});
@@ -991,8 +1031,6 @@ ExecResult run_edit(const Call& call, const EditArgs& a) {
     }
     std::ostringstream msg;
     if (!staleness_warning.empty()) msg << staleness_warning;
-    if (!a.display_description.empty())
-        msg << a.display_description << "\n\n";
     msg << "Edited " << a.path->string() << " (" << d.added << "+ "
         << d.removed << "-" << where;
     if (a.edits.size() > 1) {
@@ -1377,7 +1415,6 @@ ExecResult run_apply_patch(const Call& call, const ApplyPatchArgs& a) {
     }
     std::ostringstream msg;
     if (!stale_note.empty()) msg << stale_note;
-    if (!a.display_description.empty()) msg << a.display_description << "\n\n";
     msg << "Patched " << a.path->string() << " (" << d.added << "+ "
         << d.removed << "-, " << hunks.size() << " hunk"
         << (hunks.size()==1?"":"s") << where << "):\n\n```diff\n" << unified;

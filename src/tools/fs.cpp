@@ -106,8 +106,16 @@ constexpr std::size_t kAutoOutlineSize = 32 * 1024;
 [[nodiscard]] inline std::size_t N_reserve_hint(std::size_t file_size,
                                                int limit) noexcept {
     if (limit <= 0) return file_size;
-    const std::size_t guess = static_cast<std::size_t>(limit) * 120u;
+    const std::size_t guess = static_cast<std::size_t>(limit) * 128u;
     return guess < file_size ? guess : file_size;
+}
+
+// `cat -n` prefix: line number right-aligned in 6 columns, then a tab. Same
+// shape as Zed and Claude Code reads, so models know to drop it in edits.
+inline void append_line_number(std::string& out, int n) {
+    char buf[16];
+    const int len = std::snprintf(buf, sizeof buf, "%6d\t", n);
+    if (len > 0) out.append(buf, static_cast<std::size_t>(len));
 }
 
 struct ReadArgs {
@@ -593,8 +601,6 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
                 "# First 1 KiB of {}\n\n{}",
                 kib, total_lines, a.path->string(), peek);
         }
-        if (!a.display_description.empty())
-            out = a.display_description + "\n" + out;
         if (current_mtime.time_since_epoch().count() != 0) {
             std::error_code canon_ec;
             auto canon = call.fs().canonical(p, canon_ec);
@@ -646,6 +652,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
             if (n >= eff_offset && shown < eff_limit) {
                 size_t end = i;
                 if (end > line_start && content[end - 1] == '\r') --end;
+                append_line_number(out, n);
                 out.append(content.data() + line_start, end - line_start);
                 out.push_back('\n');
                 ++shown;
@@ -697,6 +704,7 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
         if (n >= eff_offset && shown < eff_limit) {
             size_t end = N;
             if (end > line_start && content[end - 1] == '\r') --end;
+            append_line_number(out, n);
             out.append(content.data() + line_start, end - line_start);
             out.push_back('\n');
             ++shown;
@@ -744,8 +752,6 @@ ExecResult run_read(const Call& call, const ReadArgs& a) {
     }
     if (!heads_up.empty()) out = heads_up + out;
     if (!symbol_header.empty()) out = symbol_header + out;
-    if (!a.display_description.empty())
-        out = a.display_description + "\n" + out;
     if (current_mtime.time_since_epoch().count() != 0) {
         std::error_code canon_ec;
         auto canon = call.fs().canonical(p, canon_ec);
@@ -941,7 +947,6 @@ ExecResult run_write(const Call& call, const WriteArgs& a) {
     }
     std::string prefix;
     if (!staleness_warning.empty()) prefix += staleness_warning;
-    if (!a.display_description.empty()) prefix += a.display_description + "\n";
     auto msg = std::format("{}{} {} ({}+ {}-){}",
                            prefix, exists ? "Overwrote" : "Created",
                            a.path->string(), change.added, change.removed,
@@ -1059,8 +1064,6 @@ ExecResult run_list_dir(const Call& call, const ListDirArgs& a) {
     }
     if (count == 0) return ToolOutput{"empty directory", std::nullopt};
     std::string body = out.str();
-    if (!a.display_description.empty())
-        body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
 }
 
@@ -1244,7 +1247,6 @@ ExecResult run_outline(const Call& call, const OutlineArgs& a) {
 
     int lines = static_cast<int>(std::count(content.begin(), content.end(), '\n')) + 1;
     std::ostringstream out;
-    if (!a.display_description.empty()) out << a.display_description << "\n";
     if (total == 0)
         return ToolOutput{a.path->string() + " (" + std::to_string(lines)
             + " lines): no top-level definitions or headings detected — "
@@ -1293,7 +1295,10 @@ void register_fs_tools(Shells& sh) {
         "function/class/type's definition and body (resolved to its "
         "enclosing block) with no line arithmetic — use that instead "
         "of computing ranges or shelling out to sed/head/tail. Include "
-        "a brief `display_description` so the user sees why you're reading.",
+        "a brief `display_description` so the user sees why you're reading."
+        " Each output line starts with its line number right-aligned in 6 "
+        "columns and a tab (like `cat -n`); that prefix is not file content, "
+        "so never copy it into an edit's old_text or new_text.",
         kReadArgs.schema(), EffectSet{Effect::ReadFs},
         body<ReadArgs>(run_read, kReadArgs, check_read_args), 80'000);
 

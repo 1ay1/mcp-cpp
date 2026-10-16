@@ -167,8 +167,6 @@ ExecResult run_diagnostics(const Call& call, const DiagnosticsArgs& a, CallExec&
     result << output;
 
     std::string body = result.str();
-    if (!a.display_description.empty())
-        body = a.display_description + "\n" + body;
     return ToolOutput{std::move(body), std::nullopt};
 }
 
