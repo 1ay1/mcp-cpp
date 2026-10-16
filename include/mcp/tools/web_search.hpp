@@ -25,6 +25,8 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -39,14 +41,31 @@ struct WebSearchDialValue {
     std::string label;
 };
 
+// What a dial's value is. A list dial stores one of its `values`; a text
+// dial stores what the user typed, checked against its kind and max_bytes.
+enum class WebSearchText : std::uint8_t {
+    None,      // a list dial
+    Line,      // one line of printable UTF-8 ("San Francisco,California")
+    HttpsUrl,  // one https:// URL with no spaces
+};
+
 // One extra knob a service honours (freshness, region, ...). A service
-// declares at most three. `values[0]` is always the default (id "").
+// declares at most kMaxWebSearchDials. For a list dial `values[0]` is always
+// the default (id ""). A text dial has no values; "" is its default.
 struct WebSearchDial {
     std::string id;
     std::string label;
     std::string help;
-    std::vector<WebSearchDialValue> values;
+    std::vector<WebSearchDialValue> values;   // empty for a text dial
+    WebSearchText text = WebSearchText::None;
+    std::size_t   max_bytes = 0;              // text dials only
 };
+
+// Whether `value` may be sent for `d`: a listed id, or text of the dial's
+// kind within max_bytes. "" (the default) is never sent, so it is not ok.
+// Hosts can check what a user typed with the same rule the request uses.
+[[nodiscard]] bool web_search_dial_value_ok(const WebSearchDial& d,
+                                         std::string_view value) noexcept;
 
 struct WebSearchService {
     std::string id;        // stable, stored by hosts: "brave-free", "exa-api"
@@ -56,8 +75,12 @@ struct WebSearchService {
     std::string note;      // one honest line about limits and caveats
     int         max_count = 20;  // most results one request can ask for
     bool        language = false;  // honours WebSearchPlan::language
-    std::vector<WebSearchDial> dials;  // 0..3
+    std::vector<WebSearchDial> dials;  // 0..kMaxWebSearchDials
 };
+
+// The most dials one service declares, so a host can size its settings
+// page. Tavily needs all seven.
+inline constexpr std::size_t kMaxWebSearchDials = 7;
 
 // Every service, in menu order: the Free ones first, then the API-key ones.
 [[nodiscard]] const std::vector<WebSearchService>& web_search_services();
@@ -69,9 +92,9 @@ struct WebSearchService {
 struct WebSearchSlot {
     std::string service;   // WebSearchService::id
     std::string api_key;   // empty for Free services
-    // dial id -> value id. A dial that is absent, or whose value is not one
-    // the service lists, is ignored -- a stale setting can never put arbitrary
-    // text into a request.
+    // dial id -> value. A dial that is absent, or whose value fails
+    // web_search_dial_value_ok, is ignored -- a stale setting can never put
+    // arbitrary text into a request.
     std::vector<std::pair<std::string, std::string>> dials;
 };
 

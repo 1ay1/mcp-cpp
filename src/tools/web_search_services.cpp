@@ -47,6 +47,14 @@ std::vector<WebSearchDialValue> dwmy(std::string d, std::string w,
             V(std::move(m), "Past month"), V(std::move(y), "Past year")};
 }
 
+// The same, led by Past hour, for the services that filter down to the hour.
+std::vector<WebSearchDialValue> hdwmy(std::string h, std::string d, std::string w,
+                                   std::string m, std::string y) {
+    auto v = dwmy(std::move(d), std::move(w), std::move(m), std::move(y));
+    v.insert(v.begin(), V(std::move(h), "Past hour"));
+    return v;
+}
+
 // ISO 3166-1 alpha-2, upper case. The shared short list: enough to cover
 // where most users are, without a 250-row dropdown nobody scrolls.
 WebSearchDial country_dial(std::string help) {
@@ -60,6 +68,62 @@ WebSearchDial country_dial(std::string help) {
         V("BR", "Brazil"),        V("IN", "India"),
         V("JP", "Japan"),
     }};
+}
+
+// Firecrawl's documented categories, the same for both tiers. Only one is
+// sent, which also keeps `gov` alone as Firecrawl requires.
+WebSearchDial firecrawl_category_dial() {
+    return WebSearchDial{"category", "Category",
+        "Restrict to one kind of source. Developer: code repositories and "
+        "documentation sites. Government: laws, regulations and court opinions.", {
+        V("", "Any"), V("developer", "Developer"), V("research", "Research"),
+        V("pdf", "PDF"), V("gov", "Government")}};
+}
+
+// Firecrawl folds date sorting into tbs: sbd:1 alone, or joined to the
+// freshness window as "sbd:1,qdr:w" (its documented combined form).
+WebSearchDial firecrawl_sort_dial() {
+    return WebSearchDial{"sort", "Sort",
+        "Newest first sorts by date, inside the Freshness window if one is set.", {
+        V("", "Relevance (default)"), V("date", "Newest first")}};
+}
+
+// Firecrawl's location is free text; its reference pairs it with country.
+WebSearchDial firecrawl_location_dial() {
+    WebSearchDial d{"location", "Location",
+        "A place to search from, e.g. San Francisco,California,United States. "
+        "Works best with Country set too.", {}};
+    d.text = WebSearchText::Line;
+    d.max_bytes = 200;
+    return d;
+}
+
+WebSearchDial on_off_dial(std::string id, std::string label, std::string help) {
+    return WebSearchDial{std::move(id), std::move(label), std::move(help), {
+        V("", "Off (default)"), V("true", "On")}};
+}
+
+WebSearchDial tavily_depth_dial(std::string help) {
+    return WebSearchDial{"depth", "Depth", std::move(help), {
+        V("", "Basic (default)"), V("advanced", "Advanced"),
+        V("fast", "Fast"), V("ultra-fast", "Ultra fast")}};
+}
+
+// The dials both Tavily tiers share after topic, freshness and depth. The
+// key-less mode documents "all parameters", so the free tier gets them too.
+void add_tavily_filters(WebSearchService& s) {
+    s.dials.push_back(on_off_dial("exact_match", "Exact phrases",
+        "Only results that contain the query's \"quoted phrases\" as written, "
+        "with no synonyms."));
+    s.dials.push_back(WebSearchDial{"language_filter", "Language match",
+        "Uses the web search language. Boost ranks it first; only drops every "
+        "other language. Not sent when no language is set.", {
+        V("", "Boost (default)"), V("only", "Only this language")}});
+    s.dials.push_back(country_dial("Boosts results from this country. Sent only "
+        "with the General topic, the only one Tavily allows it with."));
+    s.dials.push_back(on_off_dial("safe_search", "Safe search",
+        "Filters adult content. The fast and ultra-fast depths do not support "
+        "it, so it is not sent with them."));
 }
 
 std::vector<WebSearchService> make_catalogue() {
@@ -87,13 +151,42 @@ std::vector<WebSearchService> make_catalogue() {
         s.max_count = 30;
         s.dials.push_back(WebSearchDial{"region", "Region",
             "DuckDuckGo's kl parameter. Skews which country's results rank first.", {
+            // Every region on DuckDuckGo's URL-parameters help page, in its
+            // order. us-en is the default, so it is the "" row, not a second one.
             V("", "United States (default)"), V("wt-wt", "No region"),
-            V("uk-en", "United Kingdom"), V("au-en", "Australia"),
-            V("nz-en", "New Zealand"),   V("ca-en", "Canada"),
-            V("in-en", "India"),         V("de-de", "Germany"),
-            V("fr-fr", "France"),        V("es-es", "Spain"),
-            V("it-it", "Italy"),         V("br-pt", "Brazil"),
-            V("jp-jp", "Japan"),
+            V("xa-ar", "Arabia"),            V("xa-en", "Arabia (en)"),
+            V("ar-es", "Argentina"),         V("au-en", "Australia"),
+            V("at-de", "Austria"),           V("be-fr", "Belgium (fr)"),
+            V("be-nl", "Belgium (nl)"),      V("br-pt", "Brazil"),
+            V("bg-bg", "Bulgaria"),          V("ca-en", "Canada"),
+            V("ca-fr", "Canada (fr)"),       V("ct-ca", "Catalan"),
+            V("cl-es", "Chile"),             V("cn-zh", "China"),
+            V("co-es", "Colombia"),          V("hr-hr", "Croatia"),
+            V("cz-cs", "Czech Republic"),    V("dk-da", "Denmark"),
+            V("ee-et", "Estonia"),           V("fi-fi", "Finland"),
+            V("fr-fr", "France"),            V("de-de", "Germany"),
+            V("gr-el", "Greece"),            V("hk-tzh", "Hong Kong"),
+            V("hu-hu", "Hungary"),           V("in-en", "India"),
+            V("id-id", "Indonesia"),         V("id-en", "Indonesia (en)"),
+            V("ie-en", "Ireland"),           V("il-he", "Israel"),
+            V("it-it", "Italy"),             V("jp-jp", "Japan"),
+            V("kr-kr", "Korea"),             V("lv-lv", "Latvia"),
+            V("lt-lt", "Lithuania"),         V("xl-es", "Latin America"),
+            V("my-ms", "Malaysia"),          V("my-en", "Malaysia (en)"),
+            V("mx-es", "Mexico"),            V("nl-nl", "Netherlands"),
+            V("nz-en", "New Zealand"),       V("no-no", "Norway"),
+            V("pe-es", "Peru"),              V("ph-en", "Philippines"),
+            V("ph-tl", "Philippines (tl)"),  V("pl-pl", "Poland"),
+            V("pt-pt", "Portugal"),          V("ro-ro", "Romania"),
+            V("ru-ru", "Russia"),            V("sg-en", "Singapore"),
+            V("sk-sk", "Slovak Republic"),   V("sl-sl", "Slovenia"),
+            V("za-en", "South Africa"),      V("es-es", "Spain"),
+            V("se-sv", "Sweden"),            V("ch-de", "Switzerland (de)"),
+            V("ch-fr", "Switzerland (fr)"),  V("ch-it", "Switzerland (it)"),
+            V("tw-tzh", "Taiwan"),           V("th-th", "Thailand"),
+            V("tr-tr", "Turkey"),            V("ua-uk", "Ukraine"),
+            V("uk-en", "United Kingdom"),    V("ue-es", "United States (es)"),
+            V("ve-es", "Venezuela"),         V("vn-vi", "Vietnam"),
         }});
         s.dials.push_back(WebSearchDial{"safe", "Safe search",
             "DuckDuckGo's kp parameter.", {
@@ -113,6 +206,10 @@ std::vector<WebSearchService> make_catalogue() {
         s.dials.push_back(freshness_dial("time_range",
             "Only pages from this window (Tavily's time_range).",
             dwmy("day", "week", "month", "year")));
+        s.dials.push_back(tavily_depth_dial(
+            "Advanced reads more of each page and spends 2 of the key-less "
+            "budget's credits; fast and ultra-fast trade relevance for speed."));
+        add_tavily_filters(s);
         c.push_back(std::move(s));
     }
     {
@@ -123,12 +220,13 @@ std::vector<WebSearchService> make_catalogue() {
         s.max_count = 100;
         s.dials.push_back(freshness_dial("freshness",
             "Only pages from this window (Firecrawl's tbs=qdr:).",
-            dwmy("qdr:d", "qdr:w", "qdr:m", "qdr:y")));
-        s.dials.push_back(WebSearchDial{"category", "Category",
-            "Restrict to one kind of site.", {
-            V("", "Any"), V("github", "GitHub"), V("research", "Research"),
-            V("pdf", "PDF"), V("developer", "Developer docs")}});
+            hdwmy("qdr:h", "qdr:d", "qdr:w", "qdr:m", "qdr:y")));
+        s.dials.push_back(firecrawl_category_dial());
         s.dials.push_back(country_dial("Firecrawl's country parameter."));
+        s.dials.push_back(on_off_dial("safe", "Safe search",
+            "Filters explicit content (Firecrawl's safe)."));
+        s.dials.push_back(firecrawl_sort_dial());
+        s.dials.push_back(firecrawl_location_dial());
         c.push_back(std::move(s));
     }
 
@@ -144,7 +242,22 @@ std::vector<WebSearchService> make_catalogue() {
             dwmy("pd", "pw", "pm", "py")));
         s.dials.push_back(WebSearchDial{"safesearch", "Safe search", "", {
             V("", "Moderate (default)"), V("off", "Off"), V("strict", "Strict")}});
-        s.dials.push_back(country_dial("Where results come from."));
+        // Brave's default is US; ALL is its documented "no country" value.
+        auto country = country_dial("Where results come from.");
+        country.values.insert(country.values.begin() + 1, V("ALL", "All regions"));
+        s.dials.push_back(std::move(country));
+        s.dials.push_back(WebSearchDial{"spellcheck", "Spell correction",
+            "When on, Brave searches its corrected query instead of the one "
+            "sent, which can change identifiers and error strings.", {
+            V("", "On (default)"), V("false", "Off")}});
+        // One hosted Goggle; Brave advises hosted files over inline rules.
+        WebSearchDial goggle{"goggles", "Goggle",
+            "Re-ranks results by a Goggle's rules: the https URL of a Goggle "
+            "file on GitHub, GitLab or a Gist, registered at "
+            "search.brave.com/goggles/create.", {}};
+        goggle.text = WebSearchText::HttpsUrl;
+        goggle.max_bytes = 2048;
+        s.dials.push_back(std::move(goggle));
         c.push_back(std::move(s));
     }
     {
@@ -153,14 +266,13 @@ std::vector<WebSearchService> make_catalogue() {
         s.signup = "https://app.tavily.com";
         s.note = "Tavily's search API. 'Advanced' costs 2 credits a search.";
         s.max_count = 20; s.language = true;
-        s.dials.push_back(WebSearchDial{"depth", "Depth",
-            "Basic is 1 credit; advanced is 2 and reads more of each page.", {
-            V("", "Basic (default)"), V("advanced", "Advanced"),
-            V("fast", "Fast"), V("ultra-fast", "Ultra fast")}});
+        s.dials.push_back(tavily_depth_dial(
+            "Basic is 1 credit; advanced is 2 and reads more of each page."));
         s.dials.push_back(WebSearchDial{"topic", "Topic", "", {
             V("", "General"), V("news", "News"), V("finance", "Finance")}});
         s.dials.push_back(freshness_dial("time_range",
             "Only pages from this window.", dwmy("day", "week", "month", "year")));
+        add_tavily_filters(s);
         c.push_back(std::move(s));
     }
     {
@@ -170,11 +282,14 @@ std::vector<WebSearchService> make_catalogue() {
         s.note = "Firecrawl's search API. 2 credits a search.";
         s.max_count = 100;
         s.dials.push_back(freshness_dial("freshness",
-            "Only pages from this window.", dwmy("qdr:d", "qdr:w", "qdr:m", "qdr:y")));
-        s.dials.push_back(WebSearchDial{"category", "Category", "", {
-            V("", "Any"), V("github", "GitHub"), V("research", "Research"),
-            V("pdf", "PDF"), V("developer", "Developer docs")}});
+            "Only pages from this window.",
+            hdwmy("qdr:h", "qdr:d", "qdr:w", "qdr:m", "qdr:y")));
+        s.dials.push_back(firecrawl_category_dial());
         s.dials.push_back(country_dial("Firecrawl's country parameter."));
+        s.dials.push_back(on_off_dial("safe", "Safe search",
+            "Filters explicit content (Firecrawl's safe)."));
+        s.dials.push_back(firecrawl_sort_dial());
+        s.dials.push_back(firecrawl_location_dial());
         c.push_back(std::move(s));
     }
     {
@@ -184,16 +299,23 @@ std::vector<WebSearchService> make_catalogue() {
         s.note = "Exa's neural search. Highlights are returned as the snippet.";
         s.max_count = 100;
         s.dials.push_back(WebSearchDial{"type", "Mode",
-            "Fast and instant trade depth for speed.", {
+            "Fast and instant trade depth for speed. Deep lite, deep and deep "
+            "reasoning research and synthesise: about 4, 4-15 and 12-40 seconds, "
+            "so deep reasoning can outlast a host's request timeout.", {
             V("", "Auto (default)"), V("fast", "Fast"), V("instant", "Instant"),
-            V("deep", "Deep")}});
+            V("deep-lite", "Deep lite"), V("deep", "Deep"),
+            V("deep-reasoning", "Deep reasoning")}});
         s.dials.push_back(WebSearchDial{"category", "Category",
             "Restrict to one kind of source.", {
             V("", "Any"), V("news", "News"), V("publication", "Publications"),
             V("personal site", "Personal sites")}});
         s.dials.push_back(freshness_dial("freshness",
             "Only pages published within this window (sent as startPublishedDate).",
-            dwmy("day", "week", "month", "year")));
+            hdwmy("hour", "day", "week", "month", "year")));
+        s.dials.push_back(on_off_dial("moderation", "Safe search",
+            "Filters unsafe content (Exa's moderation)."));
+        s.dials.push_back(country_dial(
+            "The searcher's country (Exa's userLocation); localises results."));
         c.push_back(std::move(s));
     }
     {
@@ -204,7 +326,8 @@ std::vector<WebSearchService> make_catalogue() {
         s.max_count = 20; s.language = true;
         s.dials.push_back(country_dial("Google's gl parameter."));
         s.dials.push_back(freshness_dial("freshness",
-            "Google's tbs=qdr: time filter.", dwmy("qdr:d", "qdr:w", "qdr:m", "qdr:y")));
+            "Google's tbs=qdr: time filter.",
+            hdwmy("qdr:h", "qdr:d", "qdr:w", "qdr:m", "qdr:y")));
         s.dials.push_back(WebSearchDial{"autocorrect", "Spell correction", "", {
             V("", "On (default)"), V("false", "Off")}});
         c.push_back(std::move(s));
@@ -213,15 +336,16 @@ std::vector<WebSearchService> make_catalogue() {
         WebSearchService s;
         s.id = "perplexity-api"; s.label = "Perplexity API key"; s.needs_key = true;
         s.signup = "https://docs.perplexity.ai";
-        s.note = "Perplexity's Search API (ranked results, not an answer). "
-                 "'Never return' sites are left in the query as -site: here, "
-                 "because its domain-filter syntax for excluding is not documented.";
+        s.note = "Perplexity's Search API (ranked results, not an answer).";
         s.max_count = 20; s.language = true;
         s.dials.push_back(WebSearchDial{"recency", "Freshness",
             "Only pages from this window (search_recency_filter).", {
             V("", "Any time"), V("hour", "Past hour"), V("day", "Past day"),
             V("week", "Past week"), V("month", "Past month"), V("year", "Past year")}});
         s.dials.push_back(country_dial("Perplexity's country parameter."));
+        s.dials.push_back(WebSearchDial{"search_type", "Mode",
+            "Fast answers sooner with a lighter web search.", {
+            V("", "Web (default)"), V("fast", "Fast")}});
         c.push_back(std::move(s));
     }
     return c;
@@ -316,10 +440,10 @@ std::string join_strings(const json& arr, std::string_view sep) {
     return out;
 }
 
-// ISO 8601 UTC, `days` before `now`.
-std::string iso_days_ago(std::chrono::system_clock::time_point now, int days) {
+// ISO 8601 UTC, `hours` before `now`.
+std::string iso_hours_ago(std::chrono::system_clock::time_point now, int hours) {
     const std::time_t t = std::chrono::system_clock::to_time_t(
-        now - std::chrono::hours(24 * days));
+        now - std::chrono::hours(hours));
     std::tm tm{};
 #ifdef _WIN32
     gmtime_s(&tm, &t);
@@ -374,11 +498,12 @@ std::vector<std::pair<std::string, std::string>> browser_headers(
     return h;
 }
 
-int days_for(std::string_view v) {
-    if (v == "day")   return 1;
-    if (v == "week")  return 7;
-    if (v == "month") return 30;
-    if (v == "year")  return 365;
+int hours_for(std::string_view v) {
+    if (v == "hour")  return 1;
+    if (v == "day")   return 24;
+    if (v == "week")  return 24 * 7;
+    if (v == "month") return 24 * 30;
+    if (v == "year")  return 24 * 365;
     return 0;
 }
 
@@ -413,16 +538,42 @@ HttpRequest req_ddg_free(const WebSearchQuery& q) {
     return r;
 }
 
+// Tavily's country takes a lower-case English name from its own list, not
+// an ISO code. Covers country_dial's codes; anything else is not sent.
+std::string tavily_country(std::string_view code) {
+    static constexpr std::pair<std::string_view, std::string_view> names[] = {
+        {"US", "united states"}, {"GB", "united kingdom"}, {"NZ", "new zealand"},
+        {"AU", "australia"},     {"CA", "canada"},         {"DE", "germany"},
+        {"FR", "france"},        {"ES", "spain"},          {"IT", "italy"},
+        {"NL", "netherlands"},   {"BR", "brazil"},         {"IN", "india"},
+        {"JP", "japan"}};
+    for (const auto& [c, n] : names)
+        if (c == code) return std::string{n};
+    return {};
+}
+
 // Tavily, keyless or keyed. [D] POST /search ; [L] keyless = the header
-// X-Tavily-Access-Mode: keyless, no Authorization.
+// X-Tavily-Access-Mode: keyless, no Authorization. Three dials depend on
+// others, per the reference: country only with topic general, safe_search
+// not with the fast depths, filter_by_language only with a language (else
+// a 400).
 HttpRequest req_tavily(const WebSearchQuery& q, std::string_view key) {
     json b = {{"query", q.text}, {"max_results", q.count},
               {"include_answer", false}, {"include_raw_content", false}};
     if (!q.exclude.empty()) b["exclude_domains"] = q.exclude;
     if (!q.language.empty()) b["language"] = q.language;
-    if (auto v = q.dial("topic"); !v.empty())      b["topic"] = std::string{v};
+    const std::string_view topic = q.dial("topic");
+    const std::string_view depth = q.dial("depth");
+    if (!topic.empty())                            b["topic"] = std::string{topic};
     if (auto v = q.dial("time_range"); !v.empty()) b["time_range"] = std::string{v};
-    if (auto v = q.dial("depth"); !v.empty())      b["search_depth"] = std::string{v};
+    if (!depth.empty())                            b["search_depth"] = std::string{depth};
+    if (q.dial("exact_match") == "true")           b["exact_match"] = true;
+    if (q.dial("language_filter") == "only" && !q.language.empty())
+        b["filter_by_language"] = true;
+    if (auto c = tavily_country(q.dial("country")); !c.empty() && topic.empty())
+        b["country"] = c;
+    if (q.dial("safe_search") == "true" && depth != "fast" && depth != "ultra-fast")
+        b["safe_search"] = true;
     std::vector<std::pair<std::string, std::string>> h;
     if (key.empty()) h.push_back({"x-tavily-access-mode", "keyless"});
     else             h.push_back({"authorization", "Bearer " + std::string{key}});
@@ -430,21 +581,27 @@ HttpRequest req_tavily(const WebSearchQuery& q, std::string_view key) {
 }
 
 // Firecrawl, keyless or keyed. [D]+[L] POST /v2/search ; limit 1-100 ;
-// tbs=qdr:d|w|m|y ; categories is a list of strings ; excludeDomains takes
-// bare hostnames. Keyless = no Authorization header at all.
+// tbs=qdr:h|d|w|m|y, sbd:1 sorts by date and joins a window with a comma ;
+// categories is a list of strings ; excludeDomains takes bare hostnames ;
+// safe is a boolean. Keyless = no Authorization header at all.
 HttpRequest req_firecrawl(const WebSearchQuery& q, std::string_view key) {
     json b = {{"query", q.text}, {"limit", q.count}};
     if (!q.exclude.empty()) b["excludeDomains"] = q.exclude;
-    if (auto v = q.dial("freshness"); !v.empty()) b["tbs"] = std::string{v};
+    std::string tbs{q.dial("freshness")};
+    if (q.dial("sort") == "date") tbs = tbs.empty() ? "sbd:1" : "sbd:1," + tbs;
+    if (!tbs.empty()) b["tbs"] = std::move(tbs);
     if (auto v = q.dial("category"); !v.empty())  b["categories"] = json::array({std::string{v}});
     if (auto v = q.dial("country"); !v.empty())   b["country"] = std::string{v};
+    if (q.dial("safe") == "true")                 b["safe"] = true;
+    if (auto v = q.dial("location"); !v.empty())  b["location"] = std::string{v};
     std::vector<std::pair<std::string, std::string>> h;
     if (!key.empty()) h.push_back({"authorization", "Bearer " + std::string{key}});
     return json_post("https://api.firecrawl.dev/v2/search", b, std::move(h));
 }
 
 // Brave API. [D] GET /res/v1/web/search ; header X-Subscription-Token ;
-// count 1-20 ; text_decorations=false drops the <strong> highlight markers.
+// count 1-20 ; text_decorations=false drops the <strong> highlight markers ;
+// spellcheck=false searches the query as sent.
 HttpRequest req_brave_api(const WebSearchQuery& q, std::string_view key) {
     HttpRequest r;
     r.method = "GET";
@@ -459,22 +616,29 @@ HttpRequest req_brave_api(const WebSearchQuery& q, std::string_view key) {
         r.url += "&freshness=" + url_escape(v);
     if (auto v = q.dial("safesearch"); !v.empty())
         r.url += "&safesearch=" + url_escape(v);
+    if (q.dial("spellcheck") == "false")
+        r.url += "&spellcheck=false";
+    if (auto v = q.dial("goggles"); !v.empty())
+        r.url += "&goggles=" + url_escape(v);
     r.headers.push_back({"accept", "application/json"});
     r.headers.push_back({"x-subscription-token", std::string{key}});
     return r;
 }
 
 // Exa. [D] POST /search ; x-api-key ; numResults 1-100 ; contents.highlights
-// puts excerpts on each result ; startPublishedDate is an ISO 8601 instant.
+// puts excerpts on each result ; startPublishedDate is an ISO 8601 instant ;
+// userLocation takes the bare ISO alpha-2 string form ; moderation is boolean.
 HttpRequest req_exa(const WebSearchQuery& q, std::string_view key) {
     json b = {{"query", q.text}, {"numResults", q.count},
               {"contents", {{"highlights", true}}}};
     if (!q.exclude.empty()) b["excludeDomains"] = q.exclude;
     if (auto v = q.dial("type"); !v.empty())     b["type"] = std::string{v};
     if (auto v = q.dial("category"); !v.empty()) b["category"] = std::string{v};
-    if (int d = days_for(q.dial("freshness")); d > 0
+    if (int h = hours_for(q.dial("freshness")); h > 0
         && q.now != std::chrono::system_clock::time_point{})   // host gave the time
-        b["startPublishedDate"] = iso_days_ago(q.now, d);
+        b["startPublishedDate"] = iso_hours_ago(q.now, h);
+    if (q.dial("moderation") == "true")             b["moderation"] = true;
+    if (auto v = q.dial("country"); !v.empty())     b["userLocation"] = std::string{v};
     return json_post("https://api.exa.ai/search", b,
                      {{"x-api-key", std::string{key}}});
 }
@@ -492,12 +656,21 @@ HttpRequest req_serper(const WebSearchQuery& q, std::string_view key) {
 
 // Perplexity Search. [D] POST /search ; Bearer ; max_results 1-20 without a
 // tier ; country is ISO alpha-2 ; search_language_filter is a list of ISO 639-1
-// codes ; search_recency_filter is hour|day|week|month|year.
+// codes ; search_recency_filter is hour|day|week|month|year ; search_type is
+// web|fast|people (people is not offered: it searches for people, not pages) ;
+// search_domain_filter takes at most 20 hosts, a "-" in front excluding one,
+// and is either all allow or all deny (only deny is sent).
 HttpRequest req_perplexity(const WebSearchQuery& q, std::string_view key) {
     json b = {{"query", q.text}, {"max_results", q.count}};
     if (!q.language.empty()) b["search_language_filter"] = json::array({q.language});
     if (auto v = q.dial("country"); !v.empty())  b["country"] = std::string{v};
     if (auto v = q.dial("recency"); !v.empty())  b["search_recency_filter"] = std::string{v};
+    if (auto v = q.dial("search_type"); !v.empty()) b["search_type"] = std::string{v};
+    if (!q.exclude.empty()) {
+        json deny = json::array();
+        for (const auto& host : q.exclude) deny.push_back("-" + host);
+        b["search_domain_filter"] = std::move(deny);
+    }
     return json_post("https://api.perplexity.ai/search", b,
                      {{"authorization", "Bearer " + std::string{key}}});
 }
@@ -524,6 +697,63 @@ std::vector<SearchHit> collect(const json& arr, const char* url_key,
         }
         if (h.url.empty()) continue;
         if (h.title.empty()) h.title = h.url;
+        out.push_back(std::move(h));
+    }
+    return out;
+}
+
+// Percent-encode an id for a URL path, keeping '/' (a DOI and an old-style
+// arXiv id such as hep-th/9901001 both carry one).
+std::string path_escape(std::string_view s) {
+    std::string out;
+    for (std::size_t from = 0;;) {
+        const auto slash = s.find('/', from);
+        out += url_escape(s.substr(from, slash == std::string_view::npos
+                                             ? std::string_view::npos : slash - from));
+        if (slash == std::string_view::npos) return out;
+        out += '/';
+        from = slash + 1;
+    }
+}
+
+// A Firecrawl paper record carries ids, not a link. The four primaryId forms
+// Firecrawl documents become the paper's own page; anything else falls back
+// to Firecrawl's paper endpoint by the record's canonical paperId, which
+// answers for every record. "" when the record has neither.
+std::string paper_url(const json& r) {
+    const std::string primary = str_at(r, "primaryId");
+    if (const auto colon = primary.find(':');
+        colon != std::string::npos && colon + 1 < primary.size()) {
+        const std::string ns = lower(primary.substr(0, colon));
+        std::string id = primary.substr(colon + 1);
+        if (ns == "arxiv") return "https://arxiv.org/abs/" + path_escape(id);
+        if (ns == "pmid")  return "https://pubmed.ncbi.nlm.nih.gov/" + url_escape(id) + "/";
+        if (ns == "pmcid") {
+            // PMC writes its ids as PMC1234567; whether Firecrawl keeps the
+            // prefix is not documented, so both spellings are accepted.
+            if (lower(id.substr(0, 3)) != "pmc") id = "PMC" + id;
+            return "https://pmc.ncbi.nlm.nih.gov/articles/" + url_escape(id) + "/";
+        }
+        if (ns == "doi")   return "https://doi.org/" + path_escape(id);
+    }
+    if (const std::string paper = str_at(r, "paperId"); !paper.empty())
+        return "https://api.firecrawl.dev/v2/search/research/papers/" + url_escape(paper);
+    return {};
+}
+
+// Firecrawl's data.research: paper records (title, abstract, ids).
+std::vector<SearchHit> collect_papers(const json& arr, int count) {
+    std::vector<SearchHit> out;
+    if (!arr.is_array()) return out;
+    for (const auto& r : arr) {
+        if (static_cast<int>(out.size()) >= count) break;
+        if (!r.is_object()) continue;
+        SearchHit h;
+        h.url = paper_url(r);
+        if (h.url.empty() || h.url.size() > 2048) continue;   // never a cut-off link
+        h.title = tidy(str_at(r, "title"), 300);
+        if (h.title.empty()) h.title = h.url;
+        h.snippet = tidy(str_at(r, "abstract"), 500);
         out.push_back(std::move(h));
     }
     return out;
@@ -603,10 +833,8 @@ validate_dials(const WebSearchService& svc, const WebSearchSlot& slot) {
     std::vector<std::pair<std::string, std::string>> out;
     for (const auto& d : svc.dials) {
         for (const auto& [id, val] : slot.dials) {
-            if (id != d.id || val.empty()) continue;
-            const bool known = std::any_of(d.values.begin(), d.values.end(),
-                [&](const WebSearchDialValue& v) { return v.id == val; });
-            if (known) out.emplace_back(id, val);
+            if (id != d.id) continue;
+            if (web_search_dial_value_ok(d, val)) out.emplace_back(id, val);
             break;
         }
     }
@@ -620,7 +848,7 @@ bool is_html_service(std::string_view id) noexcept {
 bool has_native_exclude(std::string_view id) noexcept {
     return id == "tavily-free" || id == "tavily-api"
         || id == "firecrawl-free" || id == "firecrawl-api"
-        || id == "exa-api";
+        || id == "exa-api" || id == "perplexity-api";
 }
 
 std::string clean_api_key(std::string_view key) {
@@ -739,8 +967,16 @@ JsonHits parse_json_hits(std::string_view service_id, std::string_view body,
         out.hits = collect(*need(field(j, "results")), "url", "title",
                            {"content"}, count);
     } else if (service_id == "firecrawl-free" || service_id == "firecrawl-api") {
-        out.hits = collect(*need(field(field(j, "data"), "web")), "url", "title",
-                           {"description"}, count);
+        // Web results, then paper records. From 2026-11-16 the research
+        // category answers in data.research and no longer in data.web, so
+        // either container makes a readable reply.
+        const json& data = field(j, "data");
+        const json& web = field(data, "web");
+        const json& papers = field(data, "research");
+        if (!web.is_array() && !papers.is_array()) out.ok = false;
+        out.hits = collect(web, "url", "title", {"description"}, count);
+        for (auto& h : collect_papers(papers, count - static_cast<int>(out.hits.size())))
+            out.hits.push_back(std::move(h));
     } else if (service_id == "exa-api") {
         out.hits = collect(*need(field(j, "results")), "url", "title",
                            {"highlights", "summary", "text"}, count);
@@ -764,6 +1000,26 @@ JsonHits parse_json_hits(std::string_view service_id, std::string_view body,
 } // namespace mcp::tools::detail
 
 namespace mcp::tools {
+
+bool web_search_dial_value_ok(const WebSearchDial& d, std::string_view value) noexcept {
+    if (value.empty()) return false;
+    if (d.text == WebSearchText::None)
+        return std::any_of(d.values.begin(), d.values.end(),
+            [&](const WebSearchDialValue& v) { return v.id == value; });
+    if (value.size() > d.max_bytes || !util::is_valid_utf8(value)) return false;
+    // No control characters in either kind: the value lands in a URL or a
+    // JSON string, and a newline could start a second Goggles rule.
+    const bool url = d.text == WebSearchText::HttpsUrl;
+    for (char ch : value) {
+        const auto u = static_cast<unsigned char>(ch);
+        if (u < 0x20 || u == 0x7f || (url && u == ' ')) return false;
+    }
+    if (url) {
+        constexpr std::string_view kScheme = "https://";
+        if (value.size() <= kScheme.size() || !value.starts_with(kScheme)) return false;
+    }
+    return true;
+}
 
 const std::vector<WebSearchService>& web_search_services() {
     static const std::vector<WebSearchService> c = detail::make_catalogue();

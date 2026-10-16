@@ -47,6 +47,14 @@ std::string header(const HttpRequest& r, std::string_view name) {
     return {};
 }
 
+// The value ids one dial offers, in menu order ("" first).
+std::vector<std::string> dial_ids(std::string_view service, std::string_view dial) {
+    std::vector<std::string> out;
+    for (const auto& d : svc(service).dials)
+        if (d.id == dial) for (const auto& v : d.values) out.push_back(v.id);
+    return out;
+}
+
 class Scripted : public HttpClient {
 public:
     // First rule whose needle is in the URL wins.
@@ -97,9 +105,15 @@ TEST_CASE("web search: search catalogue is well formed") {
         CHECK(!s.id.empty());
         CHECK(!s.label.empty());
         CHECK(s.max_count >= 1);
-        CHECK(s.dials.size() <= 3);               // the pane has three dial rows
+        CHECK(s.dials.size() <= kMaxWebSearchDials);
         CHECK(s.needs_key == !s.signup.empty());
         for (const auto& d : s.dials) {
+            INFO(d.id);
+            if (d.text != WebSearchText::None) {   // free text: no list, a bound
+                CHECK(d.values.empty());
+                CHECK(d.max_bytes > 0);
+                continue;
+            }
             REQUIRE(!d.values.empty());
             CHECK(d.values.front().id.empty());   // [0] is "send nothing"
         }
@@ -138,6 +152,93 @@ TEST_CASE("web search: dials: only listed values reach a request") {
     CHECK(validate_dials(svc("ddg-free"), d).empty());
 }
 
+TEST_CASE("web search: dials offer each vendor's documented values") {
+    using V = std::vector<std::string>;
+    const V hourly_tbs{"", "qdr:h", "qdr:d", "qdr:w", "qdr:m", "qdr:y"};
+    const V categories{"", "developer", "research", "pdf", "gov"};
+    const V exa_types{"", "fast", "instant", "deep-lite", "deep", "deep-reasoning"};
+    const V exa_ages{"", "hour", "day", "week", "month", "year"};
+    // Firecrawl's four categories; github is no longer one.
+    for (const char* id : {"firecrawl-free", "firecrawl-api"}) {
+        INFO(id);
+        CHECK(dial_ids(id, "category") == categories);
+        CHECK(dial_ids(id, "freshness") == hourly_tbs);
+        WebSearchSlot old{id, {}, {{"category", "github"}}};
+        CHECK(validate_dials(svc(id), old).empty());
+    }
+    CHECK(dial_ids("exa-api", "type") == exa_types);
+    CHECK(dial_ids("exa-api", "freshness") == exa_ages);
+    CHECK(dial_ids("serper-api", "freshness") == hourly_tbs);
+    // Brave's "no country" sits right under the default.
+    const auto brave = dial_ids("brave-api", "country");
+    REQUIRE(brave.size() >= 2);
+    CHECK(brave[1] == "ALL");
+    // DuckDuckGo: all 68 documented regions, us-en being the "" default.
+    const auto kl = dial_ids("ddg-free", "region");
+    CHECK(kl.size() == 68);
+    CHECK(std::find(kl.begin(), kl.end(), "us-en") == kl.end());
+    for (const char* r : {"wt-wt", "nl-nl", "xl-es", "ue-es", "tw-tzh", "vn-vi"})
+        CHECK(std::find(kl.begin(), kl.end(), r) != kl.end());
+    // No dial lists a value twice.
+    for (const auto& s : web_search_services())
+        for (const auto& d : s.dials) {
+            V ids = dial_ids(s.id, d.id);
+            std::sort(ids.begin(), ids.end());
+            const std::string where = s.id + "." + d.id;
+            CHECK(std::adjacent_find(ids.begin(), ids.end()) == ids.end(), where);
+        }
+}
+
+TEST_CASE("web search: the new dials pass validation and fill the rows") {
+    auto dials = [](std::string_view id) { return svc(id).dials.size(); };
+    CHECK(dials("tavily-free") == kMaxWebSearchDials);
+    CHECK(dials("tavily-api") == kMaxWebSearchDials);
+    CHECK(dials("firecrawl-free") == 6);
+    CHECK(dials("firecrawl-api") == 6);
+    CHECK(dials("brave-api") == 5);
+    CHECK(dials("exa-api") == 5);
+    CHECK(dials("perplexity-api") == 3);
+    WebSearchSlot t{"tavily-free", {}, {{"exact_match", "true"}, {"language_filter", "only"},
+                                       {"country", "JP"}, {"safe_search", "true"},
+                                       {"depth", "ultra-fast"}}};
+    CHECK(validate_dials(svc("tavily-free"), t).size() == 5);
+    WebSearchSlot f{"firecrawl-api", {}, {{"sort", "date"}, {"safe", "true"}}};
+    CHECK(validate_dials(svc("firecrawl-api"), f).size() == 2);
+    WebSearchSlot e{"exa-api", {}, {{"moderation", "true"}, {"country", "GB"}}};
+    CHECK(validate_dials(svc("exa-api"), e).size() == 2);
+}
+
+TEST_CASE("web search: text dials take checked free text") {
+    const WebSearchDial* goggle = nullptr;
+    for (const auto& d : svc("brave-api").dials) if (d.id == "goggles") goggle = &d;
+    REQUIRE(goggle != nullptr);
+    const std::string url = "https://raw.githubusercontent.com/brave/goggles-quickstart/"
+                            "main/goggles/tech_blogs.goggle";
+    CHECK(web_search_dial_value_ok(*goggle, url));
+    CHECK(!web_search_dial_value_ok(*goggle, ""));
+    CHECK(!web_search_dial_value_ok(*goggle, "https://"));
+    CHECK(!web_search_dial_value_ok(*goggle, "http://example.com/a.goggle"));
+    CHECK(!web_search_dial_value_ok(*goggle, "$boost=3,site=dev.to"));   // inline rules
+    CHECK(!web_search_dial_value_ok(*goggle, "https://a.com/x y"));
+    CHECK(!web_search_dial_value_ok(*goggle, "https://a.com/x\n$discard"));
+    CHECK(!web_search_dial_value_ok(*goggle, "https://a.com/" + std::string(2048, 'x')));
+
+    const WebSearchDial* where = nullptr;
+    for (const auto& d : svc("firecrawl-free").dials) if (d.id == "location") where = &d;
+    REQUIRE(where != nullptr);
+    CHECK(web_search_dial_value_ok(*where, "San Francisco,California,United States"));
+    CHECK(web_search_dial_value_ok(*where, "Z\xc3\xbcrich"));          // UTF-8 is fine
+    CHECK(!web_search_dial_value_ok(*where, "Z\xfcrich"));             // Latin-1 is not
+    CHECK(!web_search_dial_value_ok(*where, "line one\r\nline two"));
+    CHECK(!web_search_dial_value_ok(*where, std::string(201, 'a')));
+
+    // validate_dials applies the same rule, so a bad value never reaches a slot.
+    WebSearchSlot ok{"brave-api", {}, {{"goggles", url}}};
+    CHECK(validate_dials(svc("brave-api"), ok).size() == 1);
+    WebSearchSlot bad{"brave-api", {}, {{"goggles", "javascript:alert(1)"}}};
+    CHECK(validate_dials(svc("brave-api"), bad).empty());
+}
+
 TEST_CASE("web search: keys are checked before they become a header") {
     CHECK(clean_api_key("  tvly-abc123 \n") == "tvly-abc123");
     CHECK(clean_api_key("abc\r\nx-evil: 1").empty());
@@ -158,9 +259,16 @@ TEST_CASE("web search: -site: becomes a native filter only where the service has
     auto only = split_site_exclusions("-site:reddit.com");
     CHECK(only.query == "-site:reddit.com");
     CHECK(only.exclude.empty());
+    // At most 20 lifted out (Perplexity's limit); the rest stay in the text.
+    std::string many = "q";
+    for (int i = 0; i < 21; ++i) many += " -site:s" + std::to_string(i) + ".test";
+    auto capped = split_site_exclusions(many);
+    CHECK(capped.exclude.size() == 20);
+    CHECK(capped.query == "q -site:s20.test");
 
     CHECK(has_native_exclude("tavily-free"));
     CHECK(has_native_exclude("exa-api"));
+    CHECK(has_native_exclude("perplexity-api"));
     CHECK(!has_native_exclude("brave-free"));
     CHECK(!has_native_exclude("serper-api"));
 }
@@ -206,6 +314,42 @@ TEST_CASE("web search: Tavily request: keyless header vs bearer key, exclusions 
     CHECK(keyed.url.find("tvly-k") == std::string::npos);
 }
 
+TEST_CASE("web search: Tavily filters follow the reference's rules") {
+    auto body = [](std::string_view id, const WebSearchQuery& q) {
+        return json::parse(build_web_search_request(svc(id), "", q).body);
+    };
+    auto q = query(); q.language = "de";
+    q.dials = {{"exact_match", "true"}, {"language_filter", "only"},
+               {"country", "NZ"}, {"safe_search", "true"}, {"depth", "advanced"}};
+    for (const char* id : {"tavily-free", "tavily-api"}) {
+        INFO(id);
+        auto b = body(id, q);
+        CHECK(b["exact_match"] == true);
+        CHECK(b["filter_by_language"] == true);
+        CHECK(b["country"] == "new zealand");      // Tavily wants the name
+        CHECK(b["safe_search"] == true);
+        CHECK(b["search_depth"] == "advanced");    // key-less now offers depth too
+    }
+    // country is for the general topic only.
+    q.dials = {{"country", "NZ"}, {"topic", "news"}};
+    CHECK(!body("tavily-free", q).contains("country"));
+    // safe_search is not supported with the fast depths.
+    for (const char* depth : {"fast", "ultra-fast"}) {
+        q.dials = {{"safe_search", "true"}, {"depth", depth}};
+        CHECK(!body("tavily-free", q).contains("safe_search"), depth);
+    }
+    // filter_by_language without a language is a 400, so it is not sent.
+    q.language.clear();
+    q.dials = {{"language_filter", "only"}};
+    CHECK(!body("tavily-free", q).contains("filter_by_language"));
+    // Defaults send nothing new.
+    q.dials = {};
+    const auto plain = body("tavily-free", q);
+    for (const char* k : {"exact_match", "filter_by_language", "country",
+                          "safe_search", "search_depth"})
+        CHECK(!plain.contains(k), k);
+}
+
 TEST_CASE("web search: Firecrawl request") {
     auto q = query(); q.exclude = {"github.com"};
     q.dials = {{"freshness", "qdr:m"}, {"category", "research"}, {"country", "NZ"}};
@@ -218,8 +362,23 @@ TEST_CASE("web search: Firecrawl request") {
     CHECK(b["tbs"] == "qdr:m");
     CHECK(b["categories"] == json::array({"research"}));
     CHECK(b["country"] == "NZ");
+    CHECK(!b.contains("safe"));
     CHECK(header(build_web_search_request(svc("firecrawl-api"), "fc-1", q),
                  "authorization") == "Bearer fc-1");
+
+    // Sorting by date joins the window in tbs; alone it is just sbd:1.
+    q.dials = {{"freshness", "qdr:w"}, {"sort", "date"}, {"safe", "true"},
+               {"location", "Germany"}};
+    for (const char* id : {"firecrawl-free", "firecrawl-api"}) {
+        INFO(id);
+        auto sb = json::parse(build_web_search_request(svc(id), "k", q).body);
+        CHECK(sb["tbs"] == "sbd:1,qdr:w");
+        CHECK(sb["safe"] == true);
+        CHECK(sb["location"] == "Germany");
+    }
+    q.dials = {{"sort", "date"}};
+    CHECK(json::parse(build_web_search_request(svc("firecrawl-free"), "", q).body)
+          ["tbs"] == "sbd:1");
 }
 
 TEST_CASE("web search: Brave API request keeps the key out of the URL") {
@@ -239,6 +398,16 @@ TEST_CASE("web search: Brave API request keeps the key out of the URL") {
     q.language = "zh";
     CHECK(build_web_search_request(svc("brave-api"), "k", q).url
           .find("search_lang=zh-hans") != std::string::npos);
+    // Spell correction off is sent; on is Brave's default and sends nothing.
+    q.dials = {{"spellcheck", "false"}, {"country", "ALL"}};
+    const auto url = build_web_search_request(svc("brave-api"), "k", q).url;
+    CHECK(url.find("&spellcheck=false") != std::string::npos);
+    CHECK(url.find("&country=ALL") != std::string::npos);
+    CHECK(url.find("goggles") == std::string::npos);
+    // A Goggle URL is percent-encoded into its own parameter.
+    q.dials = {{"goggles", "https://g.example/a b.goggle?x=1&y"}};
+    CHECK(build_web_search_request(svc("brave-api"), "k", q).url.find(
+          "&goggles=https%3A%2F%2Fg.example%2Fa%20b.goggle%3Fx%3D1%26y") != std::string::npos);
 }
 
 TEST_CASE("web search: Exa, Serper and Perplexity requests") {
@@ -254,6 +423,18 @@ TEST_CASE("web search: Exa, Serper and Perplexity requests") {
     CHECK(eb["type"] == "fast");
     CHECK(eb["category"] == "news");
     CHECK(eb["startPublishedDate"] == "2025-10-02T08:53:20.000Z");
+    q.dials = {{"freshness", "hour"}};
+    CHECK(json::parse(build_web_search_request(svc("exa-api"), "k", q).body)
+          ["startPublishedDate"] == "2025-10-09T07:53:20.000Z");
+    q.dials = {{"type", "deep-reasoning"}};
+    CHECK(json::parse(build_web_search_request(svc("exa-api"), "k", q).body)
+          ["type"] == "deep-reasoning");
+    q.dials = {{"moderation", "true"}, {"country", "NZ"}};
+    auto em = json::parse(build_web_search_request(svc("exa-api"), "k", q).body);
+    CHECK(em["moderation"] == true);
+    CHECK(em["userLocation"] == "NZ");
+    CHECK(!eb.contains("moderation"));
+    CHECK(!eb.contains("userLocation"));
 
     q.dials = {{"country", "NZ"}, {"freshness", "qdr:d"}, {"autocorrect", "false"}};
     auto s = build_web_search_request(svc("serper-api"), "sp-k", q);
@@ -276,6 +457,17 @@ TEST_CASE("web search: Exa, Serper and Perplexity requests") {
     CHECK(pb["country"] == "NZ");
     CHECK(pb["search_recency_filter"] == "month");
     CHECK(pb["search_language_filter"] == json::array({"fr"}));
+    CHECK(!pb.contains("search_type"));
+    CHECK(!pb.contains("search_domain_filter"));
+    q.dials = {{"search_type", "fast"}};
+    CHECK(json::parse(build_web_search_request(svc("perplexity-api"), "k", q).body)
+          ["search_type"] == "fast");
+    // Excluded hosts become the deny form of its domain filter.
+    q.dials = {};
+    q.exclude = {"reddit.com", "pinterest.com"};
+    const json deny = json::array({"-reddit.com", "-pinterest.com"});
+    CHECK(json::parse(build_web_search_request(svc("perplexity-api"), "k", q).body)
+          ["search_domain_filter"] == deny);
 }
 
 TEST_CASE("web search: reply parsers") {
@@ -330,6 +522,55 @@ TEST_CASE("web search: reply parsers") {
     CHECK(!parse_json_hits("tavily-free", "<html>nope</html>", 5).ok);
     CHECK(!parse_json_hits("tavily-free", R"({"detail":{"error":"x"}})", 5).ok);
     CHECK(!parse_json_hits("firecrawl-free", R"({"success":false,"error":"x"})", 5).ok);
+}
+
+TEST_CASE("web search: Firecrawl paper records each get a link") {
+    // The record shape is the documented research example.
+    auto p = parse_json_hits("firecrawl-api",
+        R"({"success":true,"data":{"research":[)"
+        R"({"paperId":"2014215642691656232","primaryId":"arxiv:2105.05233",)"
+        R"("ids":{"arxiv":["2105.05233"]},"title":"Diffusion Models Beat GANs on Image Synthesis",)"
+        R"("abstract":"We show that diffusion models can achieve image sample quality.","score":0.016},)"
+        R"({"paperId":"1","primaryId":"pmid:31452104","title":"P"},)"
+        R"({"paperId":"2","primaryId":"pmcid:PMC6824467","title":"C"},)"
+        R"({"paperId":"3","primaryId":"pmcid:6824467","title":"C2"},)"
+        R"({"paperId":"4","primaryId":"doi:10.1038/s41586-021-03819-2","title":"D"},)"
+        R"({"paperId":"5","primaryId":"arxiv:hep-th/9901001","title":"Old arXiv"},)"
+        R"({"paperId":"6","primaryId":"doi:10.1000/a b","title":"Odd DOI"},)"
+        R"({"paperId":"7","primaryId":"openalex:W2963403868","title":"Unknown kind"},)"
+        R"({"paperId":"8","title":"No primary id"},)"
+        R"({"title":"Nothing to link"})"
+        R"(]}})", 20);
+    REQUIRE(p.ok);
+    REQUIRE(p.hits.size() == 9);   // the last record has no id at all
+    CHECK(p.hits[0].url == "https://arxiv.org/abs/2105.05233");
+    CHECK(p.hits[0].title == "Diffusion Models Beat GANs on Image Synthesis");
+    CHECK(p.hits[0].snippet == "We show that diffusion models can achieve image sample quality.");
+    CHECK(p.hits[1].url == "https://pubmed.ncbi.nlm.nih.gov/31452104/");
+    CHECK(p.hits[2].url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC6824467/");
+    CHECK(p.hits[3].url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC6824467/");
+    CHECK(p.hits[4].url == "https://doi.org/10.1038/s41586-021-03819-2");
+    CHECK(p.hits[5].url == "https://arxiv.org/abs/hep-th/9901001");
+    CHECK(p.hits[6].url == "https://doi.org/10.1000/a%20b");
+    // A kind of id Firecrawl does not document, or none: its own paper page.
+    CHECK(p.hits[7].url == "https://api.firecrawl.dev/v2/search/research/papers/7");
+    CHECK(p.hits[8].url == "https://api.firecrawl.dev/v2/search/research/papers/8");
+
+    // Web results come first, and the count covers both lists.
+    auto mixed = parse_json_hits("firecrawl-free",
+        R"({"success":true,"data":{"web":[{"url":"https://a.test/","title":"A"}],)"
+        R"("research":[{"paperId":"1","primaryId":"pmid:1","title":"P1"},)"
+        R"({"paperId":"2","primaryId":"pmid:2","title":"P2"}]}})", 2);
+    REQUIRE(mixed.ok);
+    REQUIRE(mixed.hits.size() == 2);
+    CHECK(mixed.hits[0].url == "https://a.test/");
+    CHECK(mixed.hits[1].url == "https://pubmed.ncbi.nlm.nih.gov/1/");
+
+    // Either list makes a readable reply; an empty one is "no results".
+    auto empty = parse_json_hits("firecrawl-free", R"({"success":true,"data":{"research":[]}})", 5);
+    CHECK(empty.ok);
+    CHECK(empty.hits.empty());
+    CHECK(!parse_json_hits("firecrawl-free", R"({"success":true,"data":{}})", 5).ok);
 }
 
 TEST_CASE("web search: failures are told apart") {
@@ -445,6 +686,15 @@ TEST_CASE("web search: -site: reaches a native filter, and stays in the text els
     run(http2, p2, "rust async -site:reddit.com");
     REQUIRE(http2->seen.size() == 1);
     CHECK(json::parse(http2->seen[0].body)["q"] == "rust async -site:reddit.com");
+
+    auto http3 = std::make_shared<Scripted>();
+    http3->rules.push_back({"api.perplexity.ai", reply(200, R"({"results":[]})")});
+    WebSearchPlan p3; p3.slots = {WebSearchSlot{"perplexity-api", "k", {}}};
+    run(http3, p3, "rust async -site:reddit.com");
+    REQUIRE(http3->seen.size() == 1);
+    auto pb = json::parse(http3->seen[0].body);
+    CHECK(pb["query"] == "rust async");
+    CHECK(pb["search_domain_filter"] == json::array({"-reddit.com"}));
 }
 
 TEST_CASE("web search: at most three slots are tried") {
