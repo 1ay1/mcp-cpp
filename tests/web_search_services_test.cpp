@@ -99,7 +99,7 @@ const char* kTavily =
 
 TEST_CASE("web search: search catalogue is well formed") {
     const auto& all = web_search_services();
-    CHECK(all.size() == 10);
+    CHECK(all.size() == 11);
     for (const auto& s : all) {
         INFO(s.id);
         CHECK(!s.id.empty());
@@ -169,6 +169,7 @@ TEST_CASE("web search: dials offer each vendor's documented values") {
     CHECK(dial_ids("exa-api", "type") == exa_types);
     CHECK(dial_ids("exa-api", "freshness") == exa_ages);
     CHECK(dial_ids("serper-api", "freshness") == hourly_tbs);
+    CHECK(dial_ids("serply-api", "freshness") == hourly_tbs);
     // Brave's "no country" sits right under the default.
     const auto brave = dial_ids("brave-api", "country");
     REQUIRE(brave.size() >= 2);
@@ -468,6 +469,31 @@ TEST_CASE("web search: Exa, Serper and Perplexity requests") {
     const json deny = json::array({"-reddit.com", "-pinterest.com"});
     CHECK(json::parse(build_web_search_request(svc("perplexity-api"), "k", q).body)
           ["search_domain_filter"] == deny);
+}
+
+TEST_CASE("web search: Serply request and reply") {
+    auto q = query(); q.language = "fr";
+    q.dials = {{"country", "NZ"}, {"freshness", "qdr:d"}};
+    auto r = build_web_search_request(svc("serply-api"), "sy-k", q);
+    CHECK(r.method == "GET");
+    CHECK(r.url == "https://api.serply.io/v1/search/?q=rust%20async&num=5"
+                   "&gl=nz&tbs=qdr%3Ad");
+    CHECK(header(r, "x-api-key") == "sy-k");
+    CHECK(!header(r, "user-agent").empty());
+    CHECK(r.url.find("sy-k") == std::string::npos);
+    CHECK(r.url.find("hl=") == std::string::npos);    // no language parameter
+    CHECK(svc("serply-api").max_count == 10);
+    CHECK(!has_native_exclude("serply-api"));
+
+    auto h = parse_json_hits("serply-api",
+        R"({"results":[{"title":"S","link":"https://s.test/","description":"sd",)"
+        R"("position":1,"result_type":"organic"}],"total":1})", 5);
+    REQUIRE(h.ok);
+    REQUIRE(h.hits.size() == 1);
+    CHECK(h.hits[0].url == "https://s.test/");
+    CHECK(h.hits[0].snippet == "sd");
+    // A 2xx without `results` is not the documented shape.
+    CHECK(!parse_json_hits("serply-api", R"({"detail":"x"})", 5).ok);
 }
 
 TEST_CASE("web search: reply parsers") {
