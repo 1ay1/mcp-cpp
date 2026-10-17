@@ -485,6 +485,15 @@ TEST_CASE("web search: Serply request and reply") {
     CHECK(svc("serply-api").max_count == 10);
     CHECK(!has_native_exclude("serply-api"));
 
+    // No country set: gl=us, since without gl the proxy region is random.
+    // United States is the default row, not a second "US" row.
+    auto plain = build_web_search_request(svc("serply-api"), "sy-k", query());
+    CHECK(plain.url.find("&gl=us") != std::string::npos);
+    const auto countries = dial_ids("serply-api", "country");
+    REQUIRE(!countries.empty());
+    CHECK(countries[0].empty());
+    CHECK(std::find(countries.begin(), countries.end(), "US") == countries.end());
+
     auto h = parse_json_hits("serply-api",
         R"({"results":[{"title":"S","link":"https://s.test/","description":"sd",)"
         R"("position":1,"result_type":"organic"}],"total":1})", 5);
@@ -494,6 +503,13 @@ TEST_CASE("web search: Serply request and reply") {
     CHECK(h.hits[0].snippet == "sd");
     // A 2xx without `results` is not the documented shape.
     CHECK(!parse_json_hits("serply-api", R"({"detail":"x"})", 5).ok);
+    // A row whose `link` is a token, not a URL, is skipped and not counted.
+    auto t = parse_json_hits("serply-api",
+        R"({"results":[{"title":"T","link":"CAESBggA","description":"td"},)"
+        R"({"title":"S","link":"https://s.test/","description":"sd"}]})", 1);
+    REQUIRE(t.ok);
+    REQUIRE(t.hits.size() == 1);
+    CHECK(t.hits[0].url == "https://s.test/");
 }
 
 TEST_CASE("web search: reply parsers") {
@@ -608,6 +624,9 @@ TEST_CASE("web search: failures are told apart") {
     CHECK(classify_http(tavily, 401, "") == WebSearchFailure::BadKey);
     CHECK(classify_http(tavily, 432, "") == WebSearchFailure::QuotaExhausted);
     CHECK(classify_http(svc("exa-api"), 402, "") == WebSearchFailure::QuotaExhausted);
+    // Serply's gateway at a zero balance, expired free credits included.
+    CHECK(classify_http(svc("serply-api"), 402,
+          R"({"detail":"Insufficient prepaid credits"})") == WebSearchFailure::QuotaExhausted);
     // Brave's API answers a rejected token with 422, recorded live.
     CHECK(classify_http(svc("brave-api"), 422,
           R"({"error":{"code":"SUBSCRIPTION_TOKEN_INVALID"}})") == WebSearchFailure::BadKey);
