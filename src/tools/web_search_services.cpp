@@ -334,6 +334,24 @@ std::vector<WebSearchService> make_catalogue() {
     }
     {
         WebSearchService s;
+        s.id = "serply-api"; s.label = "Serply API key"; s.needs_key = true;
+        s.signup = "https://serply.io";
+        s.note = "Google results as JSON.";
+        s.max_count = 10;
+        // Without gl Serply serves from whichever proxy region is free, so the
+        // results can change country between calls. req_serply sends gl=us
+        // for the default, so United States takes the first row.
+        auto country = country_dial("Google's gl parameter.");
+        country.values.erase(country.values.begin() + 1);
+        country.values[0].label = "United States (default)";
+        s.dials.push_back(std::move(country));
+        s.dials.push_back(freshness_dial("freshness",
+            "Google's tbs=qdr: time filter.",
+            hdwmy("qdr:h", "qdr:d", "qdr:w", "qdr:m", "qdr:y")));
+        c.push_back(std::move(s));
+    }
+    {
+        WebSearchService s;
         s.id = "perplexity-api"; s.label = "Perplexity API key"; s.needs_key = true;
         s.signup = "https://docs.perplexity.ai";
         s.note = "Perplexity's Search API (ranked results, not an answer).";
@@ -654,6 +672,27 @@ HttpRequest req_serper(const WebSearchQuery& q, std::string_view key) {
                      {{"x-api-key", std::string{key}}});
 }
 
+// Serply. [L] GET /v1/search/?q=&num= ; X-Api-Key ; num stops at 10 ; gl and
+// tbs pass through to Google ; hl does not change the results, so no language.
+// gl is always sent, us by default: without it the proxy region is random.
+// Cloudflare in front of it refuses some default client user-agents, so the
+// request names itself.
+HttpRequest req_serply(const WebSearchQuery& q, std::string_view key) {
+    HttpRequest r;
+    r.method = "GET";
+    r.url = "https://api.serply.io/v1/search/?q=" + url_escape(q.text)
+          + "&num=" + std::to_string(q.count);
+    auto country = q.dial("country");
+    r.url += "&gl=" + (country.empty() ? std::string{"us"}
+                                       : url_escape(lower(std::string{country})));
+    if (auto v = q.dial("freshness"); !v.empty())
+        r.url += "&tbs=" + url_escape(v);
+    r.headers.push_back({"accept", "application/json"});
+    r.headers.push_back({"user-agent", "mcp-cpp"});
+    r.headers.push_back({"x-api-key", std::string{key}});
+    return r;
+}
+
 // Perplexity Search. [D] POST /search ; Bearer ; max_results 1-20 without a
 // tier ; country is ISO alpha-2 ; search_language_filter is a list of ISO 639-1
 // codes ; search_recency_filter is hour|day|week|month|year ; search_type is
@@ -877,6 +916,7 @@ HttpRequest build_web_search_request(const WebSearchService& svc,
     if (id == "brave-api")      return req_brave_api(q, key);
     if (id == "exa-api")        return req_exa(q, key);
     if (id == "serper-api")     return req_serper(q, key);
+    if (id == "serply-api")     return req_serply(q, key);
     if (id == "perplexity-api") return req_perplexity(q, key);
     return {};   // unreachable for a catalogue id; empty url fails the send
 }
@@ -984,6 +1024,14 @@ JsonHits parse_json_hits(std::string_view service_id, std::string_view body,
         // Serper omits `organic` when Google found nothing.
         const json& o = field(j, "organic");
         out.hits = collect(o, "link", "title", {"snippet"}, count);
+    } else if (service_id == "serply-api") {
+        // Now and then a row's `link` is an opaque token, not a URL. [L]
+        // Such rows are dropped before counting, so they never become hits.
+        json rows = json::array();
+        for (const auto& r : *need(field(j, "results")))
+            if (r.is_object() && str_at(r, "link").rfind("http", 0) == 0)
+                rows.push_back(r);
+        out.hits = collect(rows, "link", "title", {"description"}, count);
     } else if (service_id == "perplexity-api") {
         out.hits = collect(*need(field(j, "results")), "url", "title",
                            {"snippet"}, count);
