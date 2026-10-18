@@ -4,7 +4,7 @@ A modern, **type-theoretic** C++23 implementation of the
 [Model Context Protocol](https://modelcontextprotocol.io/specification/2026-07-28)
 (revision **2026-07-28** — the stateless core — with **dual-era** interop back
 to **2025-11-25**). Header-only, built on
-[jsonrpc-cpp](https://github.com/1ay1/jsonrpc-cpp), no codegen.
+[jsonrpc-cpp](https://github.com/agentty-org/jsonrpc-cpp), no codegen.
 
 It has no runtime: no threads, transports, futures or clocks. The protocol is
 types (every method declared once, in `protocol.hpp`) and answer tables (a
@@ -57,8 +57,8 @@ template <> struct CodecOf<PrimitiveSchema> {
 ```
 
 The algebra, codecs and JSON-RPC engine are
-[jsonrpc-cpp](https://github.com/1ay1/jsonrpc-cpp)'s, shared with
-[acp-cpp](https://github.com/1ay1/acp-cpp).
+[jsonrpc-cpp](https://github.com/agentty-org/jsonrpc-cpp)'s, shared with
+[acp-cpp](https://github.com/agentty-org/acp-cpp).
 
 ## Coverage (2025-11-25)
 

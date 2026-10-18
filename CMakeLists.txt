@@ -37,7 +37,7 @@ FetchContent_MakeAvailable(nlohmann_json)
 # added it; built alone, fetch it.
 if(NOT TARGET jsonrpc::jsonrpc)
     FetchContent_Declare(jsonrpc_cpp
-        GIT_REPOSITORY https://github.com/1ay1/jsonrpc-cpp.git
+        GIT_REPOSITORY https://github.com/agentty-org/jsonrpc-cpp.git
         GIT_TAG        master
         GIT_SHALLOW    TRUE)
     FetchContent_MakeAvailable(jsonrpc_cpp)

@@ -10,7 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT TARGET mcp::mcp)
     include(FetchContent)
     FetchContent_Declare(mcp
-        GIT_REPOSITORY https://github.com/1ay1/mcp-cpp.git
+        GIT_REPOSITORY https://github.com/agentty-org/mcp-cpp.git
         GIT_TAG        master)
     FetchContent_MakeAvailable(mcp)
 endif()
